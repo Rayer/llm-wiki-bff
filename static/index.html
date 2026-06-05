@@ -1,0 +1,701 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LLM Wiki Cloud</title>
+<style>
+  :root {
+    --bg: #0d1117; --surface: #161b22; --border: #30363d;
+    --text: #c9d1d9; --muted: #8b949e; --accent: #58a6ff;
+    --green: #3fb950; --yellow: #d2991d; --purple: #a371f7;
+    --radius: 8px;
+  }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    background: var(--bg); color: var(--text); display: flex; height: 100vh; }
+
+  /* Sidebar */
+  aside {
+    width: 280px; min-width: 280px; background: var(--surface);
+    border-right: 1px solid var(--border); display: flex; flex-direction: column;
+    overflow: hidden;
+  }
+  .sidebar-header { padding: 20px; border-bottom: 1px solid var(--border); }
+  .sidebar-header h1 { font-size: 16px; margin-bottom: 4px; }
+  .sidebar-header .project { font-size: 12px; color: var(--muted); }
+  .sidebar-nav { flex:1; overflow-y: auto; padding: 12px; }
+  .sidebar-nav .section { margin-bottom: 20px; }
+  .sidebar-nav .section-title {
+    font-size: 11px; text-transform: uppercase; letter-spacing: .5px;
+    color: var(--muted); margin-bottom: 8px; padding: 0 8px;
+  }
+  .sidebar-nav .entry, .sidebar-nav .concept {
+    display: block; padding: 6px 8px; border-radius: 4px; font-size: 13px;
+    cursor: pointer; color: var(--text); text-decoration: none;
+    transition: background .1s; white-space: nowrap; overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .sidebar-nav .entry:hover, .sidebar-nav .concept:hover { background: var(--border); }
+  .sidebar-nav .entry.active, .sidebar-nav .concept.active { background: #1b3a3f; color: var(--accent); }
+  .sidebar-nav .entry .count { color: var(--muted); font-size: 11px; }
+  .sidebar-nav .concept { color: var(--purple); }
+  .sidebar-nav .concept .status-tag { font-size: 10px; padding: 1px 6px; border-radius: 8px;
+    background: #2b2410; color: var(--yellow); margin-left: 4px; }
+
+  /* Main */
+  main { flex:1; display: flex; flex-direction: column; overflow: hidden; }
+
+  /* Query bar */
+  .query-bar {
+    padding: 16px 24px; border-bottom: 1px solid var(--border);
+    background: var(--surface); display: flex; gap: 8px; align-items: center;
+  }
+  .query-bar input {
+    flex:1; padding: 10px 16px; background: var(--bg);
+    border: 1px solid var(--border); border-radius: var(--radius);
+    color: var(--text); font-size: 14px;
+  }
+  .query-bar input:focus { outline: none; border-color: var(--accent); }
+  .query-bar input::placeholder { color: var(--muted); }
+  .mode-group {
+    display: flex; border-radius: 6px; overflow: hidden; border: 1px solid var(--border);
+  }
+  .mode-group button {
+    padding: 8px 12px; border: none; background: var(--bg); color: var(--muted);
+    cursor: pointer; font-size: 12px; border-right: 1px solid var(--border);
+  }
+  .mode-group button:last-child { border-right: none; }
+  .mode-group button.active { background: #1b3a3f; color: var(--accent); }
+  .btn {
+    padding: 8px 16px; border-radius: 6px; border: 1px solid var(--border);
+    background: var(--surface); color: var(--text); cursor: pointer; font-size: 13px;
+    white-space: nowrap;
+  }
+  .btn:hover { background: var(--border); }
+  .btn.primary { background: #1f6feb; border-color: #1f6feb; color: #fff; }
+  .btn.primary:hover { background: #388bfd; }
+
+  /* Content area */
+  .content { flex:1; overflow-y: auto; padding: 24px; }
+
+  /* Wiki render */
+  .wiki-render { max-width: 780px; line-height: 1.8; font-size: 15px; }
+  .wiki-render h1 { font-size: 22px; margin-bottom: 8px; border-bottom: 1px solid var(--border); padding-bottom: 8px; }
+  .wiki-render h2 { font-size: 17px; margin: 24px 0 8px; }
+  .wiki-render h3 { font-size: 15px; margin: 16px 0 6px; }
+  .wiki-render p { margin-bottom: 12px; }
+  .wiki-render table { border-collapse: collapse; width: 100%; margin: 12px 0; }
+  .wiki-render th, .wiki-render td { border: 1px solid var(--border); padding: 8px 12px; font-size: 13px; text-align: left; }
+  .wiki-render th { background: var(--surface); }
+  .wiki-render .wikilink { color: var(--purple); cursor: pointer; text-decoration: none; }
+  .wiki-render .wikilink:hover { text-decoration: underline; }
+  .wiki-render .wikilink.broken { color: #f85149; }
+  .wiki-render .frontmatter-block {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 6px;
+    padding: 12px 16px; margin-bottom: 16px; font-size: 13px;
+  }
+  .wiki-render .frontmatter-block .kv { display: flex; gap: 8px; }
+  .wiki-render .frontmatter-block .key { color: var(--muted); min-width: 70px; }
+  .wiki-render .frontmatter-block .val { color: var(--text); }
+  .wiki-render .frontmatter-block .tag {
+    display: inline-block; padding: 1px 8px; border-radius: 10px;
+    background: #1b3a1b; color: var(--green); font-size: 11px; margin: 0 2px 2px 0;
+  }
+  .wiki-render .blockquote {
+    border-left: 3px solid var(--accent); padding: 8px 16px; margin: 12px 0;
+    background: var(--surface); border-radius: 0 6px 6px 0; font-size: 14px;
+  }
+  .wiki-render .draft-badge {
+    display: inline-block; padding: 2px 10px; border-radius: 10px;
+    background: #2b2410; color: var(--yellow); font-size: 12px; margin-bottom: 12px;
+  }
+
+  /* Query results */
+  .query-results { max-width: 780px; }
+  .query-results .result-item {
+    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 16px; margin-bottom: 12px;
+  }
+  .query-results .result-item .source {
+    font-size: 12px; margin-top: 8px; color: var(--muted);
+  }
+  .query-results .result-item .source a {
+    color: var(--purple); cursor: pointer; text-decoration: none;
+  }
+  .query-results .result-item .source a:hover { text-decoration: underline; }
+  .query-results .result-item .ai-label {
+    display: inline-block; padding: 2px 8px; border-radius: 8px;
+    background: #1b3a3f; color: var(--accent); font-size: 11px; margin-bottom: 8px;
+  }
+
+  /* Welcome / empty state */
+  .welcome { text-align: center; padding: 60px 20px; color: var(--muted); }
+  .welcome .big-icon { font-size: 48px; margin-bottom: 16px; }
+  .welcome h2 { color: var(--text); margin-bottom: 8px; }
+  .welcome p { font-size: 14px; }
+
+  /* Bookmark import placeholder */
+  .placeholder-card {
+    background: var(--surface); border: 1px dashed var(--border); border-radius: var(--radius);
+    padding: 20px; text-align: center; color: var(--muted); margin-bottom: 16px;
+  }
+  .placeholder-card .icon { font-size: 24px; margin-bottom: 8px; }
+  .placeholder-card p { font-size: 13px; }
+
+  /* Loading state */
+  .loading { text-align: center; padding: 40px; color: var(--muted); }
+  .spinner { display: inline-block; width: 24px; height: 24px; border: 2px solid var(--border);
+    border-top-color: var(--accent); border-radius: 50%; animation: spin .6s linear infinite; margin-bottom: 8px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  @media (max-width: 768px) {
+    body { flex-direction: column; }
+    aside { width: 100%; min-width: 0; max-height: 40vh; }
+  }
+</style>
+</head>
+<body>
+
+<!-- ═══════════════ SIDEBAR ═══════════════ -->
+<aside>
+  <div class="sidebar-header">
+    <h1>🧠 LLM Wiki</h1>
+    <div class="project" id="sidebar-project">...</div>
+  </div>
+  <div class="sidebar-nav" id="sidebar">
+    <!-- Compiled sources -->
+    <div class="section">
+      <div class="section-title">📚 Compiled Sources <span id="sources-count" style="color:var(--green)">(...)</span></div>
+      <div id="sources-list"></div>
+    </div>
+    <!-- Wiki concepts -->
+    <div class="section">
+      <div class="section-title">🏷️ Wiki Concepts <span id="concepts-count" style="color:var(--yellow)">(...)</span></div>
+      <div id="concepts-list"></div>
+    </div>
+    <!-- Bookmark import -->
+    <div class="section">
+      <div class="section-title">📥 Import</div>
+      <a class="entry" onclick="showImport(event)" style="color:var(--accent); cursor:pointer;">+ Import Bookmarks</a>
+    </div>
+  </div>
+</aside>
+
+<!-- ═══════════════ MAIN ═══════════════ -->
+<main>
+  <div class="query-bar">
+    <input id="query-input" type="text" placeholder="Ask your wiki..." onkeydown="if(event.key==='Enter')doQuery()">
+    <div class="mode-group" id="mode-group">
+      <button class="active" onclick="setMode(event,'wiki')">wiki only</button>
+      <button onclick="setMode(event,'full')">wiki + LLM</button>
+    </div>
+    <button class="btn primary" onclick="doQuery()">Ask</button>
+  </div>
+
+  <div class="content" id="main-content">
+    <!-- Default: welcome -->
+    <div class="welcome" id="welcome-view">
+      <div class="big-icon">🧠</div>
+      <h2>LLM Wiki Cloud</h2>
+      <p>Select a compiled source from the sidebar, or ask a question above.</p>
+      <p id="welcome-stats" style="margin-top: 8px;">Loading stats...</p>
+    </div>
+
+    <!-- Wiki content view -->
+    <div id="wiki-view" style="display:none;" class="wiki-render"></div>
+
+    <!-- Query results view -->
+    <div id="query-view" style="display:none;" class="query-results"></div>
+
+    <!-- Import view -->
+    <div id="import-view" style="display:none;">
+      <h2 style="margin-bottom:16px;">📥 Import Bookmarks</h2>
+      <div class="placeholder-card">
+        <div class="icon">🔖</div>
+        <p><strong>Bookmark import — POC placeholder</strong></p>
+        <p style="margin-top:4px;">Paste URLs (one per line) to import as raw sources for LLM Wiki compilation.</p>
+        <p style="margin-top:8px; color:var(--yellow);" id="import-phase-msg">Coming in Phase 2</p>
+      </div>
+      <div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:16px;">
+        <textarea id="import-urls" style="width:100%;height:120px;background:var(--bg);border:1px solid var(--border);
+          border-radius:6px;color:var(--text);font-size:13px;padding:10px;resize:vertical;"
+          placeholder="https://example.com/article-1&#10;https://example.com/article-2&#10;..."></textarea>
+        <button class="btn primary" id="import-btn" style="margin-top:8px;" onclick="doImport()">Import & Compile</button>
+        <span id="import-result" style="font-size:12px;color:var(--muted);margin-left:12px;"></span>
+      </div>
+    </div>
+  </div>
+</main>
+
+<script>
+// ═══ State ═══
+let queryMode = 'wiki';
+let sourcesData = {};
+let conceptsData = {};
+let wikiPageCache = {};   // slug -> { title, type, frontmatter, body }
+let sidebarBuilt = false;
+
+// ═══ Init: load sidebar data ═══
+async function init() {
+  document.getElementById('sidebar-project').textContent = 'loading...';
+  try {
+    const [sourcesRes, conceptsRes, statusRes] = await Promise.all([
+      fetch('/api/sources'),
+      fetch('/api/concepts'),
+      fetch('/api/status'),
+    ]);
+
+    if (sourcesRes.ok) {
+      const data = await sourcesRes.json();
+      sourcesData = data.sources || [];
+      document.getElementById('sources-count').textContent = '(' + sourcesData.length + ')';
+    }
+
+    if (conceptsRes.ok) {
+      const data = await conceptsRes.json();
+      conceptsData = data.concepts || [];
+      document.getElementById('concepts-count').textContent = '(' + conceptsData.length + ')';
+    }
+
+    if (statusRes.ok) {
+      const status = await statusRes.json();
+      document.getElementById('welcome-stats').textContent =
+        status.index_sources + ' sources compiled · ' + status.index_concepts + ' concept drafts · ingest-time compile, not RAG';
+    } else {
+      document.getElementById('welcome-stats').textContent =
+        sourcesData.length + ' sources compiled · ' + conceptsData.length + ' concept drafts · ingest-time compile, not RAG';
+    }
+  } catch (err) {
+    console.warn('Sidebar load failed:', err);
+    document.getElementById('welcome-stats').textContent = 'API unavailable — check server connection';
+    document.getElementById('sidebar-project').textContent = 'offline';
+  }
+
+  buildSidebar();
+}
+
+function buildSidebar() {
+  const sourcesList = document.getElementById('sources-list');
+  const conceptsList = document.getElementById('concepts-list');
+
+  if (sourcesData.length === 0) {
+    sourcesList.innerHTML = '<div style="font-size:12px;color:var(--muted);padding:4px 8px;">No compiled sources yet</div>';
+  } else {
+    sourcesList.innerHTML = sourcesData.map((s, i) =>
+      `<a class="entry${i === 0 ? ' active' : ''}" data-slug="${escapeAttr(s.slug)}" data-type="source"
+        onclick="showWiki(event,'source','${escapeAttr(s.slug)}')">${escapeHtml(s.title || s.slug)}</a>`
+    ).join('');
+  }
+
+  if (conceptsData.length === 0) {
+    conceptsList.innerHTML = '<div style="font-size:12px;color:var(--muted);padding:4px 8px;">No concept drafts yet</div>';
+  } else {
+    conceptsList.innerHTML = conceptsData.map(c =>
+      `<a class="concept" data-slug="${escapeAttr(c.slug)}" data-type="concept"
+        onclick="showWiki(event,'concept','${escapeAttr(c.slug)}')">
+        ${escapeHtml(c.title || c.slug)} <span class="status-tag">draft</span>
+      </a>`
+    ).join('');
+  }
+  sidebarBuilt = true;
+}
+
+// ═══ Query Engine (API-backed) ═══
+async function doQuery() {
+  const input = document.getElementById('query-input');
+  const query = input.value.trim();
+  if (!query) return;
+
+  showView('query');
+
+  const container = document.getElementById('query-view');
+  container.innerHTML = '<div class="loading"><div class="spinner"></div><p>Searching wiki...</p></div>';
+
+  try {
+    const res = await fetch('/api/query?q=' + encodeURIComponent(query) + '&mode=' + queryMode);
+    if (!res.ok) {
+      container.innerHTML = '<div style="text-align:center;padding:40px;color:var(--muted);"><p>Search error: ' + res.status + '</p></div>';
+      return;
+    }
+    const data = await res.json();
+    const results = data.results || [];
+
+    if (results.length === 0) {
+      container.innerHTML = `
+        <div style="text-align:center;padding:40px;color:var(--muted);">
+          <p>No wiki matches for "<strong>${escapeHtml(query)}</strong>"${queryMode === 'full' ? ' — but LLM can still answer' : ''}.</p>
+          ${queryMode === 'full' && data.ai_synth ? `
+            <div class="result-item" style="margin-top:16px;text-align:left;">
+              <div class="ai-label">🤖 LLM Answer</div>
+              <p>${escapeHtml(data.ai_synth)}</p>
+            </div>
+          ` : ''}
+        </div>`;
+      return;
+    }
+
+    let html = `<h2 style="margin-bottom:16px;">Results for "${escapeHtml(query)}" <span style="font-size:13px;color:var(--muted);">(${queryMode} mode · ${results.length} matches)</span></h2>`;
+
+    if (queryMode === 'full' && data.ai_synth) {
+      html += `
+        <div class="result-item">
+          <div class="ai-label">🤖 Synthesized Answer</div>
+          <p>${escapeHtml(data.ai_synth)}</p>
+        </div>`;
+    }
+
+    for (const r of results) {
+      html += `
+        <div class="result-item">
+          <strong onclick="showWiki(event,'${r.type}','${escapeAttr(r.slug)}')" style="cursor:pointer;color:var(--accent);">${escapeHtml(r.title)}</strong>
+          ${r.type === 'concept' ? '<span style="font-size:11px;color:var(--yellow);margin-left:6px;">draft</span>' : ''}
+          <p style="margin-top:6px;font-size:14px;">${escapeHtml(r.snippet || '')}</p>
+          <div class="source">
+            📎 Wiki ${r.type}: <a onclick="showWiki(event,'${r.type}','${escapeAttr(r.slug)}')">[[${escapeHtml(r.title)}]]</a>
+          </div>
+        </div>`;
+    }
+
+    container.innerHTML = html;
+  } catch (err) {
+    container.innerHTML = '<div style="text-align:center;padding:40px;color:var(--muted);"><p>Network error: ' + escapeHtml(err.message) + '</p></div>';
+  }
+}
+
+// ═══ Wiki Render (API-backed) ═══
+async function showWiki(event, type, slug) {
+  if (event) event.preventDefault();
+
+  // Update sidebar active
+  document.querySelectorAll('.entry, .concept').forEach(e => e.classList.remove('active'));
+  const sidebarLink = document.querySelector(`#sources-list [data-slug="${escapeAttr(slug)}"], #concepts-list [data-slug="${escapeAttr(slug)}"]`);
+  if (sidebarLink) sidebarLink.classList.add('active');
+
+  showView('wiki');
+
+  const container = document.getElementById('wiki-view');
+  const cacheKey = type + ':' + slug;
+
+  // Check cache
+  if (wikiPageCache[cacheKey]) {
+    renderWikiPage(container, wikiPageCache[cacheKey]);
+    return;
+  }
+
+  container.innerHTML = '<div class="loading"><div class="spinner"></div><p>Loading page...</p></div>';
+
+  try {
+    const endpoint = type === 'source' ? '/api/sources/' : '/api/concepts/';
+    const res = await fetch(endpoint + encodeURIComponent(slug));
+    if (!res.ok) {
+      container.innerHTML = '<div style="padding:40px;color:var(--muted);text-align:center;"><p>Page not found: ' + slug + '</p></div>';
+      return;
+    }
+    const data = await res.json();
+    wikiPageCache[cacheKey] = data;
+    renderWikiPage(container, data);
+  } catch (err) {
+    container.innerHTML = '<div style="padding:40px;color:var(--muted);text-align:center;"><p>Network error: ' + escapeHtml(err.message) + '</p></div>';
+  }
+}
+
+function renderWikiPage(container, data) {
+  const fm = data.frontmatter || {};
+  const body = data.body || '';
+  const title = data.title || data.slug;
+  const isDraft = data.type === 'concept' || data.status === 'draft';
+
+  // Build frontmatter block
+  let fmHtml = '';
+  if (isDraft) {
+    fmHtml = `
+      <div class="kv"><span class="key">Status</span><span class="val" style="color:var(--yellow)">⚠️ draft</span></div>
+      ${fm.confidence ? `<div class="kv"><span class="key">Confidence</span><span class="val">${escapeHtml(fm.confidence)}</span></div>` : ''}`;
+  } else {
+    fmHtml = `
+      <div class="kv"><span class="key">Quality</span><span class="val" style="color:var(--green)">● ${escapeHtml(fm.quality || 'high')}</span></div>
+      <div class="kv"><span class="key">Status</span><span class="val" style="color:var(--green)">published</span></div>
+      ${fm.source ? `<div class="kv"><span class="key">Source</span><span class="val">${escapeHtml(fm.source)}</span></div>` : ''}`;
+  }
+
+  if (fm.concepts) {
+    let concepts = fm.concepts;
+    if (typeof concepts === 'string') {
+      // Could be comma-separated or YAML list
+      concepts = concepts.replace(/[\[\]'"]/g, '').split(',').map(c => c.trim()).filter(Boolean);
+    }
+    if (Array.isArray(concepts) && concepts.length) {
+      fmHtml += `<div class="kv"><span class="key">Concepts</span><span class="val">`;
+      fmHtml += concepts.map(c => {
+        const exists = conceptsData.some(cd => (cd.title || cd.slug) === c);
+        if (exists) {
+          const match = conceptsData.find(cd => (cd.title || cd.slug) === c);
+          return `<span class="tag" style="cursor:pointer;background:#1b1a3a;color:var(--purple);"
+            onclick="showWiki(event,'concept','${escapeAttr(match.slug)}')">${escapeHtml(c)}</span>`;
+        }
+        return `<span class="tag" style="opacity:0.5;">${escapeHtml(c)} (pending)</span>`;
+      }).join(' ');
+      fmHtml += `</span></div>`;
+    }
+  }
+
+  if (fm.source_url) {
+    fmHtml += `<div class="kv"><span class="key">URL</span><span class="val"><a href="${escapeAttr(fm.source_url)}" target="_blank" style="color:var(--accent);">view original ↗</a></span></div>`;
+  }
+
+  container.innerHTML = `
+    ${fmHtml ? `<div class="frontmatter-block">${fmHtml}</div>` : ''}
+    <h1>${escapeHtml(title)}</h1>
+    ${isDraft ? '<div class="draft-badge">⚠️ Draft — not yet reviewed</div>' : ''}
+    ${renderMarkdown(body)}
+  `;
+
+  document.getElementById('main-content').scrollTop = 0;
+}
+
+// ═══ Markdown → HTML Renderer ═══
+function renderMarkdown(md) {
+  if (!md) return '';
+
+  // Escape HTML first (except wikilinks we'll handle separately)
+  let lines = md.split('\n');
+  let html = '';
+  let inTable = false;
+  let inBlockquote = false;
+  let tableHtml = '';
+
+  function closeTable() {
+    if (inTable) {
+      html += '<table>' + tableHtml + '</table>';
+      tableHtml = '';
+      inTable = false;
+    }
+  }
+
+  function closeBlockquote() {
+    if (inBlockquote) {
+      html += '</div>';
+      inBlockquote = false;
+    }
+  }
+
+  for (let i = 0; i < lines.length; i++) {
+    let line = lines[i];
+
+    // Frontmatter fence — skip
+    if (line.trim() === '---' && i === 0) {
+      // Find closing ---
+      let j = i + 1;
+      while (j < lines.length && lines[j].trim() !== '---') j++;
+      i = j;
+      continue;
+    }
+
+    // Blockquote
+    if (line.startsWith('> ')) {
+      closeTable();
+      if (!inBlockquote) {
+        html += '<div class="blockquote">';
+        inBlockquote = true;
+      }
+      line = line.substring(2);
+      html += '<p>' + inlineMarkdown(line) + '</p>';
+      continue;
+    } else if (inBlockquote) {
+      closeBlockquote();
+    }
+
+    // Table row
+    if (line.startsWith('|') && line.endsWith('|')) {
+      closeBlockquote();
+      let cells = line.split('|').slice(1, -1).map(c => c.trim());
+      // Separator row
+      if (cells.every(c => /^[-: ]+$/.test(c))) {
+        if (!inTable) inTable = true;
+        continue;
+      }
+      if (!inTable) inTable = true;
+      let isHeader = (i + 1 < lines.length && lines[i + 1].trim().startsWith('|') &&
+        lines[i + 1].split('|').slice(1, -1).every(c => /^[-: ]+$/.test(c.trim())));
+      tableHtml += '<tr>';
+      for (const cell of cells) {
+        tableHtml += (isHeader ? '<th>' : '<td>') + inlineMarkdown(cell) + (isHeader ? '</th>' : '</td>');
+      }
+      tableHtml += '</tr>';
+      continue;
+    } else {
+      closeTable();
+    }
+
+    // Headings
+    if (line.startsWith('### ')) {
+      closeBlockquote();
+      html += '<h3>' + inlineMarkdown(line.substring(4)) + '</h3>';
+      continue;
+    }
+    if (line.startsWith('## ')) {
+      closeBlockquote();
+      html += '<h2>' + inlineMarkdown(line.substring(3)) + '</h2>';
+      continue;
+    }
+    if (line.startsWith('# ')) {
+      closeBlockquote();
+      html += '<h1>' + inlineMarkdown(line.substring(2)) + '</h1>';
+      continue;
+    }
+
+    // Unordered list
+    if (line.match(/^[\-\*]\s/)) {
+      closeBlockquote();
+      html += '<li>' + inlineMarkdown(line.replace(/^[\-\*]\s/, '')) + '</li>';
+      continue;
+    }
+
+    // Ordered list
+    if (line.match(/^\d+\.\s/)) {
+      closeBlockquote();
+      html += '<li>' + inlineMarkdown(line.replace(/^\d+\.\s/, '')) + '</li>';
+      continue;
+    }
+
+    // Horizontal rule
+    if (line.trim() === '---' || line.trim() === '***' || line.trim() === '___') {
+      closeBlockquote();
+      html += '<hr style="border-color:var(--border);margin:16px 0;">';
+      continue;
+    }
+
+    // Empty line
+    if (line.trim() === '') {
+      closeBlockquote();
+      html += '<br>';
+      continue;
+    }
+
+    // Regular paragraph
+    closeBlockquote();
+    html += '<p>' + inlineMarkdown(line) + '</p>';
+  }
+
+  closeTable();
+  closeBlockquote();
+
+  // Wrap consecutive <li> elements in <ul>
+  html = html.replace(/((?:<li>.*?<\/li>)+)/g, '<ul style="margin:8px 0;padding-left:24px;">$1</ul>');
+
+  return html;
+}
+
+function inlineMarkdown(text) {
+  if (!text) return '';
+
+  // Escape HTML
+  text = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+  // Bold
+  text = text.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+
+  // Italic
+  text = text.replace(/\*(.+?)\*/g, '<em>$1</em>');
+
+  // Inline code
+  text = text.replace(/`([^`]+)`/g, '<code style="background:var(--surface);padding:1px 6px;border-radius:3px;font-size:13px;">$1</code>');
+
+  // External links [text](url)
+  text = text.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" style="color:var(--accent);">$1</a>');
+
+  // Wikilinks [[title]]
+  text = text.replace(/\[\[([^\]]+)\]\]/g, (match, title) => {
+    // Check if concept exists in sidebar data
+    const exists = conceptsData.some(c => (c.title || c.slug) === title);
+    if (exists) {
+      const matchC = conceptsData.find(c => (c.title || c.slug) === title);
+      return `<a class="wikilink" onclick="showWiki(event,'concept','${escapeAttr(matchC.slug)}')">${title}</a>`;
+    }
+    return `<a class="wikilink broken" onclick="event.preventDefault();">${title}</a>`;
+  });
+
+  return text;
+}
+
+// ═══ Import View ═══
+function showImport(event) {
+  if (event) event.preventDefault();
+  showView('import');
+}
+
+async function doImport() {
+  const textarea = document.getElementById('import-urls');
+  const btn = document.getElementById('import-btn');
+  const result = document.getElementById('import-result');
+  const urlsText = textarea.value.trim();
+
+  if (!urlsText) {
+    result.textContent = 'Please paste at least one URL.';
+    result.style.color = 'var(--yellow)';
+    return;
+  }
+
+  const urls = urlsText.split('\n').map(u => u.trim()).filter(Boolean);
+
+  btn.disabled = true;
+  btn.textContent = 'Importing...';
+  result.textContent = '';
+
+  try {
+    const res = await fetch('/api/import', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ urls }),
+    });
+
+    const data = await res.json();
+
+    if (res.ok) {
+      result.textContent = '✅ ' + (data.message || 'Import request received.') + ' (' + data.received + ' URLs)';
+      result.style.color = 'var(--green)';
+    } else {
+      result.textContent = '❌ Error: ' + (data.error || 'Unknown error');
+      result.style.color = '#f85149';
+    }
+  } catch (err) {
+    result.textContent = '❌ Network error: ' + err.message;
+    result.style.color = '#f85149';
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Import & Compile';
+  }
+}
+
+// ═══ Helpers ═══
+function showView(name) {
+  document.getElementById('welcome-view').style.display = name === 'welcome' ? 'block' : 'none';
+  document.getElementById('wiki-view').style.display = name === 'wiki' ? 'block' : 'none';
+  document.getElementById('query-view').style.display = name === 'query' ? 'block' : 'none';
+  document.getElementById('import-view').style.display = name === 'import' ? 'block' : 'none';
+}
+
+function setMode(event, mode) {
+  queryMode = mode;
+  document.querySelectorAll('#mode-group button').forEach(b => b.classList.remove('active'));
+  event.target.classList.add('active');
+}
+
+function escapeHtml(s) {
+  if (!s) return '';
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+function escapeAttr(s) {
+  if (!s) return '';
+  return s.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/'/g, '&#39;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+// ═══ Start ═══
+init();
+</script>
+</body>
+</html>

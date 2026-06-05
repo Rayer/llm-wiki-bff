@@ -1,0 +1,5 @@
+gcp_project = "llm-wiki-cloud"
+bucket = "llm-wiki-data"
+user_id = "test-user"
+project_id = "demo"
+port = "8080"

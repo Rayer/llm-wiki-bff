@@ -1,0 +1,313 @@
+basePath: /
+definitions:
+  gcs.WikiPage:
+    properties:
+      concepts:
+        items:
+          type: string
+        type: array
+      path:
+        type: string
+      quality:
+        type: string
+      raw_source:
+        type: string
+      slug:
+        type: string
+      source_url:
+        type: string
+      status:
+        description: '"published" or "draft"'
+        type: string
+      title:
+        type: string
+    type: object
+  handler.ConceptDetailResponse:
+    properties:
+      body:
+        type: string
+      frontmatter:
+        additionalProperties: true
+        type: object
+      raw:
+        type: string
+      slug:
+        type: string
+      status:
+        type: string
+      title:
+        type: string
+      type:
+        type: string
+    type: object
+  handler.ConceptsListResponse:
+    properties:
+      concepts:
+        items:
+          $ref: '#/definitions/gcs.WikiPage'
+        type: array
+      count:
+        type: integer
+    type: object
+  handler.ErrorResponse:
+    properties:
+      error:
+        type: string
+    type: object
+  handler.ImportRequest:
+    properties:
+      urls:
+        items:
+          type: string
+        type: array
+    required:
+    - urls
+    type: object
+  handler.ImportResponse:
+    properties:
+      message:
+        type: string
+      received:
+        type: integer
+      urls:
+        items:
+          type: string
+        type: array
+    type: object
+  handler.QueryResponse:
+    properties:
+      ai_synth:
+        description: placeholder for LLM synthesis
+        type: string
+      mode:
+        type: string
+      query:
+        type: string
+      results:
+        items:
+          $ref: '#/definitions/search.Result'
+        type: array
+    type: object
+  handler.SourceDetailResponse:
+    properties:
+      body:
+        type: string
+      frontmatter:
+        additionalProperties: true
+        type: object
+      raw:
+        type: string
+      slug:
+        type: string
+      title:
+        type: string
+      type:
+        type: string
+    type: object
+  handler.SourcesListResponse:
+    properties:
+      count:
+        type: integer
+      sources:
+        items:
+          $ref: '#/definitions/gcs.WikiPage'
+        type: array
+    type: object
+  handler.StatusResponse:
+    properties:
+      concepts_count:
+        type: integer
+      index_concepts:
+        type: integer
+      index_sources:
+        type: integer
+      lock_expiry:
+        type: string
+      lock_worker:
+        type: string
+      locked:
+        type: boolean
+      sources_count:
+        type: integer
+    type: object
+  search.Result:
+    properties:
+      slug:
+        type: string
+      snippet:
+        type: string
+      title:
+        type: string
+      type:
+        description: '"source" or "concept"'
+        type: string
+    type: object
+host: localhost:8080
+info:
+  contact:
+    name: LLM Wiki Team
+  description: Backend-for-frontend API for the LLM Wiki project. Serves wiki sources
+    and concepts with full-text search, import, and pipeline status.
+  title: LLM Wiki BFF API
+  version: "1.0"
+paths:
+  /api/concepts:
+    get:
+      description: Returns published wiki concepts by default. Set include_drafts=true
+        to include draft concepts.
+      parameters:
+      - default: false
+        description: Include draft concepts
+        in: query
+        name: include_drafts
+        type: boolean
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/handler.ConceptsListResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+      summary: List wiki concepts
+      tags:
+      - concepts
+  /api/concepts/{slug}:
+    get:
+      description: Returns full content (frontmatter + body) for a wiki concept.
+      parameters:
+      - description: Concept slug
+        in: path
+        name: slug
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/handler.ConceptDetailResponse'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+      summary: Get a concept by slug
+      tags:
+      - concepts
+  /api/import:
+    post:
+      consumes:
+      - application/json
+      description: Accepts a list of URLs to import (Phase 2 — placeholder).
+      parameters:
+      - description: URLs to import
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handler.ImportRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/handler.ImportResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+      summary: Import bookmarks
+      tags:
+      - import
+  /api/query:
+    get:
+      description: Full-text search across sources and concepts. Mode "wiki" returns
+        raw results, "full" adds AI-synthesized answer.
+      parameters:
+      - description: Search query
+        in: query
+        name: q
+        required: true
+        type: string
+      - default: wiki
+        description: 'Search mode: wiki or full'
+        in: query
+        name: mode
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/handler.QueryResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+      summary: Search wiki content
+      tags:
+      - search
+  /api/sources:
+    get:
+      description: Returns all compiled wiki sources.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/handler.SourcesListResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+      summary: List wiki sources
+      tags:
+      - sources
+  /api/sources/{slug}:
+    get:
+      description: Returns full content (frontmatter + body) for a wiki source.
+      parameters:
+      - description: Source slug
+        in: path
+        name: slug
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/handler.SourceDetailResponse'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+      summary: Get a source by slug
+      tags:
+      - sources
+  /api/status:
+    get:
+      description: Returns counts and lock status from GCS, search index, and Firestore.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/handler.StatusResponse'
+      summary: Pipeline status
+      tags:
+      - status
+swagger: "2.0"

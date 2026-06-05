@@ -1,0 +1,11 @@
+/bff
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+.env
+*.test
+*.out
+vendor/
+.idea/
