@@ -43,12 +43,12 @@ func main() {
 		log.Printf("WARNING: Firestore client not available: %v", err)
 	}
 
-	// Build search index
+	// Build search index from generated wiki metadata
 	idx := search.NewIndex()
 	if err := idx.Build(gcsClient); err != nil {
 		log.Printf("WARNING: Search index build failed: %v", err)
 	}
-	log.Printf("Search index: %d sources, %d concepts", idx.SourceCount(), idx.ConceptCount())
+	log.Printf("Search metadata index: %d sources, %d concepts", idx.SourceCount(), idx.ConceptCount())
 
 	// Handlers
 	h := handler.New(gcsClient, fsClient, idx)

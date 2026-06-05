@@ -101,6 +101,15 @@ func (c *Client) GetPage(ctx context.Context, slug, category string) (*WikiPage,
 	}
 }
 
+// ReadMetaIndex reads the generated wiki metadata index.
+func (c *Client) ReadMetaIndex(ctx context.Context) (string, error) {
+	data, err := c.ReadFile(ctx, "meta/index.md")
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
 func (c *Client) getPageFromDir(ctx context.Context, slug, dir, status string) (*WikiPage, []byte, error) {
 	path := fmt.Sprintf("%s/%s%s.md", c.prefix(), dir, slug)
 	obj := c.bucket.Object(path)

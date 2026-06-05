@@ -2,17 +2,21 @@ package search
 
 import (
 	"context"
-	"log"
 	"strings"
 
 	"github.com/rayert/llm-wiki-bff/internal/gcs"
 )
 
-// Index provides in-memory full-text search over wiki content.
+// Index provides in-memory search over wiki metadata.
 type Index struct {
 	sources  []gcs.WikiPage
 	concepts []gcs.WikiPage
-	content  map[string]string // slug -> plain text content
+	entries  map[string]indexedPage
+}
+
+type indexedPage struct {
+	title       string
+	description string
 }
 
 // Result is a single search hit.
@@ -25,7 +29,7 @@ type Result struct {
 
 // NewIndex creates an empty search index.
 func NewIndex() *Index {
-	return &Index{content: make(map[string]string)}
+	return &Index{entries: make(map[string]indexedPage)}
 }
 
 // SourceCount returns the number of indexed sources.
@@ -34,44 +38,20 @@ func (idx *Index) SourceCount() int { return len(idx.sources) }
 // ConceptCount returns the number of indexed concepts.
 func (idx *Index) ConceptCount() int { return len(idx.concepts) }
 
-// Build loads all wiki content from GCS into the index.
+// Build loads the generated metadata index from GCS.
 func (idx *Index) Build(gcsClient *gcs.Client) error {
 	ctx := context.Background()
 
-	// Load sources
-	sources, err := gcsClient.ListSources(ctx)
+	raw, err := gcsClient.ReadMetaIndex(ctx)
 	if err != nil {
 		return err
 	}
-	idx.sources = sources
-	for _, s := range sources {
-		_, data, err := gcsClient.GetPage(ctx, s.Slug, "sources")
-		if err != nil {
-			log.Printf("index: skip source %s: %v", s.Slug, err)
-			continue
-		}
-		idx.content[s.Slug] = stripMarkdown(string(data))
-	}
 
-	// Load concepts
-	concepts, err := gcsClient.ListConcepts(ctx, true)
-	if err != nil {
-		return err
-	}
-	idx.concepts = concepts
-	for _, c := range concepts {
-		_, data, err := gcsClient.GetPage(ctx, c.Slug, "concepts")
-		if err != nil {
-			log.Printf("index: skip concept %s: %v", c.Slug, err)
-			continue
-		}
-		idx.content[c.Slug] = stripMarkdown(string(data))
-	}
-
+	idx.sources, idx.concepts, idx.entries = parseMetaIndex(raw)
 	return nil
 }
 
-// Search performs full-text search across sources and concepts.
+// Search performs keyword search across indexed wiki metadata.
 func (idx *Index) Search(query string, limit int) []Result {
 	if limit <= 0 {
 		limit = 10
@@ -83,37 +63,235 @@ func (idx *Index) Search(query string, limit int) []Result {
 
 	// Search sources
 	for _, s := range idx.sources {
-		text := strings.ToLower(idx.content[s.Slug])
+		entry := idx.entries[indexKey("source", s.Slug)]
+		text := searchableText(s.Slug, entry)
 		score := matchScore(text, words)
 		if score > 0 {
 			results = append(results, Result{
 				Slug:    s.Slug,
-				Title:   s.Title,
+				Title:   entryTitle(s.Slug, entry),
 				Type:    "source",
-				Snippet: makeSnippet(idx.content[s.Slug], words, 200),
+				Snippet: makeSnippet(displayText(s.Slug, entry), words, 200),
 			})
 		}
 	}
 
 	// Search concepts
 	for _, c := range idx.concepts {
-		text := strings.ToLower(idx.content[c.Slug])
+		entry := idx.entries[indexKey("concept", c.Slug)]
+		text := searchableText(c.Slug, entry)
 		score := matchScore(text, words)
 		if score > 0 {
 			results = append(results, Result{
 				Slug:    c.Slug,
-				Title:   c.Title,
+				Title:   entryTitle(c.Slug, entry),
 				Type:    "concept",
-				Snippet: makeSnippet(idx.content[c.Slug], words, 200),
+				Snippet: makeSnippet(displayText(c.Slug, entry), words, 200),
 			})
 		}
-		_ = score // suppress unused
 	}
 
 	if len(results) > limit {
 		results = results[:limit]
 	}
 	return results
+}
+
+func parseMetaIndex(raw string) ([]gcs.WikiPage, []gcs.WikiPage, map[string]indexedPage) {
+	var sources []gcs.WikiPage
+	var concepts []gcs.WikiPage
+	entries := make(map[string]indexedPage)
+	section := ""
+	inFrontmatter := false
+
+	for _, line := range strings.Split(raw, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if line == "---" {
+			inFrontmatter = !inFrontmatter
+			continue
+		}
+		if inFrontmatter || strings.HasPrefix(line, "_") {
+			continue
+		}
+
+		if strings.HasPrefix(line, "#") {
+			header := strings.TrimSpace(strings.TrimLeft(line, "#"))
+			switch strings.ToLower(header) {
+			case "sources", "source":
+				section = "source"
+			case "concepts", "concept":
+				section = "concept"
+			}
+			continue
+		}
+
+		pageType, slug, title, description, ok := parseIndexLine(line, section)
+		if !ok {
+			continue
+		}
+		page := gcs.WikiPage{Slug: slug, Title: title}
+		key := indexKey(pageType, slug)
+		entries[key] = indexedPage{title: title, description: description}
+		if pageType == "source" {
+			page.Path = "wiki/sources/" + slug + ".md"
+			sources = append(sources, page)
+		} else {
+			page.Path = "wiki/" + slug + ".md"
+			page.Status = "published"
+			concepts = append(concepts, page)
+		}
+	}
+
+	return sources, concepts, entries
+}
+
+func parseIndexLine(line, section string) (string, string, string, string, bool) {
+	line = strings.TrimSpace(strings.TrimLeft(line, "-*"))
+	pageType := section
+
+	lower := strings.ToLower(line)
+	for _, prefix := range []string{"source:", "sources:", "concept:", "concepts:"} {
+		if strings.HasPrefix(lower, prefix) {
+			if strings.HasPrefix(prefix, "source") {
+				pageType = "source"
+			} else {
+				pageType = "concept"
+			}
+			line = strings.TrimSpace(line[len(prefix):])
+			break
+		}
+	}
+
+	slug, title, rest, ok := parseLinkedLine(line)
+	if !ok {
+		slug, title, rest, ok = parsePlainLine(line)
+	}
+	if !ok {
+		return "", "", "", "", false
+	}
+
+	if strings.HasPrefix(slug, "wiki/sources/") {
+		pageType = "source"
+		slug = strings.TrimSuffix(strings.TrimPrefix(slug, "wiki/sources/"), ".md")
+	} else if strings.HasPrefix(slug, "sources/") {
+		pageType = "source"
+		slug = strings.TrimSuffix(strings.TrimPrefix(slug, "sources/"), ".md")
+	} else if strings.HasPrefix(slug, "wiki/") {
+		pageType = "concept"
+		slug = strings.TrimSuffix(strings.TrimPrefix(slug, "wiki/"), ".md")
+	}
+
+	if pageType == "" {
+		return "", "", "", "", false
+	}
+
+	slug = strings.TrimSuffix(strings.TrimSpace(slug), ".md")
+	title = strings.TrimSpace(title)
+	if title == "" {
+		title = slug
+	}
+
+	return pageType, slug, title, cleanDescription(rest), true
+}
+
+func parseLinkedLine(line string) (string, string, string, bool) {
+	if start := strings.Index(line, "[["); start >= 0 {
+		if end := strings.Index(line[start+2:], "]]"); end >= 0 {
+			target := line[start+2 : start+2+end]
+			rest := line[start+2+end+2:]
+			parts := strings.SplitN(target, "|", 2)
+			slug := strings.TrimSpace(parts[0])
+			title := slug
+			if len(parts) == 2 {
+				title = strings.TrimSpace(parts[1])
+			}
+			return slug, title, rest, slug != ""
+		}
+	}
+
+	if start := strings.Index(line, "["); start >= 0 {
+		mid := strings.Index(line[start:], "](")
+		if mid >= 0 {
+			mid += start
+			end := strings.Index(line[mid+2:], ")")
+			if end >= 0 {
+				title := strings.TrimSpace(line[start+1 : mid])
+				slug := strings.TrimSpace(line[mid+2 : mid+2+end])
+				rest := line[mid+2+end+1:]
+				return slug, title, rest, slug != ""
+			}
+		}
+	}
+
+	return "", "", "", false
+}
+
+func parsePlainLine(line string) (string, string, string, bool) {
+	fields := splitMetadataFields(line)
+	if len(fields) == 0 {
+		return "", "", "", false
+	}
+	slug := fields[0]
+	title := slug
+	description := ""
+	if len(fields) > 1 {
+		title = fields[1]
+	}
+	if len(fields) > 2 {
+		description = strings.Join(fields[2:], " - ")
+	}
+	return slug, title, description, true
+}
+
+func splitMetadataFields(line string) []string {
+	normalized := strings.ReplaceAll(line, "\t", " | ")
+	normalized = strings.ReplaceAll(normalized, " \u2014 ", " | ")
+	normalized = strings.ReplaceAll(normalized, " -- ", " | ")
+	normalized = strings.ReplaceAll(normalized, " - ", " | ")
+	normalized = strings.ReplaceAll(normalized, " | ", "|")
+	if !strings.Contains(normalized, "|") && strings.Count(normalized, ":") >= 2 {
+		normalized = strings.ReplaceAll(normalized, ":", "|")
+	}
+	parts := strings.Split(normalized, "|")
+	var fields []string
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			fields = append(fields, part)
+		}
+	}
+	return fields
+}
+
+func cleanDescription(s string) string {
+	s = strings.TrimSpace(s)
+	s = strings.TrimLeft(s, "-:\u2014")
+	return strings.TrimSpace(s)
+}
+
+func indexKey(pageType, slug string) string {
+	return pageType + "\x00" + slug
+}
+
+func searchableText(slug string, entry indexedPage) string {
+	return strings.ToLower(slug + " " + entry.title + " " + entry.description)
+}
+
+func displayText(slug string, entry indexedPage) string {
+	if entry.description != "" {
+		return entry.description
+	}
+	return entryTitle(slug, entry)
+}
+
+func entryTitle(slug string, entry indexedPage) string {
+	if entry.title != "" {
+		return entry.title
+	}
+	return slug
 }
 
 // matchScore returns the number of matching words found in text.
