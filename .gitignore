@@ -9,3 +9,4 @@
 *.out
 vendor/
 .idea/
+config.toml
