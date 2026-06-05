@@ -201,6 +201,10 @@ func (c *Client) listConceptDir(ctx context.Context, dir, status string, directO
 		}
 
 		slug := strings.TrimSuffix(rel, ".md")
+		// Skip metadata files (TODO: move to wiki/.meta/)
+		if slug == "index" || slug == "log" {
+			continue
+		}
 		pages = append(pages, WikiPage{
 			Slug:   slug,
 			Title:  slug,

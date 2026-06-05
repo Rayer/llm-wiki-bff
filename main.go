@@ -22,7 +22,6 @@ import (
 //	@description	Backend-for-frontend API for the LLM Wiki project. Serves wiki sources and concepts with full-text search, import, and pipeline status.
 //	@contact.name	LLM Wiki Team
 //
-//	@host		localhost:8080
 //	@BasePath	/
 
 func main() {
