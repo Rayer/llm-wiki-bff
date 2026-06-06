@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/rayert/llm-wiki-bff/internal/firestore"
 	"github.com/rayert/llm-wiki-bff/internal/gcs"
+	"github.com/rayert/llm-wiki-bff/internal/llm"
 	"github.com/rayert/llm-wiki-bff/internal/search"
 )
 
@@ -18,11 +20,12 @@ type Handler struct {
 	gcs       *gcs.Client
 	firestore *firestore.Client
 	index     *search.Index
+	llm       *llm.Client
 }
 
 // New creates a Handler with the given dependencies.
-func New(gcs *gcs.Client, fs *firestore.Client, idx *search.Index) *Handler {
-	return &Handler{gcs: gcs, firestore: fs, index: idx}
+func New(gcs *gcs.Client, fs *firestore.Client, idx *search.Index, llmClient *llm.Client) *Handler {
+	return &Handler{gcs: gcs, firestore: fs, index: idx, llm: llmClient}
 }
 
 // ═══════════════ Shared response types ═══════════════
@@ -69,8 +72,29 @@ func (h *Handler) Query(c *gin.Context) {
 		Results: results,
 	}
 
-	if mode == "full" && len(results) > 0 {
-		resp.AISynth = "AI-synthesized answer based on wiki content (placeholder — LLM integration TBD)"
+	if h.llm != nil && len(results) > 0 {
+		// Fetch full text for top 5 results
+		topN := 5
+		if len(results) < topN {
+			topN = len(results)
+		}
+		var contexts []string
+		for _, r := range results[:topN] {
+			category := r.Type + "s"
+			_, data, err := h.gcs.GetPage(context.Background(), r.Slug, category)
+			if err != nil {
+				continue
+			}
+			contexts = append(contexts, fmt.Sprintf("[%s] %s\n\n%s", r.Title, r.Slug, string(data)))
+		}
+
+		if len(contexts) > 0 {
+			systemPrompt := buildSystemPrompt(mode)
+			userPrompt := buildUserPrompt(q, contexts)
+			if answer, err := h.llm.Chat(systemPrompt, userPrompt); err == nil {
+				resp.AISynth = answer
+			}
+		}
 	}
 
 	c.JSON(http.StatusOK, resp)
@@ -314,6 +338,27 @@ func (h *Handler) Status(c *gin.Context) {
 }
 
 // ═══════════════ Helpers ═══════════════
+
+// buildSystemPrompt returns the system prompt for the given mode.
+func buildSystemPrompt(mode string) string {
+	if mode == "full" {
+		return "You are a wiki Q&A assistant. Use the wiki content below as reference. You may supplement with general knowledge. Mark wiki-sourced info with [wiki] and external knowledge with [general]. Cite sources when using wiki content."
+	}
+	return "You are a wiki Q&A assistant. Answer ONLY using the wiki content provided below. Do not use external knowledge. Cite sources for every claim using [Source Name]."
+}
+
+// buildUserPrompt builds the user message with wiki context.
+func buildUserPrompt(query string, contexts []string) string {
+	var sb strings.Builder
+	sb.WriteString("User question: ")
+	sb.WriteString(query)
+	sb.WriteString("\n\nWiki content:\n")
+	for _, ctx := range contexts {
+		sb.WriteString("\n---\n")
+		sb.WriteString(ctx)
+	}
+	return sb.String()
+}
 
 // parseFrontmatter extracts YAML frontmatter (between --- markers) from markdown.
 // Returns frontmatter map and body string.
