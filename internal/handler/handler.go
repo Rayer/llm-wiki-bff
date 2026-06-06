@@ -39,10 +39,11 @@ type ErrorResponse struct {
 
 // QueryResponse is the response for GET /api/query.
 type QueryResponse struct {
-	Query   string          `json:"query"`
-	Mode    string          `json:"mode"`
-	Results []search.Result `json:"results"`
-	AISynth string          `json:"ai_synth,omitempty"` // placeholder for LLM synthesis
+	Query     string            `json:"query"`
+	Mode      string            `json:"mode"`
+	Results   []search.Result   `json:"results"`
+	AISynth   string            `json:"ai_synth,omitempty"`
+	Citations []search.Citation `json:"citations,omitempty"`
 }
 
 // Query handles GET /api/query?q=...&mode=wiki|full
@@ -104,6 +105,9 @@ func (h *Handler) Query(c *gin.Context) {
 			userPrompt := buildUserPrompt(q, contexts)
 			if answer, err := h.llm.Chat(systemPrompt, userPrompt); err == nil {
 				resp.AISynth = answer
+				citations, filtered := search.ParseCitations(answer, results)
+				resp.Citations = citations
+				resp.Results = filtered
 			}
 		}
 	}

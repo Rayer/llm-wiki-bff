@@ -28,6 +28,13 @@ type Result struct {
 	Snippet string `json:"snippet"`
 }
 
+// Citation links a mention in ai_synth back to a wiki page.
+type Citation struct {
+	Text string `json:"text"`
+	Slug string `json:"slug"`
+	Type string `json:"type"` // "source" or "concept"
+}
+
 type scoredResult struct {
 	result Result
 	score  int
@@ -337,6 +344,56 @@ func entryTitle(slug string, entry indexedPage) string {
 		return entry.title
 	}
 	return slug
+}
+
+// ParseCitations extracts [Name] citations from ai_synth and matches them to results.
+func ParseCitations(aiSynth string, results []Result) ([]Citation, []Result) {
+	if aiSynth == "" {
+		return nil, results
+	}
+
+	// Build lookup by title
+	byTitle := make(map[string]Result)
+	for _, r := range results {
+		byTitle[strings.ToLower(r.Title)] = r
+	}
+
+	var citations []Citation
+	cited := make(map[string]bool)
+	remaining := aiSynth
+
+	for {
+		start := strings.Index(remaining, "[")
+		if start < 0 {
+			break
+		}
+		end := strings.Index(remaining[start:], "]")
+		if end < 0 {
+			break
+		}
+		text := remaining[start+1 : start+end]
+		remaining = remaining[start+end+1:]
+
+		// Skip URLs and other bracket content
+		if strings.Contains(text, "http") || strings.Contains(text, "wiki") || strings.Contains(text, "general") {
+			continue
+		}
+
+		if r, ok := byTitle[strings.ToLower(text)]; ok {
+			citations = append(citations, Citation{Text: text, Slug: r.Slug, Type: r.Type})
+			cited[r.Slug] = true
+		}
+	}
+
+	// Filter results to only cited
+	var filtered []Result
+	for _, r := range results {
+		if cited[r.Slug] {
+			filtered = append(filtered, r)
+		}
+	}
+
+	return citations, filtered
 }
 
 // matchScore returns the number of matching words found in text.
