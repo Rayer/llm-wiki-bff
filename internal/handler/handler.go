@@ -68,7 +68,7 @@ func (h *Handler) Query(c *gin.Context) {
 	searchQuery := q
 	if h.llm != nil {
 		if expanded, err := h.llm.Chat(
-			"Rewrite the user's question into 3-5 search keywords (space-separated). Only return the keywords, nothing else. Example: '台北適合小孩運動的地方' → '親子 公園 溜滑梯 遊戲場 台北'",
+			"Rewrite the user's question into 3-5 search keywords (space-separated). Preserve location/place names. Only return keywords, nothing else. Example: '台北適合小孩運動的地方' → '台北 親子 公園 溜滑梯 遊戲場'",
 			q,
 		); err == nil && expanded != "" {
 			searchQuery = expanded
@@ -352,10 +352,11 @@ func (h *Handler) Status(c *gin.Context) {
 
 // buildSystemPrompt returns the system prompt for the given mode.
 func buildSystemPrompt(mode string) string {
+	base := "CRITICAL: If the user asks about a specific location (city, district, area), ONLY include results relevant to that location. Ignore results from other locations even if they match on topic keywords. "
 	if mode == "full" {
-		return "You are a wiki Q&A assistant. Use the wiki content below as reference. You may supplement with general knowledge. Mark wiki-sourced info with [wiki] and external knowledge with [general]. Cite sources when using wiki content."
+		return base + "You are a wiki Q&A assistant. Use the wiki content below as reference. You may supplement with general knowledge. Mark wiki-sourced info with [wiki] and external knowledge with [general]. Cite sources when using wiki content."
 	}
-	return "You are a wiki Q&A assistant. Answer ONLY using the wiki content provided below. Do not use external knowledge. Cite sources for every claim using [Source Name]."
+	return base + "You are a wiki Q&A assistant. Answer ONLY using the wiki content provided below. Do not use external knowledge. Cite sources for every claim using [Source Name]."
 }
 
 // buildUserPrompt builds the user message with wiki context.
