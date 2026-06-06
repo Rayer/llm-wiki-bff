@@ -356,11 +356,11 @@ func (h *Handler) Status(c *gin.Context) {
 
 // buildSystemPrompt returns the system prompt for the given mode.
 func buildSystemPrompt(mode string) string {
-	base := "CRITICAL: If the user asks about a specific location (city, district, area), ONLY include results relevant to that location. Ignore results from other locations even if they match on topic keywords. "
+	base := "CRITICAL: If the user asks about a specific location (city, district, area), ONLY include results relevant to that location. Ignore results from other locations even if they match on topic keywords. Cite every fact with [Source Name]. "
 	if mode == "full" {
-		return base + "You are a wiki Q&A assistant. Use the wiki content below as reference. You may supplement with general knowledge. Mark wiki-sourced info with [wiki] and external knowledge with [general]. Cite sources when using wiki content."
+		return base + "You are a wiki Q&A assistant. Use the wiki content below as reference. You may supplement with general knowledge. Always cite wiki-sourced info with [Source Name]. For general knowledge, no citation needed."
 	}
-	return base + "You are a wiki Q&A assistant. Answer ONLY using the wiki content provided below. Do not use external knowledge. Cite sources for every claim using [Source Name]."
+	return base + "You are a wiki Q&A assistant. Answer ONLY using the wiki content provided below. Do not use external knowledge. Cite every claim using [Source Name]."
 }
 
 // buildUserPrompt builds the user message with wiki context.
