@@ -2,6 +2,7 @@ package search
 
 import (
 	"context"
+	"net/url"
 	"sort"
 	"strings"
 
@@ -33,6 +34,7 @@ type Citation struct {
 	Text string `json:"text"`
 	Slug string `json:"slug"`
 	Type string `json:"type"` // "source" or "concept"
+	Path string `json:"path"` // pre-encoded URL path: /concepts/xxx or /sources/xxx
 }
 
 type scoredResult struct {
@@ -380,7 +382,12 @@ func ParseCitations(aiSynth string, results []Result) ([]Citation, []Result) {
 		}
 
 		if r, ok := byTitle[strings.ToLower(text)]; ok {
-			citations = append(citations, Citation{Text: text, Slug: r.Slug, Type: r.Type})
+			collection := "concepts"
+			if r.Type == "source" {
+				collection = "sources"
+			}
+			path := "/" + collection + "/" + url.QueryEscape(r.Slug)
+			citations = append(citations, Citation{Text: text, Slug: r.Slug, Type: r.Type, Path: path})
 			cited[r.Slug] = true
 		}
 	}
