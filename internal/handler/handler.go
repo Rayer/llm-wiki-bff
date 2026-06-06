@@ -106,6 +106,8 @@ func (h *Handler) Query(c *gin.Context) {
 			systemPrompt := buildSystemPrompt(mode)
 			userPrompt := buildUserPrompt(q, contexts)
 			if answer, err := h.llm.Chat(systemPrompt, userPrompt); err == nil {
+				// Post-process: ensure citation names are bracketed [like this]
+				answer = ensureBrackets(answer, results)
 				resp.AISynth = answer
 				citations, filtered := search.ParseCitations(answer, results)
 				resp.Citations = citations
@@ -369,7 +371,15 @@ func (h *Handler) Status(c *gin.Context) {
 
 // buildSystemPrompt returns the system prompt for the given mode.
 func buildSystemPrompt(mode string) string {
-	base := "CRITICAL: If the user asks about a specific location (city, district, area), ONLY include results relevant to that location. Ignore results from other locations even if they match on topic keywords. Cite every fact with [Source Name]. "
+	base := "CRITICAL: If the user asks about a specific location (city, district, area), ONLY include results relevant to that location. Ignore results from other locations even if they match on topic keywords." +
+		"\n\nCITATION FORMAT RULES (mandatory):" +
+		"\n- EVERY factual claim from wiki content MUST have a bracketed citation: [Exact Source Name]" +
+		"\n- Use the EXACT full title from the wiki content inside brackets" +
+		"\n- Never use **bold** instead of brackets" +
+		"\n- Never append source names as plain text without brackets" +
+		"\n- Correct example: 「...適合親子放電。[中和員山公園遊逸之丘]」" +
+		"\n- Wrong example: 「...適合親子放電。中和員山公園遊逸之丘」" +
+		"\n- Each paragraph referencing a source MUST end with its bracketed citation. "
 	if mode == "full" {
 		return base + "You are a wiki Q&A assistant. Use the wiki content below as reference. You may supplement with general knowledge. Always cite wiki-sourced info with [Source Name]. For general knowledge, no citation needed."
 	}
@@ -387,6 +397,66 @@ func buildUserPrompt(query string, contexts []string) string {
 		sb.WriteString(ctx)
 	}
 	return sb.String()
+}
+
+// ensureBrackets post-processes LLM output to wrap known citation names
+// in brackets [like this] when the LLM outputs them as plain text.
+func ensureBrackets(text string, results []search.Result) string {
+	// Collect unique citation names, longest first to avoid partial matches
+	names := make(map[string]bool)
+	var sorted []string
+	for _, r := range results {
+		if !names[r.Title] {
+			names[r.Title] = true
+			sorted = append(sorted, r.Title)
+		}
+	}
+	// Sort by length descending so longer names are checked first
+	for i := 0; i < len(sorted); i++ {
+		for j := i + 1; j < len(sorted); j++ {
+			if len(sorted[j]) > len(sorted[i]) {
+				sorted[i], sorted[j] = sorted[j], sorted[i]
+			}
+		}
+	}
+
+	for _, name := range sorted {
+		if len(name) < 3 {
+			continue
+		}
+		bracketed := "[" + name + "]"
+		// Skip if already properly bracketed
+		if strings.Contains(text, bracketed) {
+			continue
+		}
+		// Replace plain occurrences — only when not already inside brackets
+		// Simple approach: replace occurrences that are not preceded by '[' and not followed by ']'
+		idx := 0
+		for {
+			pos := strings.Index(text[idx:], name)
+			if pos < 0 {
+				break
+			}
+			absPos := idx + pos
+			// Check it's not already inside brackets
+			before := ""
+			if absPos > 0 {
+				before = text[absPos-1 : absPos]
+			}
+			after := ""
+			if absPos+len(name) < len(text) {
+				after = text[absPos+len(name) : absPos+len(name)+1]
+			}
+			if before == "[" && after == "]" {
+				idx = absPos + len(name)
+				continue
+			}
+			// Replace this occurrence
+			text = text[:absPos] + bracketed + text[absPos+len(name):]
+			idx = absPos + len(bracketed)
+		}
+	}
+	return text
 }
 
 // parseFrontmatter extracts YAML frontmatter (between --- markers) from markdown.
