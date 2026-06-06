@@ -7,11 +7,12 @@ import (
 )
 
 type config struct {
-	GCPProject string
-	Bucket     string
-	UserID     string
-	ProjectID  string
-	Port       string
+	GCPProject     string
+	Bucket         string
+	UserID         string
+	ProjectID      string
+	Port           string
+	DeepSeekAPIKey string
 }
 
 func loadConfig(path string) (config, error) {
@@ -30,10 +31,11 @@ func loadConfig(path string) (config, error) {
 	}
 
 	return config{
-		GCPProject: v.GetString("gcp_project"),
-		Bucket:     v.GetString("bucket"),
-		UserID:     v.GetString("user_id"),
-		ProjectID:  v.GetString("project_id"),
-		Port:       v.GetString("port"),
+		GCPProject:     v.GetString("gcp_project"),
+		Bucket:         v.GetString("bucket"),
+		UserID:         v.GetString("user_id"),
+		ProjectID:      v.GetString("project_id"),
+		Port:           v.GetString("port"),
+		DeepSeekAPIKey: v.GetString("deepseek_api_key"),
 	}, nil
 }
