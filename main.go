@@ -3,7 +3,6 @@ package main
 import (
 	"log"
 	"net/http"
-	"os"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -53,7 +52,7 @@ func main() {
 	log.Printf("Search metadata index: %d sources, %d concepts", idx.SourceCount(), idx.ConceptCount())
 
 	// LLM client (optional — query works without it)
-	llmClient := llm.NewClient(os.Getenv("DEEPSEEK_API_KEY"))
+	llmClient := llm.NewClient(cfg.DeepSeekAPIKey)
 	if llmClient != nil {
 		log.Printf("LLM client: DeepSeek ready")
 	} else {

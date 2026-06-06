@@ -386,7 +386,7 @@ func ParseCitations(aiSynth string, results []Result) ([]Citation, []Result) {
 			if r.Type == "source" {
 				collection = "sources"
 			}
-			path := "/" + collection + "/" + url.QueryEscape(r.Slug)
+			path := "/" + collection + "/" + url.PathEscape(r.Slug)
 			citations = append(citations, Citation{Text: text, Slug: r.Slug, Type: r.Type, Path: path})
 			cited[r.Slug] = true
 		}

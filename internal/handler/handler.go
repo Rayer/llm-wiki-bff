@@ -3,7 +3,9 @@ package handler
 import (
 	"context"
 	"fmt"
+	"log"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -108,6 +110,8 @@ func (h *Handler) Query(c *gin.Context) {
 				citations, filtered := search.ParseCitations(answer, results)
 				resp.Citations = citations
 				resp.Results = filtered
+			} else {
+				log.Printf("LLM synthesis failed: %v", err)
 			}
 		}
 	}
@@ -167,6 +171,11 @@ type SourceDetailResponse struct {
 //	@Router			/api/sources/{slug} [get]
 func (h *Handler) GetSource(c *gin.Context) {
 	slug := c.Param("slug")
+	// Decode percent-encoded characters (! → %21 etc.) that Go's HTTP server
+	// doesn't decode because they're valid path chars.
+	if decoded, err := url.PathUnescape(slug); err == nil {
+		slug = decoded
+	}
 	ctx := context.Background()
 	_, data, err := h.gcs.GetPage(ctx, slug, "sources")
 	if err != nil {
@@ -247,6 +256,10 @@ type ConceptDetailResponse struct {
 //	@Router			/api/concepts/{slug} [get]
 func (h *Handler) GetConcept(c *gin.Context) {
 	slug := c.Param("slug")
+	// Decode percent-encoded characters that Go's HTTP server doesn't decode.
+	if decoded, err := url.PathUnescape(slug); err == nil {
+		slug = decoded
+	}
 	ctx := context.Background()
 	page, data, err := h.gcs.GetPage(ctx, slug, "concepts")
 	if err != nil {
