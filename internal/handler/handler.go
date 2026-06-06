@@ -84,8 +84,8 @@ func (h *Handler) Query(c *gin.Context) {
 	}
 
 	if h.llm != nil && len(results) > 0 {
-		// Fetch full text for top 5 results
-		topN := 5
+		// Fetch full text for top 10 results
+		topN := 10
 		if len(results) < topN {
 			topN = len(results)
 		}

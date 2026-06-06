@@ -1,6 +1,9 @@
 package search
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestParseMetaIndexSectionedWikiLinks(t *testing.T) {
 	raw := `---
@@ -76,5 +79,43 @@ concept: concept-slug | Concept Title | Concept description
 	}
 	if got, want := results[0].Snippet, "Source description"; got != want {
 		t.Fatalf("first snippet = %q, want %q", got, want)
+	}
+}
+
+func TestSearchInterleavesSourcesAndConcepts(t *testing.T) {
+	var raw strings.Builder
+	for i := 0; i < 12; i++ {
+		raw.WriteString("source: source-")
+		raw.WriteString(string(rune('a' + i)))
+		raw.WriteString(" | Source | shared description\n")
+	}
+	for i := 0; i < 3; i++ {
+		raw.WriteString("concept: concept-")
+		raw.WriteString(string(rune('a' + i)))
+		raw.WriteString(" | Concept | shared description\n")
+	}
+
+	idx := NewIndex()
+	idx.sources, idx.concepts, idx.entries = parseMetaIndex(raw.String())
+
+	results := idx.Search("shared", 10)
+	if got, want := len(results), 10; got != want {
+		t.Fatalf("results len = %d, want %d", got, want)
+	}
+	if got, want := results[0].Type, "source"; got != want {
+		t.Fatalf("first result type = %q, want %q", got, want)
+	}
+	if got, want := results[1].Type, "concept"; got != want {
+		t.Fatalf("second result type = %q, want %q", got, want)
+	}
+
+	concepts := 0
+	for _, result := range results {
+		if result.Type == "concept" {
+			concepts++
+		}
+	}
+	if got, want := concepts, 3; got != want {
+		t.Fatalf("concept result count = %d, want %d", got, want)
 	}
 }

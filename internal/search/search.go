@@ -2,6 +2,7 @@ package search
 
 import (
 	"context"
+	"sort"
 	"strings"
 
 	"github.com/rayert/llm-wiki-bff/internal/gcs"
@@ -25,6 +26,11 @@ type Result struct {
 	Title   string `json:"title"`
 	Type    string `json:"type"` // "source" or "concept"
 	Snippet string `json:"snippet"`
+}
+
+type scoredResult struct {
+	result Result
+	score  int
 }
 
 // NewIndex creates an empty search index.
@@ -59,7 +65,8 @@ func (idx *Index) Search(query string, limit int) []Result {
 	query = strings.ToLower(query)
 	words := strings.Fields(query)
 
-	var results []Result
+	var sourceResults []scoredResult
+	var conceptResults []scoredResult
 
 	// Search sources
 	for _, s := range idx.sources {
@@ -67,11 +74,14 @@ func (idx *Index) Search(query string, limit int) []Result {
 		text := searchableText(s.Slug, entry)
 		score := matchScore(text, words)
 		if score > 0 {
-			results = append(results, Result{
-				Slug:    s.Slug,
-				Title:   entryTitle(s.Slug, entry),
-				Type:    "source",
-				Snippet: makeSnippet(displayText(s.Slug, entry), words, 200),
+			sourceResults = append(sourceResults, scoredResult{
+				score: score,
+				result: Result{
+					Slug:    s.Slug,
+					Title:   entryTitle(s.Slug, entry),
+					Type:    "source",
+					Snippet: makeSnippet(displayText(s.Slug, entry), words, 200),
+				},
 			})
 		}
 	}
@@ -82,17 +92,52 @@ func (idx *Index) Search(query string, limit int) []Result {
 		text := searchableText(c.Slug, entry)
 		score := matchScore(text, words)
 		if score > 0 {
-			results = append(results, Result{
-				Slug:    c.Slug,
-				Title:   entryTitle(c.Slug, entry),
-				Type:    "concept",
-				Snippet: makeSnippet(displayText(c.Slug, entry), words, 200),
+			conceptResults = append(conceptResults, scoredResult{
+				score: score,
+				result: Result{
+					Slug:    c.Slug,
+					Title:   entryTitle(c.Slug, entry),
+					Type:    "concept",
+					Snippet: makeSnippet(displayText(c.Slug, entry), words, 200),
+				},
 			})
 		}
 	}
 
+	sortScoredResults(sourceResults)
+	sortScoredResults(conceptResults)
+	sourceResults = limitScoredResults(sourceResults, limit)
+	conceptResults = limitScoredResults(conceptResults, limit)
+
+	results := interleaveResults(sourceResults, conceptResults, limit)
+	return results
+}
+
+func sortScoredResults(results []scoredResult) {
+	sort.SliceStable(results, func(i, j int) bool {
+		return results[i].score > results[j].score
+	})
+}
+
+func limitScoredResults(results []scoredResult, limit int) []scoredResult {
 	if len(results) > limit {
-		results = results[:limit]
+		return results[:limit]
+	}
+	return results
+}
+
+func interleaveResults(sources, concepts []scoredResult, limit int) []Result {
+	results := make([]Result, 0, limit)
+	for i := 0; len(results) < limit && (i < len(sources) || i < len(concepts)); i++ {
+		if i < len(sources) {
+			results = append(results, sources[i].result)
+			if len(results) == limit {
+				break
+			}
+		}
+		if i < len(concepts) {
+			results = append(results, concepts[i].result)
+		}
 	}
 	return results
 }
