@@ -64,7 +64,18 @@ func (h *Handler) Query(c *gin.Context) {
 		return
 	}
 
-	results := h.index.Search(q, 10)
+	// Query expansion: LLM rewrites natural language into search keywords
+	searchQuery := q
+	if h.llm != nil {
+		if expanded, err := h.llm.Chat(
+			"Rewrite the user's question into 3-5 search keywords (space-separated). Only return the keywords, nothing else. Example: '台北適合小孩運動的地方' → '親子 公園 溜滑梯 遊戲場 台北'",
+			q,
+		); err == nil && expanded != "" {
+			searchQuery = expanded
+		}
+	}
+
+	results := h.index.Search(searchQuery, 10)
 
 	resp := QueryResponse{
 		Query:   q,

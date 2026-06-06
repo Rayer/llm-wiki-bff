@@ -22,6 +22,7 @@ func loadConfig(path string) (config, error) {
 	v.AddConfigPath(path)
 	v.SetDefault("port", "8080")
 	v.AutomaticEnv()
+	v.BindEnv("deepseek_api_key")
 
 	if err := v.ReadInConfig(); err != nil {
 		var notFound viper.ConfigFileNotFoundError
