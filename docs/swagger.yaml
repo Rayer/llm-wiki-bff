@@ -74,6 +74,13 @@ definitions:
           type: string
         type: array
     type: object
+  handler.QueryRequest:
+    properties:
+      mode:
+        type: string
+      q:
+        type: string
+    type: object
   handler.QueryResponse:
     properties:
       ai_synth:
@@ -246,20 +253,18 @@ paths:
       tags:
       - import
   /api/query:
-    get:
+    post:
+      consumes:
+      - application/json
       description: Full-text search across sources and concepts. Mode "wiki" returns
         raw results, "full" adds AI-synthesized answer.
       parameters:
-      - description: Search query
-        in: query
-        name: q
+      - description: Search query and mode
+        in: body
+        name: request
         required: true
-        type: string
-      - default: wiki
-        description: 'Search mode: wiki or full'
-        in: query
-        name: mode
-        type: string
+        schema:
+          $ref: '#/definitions/handler.QueryRequest'
       produces:
       - application/json
       responses:

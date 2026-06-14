@@ -84,7 +84,7 @@ func main() {
 	// ── API ──
 	api := r.Group("/api")
 	{
-		api.GET("/query", h.Query)               // ?q=...&mode=wiki|full
+		api.POST("/query", h.Query)               // {"q": "...", "mode": "wiki|full"}
 		api.GET("/sources", h.ListSources)       // list compiled wiki sources
 		api.GET("/sources/:slug", h.GetSource)   // get single source content
 		api.GET("/concepts", h.ListConcepts)     // list wiki concepts (including drafts)

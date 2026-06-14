@@ -134,8 +134,11 @@ const docTemplate = `{
             }
         },
         "/api/query": {
-            "get": {
+            "post": {
                 "description": "Full-text search across sources and concepts. Mode \"wiki\" returns raw results, \"full\" adds AI-synthesized answer.",
+                "consumes": [
+                    "application/json"
+                ],
                 "produces": [
                     "application/json"
                 ],
@@ -145,18 +148,13 @@ const docTemplate = `{
                 "summary": "Search wiki content",
                 "parameters": [
                     {
-                        "type": "string",
-                        "description": "Search query",
-                        "name": "q",
-                        "in": "query",
-                        "required": true
-                    },
-                    {
-                        "type": "string",
-                        "default": "wiki",
-                        "description": "Search mode: wiki or full",
-                        "name": "mode",
-                        "in": "query"
+                        "description": "Search query and mode",
+                        "name": "request",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handler.QueryRequest"
+                        }
                     }
                 ],
                 "responses": {
@@ -368,6 +366,17 @@ const docTemplate = `{
                     "items": {
                         "type": "string"
                     }
+                }
+            }
+        },
+        "handler.QueryRequest": {
+            "type": "object",
+            "properties": {
+                "mode": {
+                    "type": "string"
+                },
+                "q": {
+                    "type": "string"
                 }
             }
         },

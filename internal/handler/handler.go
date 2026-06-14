@@ -39,7 +39,13 @@ type ErrorResponse struct {
 
 // ═══════════════ QUERY ═══════════════
 
-// QueryResponse is the response for GET /api/query.
+// QueryRequest is the request body for POST /api/query.
+type QueryRequest struct {
+	Query string `json:"q"`
+	Mode  string `json:"mode"`
+}
+
+// QueryResponse is the response for POST /api/query.
 type QueryResponse struct {
 	Query     string            `json:"query"`
 	Mode      string            `json:"mode"`
@@ -48,22 +54,30 @@ type QueryResponse struct {
 	Citations []search.Citation `json:"citations,omitempty"`
 }
 
-// Query handles GET /api/query?q=...&mode=wiki|full
+// Query handles POST /api/query with JSON body {"q": "...", "mode": "wiki|full"}
 //
 //	@Summary		Search wiki content
 //	@Description	Full-text search across sources and concepts. Mode "wiki" returns raw results, "full" adds AI-synthesized answer.
 //	@Tags			search
+//	@Accept			json
 //	@Produce		json
-//	@Param			q		query		string	true	"Search query"
-//	@Param			mode	query		string	false	"Search mode: wiki or full"	default(wiki)
+//	@Param			request	body		QueryRequest	true	"Search query and mode"
 //	@Success		200		{object}	QueryResponse
 //	@Failure		400		{object}	ErrorResponse
-//	@Router			/api/query [get]
+//	@Router			/api/query [post]
 func (h *Handler) Query(c *gin.Context) {
-	q := strings.TrimSpace(c.Query("q"))
-	mode := c.DefaultQuery("mode", "wiki")
+	var req QueryRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "invalid JSON: " + err.Error()})
+		return
+	}
+	q := strings.TrimSpace(req.Query)
+	mode := req.Mode
+	if mode == "" {
+		mode = "wiki"
+	}
 	if q == "" {
-		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "q parameter is required"})
+		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "q field is required"})
 		return
 	}
 
@@ -79,6 +93,8 @@ func (h *Handler) Query(c *gin.Context) {
 	}
 
 	results := h.index.Search(searchQuery, 10)
+	//log the result
+	log.Printf("Search query: %s, results: %v", searchQuery, results)
 
 	resp := QueryResponse{
 		Query:   q,
