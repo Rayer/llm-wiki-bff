@@ -9,6 +9,7 @@ import (
 	swaggerFiles "github.com/swaggo/files"
 	ginSwagger "github.com/swaggo/gin-swagger"
 
+	"github.com/rayert/llm-wiki-bff/internal/config"
 	"github.com/rayert/llm-wiki-bff/internal/firestore"
 	"github.com/rayert/llm-wiki-bff/internal/gcs"
 	"github.com/rayert/llm-wiki-bff/internal/handler"
@@ -26,7 +27,7 @@ import (
 //	@BasePath	/
 
 func main() {
-	cfg, err := loadConfig(".")
+	cfg, err := config.Load(".")
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
 	}
@@ -90,6 +91,18 @@ func main() {
 		api.GET("/concepts/:slug", h.GetConcept) // get single concept
 		api.POST("/import", h.Import)            // bookmark import (placeholder)
 		api.GET("/status", h.Status)             // pipeline status
+
+		// Metrics (Grafana)
+		api.GET("/metrics", h.Metrics)         // pipeline execution metrics
+		r.GET("/metrics", h.PrometheusMetrics) // Prometheus format (root level)
+
+		// Raw content management
+		api.POST("/raw/upload", h.UploadRaw)             // upload .md file to raw/
+		api.POST("/raw/scrape", h.ScrapeRaw)             // scrape URL → raw/
+		api.POST("/raw/generate-title", h.GenerateTitle) // LLM title from content
+
+		// Pipeline
+		api.POST("/pipeline/run", h.RunPipeline) // trigger OLW pipeline
 	}
 
 	// ── Static frontend ──

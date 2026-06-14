@@ -77,8 +77,11 @@ definitions:
   handler.QueryResponse:
     properties:
       ai_synth:
-        description: placeholder for LLM synthesis
         type: string
+      citations:
+        items:
+          $ref: '#/definitions/search.Citation'
+        type: array
       mode:
         type: string
       query:
@@ -127,8 +130,23 @@ definitions:
         type: string
       locked:
         type: boolean
+      running_pipelines:
+        type: integer
       sources_count:
         type: integer
+    type: object
+  search.Citation:
+    properties:
+      path:
+        description: 'pre-encoded URL path: /concepts/xxx or /sources/xxx'
+        type: string
+      slug:
+        type: string
+      text:
+        type: string
+      type:
+        description: '"source" or "concept"'
+        type: string
     type: object
   search.Result:
     properties:
@@ -142,7 +160,6 @@ definitions:
         description: '"source" or "concept"'
         type: string
     type: object
-host: localhost:8080
 info:
   contact:
     name: LLM Wiki Team

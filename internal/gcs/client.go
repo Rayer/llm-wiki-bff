@@ -2,9 +2,11 @@ package gcs
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 
 	"cloud.google.com/go/storage"
@@ -181,6 +183,100 @@ func (c *Client) listDir(ctx context.Context, dir string) ([]WikiPage, error) {
 		})
 	}
 	return pages, nil
+}
+
+// UploadFile uploads a local file to GCS under the user/project prefix.
+// gcsRelPath is the path relative to the prefix (e.g., "wiki/陽明山.md").
+// Returns the SHA256 hex digest of the uploaded content.
+func (c *Client) UploadFile(ctx context.Context, localPath, gcsRelPath string) (string, error) {
+	data, err := os.ReadFile(localPath)
+	if err != nil {
+		return "", fmt.Errorf("read %s: %w", localPath, err)
+	}
+	return c.uploadBytes(ctx, data, gcsRelPath)
+}
+
+// UploadFileWithDigest is like UploadFile but accepts pre-computed content + digest.
+func (c *Client) UploadFileWithDigest(ctx context.Context, localPath, gcsRelPath, digest string) (string, error) {
+	data, err := os.ReadFile(localPath)
+	if err != nil {
+		return "", fmt.Errorf("read %s: %w", localPath, err)
+	}
+	return digest, c.uploadBytesWithDigest(ctx, data, gcsRelPath, digest)
+}
+
+func (c *Client) uploadBytes(ctx context.Context, data []byte, gcsRelPath string) (string, error) {
+	digest := fmt.Sprintf("%x", sha256.Sum256(data))
+	return digest, c.uploadBytesWithDigest(ctx, data, gcsRelPath, digest)
+}
+
+func (c *Client) uploadBytesWithDigest(ctx context.Context, data []byte, gcsRelPath, digest string) error {
+	path := fmt.Sprintf("%s/%s", c.prefix(), gcsRelPath)
+	obj := c.bucket.Object(path)
+
+	// Detect content type
+	contentType := "application/octet-stream"
+	if strings.HasSuffix(gcsRelPath, ".md") {
+		contentType = "text/markdown; charset=utf-8"
+	} else if strings.HasSuffix(gcsRelPath, ".db") {
+		contentType = "application/octet-stream"
+	}
+
+	w := obj.NewWriter(ctx)
+	w.ContentType = contentType
+	w.Metadata = map[string]string{
+		"sha256": digest,
+	}
+	if _, err := w.Write(data); err != nil {
+		w.Close()
+		return fmt.Errorf("write %s: %w", path, err)
+	}
+	if err := w.Close(); err != nil {
+		return fmt.Errorf("close %s: %w", path, err)
+	}
+	return nil
+}
+
+// WriteBytes uploads bytes to GCS under the user/project prefix and returns the
+// SHA256 digest. gcsRelPath is relative to the prefix (e.g., "raw/my-note.md").
+func (c *Client) WriteBytes(ctx context.Context, data []byte, gcsRelPath string) (string, error) {
+	return c.uploadBytes(ctx, data, gcsRelPath)
+}
+
+// GetMetaSHA256 returns the SHA256 digest from GCS object metadata, or "" if the
+// object doesn't exist or has no sha256 metadata.
+func (c *Client) GetMetaSHA256(ctx context.Context, gcsRelPath string) (string, error) {
+	path := fmt.Sprintf("%s/%s", c.prefix(), gcsRelPath)
+	obj := c.bucket.Object(path)
+	attrs, err := obj.Attrs(ctx)
+	if err != nil {
+		if errors.Is(err, storage.ErrObjectNotExist) {
+			return "", nil
+		}
+		return "", fmt.Errorf("attrs %s: %w", path, err)
+	}
+	return attrs.Metadata["sha256"], nil
+}
+
+// Prefix returns the GCS prefix for this client's user/project.
+func (c *Client) Prefix() string {
+	return c.prefix()
+}
+
+// BucketStats returns object count for the user/project prefix.
+// Does NOT iterate to sum bytes — uses a single paged listing.
+func (c *Client) BucketStats(ctx context.Context) (int64, int64, error) {
+	prefix := fmt.Sprintf("%s/", c.prefix())
+	it := c.bucket.Objects(ctx, &storage.Query{Prefix: prefix})
+	var count int64
+	for i := 0; i < 1000; i++ {
+		_, err := it.Next()
+		if err != nil {
+			break
+		}
+		count++
+	}
+	return 0, count, nil // bytes=0 (skip expensive size summation)
 }
 
 // listConceptDir lists concept markdown files from either wiki/ or wiki/.drafts/.

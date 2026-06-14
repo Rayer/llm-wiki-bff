@@ -375,8 +375,13 @@ const docTemplate = `{
             "type": "object",
             "properties": {
                 "ai_synth": {
-                    "description": "placeholder for LLM synthesis",
                     "type": "string"
+                },
+                "citations": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/search.Citation"
+                    }
                 },
                 "mode": {
                     "type": "string"
@@ -451,8 +456,30 @@ const docTemplate = `{
                 "locked": {
                     "type": "boolean"
                 },
+                "running_pipelines": {
+                    "type": "integer"
+                },
                 "sources_count": {
                     "type": "integer"
+                }
+            }
+        },
+        "search.Citation": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "description": "pre-encoded URL path: /concepts/xxx or /sources/xxx",
+                    "type": "string"
+                },
+                "slug": {
+                    "type": "string"
+                },
+                "text": {
+                    "type": "string"
+                },
+                "type": {
+                    "description": "\"source\" or \"concept\"",
+                    "type": "string"
                 }
             }
         },
