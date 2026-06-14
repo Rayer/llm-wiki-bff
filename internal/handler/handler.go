@@ -11,10 +11,10 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/rayert/llm-wiki-bff/internal/firestore"
-	"github.com/rayert/llm-wiki-bff/internal/gcs"
-	"github.com/rayert/llm-wiki-bff/internal/llm"
-	"github.com/rayert/llm-wiki-bff/internal/search"
+	"github.com/rayer/llm-wiki-bff/internal/firestore"
+	"github.com/rayer/llm-wiki-bff/internal/gcs"
+	"github.com/rayer/llm-wiki-bff/internal/llm"
+	"github.com/rayer/llm-wiki-bff/internal/search"
 )
 
 // Handler holds all dependencies for API handlers.

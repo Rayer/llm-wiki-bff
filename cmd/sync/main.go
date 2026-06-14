@@ -10,9 +10,9 @@ import (
 	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
 
-	"github.com/rayert/llm-wiki-bff/internal/config"
-	"github.com/rayert/llm-wiki-bff/internal/gcs"
-	"github.com/rayert/llm-wiki-bff/internal/sync"
+	"github.com/rayer/llm-wiki-bff/internal/config"
+	"github.com/rayer/llm-wiki-bff/internal/gcs"
+	"github.com/rayer/llm-wiki-bff/internal/sync"
 )
 
 func main() {

@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/rayert/llm-wiki-bff/internal/gcs"
+	"github.com/rayer/llm-wiki-bff/internal/gcs"
 )
 
 // Result records the outcome of syncing a single file.

@@ -6,7 +6,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/rayert/llm-wiki-bff/internal/gcs"
+	"github.com/rayer/llm-wiki-bff/internal/gcs"
 )
 
 // Index provides in-memory search over wiki metadata.

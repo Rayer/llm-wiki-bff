@@ -1,4 +1,4 @@
-module github.com/rayert/llm-wiki-bff
+module github.com/rayer/llm-wiki-bff
 
 go 1.26.0
 
