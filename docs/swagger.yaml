@@ -89,6 +89,8 @@ definitions:
         items:
           $ref: '#/definitions/search.Citation'
         type: array
+      expand:
+        $ref: '#/definitions/llm.ExpandResult'
       mode:
         type: string
       query:
@@ -141,6 +143,29 @@ definitions:
         type: integer
       sources_count:
         type: integer
+    type: object
+  llm.ExpandResult:
+    properties:
+      additional_request:
+        items:
+          type: string
+        type: array
+      districts:
+        items:
+          type: string
+        type: array
+      facilities:
+        items:
+          type: string
+        type: array
+      keywords:
+        items:
+          type: string
+        type: array
+      suggestions:
+        items:
+          type: string
+        type: array
     type: object
   search.Citation:
     properties:

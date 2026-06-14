@@ -1,0 +1,68 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llm-wiki-bff
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: llm-wiki-bff
+  template:
+    metadata:
+      labels:
+        app: llm-wiki-bff
+    spec:
+      containers:
+        - name: bff
+          image: llm-wiki-bff:latest
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 8080
+          env:
+            - name: GCP_PROJECT
+              value: "llm-wiki-cloud"
+            - name: BUCKET
+              value: "llm-wiki-data"
+            - name: USER_ID
+              value: "test-user"
+            - name: PROJECT_ID
+              value: "demo"
+            - name: GOOGLE_APPLICATION_CREDENTIALS
+              value: /secrets/gcp/key.json
+          envFrom:
+            - secretRef:
+                name: bff-secrets
+          volumeMounts:
+            - name: gcp-sa
+              mountPath: /secrets/gcp
+              readOnly: true
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "100m"
+            limits:
+              memory: "256Mi"
+              cpu: "500m"
+          livenessProbe:
+            httpGet:
+              path: /api/status
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 30
+      volumes:
+        - name: gcp-sa
+          secret:
+            secretName: gcp-sa-key
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: llm-wiki-bff
+  namespace: default
+spec:
+  selector:
+    app: llm-wiki-bff
+  ports:
+    - port: 8080
+      targetPort: 8080

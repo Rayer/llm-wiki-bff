@@ -392,6 +392,9 @@ const docTemplate = `{
                         "$ref": "#/definitions/search.Citation"
                     }
                 },
+                "expand": {
+                    "$ref": "#/definitions/llm.ExpandResult"
+                },
                 "mode": {
                     "type": "string"
                 },
@@ -470,6 +473,41 @@ const docTemplate = `{
                 },
                 "sources_count": {
                     "type": "integer"
+                }
+            }
+        },
+        "llm.ExpandResult": {
+            "type": "object",
+            "properties": {
+                "additional_request": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "districts": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "facilities": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "keywords": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "suggestions": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
                 }
             }
         },

@@ -23,11 +23,12 @@ type Handler struct {
 	firestore *firestore.Client
 	index     *search.Index
 	llm       *llm.Client
+	expander  *llm.QueryExpander
 }
 
 // New creates a Handler with the given dependencies.
-func New(gcs *gcs.Client, fs *firestore.Client, idx *search.Index, llmClient *llm.Client) *Handler {
-	return &Handler{gcs: gcs, firestore: fs, index: idx, llm: llmClient}
+func New(gcs *gcs.Client, fs *firestore.Client, idx *search.Index, llmClient *llm.Client, expander *llm.QueryExpander) *Handler {
+	return &Handler{gcs: gcs, firestore: fs, index: idx, llm: llmClient, expander: expander}
 }
 
 // ═══════════════ Shared response types ═══════════════
@@ -47,11 +48,12 @@ type QueryRequest struct {
 
 // QueryResponse is the response for POST /api/query.
 type QueryResponse struct {
-	Query     string            `json:"query"`
-	Mode      string            `json:"mode"`
-	Results   []search.Result   `json:"results"`
-	AISynth   string            `json:"ai_synth,omitempty"`
-	Citations []search.Citation `json:"citations,omitempty"`
+	Query     string              `json:"query"`
+	Mode      string              `json:"mode"`
+	Results   []search.Result     `json:"results"`
+	Expand    *llm.ExpandResult   `json:"expand,omitempty"`
+	AISynth   string              `json:"ai_synth,omitempty"`
+	Citations []search.Citation   `json:"citations,omitempty"`
 }
 
 // Query handles POST /api/query with JSON body {"q": "...", "mode": "wiki|full"}
@@ -81,25 +83,24 @@ func (h *Handler) Query(c *gin.Context) {
 		return
 	}
 
-	// Query expansion: LLM rewrites natural language into search keywords
+	// Query expansion: LLM rewrites natural language into structured search keywords.
 	searchQuery := q
-	if h.llm != nil {
-		if expanded, err := h.llm.Chat(
-			"Rewrite the user's question into 3-5 search keywords (space-separated). Preserve location/place names. Only return keywords, nothing else. Example: '台北適合小孩運動的地方' → '台北 親子 公園 溜滑梯 遊戲場'",
-			q,
-		); err == nil && expanded != "" {
-			searchQuery = expanded
+	var expandResult *llm.ExpandResult
+	if h.expander != nil {
+		if result := h.expander.Expand(q); result != nil {
+			expandResult = result
+			searchQuery = strings.Join(result.Keywords, " ")
 		}
 	}
 
 	results := h.index.Search(searchQuery, 10)
-	//log the result
-	log.Printf("Search query: %s, results: %v", searchQuery, results)
+	log.Printf("Search query: %s, results: %v\n", searchQuery, results)
 
 	resp := QueryResponse{
 		Query:   q,
 		Mode:    mode,
 		Results: results,
+		Expand:  expandResult,
 	}
 
 	if h.llm != nil && len(results) > 0 {

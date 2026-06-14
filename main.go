@@ -60,8 +60,16 @@ func main() {
 		log.Printf("LLM client: DEEPSEEK_API_KEY not set — query synthesis disabled")
 	}
 
+	// Query expander (lifestyle domain for MVP)
+	expander, err := llm.NewExpander(llmClient, "lifestyle")
+	if err != nil {
+		log.Printf("Query expander: %v", err)
+	} else if expander != nil {
+		log.Printf("Query expander: lifestyle domain ready")
+	}
+
 	// Handlers
-	h := handler.New(gcsClient, fsClient, idx, llmClient)
+	h := handler.New(gcsClient, fsClient, idx, llmClient, expander)
 
 	// Gin router
 	r := gin.Default()
