@@ -11,7 +11,6 @@ RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /bff .
 FROM gcr.io/distroless/static-debian12:nonroot
 
 COPY --from=build /bff /bff
-COPY config.toml /config.toml
 
 EXPOSE 8080
 ENTRYPOINT ["/bff"]
