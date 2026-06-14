@@ -1,3 +1,8 @@
-// Package main — config loading moved to internal/config.
-// This file kept for compatibility; main.go now imports internal/config directly.
 package main
+
+import "github.com/rayert/llm-wiki-bff/internal/config"
+
+// loadConfig reads config.toml from dir and applies env overrides.
+func loadConfig(dir string) (config.Config, error) {
+	return config.Load(dir)
+}
