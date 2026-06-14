@@ -1,14 +1,17 @@
-FROM golang:1.26-alpine AS builder
-WORKDIR /app
+# Multi-stage Go build
+FROM golang:1.26-alpine AS build
+
+WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -o /bff .
+RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /bff .
 
-FROM alpine:3.21
-RUN apk add --no-cache ca-certificates
-COPY --from=builder /bff /bff
-COPY static/ /static/
-ENV PORT=8080
+# Runtime
+FROM gcr.io/distroless/static-debian12:nonroot
+
+COPY --from=build /bff /bff
+COPY config.toml /config.toml
+
 EXPOSE 8080
 ENTRYPOINT ["/bff"]
