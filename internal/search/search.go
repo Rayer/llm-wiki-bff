@@ -2,6 +2,7 @@ package search
 
 import (
 	"context"
+	"fmt"
 	"net/url"
 	"sort"
 	"strings"
@@ -11,9 +12,10 @@ import (
 
 // Index provides in-memory search over wiki metadata.
 type Index struct {
-	sources  []gcs.WikiPage
-	concepts []gcs.WikiPage
-	entries  map[string]indexedPage
+	sources       []gcs.WikiPage
+	concepts      []gcs.WikiPage
+	entries       map[string]indexedPage
+	conceptBodies map[string]string // slug → body text (for full-content grep)
 }
 
 type indexedPage struct {
@@ -66,6 +68,62 @@ func (idx *Index) Build(gcsClient *gcs.Client) error {
 	return nil
 }
 
+// LoadConceptBodies fetches all concept bodies from GCS for full-content grep.
+// Individual fetch failures are logged and skipped — only returns error if ALL fail.
+func (idx *Index) LoadConceptBodies(ctx context.Context, gcsClient *gcs.Client) error {
+	if idx.conceptBodies == nil {
+		idx.conceptBodies = make(map[string]string)
+	}
+
+	type result struct {
+		slug string
+		body string
+	}
+
+	sem := make(chan struct{}, 20) // max concurrent GCS reads
+	results := make(chan result, len(idx.concepts))
+
+	for _, c := range idx.concepts {
+		sem <- struct{}{}
+		go func(slug string) {
+			defer func() { <-sem }()
+			_, data, err := gcsClient.GetPage(ctx, slug, "concepts")
+			if err != nil {
+				return
+			}
+			body := string(data)
+			body = stripFrontmatter(body)
+			results <- result{slug: slug, body: body}
+		}(c.Slug)
+	}
+
+	// Collect results
+	for range idx.concepts {
+		select {
+		case r := <-results:
+			idx.conceptBodies[r.slug] = r.body
+		default:
+			// no more results (all goroutines finished without producing)
+			break
+		}
+	}
+
+	if len(idx.conceptBodies) == 0 {
+		return fmt.Errorf("failed to load any concept bodies")
+	}
+	return nil
+}
+
+// stripFrontmatter removes YAML frontmatter from markdown.
+func stripFrontmatter(md string) string {
+	if strings.HasPrefix(md, "---") {
+		if idx := strings.Index(md[3:], "\n---"); idx >= 0 {
+			return md[idx+5:]
+		}
+	}
+	return md
+}
+
 // Search performs keyword search across indexed wiki metadata.
 func (idx *Index) Search(query string, limit int) []Result {
 	if limit <= 0 {
@@ -80,7 +138,7 @@ func (idx *Index) Search(query string, limit int) []Result {
 	// Search sources
 	for _, s := range idx.sources {
 		entry := idx.entries[indexKey("source", s.Slug)]
-		text := searchableText(s.Slug, entry)
+		text := idx.searchableText(s.Slug, entry)
 		score := matchScore(text, words)
 		if score > 0 {
 			sourceResults = append(sourceResults, scoredResult{
@@ -98,7 +156,7 @@ func (idx *Index) Search(query string, limit int) []Result {
 	// Search concepts
 	for _, c := range idx.concepts {
 		entry := idx.entries[indexKey("concept", c.Slug)]
-		text := searchableText(c.Slug, entry)
+		text := idx.searchableText(c.Slug, entry)
 		score := matchScore(text, words)
 		if score > 0 {
 			conceptResults = append(conceptResults, scoredResult{
@@ -330,8 +388,14 @@ func indexKey(pageType, slug string) string {
 	return pageType + "\x00" + slug
 }
 
-func searchableText(slug string, entry indexedPage) string {
-	return strings.ToLower(slug + " " + entry.title + " " + entry.description)
+func (idx *Index) searchableText(slug string, entry indexedPage) string {
+	text := slug + " " + entry.title + " " + entry.description
+	if idx.conceptBodies != nil {
+		if body, ok := idx.conceptBodies[slug]; ok {
+			text += " " + body
+		}
+	}
+	return strings.ToLower(text)
 }
 
 func displayText(slug string, entry indexedPage) string {

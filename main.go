@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"log"
 	"net/http"
 	"strings"
@@ -51,6 +52,13 @@ func main() {
 		log.Printf("WARNING: Search index build failed: %v", err)
 	}
 	log.Printf("Search metadata index: %d sources, %d concepts", idx.SourceCount(), idx.ConceptCount())
+
+	// Load concept bodies for full-content grep (LWC-17 Gap 2 fix)
+	if err := idx.LoadConceptBodies(context.Background(), gcsClient); err != nil {
+		log.Printf("WARNING: Concept body loading failed: %v", err)
+	} else {
+		log.Printf("Concept bodies loaded: %d concepts", idx.ConceptCount())
+	}
 
 	// LLM client (optional — query works without it)
 	llmClient := llm.NewClient(cfg.DeepSeekAPIKey)
