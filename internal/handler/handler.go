@@ -469,7 +469,13 @@ func buildSystemPrompt(mode string) string {
 		"\n- Wrong example: 「...適合親子放電。中和員山公園遊逸之丘」" +
 		"\n- Each paragraph referencing a source MUST end with its bracketed citation. "
 	if mode == "full" {
-		return base + "You are a wiki Q&A assistant. Use the wiki content below as reference. You may supplement with general knowledge. Always cite wiki-sourced info with [Source Name]. For general knowledge, no citation needed."
+		return "You are a wiki Q&A assistant with access to general knowledge. Use the wiki content as primary reference. If the wiki has relevant information, cite it with [Source Name]. If the wiki does NOT contain information matching the user's request (e.g., a different city or topic), freely use your general knowledge to provide a helpful answer — do NOT say 'I cannot find' or apologize. Clearly distinguish wiki-sourced info (cited) from general knowledge (not cited)." +
+			"\n\nCITATION FORMAT RULES (mandatory):" +
+			"\n- EVERY factual claim from wiki content MUST have a bracketed citation: [Exact Source Name]" +
+			"\n- Use the EXACT full title from the wiki content inside brackets" +
+			"\n- Never use **bold** instead of brackets" +
+			"\n- Correct example: 「...適合親子放電。[中和員山公園遊逸之丘]」" +
+			"\n- Wrong example: 「...適合親子放電。中和員山公園遊逸之丘」"
 	}
 	return base + "You are a wiki Q&A assistant. Answer ONLY using the wiki content provided below. Do not use external knowledge. Cite every claim using [Source Name]."
 }
