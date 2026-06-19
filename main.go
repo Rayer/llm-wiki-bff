@@ -135,7 +135,6 @@ func main() {
 		v1.POST("/import", h.Import)
 		v1.GET("/status", h.Status)
 		v1.GET("/metrics", h.Metrics)
-		v1.GET("/metrics", h.PrometheusMetrics)
 		v1.POST("/raw/upload", h.UploadRaw)
 		v1.POST("/raw/scrape", h.ScrapeRaw)
 		v1.POST("/raw/generate-title", h.GenerateTitle)
