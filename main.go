@@ -15,6 +15,7 @@ import (
 	"github.com/rayer/llm-wiki-bff/internal/firestore"
 	"github.com/rayer/llm-wiki-bff/internal/gcs"
 	"github.com/rayer/llm-wiki-bff/internal/handler"
+	handlerv1 "github.com/rayer/llm-wiki-bff/internal/handler/v1"
 	"github.com/rayer/llm-wiki-bff/internal/llm"
 	"github.com/rayer/llm-wiki-bff/internal/search"
 
@@ -79,6 +80,7 @@ func main() {
 
 	// Handlers
 	h := handler.New(gcsClient, fsClient, idx, llmClient, expander)
+	hV1 := handlerv1.New(gcsClient, fsClient, idx, llmClient, expander)
 
 	// Gin router
 	r := gin.Default()
@@ -119,18 +121,15 @@ func main() {
 	v1.Use(auth.JWTAuth(cfg))
 	v1.Use(auth.ProjectMiddleware())
 	{
-		v1.POST("/query", h.V1Query)
-		v1.GET("/sources", h.V1ListSources)
-		v1.GET("/sources/:slug", h.V1GetSource)
-		v1.GET("/concepts", h.V1ListConcepts)
-		v1.GET("/concepts/:slug", h.V1GetConcept)
-		v1.POST("/import", h.Import)
-		v1.GET("/status", h.V1Status)
-		v1.GET("/metrics", h.Metrics)
-		v1.POST("/raw/upload", h.UploadRaw)
-		v1.POST("/raw/scrape", h.ScrapeRaw)
-		v1.POST("/raw/generate-title", h.GenerateTitle)
-		v1.POST("/pipeline/run", h.RunPipeline)
+		v1.GET("/health", hV1.Health)
+		v1.POST("/query", hV1.Query)
+		v1.GET("/sources", hV1.ListSources)
+		v1.GET("/sources/:slug", hV1.GetSource)
+		v1.GET("/concepts", hV1.ListConcepts)
+		v1.GET("/concepts/:slug", hV1.GetConcept)
+		v1.POST("/import", hV1.Import)
+		v1.GET("/status", hV1.Status)
+		v1.GET("/metrics", hV1.PrometheusMetrics)
 	}
 
 	// ── Static frontend ──

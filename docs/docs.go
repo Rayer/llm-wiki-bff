@@ -17,243 +17,6 @@ const docTemplate = `{
     "host": "{{.Host}}",
     "basePath": "{{.BasePath}}",
     "paths": {
-        "/api/concepts": {
-            "get": {
-                "description": "Returns published wiki concepts by default. Set include_drafts=true to include draft concepts.",
-                "produces": [
-                    "application/json"
-                ],
-                "tags": [
-                    "concepts"
-                ],
-                "summary": "List wiki concepts",
-                "parameters": [
-                    {
-                        "type": "boolean",
-                        "default": false,
-                        "description": "Include draft concepts",
-                        "name": "include_drafts",
-                        "in": "query"
-                    }
-                ],
-                "responses": {
-                    "200": {
-                        "description": "OK",
-                        "schema": {
-                            "$ref": "#/definitions/handler.ConceptsListResponse"
-                        }
-                    },
-                    "400": {
-                        "description": "Bad Request",
-                        "schema": {
-                            "$ref": "#/definitions/handler.ErrorResponse"
-                        }
-                    },
-                    "500": {
-                        "description": "Internal Server Error",
-                        "schema": {
-                            "$ref": "#/definitions/handler.ErrorResponse"
-                        }
-                    }
-                }
-            }
-        },
-        "/api/concepts/{slug}": {
-            "get": {
-                "description": "Returns full content (frontmatter + body) for a wiki concept.",
-                "produces": [
-                    "application/json"
-                ],
-                "tags": [
-                    "concepts"
-                ],
-                "summary": "Get a concept by slug",
-                "parameters": [
-                    {
-                        "type": "string",
-                        "description": "Concept slug",
-                        "name": "slug",
-                        "in": "path",
-                        "required": true
-                    }
-                ],
-                "responses": {
-                    "200": {
-                        "description": "OK",
-                        "schema": {
-                            "$ref": "#/definitions/handler.ConceptDetailResponse"
-                        }
-                    },
-                    "404": {
-                        "description": "Not Found",
-                        "schema": {
-                            "$ref": "#/definitions/handler.ErrorResponse"
-                        }
-                    }
-                }
-            }
-        },
-        "/api/import": {
-            "post": {
-                "description": "Accepts a list of URLs to import (Phase 2 — placeholder).",
-                "consumes": [
-                    "application/json"
-                ],
-                "produces": [
-                    "application/json"
-                ],
-                "tags": [
-                    "import"
-                ],
-                "summary": "Import bookmarks",
-                "parameters": [
-                    {
-                        "description": "URLs to import",
-                        "name": "body",
-                        "in": "body",
-                        "required": true,
-                        "schema": {
-                            "$ref": "#/definitions/handler.ImportRequest"
-                        }
-                    }
-                ],
-                "responses": {
-                    "200": {
-                        "description": "OK",
-                        "schema": {
-                            "$ref": "#/definitions/handler.ImportResponse"
-                        }
-                    },
-                    "400": {
-                        "description": "Bad Request",
-                        "schema": {
-                            "$ref": "#/definitions/handler.ErrorResponse"
-                        }
-                    }
-                }
-            }
-        },
-        "/api/query": {
-            "post": {
-                "description": "Full-text search across sources and concepts. Mode \"wiki\" returns raw results, \"full\" adds AI-synthesized answer.",
-                "consumes": [
-                    "application/json"
-                ],
-                "produces": [
-                    "application/json"
-                ],
-                "tags": [
-                    "search"
-                ],
-                "summary": "Search wiki content",
-                "parameters": [
-                    {
-                        "description": "Search query and mode",
-                        "name": "request",
-                        "in": "body",
-                        "required": true,
-                        "schema": {
-                            "$ref": "#/definitions/handler.QueryRequest"
-                        }
-                    }
-                ],
-                "responses": {
-                    "200": {
-                        "description": "OK",
-                        "schema": {
-                            "$ref": "#/definitions/handler.QueryResponse"
-                        }
-                    },
-                    "400": {
-                        "description": "Bad Request",
-                        "schema": {
-                            "$ref": "#/definitions/handler.ErrorResponse"
-                        }
-                    }
-                }
-            }
-        },
-        "/api/sources": {
-            "get": {
-                "description": "Returns all compiled wiki sources.",
-                "produces": [
-                    "application/json"
-                ],
-                "tags": [
-                    "sources"
-                ],
-                "summary": "List wiki sources",
-                "responses": {
-                    "200": {
-                        "description": "OK",
-                        "schema": {
-                            "$ref": "#/definitions/handler.SourcesListResponse"
-                        }
-                    },
-                    "500": {
-                        "description": "Internal Server Error",
-                        "schema": {
-                            "$ref": "#/definitions/handler.ErrorResponse"
-                        }
-                    }
-                }
-            }
-        },
-        "/api/sources/{slug}": {
-            "get": {
-                "description": "Returns full content (frontmatter + body) for a wiki source.",
-                "produces": [
-                    "application/json"
-                ],
-                "tags": [
-                    "sources"
-                ],
-                "summary": "Get a source by slug",
-                "parameters": [
-                    {
-                        "type": "string",
-                        "description": "Source slug",
-                        "name": "slug",
-                        "in": "path",
-                        "required": true
-                    }
-                ],
-                "responses": {
-                    "200": {
-                        "description": "OK",
-                        "schema": {
-                            "$ref": "#/definitions/handler.SourceDetailResponse"
-                        }
-                    },
-                    "404": {
-                        "description": "Not Found",
-                        "schema": {
-                            "$ref": "#/definitions/handler.ErrorResponse"
-                        }
-                    }
-                }
-            }
-        },
-        "/api/status": {
-            "get": {
-                "description": "Returns counts and lock status from GCS, search index, and Firestore.",
-                "produces": [
-                    "application/json"
-                ],
-                "tags": [
-                    "status"
-                ],
-                "summary": "Pipeline status",
-                "responses": {
-                    "200": {
-                        "description": "OK",
-                        "schema": {
-                            "$ref": "#/definitions/handler.StatusResponse"
-                        }
-                    }
-                }
-            }
-        },
         "/api/v1/concepts": {
             "get": {
                 "description": "Returns published wiki concepts by default. Set include_drafts=true to include draft concepts.",
@@ -326,6 +89,98 @@ const docTemplate = `{
                         "schema": {
                             "$ref": "#/definitions/handler.ErrorResponse"
                         }
+                    },
+                    "500": {
+                        "description": "Internal Server Error",
+                        "schema": {
+                            "$ref": "#/definitions/handler.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/health": {
+            "get": {
+                "description": "Returns the V1 API health status.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "health"
+                ],
+                "summary": "Health check",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/handler.HealthResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/import": {
+            "post": {
+                "description": "Accepts a list of URLs to import (Phase 2 — placeholder).",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "import"
+                ],
+                "summary": "Import bookmarks",
+                "parameters": [
+                    {
+                        "description": "URLs to import",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handler.ImportRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/handler.ImportResponse"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/handler.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/metrics": {
+            "get": {
+                "description": "Returns scoped wiki statistics in Prometheus exposition format.",
+                "produces": [
+                    "text/plain"
+                ],
+                "tags": [
+                    "metrics"
+                ],
+                "summary": "Prometheus metrics",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error",
+                        "schema": {
+                            "type": "string"
+                        }
                     }
                 }
             }
@@ -363,6 +218,12 @@ const docTemplate = `{
                     },
                     "400": {
                         "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/handler.ErrorResponse"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error",
                         "schema": {
                             "$ref": "#/definitions/handler.ErrorResponse"
                         }
@@ -427,6 +288,12 @@ const docTemplate = `{
                         "schema": {
                             "$ref": "#/definitions/handler.ErrorResponse"
                         }
+                    },
+                    "500": {
+                        "description": "Internal Server Error",
+                        "schema": {
+                            "$ref": "#/definitions/handler.ErrorResponse"
+                        }
                     }
                 }
             }
@@ -446,6 +313,12 @@ const docTemplate = `{
                         "description": "OK",
                         "schema": {
                             "$ref": "#/definitions/handler.StatusResponse"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error",
+                        "schema": {
+                            "$ref": "#/definitions/handler.ErrorResponse"
                         }
                     }
                 }
@@ -531,6 +404,14 @@ const docTemplate = `{
             "type": "object",
             "properties": {
                 "error": {
+                    "type": "string"
+                }
+            }
+        },
+        "handler.HealthResponse": {
+            "type": "object",
+            "properties": {
+                "status": {
                     "type": "string"
                 }
             }

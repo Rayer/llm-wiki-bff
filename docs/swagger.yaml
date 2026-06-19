@@ -54,6 +54,11 @@ definitions:
       error:
         type: string
     type: object
+  handler.HealthResponse:
+    properties:
+      status:
+        type: string
+    type: object
   handler.ImportRequest:
     properties:
       urls:
@@ -200,163 +205,6 @@ info:
   title: LLM Wiki BFF API
   version: "1.0"
 paths:
-  /api/concepts:
-    get:
-      description: Returns published wiki concepts by default. Set include_drafts=true
-        to include draft concepts.
-      parameters:
-      - default: false
-        description: Include draft concepts
-        in: query
-        name: include_drafts
-        type: boolean
-      produces:
-      - application/json
-      responses:
-        "200":
-          description: OK
-          schema:
-            $ref: '#/definitions/handler.ConceptsListResponse'
-        "400":
-          description: Bad Request
-          schema:
-            $ref: '#/definitions/handler.ErrorResponse'
-        "500":
-          description: Internal Server Error
-          schema:
-            $ref: '#/definitions/handler.ErrorResponse'
-      summary: List wiki concepts
-      tags:
-      - concepts
-  /api/concepts/{slug}:
-    get:
-      description: Returns full content (frontmatter + body) for a wiki concept.
-      parameters:
-      - description: Concept slug
-        in: path
-        name: slug
-        required: true
-        type: string
-      produces:
-      - application/json
-      responses:
-        "200":
-          description: OK
-          schema:
-            $ref: '#/definitions/handler.ConceptDetailResponse'
-        "404":
-          description: Not Found
-          schema:
-            $ref: '#/definitions/handler.ErrorResponse'
-      summary: Get a concept by slug
-      tags:
-      - concepts
-  /api/import:
-    post:
-      consumes:
-      - application/json
-      description: Accepts a list of URLs to import (Phase 2 — placeholder).
-      parameters:
-      - description: URLs to import
-        in: body
-        name: body
-        required: true
-        schema:
-          $ref: '#/definitions/handler.ImportRequest'
-      produces:
-      - application/json
-      responses:
-        "200":
-          description: OK
-          schema:
-            $ref: '#/definitions/handler.ImportResponse'
-        "400":
-          description: Bad Request
-          schema:
-            $ref: '#/definitions/handler.ErrorResponse'
-      summary: Import bookmarks
-      tags:
-      - import
-  /api/query:
-    post:
-      consumes:
-      - application/json
-      description: Full-text search across sources and concepts. Mode "wiki" returns
-        raw results, "full" adds AI-synthesized answer.
-      parameters:
-      - description: Search query and mode
-        in: body
-        name: request
-        required: true
-        schema:
-          $ref: '#/definitions/handler.QueryRequest'
-      produces:
-      - application/json
-      responses:
-        "200":
-          description: OK
-          schema:
-            $ref: '#/definitions/handler.QueryResponse'
-        "400":
-          description: Bad Request
-          schema:
-            $ref: '#/definitions/handler.ErrorResponse'
-      summary: Search wiki content
-      tags:
-      - search
-  /api/sources:
-    get:
-      description: Returns all compiled wiki sources.
-      produces:
-      - application/json
-      responses:
-        "200":
-          description: OK
-          schema:
-            $ref: '#/definitions/handler.SourcesListResponse'
-        "500":
-          description: Internal Server Error
-          schema:
-            $ref: '#/definitions/handler.ErrorResponse'
-      summary: List wiki sources
-      tags:
-      - sources
-  /api/sources/{slug}:
-    get:
-      description: Returns full content (frontmatter + body) for a wiki source.
-      parameters:
-      - description: Source slug
-        in: path
-        name: slug
-        required: true
-        type: string
-      produces:
-      - application/json
-      responses:
-        "200":
-          description: OK
-          schema:
-            $ref: '#/definitions/handler.SourceDetailResponse'
-        "404":
-          description: Not Found
-          schema:
-            $ref: '#/definitions/handler.ErrorResponse'
-      summary: Get a source by slug
-      tags:
-      - sources
-  /api/status:
-    get:
-      description: Returns counts and lock status from GCS, search index, and Firestore.
-      produces:
-      - application/json
-      responses:
-        "200":
-          description: OK
-          schema:
-            $ref: '#/definitions/handler.StatusResponse'
-      summary: Pipeline status
-      tags:
-      - status
   /api/v1/concepts:
     get:
       description: Returns published wiki concepts by default. Set include_drafts=true
@@ -405,9 +253,69 @@ paths:
           description: Not Found
           schema:
             $ref: '#/definitions/handler.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
       summary: Get a concept by slug
       tags:
       - concepts
+  /api/v1/health:
+    get:
+      description: Returns the V1 API health status.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/handler.HealthResponse'
+      summary: Health check
+      tags:
+      - health
+  /api/v1/import:
+    post:
+      consumes:
+      - application/json
+      description: Accepts a list of URLs to import (Phase 2 — placeholder).
+      parameters:
+      - description: URLs to import
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handler.ImportRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/handler.ImportResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+      summary: Import bookmarks
+      tags:
+      - import
+  /api/v1/metrics:
+    get:
+      description: Returns scoped wiki statistics in Prometheus exposition format.
+      produces:
+      - text/plain
+      responses:
+        "200":
+          description: OK
+          schema:
+            type: string
+        "500":
+          description: Internal Server Error
+          schema:
+            type: string
+      summary: Prometheus metrics
+      tags:
+      - metrics
   /api/v1/query:
     post:
       consumes:
@@ -430,6 +338,10 @@ paths:
             $ref: '#/definitions/handler.QueryResponse'
         "400":
           description: Bad Request
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+        "500":
+          description: Internal Server Error
           schema:
             $ref: '#/definitions/handler.ErrorResponse'
       summary: Search wiki content
@@ -472,6 +384,10 @@ paths:
           description: Not Found
           schema:
             $ref: '#/definitions/handler.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
       summary: Get a source by slug
       tags:
       - sources
@@ -485,6 +401,10 @@ paths:
           description: OK
           schema:
             $ref: '#/definitions/handler.StatusResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
       summary: Pipeline status
       tags:
       - status

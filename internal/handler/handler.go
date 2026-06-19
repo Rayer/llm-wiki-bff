@@ -31,42 +31,9 @@ func New(gcs *gcs.Client, fs *firestore.Client, idx *search.Index, llmClient *ll
 	return &Handler{gcs: gcs, firestore: fs, index: idx, llm: llmClient, expander: expander}
 }
 
-// ═══════════════ Shared response types ═══════════════
-
-// ErrorResponse is returned on errors.
-type ErrorResponse struct {
-	Error string `json:"error"`
-}
-
 // ═══════════════ QUERY ═══════════════
 
-// QueryRequest is the request body for POST /api/query.
-type QueryRequest struct {
-	Query string `json:"q"`
-	Mode  string `json:"mode"`
-}
-
-// QueryResponse is the response for POST /api/query.
-type QueryResponse struct {
-	Query     string              `json:"query"`
-	Mode      string              `json:"mode"`
-	Results   []search.Result     `json:"results"`
-	Expand    *llm.ExpandResult   `json:"expand,omitempty"`
-	AISynth   string              `json:"ai_synth,omitempty"`
-	Citations []search.Citation   `json:"citations,omitempty"`
-}
-
 // Query handles POST /api/query with JSON body {"q": "...", "mode": "wiki|full"}
-//
-//	@Summary		Search wiki content
-//	@Description	Full-text search across sources and concepts. Mode "wiki" returns raw results, "full" adds AI-synthesized answer.
-//	@Tags			search
-//	@Accept			json
-//	@Produce		json
-//	@Param			request	body		QueryRequest	true	"Search query and mode"
-//	@Success		200		{object}	QueryResponse
-//	@Failure		400		{object}	ErrorResponse
-//	@Router			/api/query [post]
 func (h *Handler) Query(c *gin.Context) {
 	var req QueryRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -140,21 +107,7 @@ func (h *Handler) Query(c *gin.Context) {
 
 // ═══════════════ SOURCES ═══════════════
 
-// SourcesListResponse is the response for GET /api/sources.
-type SourcesListResponse struct {
-	Sources []gcs.WikiPage `json:"sources"`
-	Count   int            `json:"count"`
-}
-
 // ListSources handles GET /api/sources
-//
-//	@Summary		List wiki sources
-//	@Description	Returns all compiled wiki sources.
-//	@Tags			sources
-//	@Produce		json
-//	@Success		200	{object}	SourcesListResponse
-//	@Failure		500	{object}	ErrorResponse
-//	@Router			/api/sources [get]
 func (h *Handler) ListSources(c *gin.Context) {
 	ctx := context.Background()
 	sources, err := h.gcs.ListSources(ctx)
@@ -168,26 +121,7 @@ func (h *Handler) ListSources(c *gin.Context) {
 	c.JSON(http.StatusOK, SourcesListResponse{Sources: sources, Count: len(sources)})
 }
 
-// SourceDetailResponse is the response for GET /api/sources/:slug.
-type SourceDetailResponse struct {
-	Slug        string                 `json:"slug"`
-	Title       string                 `json:"title"`
-	Type        string                 `json:"type"`
-	Frontmatter map[string]interface{} `json:"frontmatter"`
-	Body        string                 `json:"body"`
-	Raw         string                 `json:"raw"`
-}
-
 // GetSource handles GET /api/sources/:slug
-//
-//	@Summary		Get a source by slug
-//	@Description	Returns full content (frontmatter + body) for a wiki source.
-//	@Tags			sources
-//	@Produce		json
-//	@Param			slug	path		string	true	"Source slug"
-//	@Success		200		{object}	SourceDetailResponse
-//	@Failure		404		{object}	ErrorResponse
-//	@Router			/api/sources/{slug} [get]
 func (h *Handler) GetSource(c *gin.Context) {
 	slug := c.Param("slug")
 	// Decode percent-encoded characters (! → %21 etc.) that Go's HTTP server
@@ -216,23 +150,7 @@ func (h *Handler) GetSource(c *gin.Context) {
 
 // ═══════════════ CONCEPTS ═══════════════
 
-// ConceptsListResponse is the response for GET /api/concepts.
-type ConceptsListResponse struct {
-	Concepts []gcs.WikiPage `json:"concepts"`
-	Count    int            `json:"count"`
-}
-
 // ListConcepts handles GET /api/concepts
-//
-//	@Summary		List wiki concepts
-//	@Description	Returns published wiki concepts by default. Set include_drafts=true to include draft concepts.
-//	@Tags			concepts
-//	@Produce		json
-//	@Param			include_drafts	query	bool	false	"Include draft concepts"	default(false)
-//	@Success		200	{object}	ConceptsListResponse
-//	@Failure		400	{object}	ErrorResponse
-//	@Failure		500	{object}	ErrorResponse
-//	@Router			/api/concepts [get]
 func (h *Handler) ListConcepts(c *gin.Context) {
 	ctx := context.Background()
 	includeDrafts, err := strconv.ParseBool(c.DefaultQuery("include_drafts", "false"))
@@ -252,27 +170,7 @@ func (h *Handler) ListConcepts(c *gin.Context) {
 	c.JSON(http.StatusOK, ConceptsListResponse{Concepts: concepts, Count: len(concepts)})
 }
 
-// ConceptDetailResponse is the response for GET /api/concepts/:slug.
-type ConceptDetailResponse struct {
-	Slug        string                 `json:"slug"`
-	Title       string                 `json:"title"`
-	Type        string                 `json:"type"`
-	Status      string                 `json:"status"`
-	Frontmatter map[string]interface{} `json:"frontmatter"`
-	Body        string                 `json:"body"`
-	Raw         string                 `json:"raw"`
-}
-
 // GetConcept handles GET /api/concepts/:slug
-//
-//	@Summary		Get a concept by slug
-//	@Description	Returns full content (frontmatter + body) for a wiki concept.
-//	@Tags			concepts
-//	@Produce		json
-//	@Param			slug	path		string	true	"Concept slug"
-//	@Success		200		{object}	ConceptDetailResponse
-//	@Failure		404		{object}	ErrorResponse
-//	@Router			/api/concepts/{slug} [get]
 func (h *Handler) GetConcept(c *gin.Context) {
 	slug := c.Param("slug")
 	// Decode percent-encoded characters that Go's HTTP server doesn't decode.
@@ -301,29 +199,7 @@ func (h *Handler) GetConcept(c *gin.Context) {
 
 // ═══════════════ IMPORT ═══════════════
 
-// ImportRequest is the body for POST /api/import.
-type ImportRequest struct {
-	URLs []string `json:"urls" binding:"required"`
-}
-
-// ImportResponse is the response for POST /api/import.
-type ImportResponse struct {
-	Message  string   `json:"message"`
-	Received int      `json:"received"`
-	URLs     []string `json:"urls"`
-}
-
 // Import handles POST /api/import (placeholder)
-//
-//	@Summary		Import bookmarks
-//	@Description	Accepts a list of URLs to import (Phase 2 — placeholder).
-//	@Tags			import
-//	@Accept			json
-//	@Produce		json
-//	@Param			body	body		ImportRequest	true	"URLs to import"
-//	@Success		200		{object}	ImportResponse
-//	@Failure		400		{object}	ErrorResponse
-//	@Router			/api/import [post]
 func (h *Handler) Import(c *gin.Context) {
 	var req ImportRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -340,26 +216,7 @@ func (h *Handler) Import(c *gin.Context) {
 
 // ═══════════════ STATUS ═══════════════
 
-// StatusResponse is the response for GET /api/status.
-type StatusResponse struct {
-	SourcesCount     int    `json:"sources_count"`
-	ConceptsCount    int    `json:"concepts_count"`
-	IndexSources     int    `json:"index_sources"`
-	IndexConcepts    int    `json:"index_concepts"`
-	RunningPipelines int    `json:"running_pipelines"`
-	Locked           bool   `json:"locked,omitempty"`
-	LockWorker       string `json:"lock_worker,omitempty"`
-	LockExpiry       string `json:"lock_expiry,omitempty"`
-}
-
 // Status handles GET /api/status
-//
-//	@Summary		Pipeline status
-//	@Description	Returns counts and lock status from GCS, search index, and Firestore.
-//	@Tags			status
-//	@Produce		json
-//	@Success		200	{object}	StatusResponse
-//	@Router			/api/status [get]
 func (h *Handler) Status(c *gin.Context) {
 	ctx := context.Background()
 
@@ -390,27 +247,6 @@ func (h *Handler) Status(c *gin.Context) {
 }
 
 // ═══════════════ METRICS ═══════════════
-
-// MetricsResponse is for GET /api/metrics (Grafana).
-type MetricsResponse struct {
-	RunningPipelines int                `json:"running_pipelines"`
-	RecentExecutions []ExecutionSummary `json:"recent_executions"`
-	GCP              *GCPMetrics        `json:"gcp,omitempty"`
-}
-
-// GCPMetrics holds simple GCP usage stats.
-type GCPMetrics struct {
-	GCSTotalBytes int64 `json:"gcs_total_bytes"`
-	GCSTotalFiles int64 `json:"gcs_total_files"`
-}
-
-// ExecutionSummary is a lightweight execution record for metrics.
-type ExecutionSummary struct {
-	StartedAt   string  `json:"started_at"`
-	FinishedAt  string  `json:"finished_at,omitempty"`
-	DurationSec float64 `json:"duration_sec,omitempty"`
-	Status      string  `json:"status"`
-}
 
 // Metrics handles GET /api/metrics — pipeline metrics for Grafana dashboard.
 func (h *Handler) Metrics(c *gin.Context) {
