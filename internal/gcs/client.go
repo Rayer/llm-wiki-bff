@@ -56,6 +56,12 @@ func (c *Client) WithScope(userID, projectID string) *Client {
 	}
 }
 
+// NewScopedClient returns a client that shares the bucket connection but uses
+// the supplied user/project prefix.
+func (c *Client) NewScopedClient(userID, projectID string) *Client {
+	return c.WithScope(userID, projectID)
+}
+
 func (c *Client) prefix() string {
 	return fmt.Sprintf("users/%s/projects/%s", c.userID, c.projectID)
 }
