@@ -19,6 +19,11 @@ const docTemplate = `{
     "paths": {
         "/api/v1/concepts": {
             "get": {
+                "security": [
+                    {
+                        "DevUserAuth": []
+                    }
+                ],
                 "description": "Returns published wiki concepts by default. Set include_drafts=true to include draft concepts.",
                 "produces": [
                     "application/json"
@@ -34,6 +39,13 @@ const docTemplate = `{
                         "description": "Include draft concepts",
                         "name": "include_drafts",
                         "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Project ID",
+                        "name": "project",
+                        "in": "query",
+                        "required": true
                     }
                 ],
                 "responses": {
@@ -60,6 +72,11 @@ const docTemplate = `{
         },
         "/api/v1/concepts/{slug}": {
             "get": {
+                "security": [
+                    {
+                        "DevUserAuth": []
+                    }
+                ],
                 "description": "Returns full content (frontmatter + body) for a wiki concept.",
                 "produces": [
                     "application/json"
@@ -74,6 +91,13 @@ const docTemplate = `{
                         "description": "Concept slug",
                         "name": "slug",
                         "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Project ID",
+                        "name": "project",
+                        "in": "query",
                         "required": true
                     }
                 ],
@@ -101,6 +125,11 @@ const docTemplate = `{
         },
         "/api/v1/health": {
             "get": {
+                "security": [
+                    {
+                        "DevUserAuth": []
+                    }
+                ],
                 "description": "Returns the V1 API health status.",
                 "produces": [
                     "application/json"
@@ -109,6 +138,15 @@ const docTemplate = `{
                     "health"
                 ],
                 "summary": "Health check",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Project ID",
+                        "name": "project",
+                        "in": "query",
+                        "required": true
+                    }
+                ],
                 "responses": {
                     "200": {
                         "description": "OK",
@@ -121,6 +159,11 @@ const docTemplate = `{
         },
         "/api/v1/import": {
             "post": {
+                "security": [
+                    {
+                        "DevUserAuth": []
+                    }
+                ],
                 "description": "Accepts a list of URLs to import (Phase 2 — placeholder).",
                 "consumes": [
                     "application/json"
@@ -187,6 +230,11 @@ const docTemplate = `{
         },
         "/api/v1/query": {
             "post": {
+                "security": [
+                    {
+                        "DevUserAuth": []
+                    }
+                ],
                 "description": "Full-text search across sources and concepts. Mode \"wiki\" returns raw results, \"full\" adds AI-synthesized answer.",
                 "consumes": [
                     "application/json"
@@ -233,6 +281,11 @@ const docTemplate = `{
         },
         "/api/v1/sources": {
             "get": {
+                "security": [
+                    {
+                        "DevUserAuth": []
+                    }
+                ],
                 "description": "Returns all compiled wiki sources.",
                 "produces": [
                     "application/json"
@@ -241,6 +294,15 @@ const docTemplate = `{
                     "sources"
                 ],
                 "summary": "List wiki sources",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Project ID",
+                        "name": "project",
+                        "in": "query",
+                        "required": true
+                    }
+                ],
                 "responses": {
                     "200": {
                         "description": "OK",
@@ -259,6 +321,11 @@ const docTemplate = `{
         },
         "/api/v1/sources/{slug}": {
             "get": {
+                "security": [
+                    {
+                        "DevUserAuth": []
+                    }
+                ],
                 "description": "Returns full content (frontmatter + body) for a wiki source.",
                 "produces": [
                     "application/json"
@@ -273,6 +340,13 @@ const docTemplate = `{
                         "description": "Source slug",
                         "name": "slug",
                         "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Project ID",
+                        "name": "project",
+                        "in": "query",
                         "required": true
                     }
                 ],
@@ -300,6 +374,11 @@ const docTemplate = `{
         },
         "/api/v1/status": {
             "get": {
+                "security": [
+                    {
+                        "DevUserAuth": []
+                    }
+                ],
                 "description": "Returns counts and lock status from GCS, search index, and Firestore.",
                 "produces": [
                     "application/json"
@@ -308,6 +387,15 @@ const docTemplate = `{
                     "status"
                 ],
                 "summary": "Pipeline status",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Project ID",
+                        "name": "project",
+                        "in": "query",
+                        "required": true
+                    }
+                ],
                 "responses": {
                     "200": {
                         "description": "OK",
@@ -451,6 +539,9 @@ const docTemplate = `{
             "type": "object",
             "properties": {
                 "mode": {
+                    "type": "string"
+                },
+                "project": {
                     "type": "string"
                 },
                 "q": {
@@ -625,6 +716,14 @@ const docTemplate = `{
                     "type": "string"
                 }
             }
+        }
+    },
+    "securityDefinitions": {
+        "DevUserAuth": {
+            "description": "DEV mode user identity header. Required when dev_jwt=true.",
+            "type": "apiKey",
+            "name": "X-User-ID",
+            "in": "header"
         }
     }
 }`

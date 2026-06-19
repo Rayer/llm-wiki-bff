@@ -18,8 +18,9 @@ type HealthResponse struct {
 
 // QueryRequest is the request body for a query endpoint.
 type QueryRequest struct {
-	Query string `json:"q"`
-	Mode  string `json:"mode"`
+	Query   string `json:"q"`
+	Mode    string `json:"mode"`
+	Project string `json:"project"`
 }
 
 // QueryResponse is the response for a query endpoint.

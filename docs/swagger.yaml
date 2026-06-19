@@ -83,6 +83,8 @@ definitions:
     properties:
       mode:
         type: string
+      project:
+        type: string
       q:
         type: string
     type: object
@@ -215,6 +217,11 @@ paths:
         in: query
         name: include_drafts
         type: boolean
+      - description: Project ID
+        in: query
+        name: project
+        required: true
+        type: string
       produces:
       - application/json
       responses:
@@ -230,6 +237,8 @@ paths:
           description: Internal Server Error
           schema:
             $ref: '#/definitions/handler.ErrorResponse'
+      security:
+      - DevUserAuth: []
       summary: List wiki concepts
       tags:
       - concepts
@@ -240,6 +249,11 @@ paths:
       - description: Concept slug
         in: path
         name: slug
+        required: true
+        type: string
+      - description: Project ID
+        in: query
+        name: project
         required: true
         type: string
       produces:
@@ -257,12 +271,20 @@ paths:
           description: Internal Server Error
           schema:
             $ref: '#/definitions/handler.ErrorResponse'
+      security:
+      - DevUserAuth: []
       summary: Get a concept by slug
       tags:
       - concepts
   /api/v1/health:
     get:
       description: Returns the V1 API health status.
+      parameters:
+      - description: Project ID
+        in: query
+        name: project
+        required: true
+        type: string
       produces:
       - application/json
       responses:
@@ -270,6 +292,8 @@ paths:
           description: OK
           schema:
             $ref: '#/definitions/handler.HealthResponse'
+      security:
+      - DevUserAuth: []
       summary: Health check
       tags:
       - health
@@ -296,6 +320,8 @@ paths:
           description: Bad Request
           schema:
             $ref: '#/definitions/handler.ErrorResponse'
+      security:
+      - DevUserAuth: []
       summary: Import bookmarks
       tags:
       - import
@@ -344,12 +370,20 @@ paths:
           description: Internal Server Error
           schema:
             $ref: '#/definitions/handler.ErrorResponse'
+      security:
+      - DevUserAuth: []
       summary: Search wiki content
       tags:
       - search
   /api/v1/sources:
     get:
       description: Returns all compiled wiki sources.
+      parameters:
+      - description: Project ID
+        in: query
+        name: project
+        required: true
+        type: string
       produces:
       - application/json
       responses:
@@ -361,6 +395,8 @@ paths:
           description: Internal Server Error
           schema:
             $ref: '#/definitions/handler.ErrorResponse'
+      security:
+      - DevUserAuth: []
       summary: List wiki sources
       tags:
       - sources
@@ -371,6 +407,11 @@ paths:
       - description: Source slug
         in: path
         name: slug
+        required: true
+        type: string
+      - description: Project ID
+        in: query
+        name: project
         required: true
         type: string
       produces:
@@ -388,12 +429,20 @@ paths:
           description: Internal Server Error
           schema:
             $ref: '#/definitions/handler.ErrorResponse'
+      security:
+      - DevUserAuth: []
       summary: Get a source by slug
       tags:
       - sources
   /api/v1/status:
     get:
       description: Returns counts and lock status from GCS, search index, and Firestore.
+      parameters:
+      - description: Project ID
+        in: query
+        name: project
+        required: true
+        type: string
       produces:
       - application/json
       responses:
@@ -405,7 +454,15 @@ paths:
           description: Internal Server Error
           schema:
             $ref: '#/definitions/handler.ErrorResponse'
+      security:
+      - DevUserAuth: []
       summary: Pipeline status
       tags:
       - status
+securityDefinitions:
+  DevUserAuth:
+    description: DEV mode user identity header. Required when dev_jwt=true.
+    in: header
+    name: X-User-ID
+    type: apiKey
 swagger: "2.0"

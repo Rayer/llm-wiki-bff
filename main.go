@@ -28,6 +28,11 @@ import (
 //	@contact.name	LLM Wiki Team
 //
 //	@BasePath	/
+//
+//	@securityDefinitions.apikey	DevUserAuth
+//	@in							header
+//	@name						X-User-ID
+//	@description				DEV mode user identity header. Required when dev_jwt=true.
 
 func main() {
 	cfg, err := config.Load(".")
