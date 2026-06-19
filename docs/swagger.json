@@ -15,6 +15,9 @@
                 "security": [
                     {
                         "DevUserAuth": []
+                    },
+                    {
+                        "ProjectHeader": []
                     }
                 ],
                 "description": "Returns published wiki concepts by default. Set include_drafts=true to include draft concepts.",
@@ -32,13 +35,6 @@
                         "description": "Include draft concepts",
                         "name": "include_drafts",
                         "in": "query"
-                    },
-                    {
-                        "type": "string",
-                        "description": "Project ID",
-                        "name": "project",
-                        "in": "query",
-                        "required": true
                     }
                 ],
                 "responses": {
@@ -68,6 +64,9 @@
                 "security": [
                     {
                         "DevUserAuth": []
+                    },
+                    {
+                        "ProjectHeader": []
                     }
                 ],
                 "description": "Returns full content (frontmatter + body) for a wiki concept.",
@@ -84,13 +83,6 @@
                         "description": "Concept slug",
                         "name": "slug",
                         "in": "path",
-                        "required": true
-                    },
-                    {
-                        "type": "string",
-                        "description": "Project ID",
-                        "name": "project",
-                        "in": "query",
                         "required": true
                     }
                 ],
@@ -121,6 +113,9 @@
                 "security": [
                     {
                         "DevUserAuth": []
+                    },
+                    {
+                        "ProjectHeader": []
                     }
                 ],
                 "description": "Returns the V1 API health status.",
@@ -131,15 +126,6 @@
                     "health"
                 ],
                 "summary": "Health check",
-                "parameters": [
-                    {
-                        "type": "string",
-                        "description": "Project ID",
-                        "name": "project",
-                        "in": "query",
-                        "required": true
-                    }
-                ],
                 "responses": {
                     "200": {
                         "description": "OK",
@@ -155,6 +141,9 @@
                 "security": [
                     {
                         "DevUserAuth": []
+                    },
+                    {
+                        "ProjectHeader": []
                     }
                 ],
                 "description": "Accepts a list of URLs to import (Phase 2 — placeholder).",
@@ -197,6 +186,11 @@
         },
         "/api/v1/metrics": {
             "get": {
+                "security": [
+                    {
+                        "ProjectHeader": []
+                    }
+                ],
                 "description": "Returns scoped wiki statistics in Prometheus exposition format.",
                 "produces": [
                     "text/plain"
@@ -226,6 +220,9 @@
                 "security": [
                     {
                         "DevUserAuth": []
+                    },
+                    {
+                        "ProjectHeader": []
                     }
                 ],
                 "description": "Full-text search across sources and concepts. Mode \"wiki\" returns raw results, \"full\" adds AI-synthesized answer.",
@@ -277,6 +274,9 @@
                 "security": [
                     {
                         "DevUserAuth": []
+                    },
+                    {
+                        "ProjectHeader": []
                     }
                 ],
                 "description": "Returns all compiled wiki sources.",
@@ -287,15 +287,6 @@
                     "sources"
                 ],
                 "summary": "List wiki sources",
-                "parameters": [
-                    {
-                        "type": "string",
-                        "description": "Project ID",
-                        "name": "project",
-                        "in": "query",
-                        "required": true
-                    }
-                ],
                 "responses": {
                     "200": {
                         "description": "OK",
@@ -317,6 +308,9 @@
                 "security": [
                     {
                         "DevUserAuth": []
+                    },
+                    {
+                        "ProjectHeader": []
                     }
                 ],
                 "description": "Returns full content (frontmatter + body) for a wiki source.",
@@ -333,13 +327,6 @@
                         "description": "Source slug",
                         "name": "slug",
                         "in": "path",
-                        "required": true
-                    },
-                    {
-                        "type": "string",
-                        "description": "Project ID",
-                        "name": "project",
-                        "in": "query",
                         "required": true
                     }
                 ],
@@ -370,6 +357,9 @@
                 "security": [
                     {
                         "DevUserAuth": []
+                    },
+                    {
+                        "ProjectHeader": []
                     }
                 ],
                 "description": "Returns counts and lock status from GCS, search index, and Firestore.",
@@ -380,15 +370,6 @@
                     "status"
                 ],
                 "summary": "Pipeline status",
-                "parameters": [
-                    {
-                        "type": "string",
-                        "description": "Project ID",
-                        "name": "project",
-                        "in": "query",
-                        "required": true
-                    }
-                ],
                 "responses": {
                     "200": {
                         "description": "OK",
@@ -716,6 +697,12 @@
             "description": "DEV mode user identity header. Required when dev_jwt=true.",
             "type": "apiKey",
             "name": "X-User-ID",
+            "in": "header"
+        },
+        "ProjectHeader": {
+            "description": "Project identifier header.",
+            "type": "apiKey",
+            "name": "X-Project-ID",
             "in": "header"
         }
     }

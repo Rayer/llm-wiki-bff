@@ -22,6 +22,9 @@ const docTemplate = `{
                 "security": [
                     {
                         "DevUserAuth": []
+                    },
+                    {
+                        "ProjectHeader": []
                     }
                 ],
                 "description": "Returns published wiki concepts by default. Set include_drafts=true to include draft concepts.",
@@ -39,13 +42,6 @@ const docTemplate = `{
                         "description": "Include draft concepts",
                         "name": "include_drafts",
                         "in": "query"
-                    },
-                    {
-                        "type": "string",
-                        "description": "Project ID",
-                        "name": "project",
-                        "in": "query",
-                        "required": true
                     }
                 ],
                 "responses": {
@@ -75,6 +71,9 @@ const docTemplate = `{
                 "security": [
                     {
                         "DevUserAuth": []
+                    },
+                    {
+                        "ProjectHeader": []
                     }
                 ],
                 "description": "Returns full content (frontmatter + body) for a wiki concept.",
@@ -91,13 +90,6 @@ const docTemplate = `{
                         "description": "Concept slug",
                         "name": "slug",
                         "in": "path",
-                        "required": true
-                    },
-                    {
-                        "type": "string",
-                        "description": "Project ID",
-                        "name": "project",
-                        "in": "query",
                         "required": true
                     }
                 ],
@@ -128,6 +120,9 @@ const docTemplate = `{
                 "security": [
                     {
                         "DevUserAuth": []
+                    },
+                    {
+                        "ProjectHeader": []
                     }
                 ],
                 "description": "Returns the V1 API health status.",
@@ -138,15 +133,6 @@ const docTemplate = `{
                     "health"
                 ],
                 "summary": "Health check",
-                "parameters": [
-                    {
-                        "type": "string",
-                        "description": "Project ID",
-                        "name": "project",
-                        "in": "query",
-                        "required": true
-                    }
-                ],
                 "responses": {
                     "200": {
                         "description": "OK",
@@ -162,6 +148,9 @@ const docTemplate = `{
                 "security": [
                     {
                         "DevUserAuth": []
+                    },
+                    {
+                        "ProjectHeader": []
                     }
                 ],
                 "description": "Accepts a list of URLs to import (Phase 2 — placeholder).",
@@ -204,6 +193,11 @@ const docTemplate = `{
         },
         "/api/v1/metrics": {
             "get": {
+                "security": [
+                    {
+                        "ProjectHeader": []
+                    }
+                ],
                 "description": "Returns scoped wiki statistics in Prometheus exposition format.",
                 "produces": [
                     "text/plain"
@@ -233,6 +227,9 @@ const docTemplate = `{
                 "security": [
                     {
                         "DevUserAuth": []
+                    },
+                    {
+                        "ProjectHeader": []
                     }
                 ],
                 "description": "Full-text search across sources and concepts. Mode \"wiki\" returns raw results, \"full\" adds AI-synthesized answer.",
@@ -284,6 +281,9 @@ const docTemplate = `{
                 "security": [
                     {
                         "DevUserAuth": []
+                    },
+                    {
+                        "ProjectHeader": []
                     }
                 ],
                 "description": "Returns all compiled wiki sources.",
@@ -294,15 +294,6 @@ const docTemplate = `{
                     "sources"
                 ],
                 "summary": "List wiki sources",
-                "parameters": [
-                    {
-                        "type": "string",
-                        "description": "Project ID",
-                        "name": "project",
-                        "in": "query",
-                        "required": true
-                    }
-                ],
                 "responses": {
                     "200": {
                         "description": "OK",
@@ -324,6 +315,9 @@ const docTemplate = `{
                 "security": [
                     {
                         "DevUserAuth": []
+                    },
+                    {
+                        "ProjectHeader": []
                     }
                 ],
                 "description": "Returns full content (frontmatter + body) for a wiki source.",
@@ -340,13 +334,6 @@ const docTemplate = `{
                         "description": "Source slug",
                         "name": "slug",
                         "in": "path",
-                        "required": true
-                    },
-                    {
-                        "type": "string",
-                        "description": "Project ID",
-                        "name": "project",
-                        "in": "query",
                         "required": true
                     }
                 ],
@@ -377,6 +364,9 @@ const docTemplate = `{
                 "security": [
                     {
                         "DevUserAuth": []
+                    },
+                    {
+                        "ProjectHeader": []
                     }
                 ],
                 "description": "Returns counts and lock status from GCS, search index, and Firestore.",
@@ -387,15 +377,6 @@ const docTemplate = `{
                     "status"
                 ],
                 "summary": "Pipeline status",
-                "parameters": [
-                    {
-                        "type": "string",
-                        "description": "Project ID",
-                        "name": "project",
-                        "in": "query",
-                        "required": true
-                    }
-                ],
                 "responses": {
                     "200": {
                         "description": "OK",
@@ -723,6 +704,12 @@ const docTemplate = `{
             "description": "DEV mode user identity header. Required when dev_jwt=true.",
             "type": "apiKey",
             "name": "X-User-ID",
+            "in": "header"
+        },
+        "ProjectHeader": {
+            "description": "Project identifier header.",
+            "type": "apiKey",
+            "name": "X-Project-ID",
             "in": "header"
         }
     }

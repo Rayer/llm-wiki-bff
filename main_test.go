@@ -22,7 +22,7 @@ func TestCORSMiddlewareAllowsAuthHeaders(t *testing.T) {
 	router.ServeHTTP(rec, req)
 
 	allowed := rec.Header().Get("Access-Control-Allow-Headers")
-	for _, header := range []string{"Authorization", "X-User-ID"} {
+	for _, header := range []string{"Authorization", "X-User-ID", "X-Project-ID"} {
 		if !strings.Contains(allowed, header) {
 			t.Fatalf("Access-Control-Allow-Headers = %q, missing %q", allowed, header)
 		}

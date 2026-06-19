@@ -217,11 +217,6 @@ paths:
         in: query
         name: include_drafts
         type: boolean
-      - description: Project ID
-        in: query
-        name: project
-        required: true
-        type: string
       produces:
       - application/json
       responses:
@@ -239,6 +234,7 @@ paths:
             $ref: '#/definitions/handler.ErrorResponse'
       security:
       - DevUserAuth: []
+      - ProjectHeader: []
       summary: List wiki concepts
       tags:
       - concepts
@@ -249,11 +245,6 @@ paths:
       - description: Concept slug
         in: path
         name: slug
-        required: true
-        type: string
-      - description: Project ID
-        in: query
-        name: project
         required: true
         type: string
       produces:
@@ -273,18 +264,13 @@ paths:
             $ref: '#/definitions/handler.ErrorResponse'
       security:
       - DevUserAuth: []
+      - ProjectHeader: []
       summary: Get a concept by slug
       tags:
       - concepts
   /api/v1/health:
     get:
       description: Returns the V1 API health status.
-      parameters:
-      - description: Project ID
-        in: query
-        name: project
-        required: true
-        type: string
       produces:
       - application/json
       responses:
@@ -294,6 +280,7 @@ paths:
             $ref: '#/definitions/handler.HealthResponse'
       security:
       - DevUserAuth: []
+      - ProjectHeader: []
       summary: Health check
       tags:
       - health
@@ -322,6 +309,7 @@ paths:
             $ref: '#/definitions/handler.ErrorResponse'
       security:
       - DevUserAuth: []
+      - ProjectHeader: []
       summary: Import bookmarks
       tags:
       - import
@@ -339,6 +327,8 @@ paths:
           description: Internal Server Error
           schema:
             type: string
+      security:
+      - ProjectHeader: []
       summary: Prometheus metrics
       tags:
       - metrics
@@ -372,18 +362,13 @@ paths:
             $ref: '#/definitions/handler.ErrorResponse'
       security:
       - DevUserAuth: []
+      - ProjectHeader: []
       summary: Search wiki content
       tags:
       - search
   /api/v1/sources:
     get:
       description: Returns all compiled wiki sources.
-      parameters:
-      - description: Project ID
-        in: query
-        name: project
-        required: true
-        type: string
       produces:
       - application/json
       responses:
@@ -397,6 +382,7 @@ paths:
             $ref: '#/definitions/handler.ErrorResponse'
       security:
       - DevUserAuth: []
+      - ProjectHeader: []
       summary: List wiki sources
       tags:
       - sources
@@ -407,11 +393,6 @@ paths:
       - description: Source slug
         in: path
         name: slug
-        required: true
-        type: string
-      - description: Project ID
-        in: query
-        name: project
         required: true
         type: string
       produces:
@@ -431,18 +412,13 @@ paths:
             $ref: '#/definitions/handler.ErrorResponse'
       security:
       - DevUserAuth: []
+      - ProjectHeader: []
       summary: Get a source by slug
       tags:
       - sources
   /api/v1/status:
     get:
       description: Returns counts and lock status from GCS, search index, and Firestore.
-      parameters:
-      - description: Project ID
-        in: query
-        name: project
-        required: true
-        type: string
       produces:
       - application/json
       responses:
@@ -456,6 +432,7 @@ paths:
             $ref: '#/definitions/handler.ErrorResponse'
       security:
       - DevUserAuth: []
+      - ProjectHeader: []
       summary: Pipeline status
       tags:
       - status
@@ -464,5 +441,10 @@ securityDefinitions:
     description: DEV mode user identity header. Required when dev_jwt=true.
     in: header
     name: X-User-ID
+    type: apiKey
+  ProjectHeader:
+    description: Project identifier header.
+    in: header
+    name: X-Project-ID
     type: apiKey
 swagger: "2.0"

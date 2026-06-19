@@ -33,6 +33,11 @@ import (
 //	@in							header
 //	@name						X-User-ID
 //	@description				DEV mode user identity header. Required when dev_jwt=true.
+//
+//	@securityDefinitions.apikey	ProjectHeader
+//	@in							header
+//	@name						X-Project-ID
+//	@description				Project identifier header.
 
 func main() {
 	cfg, err := config.Load(".")
@@ -156,7 +161,7 @@ func corsMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		c.Header("Access-Control-Allow-Origin", "*")
 		c.Header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
-		c.Header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-User-ID")
+		c.Header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-User-ID, X-Project-ID")
 		if c.Request.Method == "OPTIONS" {
 			c.AbortWithStatus(http.StatusNoContent)
 			return

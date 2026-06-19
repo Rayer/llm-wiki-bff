@@ -16,6 +16,7 @@ import (
 //	@Produce		plain
 //	@Success		200	{string}	string
 //	@Failure		500	{string}	string
+//	@Security		ProjectHeader
 //	@Router			/api/v1/metrics [get]
 func (h *Handler) PrometheusMetrics(c *gin.Context) {
 	gcsClient, err := h.GetGCSClient(c)

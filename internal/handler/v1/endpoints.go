@@ -22,9 +22,9 @@ import (
 //	@Description	Returns the V1 API health status.
 //	@Tags			health
 //	@Produce		json
-//	@Param			project	query	string	true	"Project ID"
 //	@Success		200		{object}	handler.HealthResponse
 //	@Security		DevUserAuth
+//	@Security		ProjectHeader
 //	@Router			/api/v1/health [get]
 func (h *Handler) Health(c *gin.Context) {
 	c.JSON(http.StatusOK, handler.HealthResponse{Status: "ok"})
@@ -42,6 +42,7 @@ func (h *Handler) Health(c *gin.Context) {
 //	@Failure		400		{object}	handler.ErrorResponse
 //	@Failure		500		{object}	handler.ErrorResponse
 //	@Security		DevUserAuth
+//	@Security		ProjectHeader
 //	@Router			/api/v1/query [post]
 func (h *Handler) Query(c *gin.Context) {
 	gcsClient, err := h.GetGCSClient(c)
@@ -120,10 +121,10 @@ func (h *Handler) Query(c *gin.Context) {
 //	@Description	Returns all compiled wiki sources.
 //	@Tags			sources
 //	@Produce		json
-//	@Param			project	query	string	true	"Project ID"
 //	@Success		200		{object}	handler.SourcesListResponse
 //	@Failure		500		{object}	handler.ErrorResponse
 //	@Security		DevUserAuth
+//	@Security		ProjectHeader
 //	@Router			/api/v1/sources [get]
 func (h *Handler) ListSources(c *gin.Context) {
 	gcsClient, err := h.GetGCSClient(c)
@@ -150,11 +151,11 @@ func (h *Handler) ListSources(c *gin.Context) {
 //	@Tags			sources
 //	@Produce		json
 //	@Param			slug	path		string	true	"Source slug"
-//	@Param			project	query		string	true	"Project ID"
 //	@Success		200		{object}	handler.SourceDetailResponse
 //	@Failure		404		{object}	handler.ErrorResponse
 //	@Failure		500		{object}	handler.ErrorResponse
 //	@Security		DevUserAuth
+//	@Security		ProjectHeader
 //	@Router			/api/v1/sources/{slug} [get]
 func (h *Handler) GetSource(c *gin.Context) {
 	gcsClient, err := h.GetGCSClient(c)
@@ -191,11 +192,11 @@ func (h *Handler) GetSource(c *gin.Context) {
 //	@Tags			concepts
 //	@Produce		json
 //	@Param			include_drafts	query	bool	false	"Include draft concepts"	default(false)
-//	@Param			project			query	string	true	"Project ID"
 //	@Success		200				{object}	handler.ConceptsListResponse
 //	@Failure		400				{object}	handler.ErrorResponse
 //	@Failure		500				{object}	handler.ErrorResponse
 //	@Security		DevUserAuth
+//	@Security		ProjectHeader
 //	@Router			/api/v1/concepts [get]
 func (h *Handler) ListConcepts(c *gin.Context) {
 	gcsClient, err := h.GetGCSClient(c)
@@ -228,11 +229,11 @@ func (h *Handler) ListConcepts(c *gin.Context) {
 //	@Tags			concepts
 //	@Produce		json
 //	@Param			slug	path		string	true	"Concept slug"
-//	@Param			project	query		string	true	"Project ID"
 //	@Success		200		{object}	handler.ConceptDetailResponse
 //	@Failure		404		{object}	handler.ErrorResponse
 //	@Failure		500		{object}	handler.ErrorResponse
 //	@Security		DevUserAuth
+//	@Security		ProjectHeader
 //	@Router			/api/v1/concepts/{slug} [get]
 func (h *Handler) GetConcept(c *gin.Context) {
 	gcsClient, err := h.GetGCSClient(c)
@@ -274,6 +275,7 @@ func (h *Handler) GetConcept(c *gin.Context) {
 //	@Success		200		{object}	handler.ImportResponse
 //	@Failure		400		{object}	handler.ErrorResponse
 //	@Security		DevUserAuth
+//	@Security		ProjectHeader
 //	@Router			/api/v1/import [post]
 func (h *Handler) Import(c *gin.Context) {
 	var req handler.ImportRequest
@@ -295,10 +297,10 @@ func (h *Handler) Import(c *gin.Context) {
 //	@Description	Returns counts and lock status from GCS, search index, and Firestore.
 //	@Tags			status
 //	@Produce		json
-//	@Param			project	query	string	true	"Project ID"
 //	@Success		200		{object}	handler.StatusResponse
 //	@Failure		500		{object}	handler.ErrorResponse
 //	@Security		DevUserAuth
+//	@Security		ProjectHeader
 //	@Router			/api/v1/status [get]
 func (h *Handler) Status(c *gin.Context) {
 	gcsClient, err := h.GetGCSClient(c)
