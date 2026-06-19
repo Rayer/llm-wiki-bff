@@ -357,4 +357,135 @@ paths:
       summary: Pipeline status
       tags:
       - status
+  /api/v1/concepts:
+    get:
+      description: Returns published wiki concepts by default. Set include_drafts=true
+        to include draft concepts.
+      parameters:
+      - default: false
+        description: Include draft concepts
+        in: query
+        name: include_drafts
+        type: boolean
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/handler.ConceptsListResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+      summary: List wiki concepts
+      tags:
+      - concepts
+  /api/v1/concepts/{slug}:
+    get:
+      description: Returns full content (frontmatter + body) for a wiki concept.
+      parameters:
+      - description: Concept slug
+        in: path
+        name: slug
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/handler.ConceptDetailResponse'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+      summary: Get a concept by slug
+      tags:
+      - concepts
+  /api/v1/query:
+    post:
+      consumes:
+      - application/json
+      description: Full-text search across sources and concepts. Mode "wiki" returns
+        raw results, "full" adds AI-synthesized answer.
+      parameters:
+      - description: Search query and mode
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/handler.QueryRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/handler.QueryResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+      summary: Search wiki content
+      tags:
+      - search
+  /api/v1/sources:
+    get:
+      description: Returns all compiled wiki sources.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/handler.SourcesListResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+      summary: List wiki sources
+      tags:
+      - sources
+  /api/v1/sources/{slug}:
+    get:
+      description: Returns full content (frontmatter + body) for a wiki source.
+      parameters:
+      - description: Source slug
+        in: path
+        name: slug
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/handler.SourceDetailResponse'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+      summary: Get a source by slug
+      tags:
+      - sources
+  /api/v1/status:
+    get:
+      description: Returns counts and lock status from GCS, search index, and Firestore.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/handler.StatusResponse'
+      summary: Pipeline status
+      tags:
+      - status
 swagger: "2.0"

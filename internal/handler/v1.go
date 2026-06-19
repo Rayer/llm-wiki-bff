@@ -29,6 +29,16 @@ func getGCSClient(c *gin.Context, defaultClient *gcs.Client) (*gcs.Client, error
 }
 
 // V1Query handles POST /api/v1/query using the request's GCS scope.
+//
+//	@Summary		Search wiki content
+//	@Description	Full-text search across sources and concepts. Mode "wiki" returns raw results, "full" adds AI-synthesized answer.
+//	@Tags			search
+//	@Accept			json
+//	@Produce		json
+//	@Param			request	body		QueryRequest	true	"Search query and mode"
+//	@Success		200		{object}	QueryResponse
+//	@Failure		400		{object}	ErrorResponse
+//	@Router			/api/v1/query [post]
 func (h *Handler) V1Query(c *gin.Context) {
 	gcsClient, err := getGCSClient(c, h.gcs)
 	if err != nil {
@@ -104,6 +114,14 @@ func (h *Handler) V1Query(c *gin.Context) {
 }
 
 // V1ListSources handles GET /api/v1/sources using the request's GCS scope.
+//
+//	@Summary		List wiki sources
+//	@Description	Returns all compiled wiki sources.
+//	@Tags			sources
+//	@Produce		json
+//	@Success		200	{object}	SourcesListResponse
+//	@Failure		500	{object}	ErrorResponse
+//	@Router			/api/v1/sources [get]
 func (h *Handler) V1ListSources(c *gin.Context) {
 	gcsClient, err := getGCSClient(c, h.gcs)
 	if err != nil {
@@ -123,6 +141,15 @@ func (h *Handler) V1ListSources(c *gin.Context) {
 }
 
 // V1GetSource handles GET /api/v1/sources/:slug using the request's GCS scope.
+//
+//	@Summary		Get a source by slug
+//	@Description	Returns full content (frontmatter + body) for a wiki source.
+//	@Tags			sources
+//	@Produce		json
+//	@Param			slug	path		string	true	"Source slug"
+//	@Success		200		{object}	SourceDetailResponse
+//	@Failure		404		{object}	ErrorResponse
+//	@Router			/api/v1/sources/{slug} [get]
 func (h *Handler) V1GetSource(c *gin.Context) {
 	gcsClient, err := getGCSClient(c, h.gcs)
 	if err != nil {
@@ -152,6 +179,16 @@ func (h *Handler) V1GetSource(c *gin.Context) {
 }
 
 // V1ListConcepts handles GET /api/v1/concepts using the request's GCS scope.
+//
+//	@Summary		List wiki concepts
+//	@Description	Returns published wiki concepts by default. Set include_drafts=true to include draft concepts.
+//	@Tags			concepts
+//	@Produce		json
+//	@Param			include_drafts	query	bool	false	"Include draft concepts"	default(false)
+//	@Success		200	{object}	ConceptsListResponse
+//	@Failure		400	{object}	ErrorResponse
+//	@Failure		500	{object}	ErrorResponse
+//	@Router			/api/v1/concepts [get]
 func (h *Handler) V1ListConcepts(c *gin.Context) {
 	gcsClient, err := getGCSClient(c, h.gcs)
 	if err != nil {
@@ -177,6 +214,15 @@ func (h *Handler) V1ListConcepts(c *gin.Context) {
 }
 
 // V1GetConcept handles GET /api/v1/concepts/:slug using the request's GCS scope.
+//
+//	@Summary		Get a concept by slug
+//	@Description	Returns full content (frontmatter + body) for a wiki concept.
+//	@Tags			concepts
+//	@Produce		json
+//	@Param			slug	path		string	true	"Concept slug"
+//	@Success		200		{object}	ConceptDetailResponse
+//	@Failure		404		{object}	ErrorResponse
+//	@Router			/api/v1/concepts/{slug} [get]
 func (h *Handler) V1GetConcept(c *gin.Context) {
 	gcsClient, err := getGCSClient(c, h.gcs)
 	if err != nil {
@@ -207,6 +253,13 @@ func (h *Handler) V1GetConcept(c *gin.Context) {
 }
 
 // V1Status handles GET /api/v1/status using the request's GCS scope.
+//
+//	@Summary		Pipeline status
+//	@Description	Returns counts and lock status from GCS, search index, and Firestore.
+//	@Tags			status
+//	@Produce		json
+//	@Success		200	{object}	StatusResponse
+//	@Router			/api/v1/status [get]
 func (h *Handler) V1Status(c *gin.Context) {
 	gcsClient, err := getGCSClient(c, h.gcs)
 	if err != nil {
