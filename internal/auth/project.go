@@ -42,8 +42,8 @@ func ProjectMiddleware() gin.HandlerFunc {
 		}
 
 		project = strings.TrimSpace(project)
-		if project == "" {
-			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "project parameter is required"})
+		if !ValidPathSegment(project) {
+			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "invalid project parameter"})
 			return
 		}
 

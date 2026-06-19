@@ -30,9 +30,13 @@ func JWTAuth(cfg config.Config) gin.HandlerFunc {
 		// DEV mode: inject default user when DevJWT is configured and no auth header
 		if cfg.DevJWT && authHeader == "" {
 			// Allow X-User-ID header override for multi-user testing
-			userID := c.GetHeader("X-User-ID")
+			userID := strings.TrimSpace(c.GetHeader("X-User-ID"))
 			if userID == "" {
-				userID = cfg.DefaultUserID
+				userID = strings.TrimSpace(cfg.DefaultUserID)
+			}
+			if !ValidPathSegment(userID) {
+				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid user ID"})
+				return
 			}
 			c.Set("userID", userID)
 			c.Next()
@@ -61,10 +65,11 @@ func JWTAuth(cfg config.Config) gin.HandlerFunc {
 			return []byte(cfg.JWTSecret), nil
 		}, jwt.WithValidMethods([]string{"HS256"}))
 		if err != nil {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid token: " + err.Error()})
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid token"})
 			return
 		}
-		if !token.Valid {
+		claims.Sub = strings.TrimSpace(claims.Sub)
+		if !token.Valid || !ValidPathSegment(claims.Sub) {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid token"})
 			return
 		}
@@ -72,6 +77,14 @@ func JWTAuth(cfg config.Config) gin.HandlerFunc {
 		c.Set("userID", claims.Sub)
 		c.Next()
 	}
+}
+
+// ValidPathSegment reports whether value can be safely used as one path segment.
+func ValidPathSegment(value string) bool {
+	return value != "" &&
+		value != "." &&
+		value != ".." &&
+		!strings.ContainsAny(value, `/\`+"\x00")
 }
 
 // GenerateToken creates a self-signed HS256 JWT for development/testing.

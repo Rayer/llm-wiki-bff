@@ -2,8 +2,6 @@ package config
 
 import (
 	"errors"
-	"fmt"
-	"strings"
 
 	"github.com/spf13/viper"
 )
@@ -48,9 +46,6 @@ func Load(path string) (Config, error) {
 		JWTSecret:      v.GetString("jwt_secret"),
 		DevJWT:         v.GetBool("dev_jwt"),
 		DefaultUserID:  v.GetString("default_user_id"),
-	}
-	if !cfg.DevJWT && strings.TrimSpace(cfg.JWTSecret) == "" {
-		return Config{}, fmt.Errorf("JWT_SECRET is required when dev_jwt is false")
 	}
 	return cfg, nil
 }
