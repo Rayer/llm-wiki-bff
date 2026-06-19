@@ -15,6 +15,7 @@ bucket = "wiki-bucket"
 user_id = "user-123"
 project_id = "project-456"
 port = "9090"
+dev_jwt = true
 `), 0o600); err != nil {
 		t.Fatalf("write config file: %v", err)
 	}
@@ -49,6 +50,7 @@ gcp_project = "wiki-gcp"
 bucket = "wiki-bucket"
 user_id = "user-123"
 project_id = "project-456"
+dev_jwt = true
 `), 0o600); err != nil {
 		t.Fatalf("write config file: %v", err)
 	}

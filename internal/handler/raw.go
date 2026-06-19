@@ -76,10 +76,6 @@ type RawUploadResponse struct {
 
 // UploadRaw handles POST /api/raw/upload — multipart file upload to GCS raw/.
 func (h *Handler) UploadRaw(c *gin.Context) {
-	// Extract user/project from context (set by auth middleware on v1 routes)
-	userID, projectID := getUserProject(c)
-	log.Printf("UploadRaw [user=%s project=%s]", userID, projectID)
-
 	// Enforce request body size limit (10MB)
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxUploadSize)
 
@@ -161,9 +157,6 @@ func (h *Handler) ScrapeRaw(c *gin.Context) {
 		return
 	}
 
-	userID, projectID := getUserProject(c)
-	log.Printf("ScrapeRaw [user=%s project=%s]: url=%s", userID, projectID, req.URL)
-
 	if !strings.HasPrefix(req.URL, "http://") && !strings.HasPrefix(req.URL, "https://") {
 		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "url must start with http:// or https://"})
 		return
@@ -226,9 +219,6 @@ type PipelineRunResponse struct {
 func (h *Handler) RunPipeline(c *gin.Context) {
 	ctx := c.Request.Context()
 
-	userID, projectID := getUserProject(c)
-	log.Printf("RunPipeline [user=%s project=%s]", userID, projectID)
-
 	// Count raw files in GCS for reporting
 	sources, _ := h.gcs.ListSources(ctx)
 	rawCount := len(sources)
@@ -262,9 +252,6 @@ func (h *Handler) GenerateTitle(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "content field is required"})
 		return
 	}
-
-	userID, projectID := getUserProject(c)
-	log.Printf("GenerateTitle [user=%s project=%s]: contentLen=%d", userID, projectID, len(req.Content))
 
 	if h.llm == nil {
 		c.JSON(http.StatusOK, gin.H{"title": "Untitled"})

@@ -84,16 +84,8 @@ func main() {
 	r := gin.Default()
 
 	// CORS
-	r.Use(func(c *gin.Context) {
-		c.Header("Access-Control-Allow-Origin", "*")
-		c.Header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
-		c.Header("Access-Control-Allow-Headers", "Content-Type")
-		if c.Request.Method == "OPTIONS" {
-			c.AbortWithStatus(http.StatusNoContent)
-			return
-		}
-		c.Next()
-	})
+	r.Use(corsMiddleware())
+	r.Use(defaultRequestScope(cfg))
 
 	// ── Swagger UI ──
 	r.GET("/swagger/*any", ginSwagger.WrapHandler(swaggerFiles.Handler))
@@ -101,7 +93,7 @@ func main() {
 	// ── API ──
 	api := r.Group("/api")
 	{
-		api.POST("/query", h.Query)               // {"q": "...", "mode": "wiki|full"}
+		api.POST("/query", h.Query)              // {"q": "...", "mode": "wiki|full"}
 		api.GET("/sources", h.ListSources)       // list compiled wiki sources
 		api.GET("/sources/:slug", h.GetSource)   // get single source content
 		api.GET("/concepts", h.ListConcepts)     // list wiki concepts (including drafts)
@@ -154,4 +146,25 @@ func main() {
 	log.Printf("BFF listening on :%s", cfg.Port)
 	log.Printf("Swagger UI: http://localhost:%s/swagger/index.html", cfg.Port)
 	log.Fatal(r.Run(":" + cfg.Port))
+}
+
+func corsMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.Header("Access-Control-Allow-Origin", "*")
+		c.Header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
+		c.Header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-User-ID")
+		if c.Request.Method == "OPTIONS" {
+			c.AbortWithStatus(http.StatusNoContent)
+			return
+		}
+		c.Next()
+	}
+}
+
+func defaultRequestScope(cfg config.Config) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.Set("userID", cfg.UserID)
+		c.Set("projectID", cfg.ProjectID)
+		c.Next()
+	}
 }

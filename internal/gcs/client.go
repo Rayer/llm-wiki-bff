@@ -46,6 +46,16 @@ func NewClient(bucket, userID, projectID string) (*Client, error) {
 	}, nil
 }
 
+// WithScope returns a client that shares the bucket connection but uses the
+// supplied user/project prefix.
+func (c *Client) WithScope(userID, projectID string) *Client {
+	return &Client{
+		bucket:    c.bucket,
+		userID:    userID,
+		projectID: projectID,
+	}
+}
+
 func (c *Client) prefix() string {
 	return fmt.Sprintf("users/%s/projects/%s", c.userID, c.projectID)
 }

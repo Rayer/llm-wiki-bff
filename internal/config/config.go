@@ -2,6 +2,8 @@ package config
 
 import (
 	"errors"
+	"fmt"
+	"strings"
 
 	"github.com/spf13/viper"
 )
@@ -36,7 +38,7 @@ func Load(path string) (Config, error) {
 		}
 	}
 
-	return Config{
+	cfg := Config{
 		GCPProject:     v.GetString("gcp_project"),
 		Bucket:         v.GetString("bucket"),
 		UserID:         v.GetString("user_id"),
@@ -46,5 +48,9 @@ func Load(path string) (Config, error) {
 		JWTSecret:      v.GetString("jwt_secret"),
 		DevJWT:         v.GetBool("dev_jwt"),
 		DefaultUserID:  v.GetString("default_user_id"),
-	}, nil
+	}
+	if !cfg.DevJWT && strings.TrimSpace(cfg.JWTSecret) == "" {
+		return Config{}, fmt.Errorf("JWT_SECRET is required when dev_jwt is false")
+	}
+	return cfg, nil
 }

@@ -2,7 +2,6 @@ package handler
 
 import (
 	"fmt"
-	"log"
 	"net/http"
 	"strings"
 
@@ -13,9 +12,6 @@ import (
 // Returns current wiki stats as Prometheus gauges. Scraped by Grafana Alloy.
 func (h *Handler) PrometheusMetrics(c *gin.Context) {
 	var sb strings.Builder
-
-	userID, projectID := getUserProject(c)
-	log.Printf("PrometheusMetrics [user=%s project=%s]", userID, projectID)
 
 	// Collect data
 	sources, _ := h.gcs.ListSources(c.Request.Context())
