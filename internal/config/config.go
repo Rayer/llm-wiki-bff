@@ -14,6 +14,9 @@ type Config struct {
 	ProjectID      string
 	Port           string
 	DeepSeekAPIKey string
+	JWTSecret      string
+	DevJWT         bool
+	DefaultUserID  string
 }
 
 // Load reads config.toml from the given path and returns a Config.
@@ -40,5 +43,8 @@ func Load(path string) (Config, error) {
 		ProjectID:      v.GetString("project_id"),
 		Port:           v.GetString("port"),
 		DeepSeekAPIKey: v.GetString("deepseek_api_key"),
+		JWTSecret:      v.GetString("jwt_secret"),
+		DevJWT:         v.GetBool("dev_jwt"),
+		DefaultUserID:  v.GetString("default_user_id"),
 	}, nil
 }

@@ -26,6 +26,15 @@ type Handler struct {
 	expander  *llm.QueryExpander
 }
 
+// getUserProject extracts userID and projectID from the Gin context.
+// These are set by the JWT auth and project middlewares on v1 routes.
+// Falls back to empty strings if not set (MVP /api/ routes without auth).
+func getUserProject(c *gin.Context) (string, string) {
+	userID := c.GetString("userID")
+	projectID := c.GetString("projectID")
+	return userID, projectID
+}
+
 // New creates a Handler with the given dependencies.
 func New(gcs *gcs.Client, fs *firestore.Client, idx *search.Index, llmClient *llm.Client, expander *llm.QueryExpander) *Handler {
 	return &Handler{gcs: gcs, firestore: fs, index: idx, llm: llmClient, expander: expander}
@@ -82,6 +91,10 @@ func (h *Handler) Query(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "q field is required"})
 		return
 	}
+
+	// Extract user/project from context (set by auth middleware on v1 routes)
+	userID, projectID := getUserProject(c)
+	log.Printf("Query [user=%s project=%s]: q=%s mode=%s", userID, projectID, q, mode)
 
 	// Query expansion: LLM rewrites natural language into structured search keywords.
 	searchQuery := q
@@ -156,6 +169,9 @@ type SourcesListResponse struct {
 //	@Failure		500	{object}	ErrorResponse
 //	@Router			/api/sources [get]
 func (h *Handler) ListSources(c *gin.Context) {
+	userID, projectID := getUserProject(c)
+	log.Printf("ListSources [user=%s project=%s]", userID, projectID)
+
 	ctx := context.Background()
 	sources, err := h.gcs.ListSources(ctx)
 	if err != nil {
@@ -195,6 +211,10 @@ func (h *Handler) GetSource(c *gin.Context) {
 	if decoded, err := url.PathUnescape(slug); err == nil {
 		slug = decoded
 	}
+
+	userID, projectID := getUserProject(c)
+	log.Printf("GetSource [user=%s project=%s]: slug=%s", userID, projectID, slug)
+
 	ctx := context.Background()
 	_, data, err := h.gcs.GetPage(ctx, slug, "sources")
 	if err != nil {
@@ -241,6 +261,9 @@ func (h *Handler) ListConcepts(c *gin.Context) {
 		return
 	}
 
+	userID, projectID := getUserProject(c)
+	log.Printf("ListConcepts [user=%s project=%s]: includeDrafts=%v", userID, projectID, includeDrafts)
+
 	concepts, err := h.gcs.ListConcepts(ctx, includeDrafts)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
@@ -279,6 +302,10 @@ func (h *Handler) GetConcept(c *gin.Context) {
 	if decoded, err := url.PathUnescape(slug); err == nil {
 		slug = decoded
 	}
+
+	userID, projectID := getUserProject(c)
+	log.Printf("GetConcept [user=%s project=%s]: slug=%s", userID, projectID, slug)
+
 	ctx := context.Background()
 	page, data, err := h.gcs.GetPage(ctx, slug, "concepts")
 	if err != nil {
@@ -331,6 +358,9 @@ func (h *Handler) Import(c *gin.Context) {
 		return
 	}
 
+	userID, projectID := getUserProject(c)
+	log.Printf("Import [user=%s project=%s]: urls=%v", userID, projectID, req.URLs)
+
 	c.JSON(http.StatusOK, ImportResponse{
 		Message:  "Bookmark import — Phase 2 (not yet implemented)",
 		Received: len(req.URLs),
@@ -362,6 +392,9 @@ type StatusResponse struct {
 //	@Router			/api/status [get]
 func (h *Handler) Status(c *gin.Context) {
 	ctx := context.Background()
+
+	userID, projectID := getUserProject(c)
+	log.Printf("Status [user=%s project=%s]", userID, projectID)
 
 	sources, _ := h.gcs.ListSources(ctx)
 	concepts, _ := h.gcs.ListConcepts(ctx, true)
@@ -415,6 +448,9 @@ type ExecutionSummary struct {
 // Metrics handles GET /api/metrics — pipeline metrics for Grafana dashboard.
 func (h *Handler) Metrics(c *gin.Context) {
 	ctx := context.Background()
+
+	userID, projectID := getUserProject(c)
+	log.Printf("Metrics [user=%s project=%s]", userID, projectID)
 	resp := MetricsResponse{
 		RecentExecutions: []ExecutionSummary{},
 	}

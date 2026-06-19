@@ -10,6 +10,7 @@ import (
 	swaggerFiles "github.com/swaggo/files"
 	ginSwagger "github.com/swaggo/gin-swagger"
 
+	"github.com/rayer/llm-wiki-bff/internal/auth"
 	"github.com/rayer/llm-wiki-bff/internal/config"
 	"github.com/rayer/llm-wiki-bff/internal/firestore"
 	"github.com/rayer/llm-wiki-bff/internal/gcs"
@@ -119,6 +120,26 @@ func main() {
 
 		// Pipeline
 		api.POST("/pipeline/run", h.RunPipeline) // trigger OLW pipeline
+	}
+
+	// ── API v1 (with JWT auth + project routing) ──
+	v1 := r.Group("/api/v1")
+	v1.Use(auth.JWTAuth(cfg))
+	v1.Use(auth.ProjectMiddleware())
+	{
+		v1.POST("/query", h.Query)
+		v1.GET("/sources", h.ListSources)
+		v1.GET("/sources/:slug", h.GetSource)
+		v1.GET("/concepts", h.ListConcepts)
+		v1.GET("/concepts/:slug", h.GetConcept)
+		v1.POST("/import", h.Import)
+		v1.GET("/status", h.Status)
+		v1.GET("/metrics", h.Metrics)
+		v1.GET("/metrics", h.PrometheusMetrics)
+		v1.POST("/raw/upload", h.UploadRaw)
+		v1.POST("/raw/scrape", h.ScrapeRaw)
+		v1.POST("/raw/generate-title", h.GenerateTitle)
+		v1.POST("/pipeline/run", h.RunPipeline)
 	}
 
 	// ── Static frontend ──
