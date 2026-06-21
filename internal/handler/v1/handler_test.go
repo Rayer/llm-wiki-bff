@@ -2,11 +2,9 @@ package v1
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
-	"strconv"
 	"strings"
 	"testing"
 
@@ -99,8 +97,34 @@ func TestPrometheusMetricsReturnsText(t *testing.T) {
 }
 
 func TestPipelineRunExecutesCloudRunJob(t *testing.T) {
-	argsFile := installFakeGcloud(t, 0, "job submitted")
-	h := &Handler{index: search.NewIndex(), defaultUser: "default-user"}
+	var runRequest map[string]any
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/token":
+			if got := r.Header.Get("Metadata-Flavor"); got != "Google" {
+				t.Errorf("Metadata-Flavor = %q, want Google", got)
+			}
+			return testHTTPResponse(http.StatusOK, `{"access_token":"test-token"}`), nil
+		case "/run":
+			if got := r.Header.Get("Authorization"); got != "Bearer test-token" {
+				t.Errorf("Authorization = %q, want Bearer test-token", got)
+			}
+			if err := json.NewDecoder(r.Body).Decode(&runRequest); err != nil {
+				t.Errorf("decode run request: %v", err)
+			}
+			return testHTTPResponse(http.StatusOK, `{}`), nil
+		default:
+			return testHTTPResponse(http.StatusNotFound, `not found`), nil
+		}
+	})}
+
+	h := &Handler{
+		index:            search.NewIndex(),
+		defaultUser:      "default-user",
+		httpClient:       client,
+		metadataTokenURL: "http://metadata.test/token",
+		cloudRunJobURL:   "https://run.test/run",
+	}
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
 	c.Request = httptest.NewRequest(http.MethodPost, "/api/v1/pipeline/run", strings.NewReader(`{"project":"demo","command":"sync"}`))
@@ -119,26 +143,53 @@ func TestPipelineRunExecutesCloudRunJob(t *testing.T) {
 	if body["status"] != "accepted" || body["command"] != "sync" || body["project"] != "demo" {
 		t.Fatalf("body = %#v", body)
 	}
-	args, err := os.ReadFile(argsFile)
-	if err != nil {
-		t.Fatalf("read gcloud args: %v", err)
+	want := map[string]any{
+		"overrides": map[string]any{
+			"containerOverrides": []any{
+				map[string]any{
+					"args": []any{"sync"},
+					"env": []any{
+						map[string]any{"name": "USER_ID", "value": "request-user"},
+						map[string]any{"name": "PROJECT_ID", "value": "demo"},
+					},
+				},
+			},
+		},
 	}
-	want := strings.Join([]string{
-		"run", "jobs", "exec", "olw-pipeline",
-		"--project", "llm-wiki-cloud",
-		"--region", "asia-east1",
-		"--args", "sync",
-		"--update-env-vars", "USER_ID=request-user,PROJECT_ID=demo",
-		"",
-	}, "\n")
-	if string(args) != want {
-		t.Fatalf("gcloud args:\n%s\nwant:\n%s", args, want)
+	if got, _ := json.Marshal(runRequest); string(got) != mustJSON(t, want) {
+		t.Fatalf("run request = %s, want %s", got, mustJSON(t, want))
 	}
 }
 
 func TestPipelineRunDefaultsCommandAndUser(t *testing.T) {
-	argsFile := installFakeGcloud(t, 0, "job submitted")
-	h := &Handler{index: search.NewIndex(), defaultUser: "default-user"}
+	var runRequest struct {
+		Overrides struct {
+			ContainerOverrides []struct {
+				Args []string `json:"args"`
+				Env  []struct {
+					Name  string `json:"name"`
+					Value string `json:"value"`
+				} `json:"env"`
+			} `json:"containerOverrides"`
+		} `json:"overrides"`
+	}
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == "/token" {
+			return testHTTPResponse(http.StatusOK, `{"access_token":"test-token"}`), nil
+		}
+		if err := json.NewDecoder(r.Body).Decode(&runRequest); err != nil {
+			t.Errorf("decode run request: %v", err)
+		}
+		return testHTTPResponse(http.StatusOK, `{}`), nil
+	})}
+
+	h := &Handler{
+		index:            search.NewIndex(),
+		defaultUser:      "default-user",
+		httpClient:       client,
+		metadataTokenURL: "http://metadata.test/token",
+		cloudRunJobURL:   "https://run.test/run",
+	}
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
 	c.Request = httptest.NewRequest(http.MethodPost, "/api/v1/pipeline/run", strings.NewReader(`{"project":"demo"}`))
@@ -149,13 +200,12 @@ func TestPipelineRunDefaultsCommandAndUser(t *testing.T) {
 	if recorder.Code != http.StatusAccepted {
 		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusAccepted, recorder.Body.String())
 	}
-	args, err := os.ReadFile(argsFile)
-	if err != nil {
-		t.Fatalf("read gcloud args: %v", err)
+	override := runRequest.Overrides.ContainerOverrides[0]
+	if len(override.Args) != 1 || override.Args[0] != "run" {
+		t.Fatalf("args = %#v, want [run]", override.Args)
 	}
-	if got := string(args); !strings.Contains(got, "--args\nrun\n") ||
-		!strings.Contains(got, "USER_ID=default-user,PROJECT_ID=demo\n") {
-		t.Fatalf("gcloud args do not contain defaults:\n%s", got)
+	if override.Env[0].Value != "default-user" || override.Env[1].Value != "demo" {
+		t.Fatalf("env = %#v", override.Env)
 	}
 }
 
@@ -176,9 +226,21 @@ func TestPipelineRunRequiresProject(t *testing.T) {
 	}
 }
 
-func TestPipelineRunReturnsGcloudOutputOnFailure(t *testing.T) {
-	installFakeGcloud(t, 1, "permission denied")
-	h := &Handler{index: search.NewIndex(), defaultUser: "default-user"}
+func TestPipelineRunReturnsCloudRunResponseOnFailure(t *testing.T) {
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == "/token" {
+			return testHTTPResponse(http.StatusOK, `{"access_token":"test-token"}`), nil
+		}
+		return testHTTPResponse(http.StatusForbidden, "permission denied\n"), nil
+	})}
+
+	h := &Handler{
+		index:            search.NewIndex(),
+		defaultUser:      "default-user",
+		httpClient:       client,
+		metadataTokenURL: "http://metadata.test/token",
+		cloudRunJobURL:   "https://run.test/run",
+	}
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
 	c.Request = httptest.NewRequest(http.MethodPost, "/api/v1/pipeline/run", strings.NewReader(`{"project":"demo"}`))
@@ -194,19 +256,27 @@ func TestPipelineRunReturnsGcloudOutputOnFailure(t *testing.T) {
 	}
 }
 
-func installFakeGcloud(t *testing.T, exitCode int, output string) string {
+func mustJSON(t *testing.T, value any) string {
 	t.Helper()
-	dir := t.TempDir()
-	argsFile := filepath.Join(dir, "args")
-	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$FAKE_GCLOUD_ARGS\"\nprintf '%s\\n' \"$FAKE_GCLOUD_OUTPUT\"\nexit \"$FAKE_GCLOUD_EXIT\"\n"
-	if err := os.WriteFile(filepath.Join(dir, "gcloud"), []byte(script), 0o755); err != nil {
-		t.Fatalf("write fake gcloud: %v", err)
+	data, err := json.Marshal(value)
+	if err != nil {
+		t.Fatalf("marshal JSON: %v", err)
 	}
-	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
-	t.Setenv("FAKE_GCLOUD_ARGS", argsFile)
-	t.Setenv("FAKE_GCLOUD_OUTPUT", output)
-	t.Setenv("FAKE_GCLOUD_EXIT", strconv.Itoa(exitCode))
-	return argsFile
+	return string(data)
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func testHTTPResponse(status int, body string) *http.Response {
+	return &http.Response{
+		StatusCode: status,
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}
 }
 
 func TestHandlersMatchGinHandlerSignature(t *testing.T) {

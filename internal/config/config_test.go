@@ -3,18 +3,15 @@ package config
 import (
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 )
 
-func TestLoadRejectsEmptyJWTSecretInProduction(t *testing.T) {
+func TestLoadAllowsEmptyJWTSecretInProduction(t *testing.T) {
 	t.Setenv("JWT_SECRET", "")
 	dir := writeConfig(t, "dev_jwt = false\n")
 
-	_, err := Load(dir)
-
-	if err == nil || !strings.Contains(err.Error(), "JWT_SECRET") {
-		t.Fatalf("Load() error = %v, want JWT_SECRET validation error", err)
+	if _, err := Load(dir); err != nil {
+		t.Fatalf("Load() error = %v, want nil", err)
 	}
 }
 

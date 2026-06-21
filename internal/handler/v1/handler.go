@@ -2,6 +2,8 @@ package v1
 
 import (
 	"fmt"
+	"net/http"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/rayer/llm-wiki-bff/internal/firestore"
@@ -18,6 +20,10 @@ type Handler struct {
 	llm         *llm.Client
 	expander    *llm.QueryExpander
 	defaultUser string
+
+	httpClient       *http.Client
+	metadataTokenURL string
+	cloudRunJobURL   string
 }
 
 // New creates a V1 Handler with the given dependencies.
@@ -29,6 +35,7 @@ func New(gcsClient *gcs.Client, fs *firestore.Client, idx *search.Index, llmClie
 		llm:         llmClient,
 		expander:    expander,
 		defaultUser: defaultUser,
+		httpClient:  &http.Client{Timeout: 30 * time.Second},
 	}
 }
 

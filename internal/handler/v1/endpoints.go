@@ -1,11 +1,14 @@
 package v1
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"net/url"
-	"os/exec"
 	"strconv"
 	"strings"
 	"time"
@@ -15,6 +18,11 @@ import (
 	"github.com/rayer/llm-wiki-bff/internal/handler"
 	"github.com/rayer/llm-wiki-bff/internal/llm"
 	"github.com/rayer/llm-wiki-bff/internal/search"
+)
+
+const (
+	defaultMetadataTokenURL = "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token"
+	defaultCloudRunJobURL   = "https://run.googleapis.com/v2/projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline:run"
 )
 
 // Health handles GET /api/v1/health.
@@ -310,17 +318,58 @@ func (h *Handler) PipelineRun(c *gin.Context) {
 		userID = h.defaultUser
 	}
 
-	cmd := exec.Command(
-		"gcloud", "run", "jobs", "exec", "olw-pipeline",
-		"--project", "llm-wiki-cloud",
-		"--region", "asia-east1",
-		"--args", req.Command,
-		"--update-env-vars", fmt.Sprintf("USER_ID=%s,PROJECT_ID=%s", userID, req.Project),
-	)
-	output, err := cmd.CombinedOutput()
+	token, err := h.getMetadataAccessToken(c.Request.Context())
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{
-			Error: fmt.Sprintf("pipeline failed: %s", string(output)),
+			Error: fmt.Sprintf("pipeline failed: %s", err),
+		})
+		return
+	}
+
+	body, err := json.Marshal(gin.H{
+		"overrides": gin.H{
+			"containerOverrides": []gin.H{
+				{
+					"args": []string{req.Command},
+					"env": []gin.H{
+						{"name": "USER_ID", "value": userID},
+						{"name": "PROJECT_ID", "value": req.Project},
+					},
+				},
+			},
+		},
+	})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "pipeline failed: " + err.Error()})
+		return
+	}
+
+	runURL := h.cloudRunJobURL
+	if runURL == "" {
+		runURL = defaultCloudRunJobURL
+	}
+	runReq, err := http.NewRequestWithContext(c.Request.Context(), http.MethodPost, runURL, bytes.NewReader(body))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "pipeline failed: " + err.Error()})
+		return
+	}
+	runReq.Header.Set("Authorization", "Bearer "+token)
+	runReq.Header.Set("Content-Type", "application/json")
+
+	resp, err := h.pipelineHTTPClient().Do(runReq)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "pipeline failed: " + err.Error()})
+		return
+	}
+	defer resp.Body.Close()
+	responseBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "pipeline failed: " + err.Error()})
+		return
+	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{
+			Error: fmt.Sprintf("pipeline failed: %s", string(responseBody)),
 		})
 		return
 	}
@@ -330,6 +379,49 @@ func (h *Handler) PipelineRun(c *gin.Context) {
 		"command": req.Command,
 		"project": req.Project,
 	})
+}
+
+func (h *Handler) getMetadataAccessToken(ctx context.Context) (string, error) {
+	tokenURL := h.metadataTokenURL
+	if tokenURL == "" {
+		tokenURL = defaultMetadataTokenURL
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, tokenURL, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Metadata-Flavor", "Google")
+
+	resp, err := h.pipelineHTTPClient().Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return "", fmt.Errorf("metadata token request failed: %s", string(body))
+	}
+
+	var tokenResponse struct {
+		AccessToken string `json:"access_token"`
+	}
+	if err := json.Unmarshal(body, &tokenResponse); err != nil {
+		return "", err
+	}
+	if tokenResponse.AccessToken == "" {
+		return "", fmt.Errorf("metadata token response missing access_token")
+	}
+	return tokenResponse.AccessToken, nil
+}
+
+func (h *Handler) pipelineHTTPClient() *http.Client {
+	if h.httpClient != nil {
+		return h.httpClient
+	}
+	return &http.Client{Timeout: 30 * time.Second}
 }
 
 // Status handles GET /api/v1/status using the request's GCS scope.
