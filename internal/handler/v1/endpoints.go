@@ -5,6 +5,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"os/exec"
 	"strconv"
 	"strings"
 	"time"
@@ -288,6 +289,46 @@ func (h *Handler) Import(c *gin.Context) {
 		Message:  "Bookmark import — Phase 2 (not yet implemented)",
 		Received: len(req.URLs),
 		URLs:     req.URLs,
+	})
+}
+
+// PipelineRun handles POST /api/v1/pipeline/run.
+func (h *Handler) PipelineRun(c *gin.Context) {
+	var req struct {
+		Project string `json:"project" binding:"required"`
+		Command string `json:"command"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, handler.ErrorResponse{Error: "project is required"})
+		return
+	}
+	if req.Command == "" {
+		req.Command = "run"
+	}
+	userID := c.GetString("userID")
+	if userID == "" {
+		userID = h.defaultUser
+	}
+
+	cmd := exec.Command(
+		"gcloud", "run", "jobs", "exec", "olw-pipeline",
+		"--project", "llm-wiki-cloud",
+		"--region", "asia-east1",
+		"--args", req.Command,
+		"--update-env-vars", fmt.Sprintf("USER_ID=%s,PROJECT_ID=%s", userID, req.Project),
+	)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{
+			Error: fmt.Sprintf("pipeline failed: %s", string(output)),
+		})
+		return
+	}
+
+	c.JSON(http.StatusAccepted, gin.H{
+		"status":  "accepted",
+		"command": req.Command,
+		"project": req.Project,
 	})
 }
 

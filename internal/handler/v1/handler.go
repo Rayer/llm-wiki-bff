@@ -12,21 +12,23 @@ import (
 
 // Handler holds the dependencies for the V1 API.
 type Handler struct {
-	gcs       *gcs.Client
-	firestore *firestore.Client
-	index     *search.Index
-	llm       *llm.Client
-	expander  *llm.QueryExpander
+	gcs         *gcs.Client
+	firestore   *firestore.Client
+	index       *search.Index
+	llm         *llm.Client
+	expander    *llm.QueryExpander
+	defaultUser string
 }
 
 // New creates a V1 Handler with the given dependencies.
-func New(gcsClient *gcs.Client, fs *firestore.Client, idx *search.Index, llmClient *llm.Client, expander *llm.QueryExpander) *Handler {
+func New(gcsClient *gcs.Client, fs *firestore.Client, idx *search.Index, llmClient *llm.Client, expander *llm.QueryExpander, defaultUser string) *Handler {
 	return &Handler{
-		gcs:       gcsClient,
-		firestore: fs,
-		index:     idx,
-		llm:       llmClient,
-		expander:  expander,
+		gcs:         gcsClient,
+		firestore:   fs,
+		index:       idx,
+		llm:         llmClient,
+		expander:    expander,
+		defaultUser: defaultUser,
 	}
 }
 

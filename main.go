@@ -90,7 +90,7 @@ func main() {
 
 	// Handlers
 	h := handler.New(gcsClient, fsClient, idx, llmClient, expander)
-	hV1 := handlerv1.New(gcsClient, fsClient, idx, llmClient, expander)
+	hV1 := handlerv1.New(gcsClient, fsClient, idx, llmClient, expander, cfg.DefaultUserID)
 
 	// Gin router
 	r := gin.Default()
@@ -138,6 +138,7 @@ func main() {
 		v1.GET("/concepts", hV1.ListConcepts)
 		v1.GET("/concepts/:slug", hV1.GetConcept)
 		v1.POST("/import", hV1.Import)
+		v1.POST("/pipeline/run", hV1.PipelineRun)
 		v1.GET("/status", hV1.Status)
 		v1.GET("/metrics", hV1.PrometheusMetrics)
 	}
