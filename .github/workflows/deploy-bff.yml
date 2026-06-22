@@ -9,12 +9,11 @@ env:
   PROJECT_ID: llm-wiki-cloud
   SERVICE_NAME: llm-wiki-bff-dev
   REGION: asia-east1
-  BFF_IMAGE: gcr.io/llm-wiki-cloud/llm-wiki-bff-dev
-  PIPELINE_IMAGE: gcr.io/llm-wiki-cloud/olw-worker-fuse
+  AR_REPO: asia-east1-docker.pkg.dev/llm-wiki-cloud/cloud-run-images
 
 jobs:
-  test-and-deploy-bff:
-    name: Test & Deploy BFF
+  test-and-deploy:
+    name: Test & Deploy
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -50,17 +49,21 @@ jobs:
       - name: Build and deploy to Cloud Run
         run: |
           SHORT_SHA=$(git rev-parse --short HEAD)
-          TAG="gcr.io/${{ env.PROJECT_ID }}/${{ env.SERVICE_NAME }}:$SHORT_SHA"
-          gcloud builds submit --tag "$TAG" --timeout=600s --quiet
+          IMAGE="${{ env.AR_REPO }}/${{ env.SERVICE_NAME }}:$SHORT_SHA"
+          echo "Building $IMAGE…"
+          gcloud builds submit --tag "$IMAGE" --timeout=600s --quiet
+          echo "Deploying $IMAGE…"
           gcloud run deploy ${{ env.SERVICE_NAME }} \
-            --image "$TAG" \
+            --image "$IMAGE" \
             --region ${{ env.REGION }} \
+            --network default --subnet default \
+            --vpc-egress all-traffic \
             --allow-unauthenticated \
             --quiet
+          echo "✅ Deployed ${{ env.SERVICE_NAME }} ($SHORT_SHA)"
 
       - name: Show deployment info
         run: |
-          echo "✅ Deployed ${{ env.SERVICE_NAME }} (commit $SHORT_SHA)"
           gcloud run services describe ${{ env.SERVICE_NAME }} \
             --region ${{ env.REGION }} \
             --format="value(status.url)"
