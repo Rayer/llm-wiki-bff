@@ -17,6 +17,14 @@ type Config struct {
 	JWTSecret      string
 	DevJWT         bool
 	DefaultUserID  string
+	Users          []UserConfig
+}
+
+// UserConfig holds a hardcoded user for authentication.
+type UserConfig struct {
+	ID           string
+	Email        string
+	PasswordHash string
 }
 
 // Load reads config.toml from the given path and returns a Config.

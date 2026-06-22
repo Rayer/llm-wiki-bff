@@ -118,6 +118,9 @@ func main() {
 	// Gin router
 		r := gin.Default()
 
+		// Public auth routes (no middleware)
+		r.POST("/api/v1/auth/login", auth.LoginHandler(cfg))
+
 		// OpenTelemetry latency middleware (per-endpoint)
 		r.Use(middleware.LatencyMiddleware())
 
