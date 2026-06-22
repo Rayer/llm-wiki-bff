@@ -59,6 +59,8 @@ func main() {
 	fsClient, err := firestore.NewClient(cfg.GCPProject, cfg.UserID, cfg.ProjectID)
 	if err != nil {
 		log.Printf("WARNING: Firestore client not available: %v", err)
+	} else {
+		auth.CreateTestUser(context.Background(), fsClient.Raw())
 	}
 
 	// Search metadata index
@@ -119,7 +121,7 @@ func main() {
 		r := gin.Default()
 
 		// Public auth routes (no middleware)
-		r.POST("/api/v1/auth/login", auth.LoginHandler(cfg))
+		r.POST("/api/v1/auth/login", auth.LoginHandler(fsClient.Raw(), cfg.JWTSecret))
 
 		// OpenTelemetry latency middleware (per-endpoint)
 		r.Use(middleware.LatencyMiddleware())

@@ -170,3 +170,8 @@ func (c *Client) ListRecentExecutions(ctx context.Context, limit int) ([]Executi
 func (c *Client) Close() error {
 	return c.fs.Close()
 }
+
+// Raw exposes the underlying firestore.Client for direct operations.
+func (c *Client) Raw() *firestore.Client {
+	return c.fs
+}

@@ -1,11 +1,12 @@
 package auth
 
 import (
+	"context"
 	"net/http"
 	"time"
 
+	"cloud.google.com/go/firestore"
 	"github.com/gin-gonic/gin"
-	"github.com/rayer/llm-wiki-bff/internal/config"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -27,16 +28,17 @@ type User struct {
 	Email string `json:"email"`
 }
 
-// LoginHandler returns a Gin handler that validates credentials and issues a JWT.
-func LoginHandler(cfg config.Config) gin.HandlerFunc {
+// LoginHandler returns a Gin handler that validates credentials against Firestore and issues a JWT.
+func LoginHandler(fsClient *firestore.Client, jwtSecret string) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var req LoginRequest
 		if err := c.ShouldBindJSON(&req); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "email and password are required"})
 			return
 		}
-		user, ok := lookupUser(cfg, req.Email)
-		if !ok {
+		ctx := c.Request.Context()
+		userID, user, err := GetUserByEmail(ctx, fsClient, req.Email)
+		if err != nil || user == nil {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid credentials"})
 			return
 		}
@@ -44,29 +46,25 @@ func LoginHandler(cfg config.Config) gin.HandlerFunc {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid credentials"})
 			return
 		}
-		token, err := GenerateToken(user.ID, cfg.JWTSecret, 24*time.Hour)
+		token, err := GenerateToken(userID, jwtSecret, 24*time.Hour)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate token"})
 			return
 		}
 		c.JSON(http.StatusOK, LoginResponse{
 			Token: token,
-			User:  User{ID: user.ID, Email: user.Email},
+			User:  User{ID: userID, Email: user.Email},
 		})
 	}
 }
 
-type storedUser struct {
-	ID           string
-	Email        string
-	PasswordHash string
-}
-
-func lookupUser(cfg config.Config, email string) (storedUser, bool) {
-	for _, u := range cfg.Users {
-		if u.Email == email {
-			return storedUser{ID: u.ID, Email: u.Email, PasswordHash: u.PasswordHash}, true
-		}
+// CreateTestUser creates the default test user in Firestore (for dev/CI).
+func CreateTestUser(ctx context.Context, fs *firestore.Client) {
+	pw := "test123"
+	hash, err := bcrypt.GenerateFromPassword([]byte(pw), bcrypt.DefaultCost)
+	if err != nil {
+		// best-effort: do not block startup
+		return
 	}
-	return storedUser{}, false
+	_ = CreateUser(ctx, fs, "test-user", "test@example.com", string(hash))
 }
