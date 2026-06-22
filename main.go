@@ -100,7 +100,7 @@ func main() {
 	}
 
 		// OpenTelemetry metrics (graceful fallback)
-		provider, err := observability.InitMetrics(context.Background(), "llm-wiki-bff-dev")
+		provider, err := observability.InitMetrics(context.Background(), "llm-wiki-bff-dev", observability.GetProjectID())
 		if err != nil {
 			log.Printf("[observability] WARNING: metrics init failed (continuing): %v", err)
 		} else {

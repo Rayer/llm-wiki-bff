@@ -4,34 +4,36 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
 	"time"
 
 	"go.opentelemetry.io/contrib/detectors/gcp"
 	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/resource"
 	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
+
+	mexporter "github.com/GoogleCloudPlatform/opentelemetry-operations-go/exporter/metric"
 )
 
 // InitMetrics sets up the OTel MeterProvider with GCP resource detection
-// and OTLP gRPC export to monitoring.googleapis.com.
-// Returns a MeterProvider that should be Shutdown() on graceful exit.
-// On failure, returns an error — caller should log and continue without metrics.
-func InitMetrics(ctx context.Context, serviceName string) (*sdkmetric.MeterProvider, error) {
+// and the native Cloud Monitoring exporter (not generic OTLP).
+func InitMetrics(ctx context.Context, serviceName, projectID string) (*sdkmetric.MeterProvider, error) {
+	exporter, err := mexporter.New(
+		mexporter.WithProjectID(projectID),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("metric exporter: %w", err)
+	}
+
+	// GCP resource detection, fall back to env
 	res, err := resource.New(ctx,
 		resource.WithDetectors(gcp.NewDetector()),
 		resource.WithAttributes(semconv.ServiceName(serviceName)),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("resource detection: %w", err)
-	}
-
-	exporter, err := otlpmetricgrpc.New(ctx,
-		otlpmetricgrpc.WithEndpoint("monitoring.googleapis.com:443"),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("otlp exporter: %w", err)
+		log.Printf("[observability] resource detection failed, using env: %v", err)
+		res = resource.Environment()
 	}
 
 	provider := sdkmetric.NewMeterProvider(
@@ -43,4 +45,15 @@ func InitMetrics(ctx context.Context, serviceName string) (*sdkmetric.MeterProvi
 	otel.SetMeterProvider(provider)
 	log.Printf("[observability] OTel meter provider initialized for %s", serviceName)
 	return provider, nil
+}
+
+// GetProjectID returns the GCP project ID from env or metadata.
+func GetProjectID() string {
+	if id := os.Getenv("GOOGLE_CLOUD_PROJECT"); id != "" {
+		return id
+	}
+	if id := os.Getenv("GCP_PROJECT"); id != "" {
+		return id
+	}
+	return ""
 }
