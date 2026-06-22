@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	conceptcache "github.com/rayer/llm-wiki-bff/internal/cache"
 	"github.com/rayer/llm-wiki-bff/internal/gcs"
 	"github.com/rayer/llm-wiki-bff/internal/handler"
 	"github.com/rayer/llm-wiki-bff/internal/llm"
@@ -84,7 +85,15 @@ func (h *Handler) Query(c *gin.Context) {
 		}
 	}
 
-	results := h.index.Search(searchQuery, 10)
+	if h.cache == nil {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "concept cache is not configured"})
+		return
+	}
+	results, err := h.cache.Search(c.Request.Context(), gcsClient, searchQuery, 10)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "concept cache: " + err.Error()})
+		return
+	}
 	log.Printf("Search query: %s, results: %v\n", searchQuery, results)
 
 	resp := handler.QueryResponse{
@@ -96,15 +105,7 @@ func (h *Handler) Query(c *gin.Context) {
 
 	if h.llm != nil && len(results) > 0 {
 		topN := min(10, len(results))
-		var contexts []string
-		for _, result := range results[:topN] {
-			category := result.Type + "s"
-			_, data, err := gcsClient.GetPage(c.Request.Context(), result.Slug, category)
-			if err != nil {
-				continue
-			}
-			contexts = append(contexts, fmt.Sprintf("[%s] %s\n\n%s", result.Title, result.Slug, string(data)))
-		}
+		contexts := cachedContexts(h.cache, gcsClient, results[:topN])
 
 		if len(contexts) > 0 {
 			systemPrompt := buildSystemPrompt(mode)
@@ -122,6 +123,28 @@ func (h *Handler) Query(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, resp)
+}
+
+func cachedContexts(conceptCache *conceptcache.Cache, reader conceptcache.Reader, results []search.Result) []string {
+	contexts := make([]string, 0, len(results))
+	for _, result := range results {
+		entry, ok := conceptCache.Entry(reader, result.Slug)
+		if !ok {
+			continue
+		}
+		sourceContext := "Sources: none listed"
+		if len(entry.Sources) > 0 {
+			sourceContext = "Sources: " + strings.Join(entry.Sources, ", ")
+		}
+		contexts = append(contexts, fmt.Sprintf(
+			"[%s] %s\n%s\n\n%s",
+			entry.Title,
+			entry.Slug,
+			sourceContext,
+			entry.Body,
+		))
+	}
+	return contexts
 }
 
 // ListSources handles GET /api/v1/sources using the request's GCS scope.

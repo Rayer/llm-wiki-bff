@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	conceptcache "github.com/rayer/llm-wiki-bff/internal/cache"
 	"github.com/rayer/llm-wiki-bff/internal/firestore"
 	"github.com/rayer/llm-wiki-bff/internal/gcs"
 	"github.com/rayer/llm-wiki-bff/internal/llm"
@@ -17,6 +18,7 @@ type Handler struct {
 	gcs         *gcs.Client
 	firestore   *firestore.Client
 	index       *search.Index
+	cache       *conceptcache.Cache
 	llm         *llm.Client
 	expander    *llm.QueryExpander
 	defaultUser string
@@ -27,11 +29,12 @@ type Handler struct {
 }
 
 // New creates a V1 Handler with the given dependencies.
-func New(gcsClient *gcs.Client, fs *firestore.Client, idx *search.Index, llmClient *llm.Client, expander *llm.QueryExpander, defaultUser string) *Handler {
+func New(gcsClient *gcs.Client, fs *firestore.Client, idx *search.Index, cache *conceptcache.Cache, llmClient *llm.Client, expander *llm.QueryExpander, defaultUser string) *Handler {
 	return &Handler{
 		gcs:         gcsClient,
 		firestore:   fs,
 		index:       idx,
+		cache:       cache,
 		llm:         llmClient,
 		expander:    expander,
 		defaultUser: defaultUser,

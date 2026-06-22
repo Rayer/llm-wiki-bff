@@ -1,6 +1,7 @@
 package v1
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -10,13 +11,14 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus"
+	conceptcache "github.com/rayer/llm-wiki-bff/internal/cache"
 	"github.com/rayer/llm-wiki-bff/internal/gcs"
 	"github.com/rayer/llm-wiki-bff/internal/search"
 )
 
 func TestGetGCSClientUsesRequestContextIdentity(t *testing.T) {
 	defaultClient := &gcs.Client{}
-	h := New(defaultClient, nil, search.NewIndex(), nil, nil, "")
+	h := New(defaultClient, nil, search.NewIndex(), conceptcache.New(), nil, nil, "")
 	c, _ := gin.CreateTestContext(nil)
 	c.Set("userID", "request-user")
 	c.Set("projectID", "request-project")
@@ -35,7 +37,7 @@ func TestGetGCSClientUsesRequestContextIdentity(t *testing.T) {
 
 func TestGetGCSClientFallsBackWhenContextIdentityIsEmpty(t *testing.T) {
 	defaultClient := &gcs.Client{}
-	h := New(defaultClient, nil, search.NewIndex(), nil, nil, "")
+	h := New(defaultClient, nil, search.NewIndex(), conceptcache.New(), nil, nil, "")
 	c, _ := gin.CreateTestContext(nil)
 
 	client, err := h.GetGCSClient(c)
@@ -48,7 +50,7 @@ func TestGetGCSClientFallsBackWhenContextIdentityIsEmpty(t *testing.T) {
 }
 
 func TestGetGCSClientRejectsPartialContextIdentity(t *testing.T) {
-	h := New(&gcs.Client{}, nil, search.NewIndex(), nil, nil, "")
+	h := New(&gcs.Client{}, nil, search.NewIndex(), conceptcache.New(), nil, nil, "")
 	c, _ := gin.CreateTestContext(nil)
 	c.Set("userID", "request-user")
 
@@ -59,7 +61,7 @@ func TestGetGCSClientRejectsPartialContextIdentity(t *testing.T) {
 
 func TestHealthReturnsOK(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-	h := New(nil, nil, search.NewIndex(), nil, nil, "")
+	h := New(nil, nil, search.NewIndex(), conceptcache.New(), nil, nil, "")
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
 
@@ -89,7 +91,7 @@ func TestPrometheusMetricsReturnsText(t *testing.T) {
 		prometheus.Unregister(registryMetric)
 	})
 
-	h := New(nil, nil, search.NewIndex(), nil, nil, "")
+	h := New(nil, nil, search.NewIndex(), conceptcache.New(), nil, nil, "")
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
 	c.Request = httptest.NewRequest(http.MethodGet, "/api/v1/metrics", nil)
@@ -107,6 +109,50 @@ func TestPrometheusMetricsReturnsText(t *testing.T) {
 	}
 	if body := recorder.Body.String(); !strings.Contains(body, "lwc_test_default_registry_total 1\n") {
 		t.Fatalf("body does not contain default registry metric:\n%s", body)
+	}
+}
+
+type handlerCacheReader struct {
+	prefix string
+	raw    string
+}
+
+func (r *handlerCacheReader) Prefix() string {
+	return r.prefix
+}
+
+func (r *handlerCacheReader) ListConcepts(context.Context, bool) ([]gcs.WikiPage, error) {
+	return []gcs.WikiPage{{Slug: "alpha"}}, nil
+}
+
+func (r *handlerCacheReader) GetPage(context.Context, string, string) (*gcs.WikiPage, []byte, error) {
+	return &gcs.WikiPage{Slug: "alpha"}, []byte(r.raw), nil
+}
+
+func TestCachedContextsIncludeConceptSources(t *testing.T) {
+	reader := &handlerCacheReader{
+		prefix: "users/u/projects/p",
+		raw:    "---\ntitle: Alpha Concept\nsources: [Source One, Source Two]\n---\nAlpha body.",
+	}
+	conceptCache := conceptcache.New()
+	if _, err := conceptCache.Build(context.Background(), reader); err != nil {
+		t.Fatalf("build cache: %v", err)
+	}
+
+	contexts := cachedContexts(conceptCache, reader, []search.Result{{
+		Slug:  "alpha",
+		Title: "Alpha Concept",
+		Type:  "concept",
+	}})
+
+	if len(contexts) != 1 {
+		t.Fatalf("len(contexts) = %d, want 1", len(contexts))
+	}
+	if !strings.Contains(contexts[0], "Sources: Source One, Source Two") {
+		t.Fatalf("context missing sources:\n%s", contexts[0])
+	}
+	if !strings.Contains(contexts[0], "Alpha body.") {
+		t.Fatalf("context missing body:\n%s", contexts[0])
 	}
 }
 
@@ -294,7 +340,7 @@ func testHTTPResponse(status int, body string) *http.Response {
 }
 
 func TestHandlersMatchGinHandlerSignature(t *testing.T) {
-	h := New(nil, nil, search.NewIndex(), nil, nil, "")
+	h := New(nil, nil, search.NewIndex(), conceptcache.New(), nil, nil, "")
 	handlers := []gin.HandlerFunc{
 		h.Health,
 		h.Query,

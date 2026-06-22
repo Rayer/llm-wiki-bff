@@ -11,6 +11,7 @@ import (
 	ginSwagger "github.com/swaggo/gin-swagger"
 
 	"github.com/rayer/llm-wiki-bff/internal/auth"
+	conceptcache "github.com/rayer/llm-wiki-bff/internal/cache"
 	"github.com/rayer/llm-wiki-bff/internal/config"
 	"github.com/rayer/llm-wiki-bff/internal/firestore"
 	"github.com/rayer/llm-wiki-bff/internal/gcs"
@@ -73,6 +74,14 @@ func main() {
 		log.Printf("Concept bodies loaded: %d concepts", idx.ConceptCount())
 	}
 
+	// Project-scoped concept cache for the V1 query path.
+	conceptCache := conceptcache.New()
+	if entries, err := conceptCache.Build(context.Background(), gcsClient); err != nil {
+		log.Printf("WARNING: Concept cache build failed: %v", err)
+	} else {
+		log.Printf("Concept cache: %d concepts", len(entries))
+	}
+
 	// LLM client (optional — query works without it)
 	llmClient := llm.NewClient(cfg.DeepSeekAPIKey)
 	if llmClient != nil {
@@ -91,7 +100,7 @@ func main() {
 
 	// Handlers
 	h := handler.New(gcsClient, fsClient, idx, llmClient, expander)
-	hV1 := handlerv1.New(gcsClient, fsClient, idx, llmClient, expander, cfg.DefaultUserID)
+	hV1 := handlerv1.New(gcsClient, fsClient, idx, conceptCache, llmClient, expander, cfg.DefaultUserID)
 
 	// Gin router
 	r := gin.Default()
