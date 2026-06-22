@@ -120,15 +120,15 @@ func main() {
 	// Gin router
 		r := gin.Default()
 
-		// Public auth routes (no middleware)
-		r.POST("/api/v1/auth/login", auth.LoginHandler(fsClient.Raw(), cfg.JWTSecret))
+	// OpenTelemetry latency middleware (per-endpoint)
+	r.Use(middleware.LatencyMiddleware())
 
-		// OpenTelemetry latency middleware (per-endpoint)
-		r.Use(middleware.LatencyMiddleware())
-
-		// CORS
+	// CORS — must be BEFORE routes
 	r.Use(corsMiddleware())
 	r.Use(defaultRequestScope(cfg))
+
+	// Public auth routes (no auth middleware)
+	r.POST("/api/v1/auth/login", auth.LoginHandler(fsClient.Raw(), cfg.JWTSecret))
 
 	// ── Swagger UI ──
 	r.GET("/swagger/*any", ginSwagger.WrapHandler(swaggerFiles.Handler))
