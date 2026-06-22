@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 // PrometheusMetrics handles GET /api/v1/metrics using the request's GCS scope.
@@ -57,6 +58,7 @@ func (h *Handler) PrometheusMetrics(c *gin.Context) {
 	writeGauge(&body, "lwc_gcs_bytes", "Total GCS bytes", gcsBytes)
 
 	c.Data(http.StatusOK, "text/plain; version=0.0.4; charset=utf-8", []byte(body.String()))
+	promhttp.Handler().ServeHTTP(c.Writer, c.Request)
 }
 
 func writeGauge(body *strings.Builder, name, help string, value interface{}) {

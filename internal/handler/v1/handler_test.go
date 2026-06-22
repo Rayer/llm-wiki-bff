@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/gin-gonic/gin"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/rayer/llm-wiki-bff/internal/gcs"
 	"github.com/rayer/llm-wiki-bff/internal/search"
 )
@@ -78,6 +79,16 @@ func TestHealthReturnsOK(t *testing.T) {
 
 func TestPrometheusMetricsReturnsText(t *testing.T) {
 	gin.SetMode(gin.TestMode)
+	registryMetric := prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "lwc_test_default_registry_total",
+		Help: "Test metric from the default registry.",
+	})
+	prometheus.MustRegister(registryMetric)
+	registryMetric.Inc()
+	t.Cleanup(func() {
+		prometheus.Unregister(registryMetric)
+	})
+
 	h := New(nil, nil, search.NewIndex(), nil, nil, "")
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
@@ -93,6 +104,9 @@ func TestPrometheusMetricsReturnsText(t *testing.T) {
 	}
 	if body := recorder.Body.String(); !strings.Contains(body, "lwc_sources_count 0\n") {
 		t.Fatalf("body does not contain zero source metric:\n%s", body)
+	}
+	if body := recorder.Body.String(); !strings.Contains(body, "lwc_test_default_registry_total 1\n") {
+		t.Fatalf("body does not contain default registry metric:\n%s", body)
 	}
 }
 
