@@ -131,6 +131,13 @@ func (idx *Index) Search(query string, limit int) []Result {
 	}
 	query = strings.ToLower(query)
 	words := strings.Fields(query)
+	// Chinese / no-space query: add character bigrams for partial matching
+	if len(words) <= 1 && len([]rune(query)) > 2 {
+		runes := []rune(query)
+		for i := 0; i < len(runes)-1; i++ {
+			words = append(words, string(runes[i:i+2]))
+		}
+	}
 
 	var sourceResults []scoredResult
 	var conceptResults []scoredResult

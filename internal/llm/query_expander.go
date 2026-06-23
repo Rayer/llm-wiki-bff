@@ -4,6 +4,7 @@ import (
 	"embed"
 	"encoding/json"
 	"fmt"
+	"log"
 	"strings"
 )
 
@@ -26,7 +27,6 @@ type QueryExpander struct {
 }
 
 // NewExpander creates a QueryExpander for the given domain.
-// Domain "lifestyle" uses the lifestyle prompt; anything else uses default.
 func NewExpander(client *Client, domain string) (*QueryExpander, error) {
 	if client == nil {
 		return nil, nil
@@ -34,7 +34,6 @@ func NewExpander(client *Client, domain string) (*QueryExpander, error) {
 
 	prompt, err := loadPrompt(domain)
 	if err != nil {
-		// Fall back to default on load error
 		prompt, _ = loadPrompt("default")
 	}
 
@@ -57,21 +56,29 @@ func loadPrompt(domain string) (string, error) {
 }
 
 // Expand rewrites a user query into structured search keywords.
-// On any failure, returns nil so the caller can fall back to raw query.
-func (e *QueryExpander) Expand(query string) *ExpandResult {
+// Returns the expansion result; on failure returns nil AND the error
+// so callers can log and gracefully degrade.
+func (e *QueryExpander) Expand(query string) (*ExpandResult, error) {
 	if e == nil {
-		return nil
+		return nil, nil
 	}
 
 	raw, err := e.client.Chat(e.systemPrompt, query)
 	if err != nil {
-		return nil
+		log.Printf("[expander] LLM call failed for query %q: %v", query, err)
+		return nil, fmt.Errorf("expander: chat: %w", err)
 	}
 
-	return parseExpandResult(raw)
+	result, err := parseExpandResult(raw)
+	if err != nil {
+		log.Printf("[expander] parse failed for query %q (raw=%q): %v", query, raw, err)
+		return nil, fmt.Errorf("expander: parse: %w", err)
+	}
+
+	return result, nil
 }
 
-func parseExpandResult(raw string) *ExpandResult {
+func parseExpandResult(raw string) (*ExpandResult, error) {
 	raw = strings.TrimSpace(raw)
 
 	// Strip markdown code fences if present
@@ -85,10 +92,10 @@ func parseExpandResult(raw string) *ExpandResult {
 
 	var r ExpandResult
 	if err := json.Unmarshal([]byte(raw), &r); err != nil {
-		return nil
+		return nil, fmt.Errorf("json parse: %w (raw=%q)", err, raw[:min(len(raw), 200)])
 	}
 	if len(r.Keywords) == 0 {
-		return nil
+		return nil, fmt.Errorf("no keywords in response (raw=%q)", raw[:min(len(raw), 200)])
 	}
-	return &r
+	return &r, nil
 }
