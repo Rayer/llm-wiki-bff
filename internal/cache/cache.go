@@ -123,14 +123,35 @@ func (c *Cache) Build(ctx context.Context, reader Reader) ([]Entry, error) {
 	return cloneEntries(entries), nil
 }
 
+// IsReady reports whether the cache has a populated entry for the given prefix.
+func (c *Cache) IsReady(prefix string) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	project, ok := c.projects[prefix]
+	return ok && len(project.entries) > 0
+}
+
+// Prefixes returns all cached project prefixes.
+func (c *Cache) Prefixes() []string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	prefixes := make([]string, 0, len(c.projects))
+	for prefix := range c.projects {
+		prefixes = append(prefixes, prefix)
+	}
+	return prefixes
+}
+
 // Search finds matching concepts in a project cache. The project is built on
-// first use, then results are sampled without replacement using match score as
-// the weight.
+// first use with a 10-second timeout, then results are sampled without
+// replacement using match score as the weight.
 func (c *Cache) Search(ctx context.Context, reader Reader, query string, limit int) ([]search.Result, error) {
 	project, ok := c.project(reader)
 	if !ok {
-		if _, err := c.Build(ctx, reader); err != nil {
-			return nil, err
+		buildCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		if _, err := c.Build(buildCtx, reader); err != nil {
+			return nil, fmt.Errorf("concept cache build for %q: %w", reader.Prefix(), err)
 		}
 		project, _ = c.project(reader)
 	}

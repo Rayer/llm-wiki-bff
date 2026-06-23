@@ -85,6 +85,24 @@ func main() {
 		log.Printf("Concept cache: %d concepts", len(entries))
 	}
 
+	// Warm concept cache for the default user scope (used by JWTAuth when no
+	// Authorization header is present). If DefaultUserID differs from UserID,
+	// the startup-built cache would miss on the first request, triggering a
+	// costly rebuild on the critical path. Building it here ensures the cache
+	// is warm for the most common request scope.
+	if cfg.DefaultUserID != "" && cfg.DefaultUserID != cfg.UserID {
+		// Build for the scope that JWTAuth will use when no Authorization
+		// header is present. If DefaultUserID differs from UserID, the
+		// startup cache key won't match request-time keys, triggering a
+		// costly rebuild on the critical path.
+		defaultScopeClient := gcsClient.WithScope(cfg.DefaultUserID, cfg.ProjectID)
+		if entries, err := conceptCache.Build(context.Background(), defaultScopeClient); err != nil {
+			log.Printf("WARNING: Default-scope concept cache build failed: %v", err)
+		} else {
+			log.Printf("Concept cache (default scope): %d concepts", len(entries))
+		}
+	}
+
 	// LLM client (optional — query works without it)
 	llmClient := llm.NewClient(cfg.DeepSeekAPIKey)
 	if llmClient != nil {
@@ -163,6 +181,7 @@ func main() {
 	v1.Use(auth.ProjectMiddleware())
 	{
 		v1.GET("/health", hV1.Health)
+		v1.GET("/ready", hV1.Ready)
 		v1.POST("/query", hV1.Query)
 		v1.GET("/sources", hV1.ListSources)
 		v1.GET("/sources/:slug", hV1.GetSource)

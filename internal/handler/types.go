@@ -16,6 +16,14 @@ type HealthResponse struct {
 	Status string `json:"status"`
 }
 
+// ReadyResponse is returned by the V1 readiness endpoint.
+type ReadyResponse struct {
+	Ready   bool     `json:"ready"`
+	Prefix  string   `json:"prefix,omitempty"`
+	Prefixes []string `json:"prefixes,omitempty"`
+	Message string   `json:"message,omitempty"`
+}
+
 // QueryRequest is the request body for a query endpoint.
 type QueryRequest struct {
 	Query   string `json:"q"`
