@@ -147,6 +147,7 @@ func main() {
 
 	// Public auth routes (no auth middleware)
 	r.POST("/api/v1/auth/login", auth.LoginHandler(fsClient.Raw(), cfg.JWTSecret))
+	r.POST("/api/v1/auth/register", auth.RegisterHandler(fsClient.Raw(), cfg.JWTSecret))
 
 	// ── Swagger UI ──
 	r.GET("/swagger/*any", ginSwagger.WrapHandler(swaggerFiles.Handler))
