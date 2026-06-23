@@ -3,6 +3,7 @@ package v1
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -117,6 +118,14 @@ type handlerCacheReader struct {
 	raw    string
 }
 
+func (r *handlerCacheReader) ReadFile(_ context.Context, _ string) ([]byte, error) {
+	return nil, errors.New("no JSONL in tests — use ListConcepts path")
+}
+
+func (r *handlerCacheReader) WriteBytes(_ context.Context, data []byte, _ string) (string, error) {
+	return "ok", nil
+}
+
 func (r *handlerCacheReader) Prefix() string {
 	return r.prefix
 }
@@ -135,9 +144,6 @@ func TestCachedContextsIncludeConceptSources(t *testing.T) {
 		raw:    "---\ntitle: Alpha Concept\nsources: [Source One, Source Two]\n---\nAlpha body.",
 	}
 	conceptCache := conceptcache.New()
-	if _, err := conceptCache.Build(context.Background(), reader); err != nil {
-		t.Fatalf("build cache: %v", err)
-	}
 
 	contexts := cachedContexts(conceptCache, reader, []search.Result{{
 		Slug:  "alpha",
@@ -148,7 +154,7 @@ func TestCachedContextsIncludeConceptSources(t *testing.T) {
 	if len(contexts) != 1 {
 		t.Fatalf("len(contexts) = %d, want 1", len(contexts))
 	}
-	if !strings.Contains(contexts[0], "Sources: Source One, Source Two") {
+	if !strings.Contains(contexts[0], "Sources: [Source One, Source Two]") {
 		t.Fatalf("context missing sources:\n%s", contexts[0])
 	}
 	if !strings.Contains(contexts[0], "Alpha body.") {

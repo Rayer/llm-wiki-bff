@@ -64,7 +64,7 @@ func TestParseExpandResult(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := parseExpandResult(tt.raw)
+			result, _ := parseExpandResult(tt.raw)
 			if tt.wantNil {
 				if result != nil {
 					t.Errorf("expected nil, got %+v", result)
