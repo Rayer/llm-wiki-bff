@@ -40,51 +40,6 @@ func (h *Handler) Health(c *gin.Context) {
 	c.JSON(http.StatusOK, handler.HealthResponse{Status: "ok"})
 }
 
-// Ready handles GET /api/v1/ready — returns 200 when the concept cache is warm
-// for the requesting project, 503 otherwise.
-//
-//	@Summary		Readiness check
-//	@Description	Returns 200 when the concept cache is warm for the request scope. Returns 503 if the cache is not ready.
-//	@Tags			health
-//	@Produce		json
-//	@Success		200	{object}	handler.ReadyResponse
-//	@Failure		503	{object}	handler.ReadyResponse
-//	@Security		DevUserAuth
-//	@Security		ProjectHeader
-//	@Router			/api/v1/ready [get]
-func (h *Handler) Ready(c *gin.Context) {
-	gcsClient, err := h.GetGCSClient(c)
-	if err != nil {
-		c.JSON(http.StatusServiceUnavailable, handler.ReadyResponse{
-			Ready:   false,
-			Message: "GCS client unavailable: " + err.Error(),
-		})
-		return
-	}
-	prefix := gcsClient.Prefix()
-	if h.cache == nil {
-		c.JSON(http.StatusServiceUnavailable, handler.ReadyResponse{
-			Ready:   false,
-			Prefix:  prefix,
-			Message: "concept cache is not configured",
-		})
-		return
-	}
-	if h.cache.IsReady(prefix) {
-		c.JSON(http.StatusOK, handler.ReadyResponse{
-			Ready:  true,
-			Prefix: prefix,
-		})
-		return
-	}
-	c.JSON(http.StatusServiceUnavailable, handler.ReadyResponse{
-		Ready:    false,
-		Prefix:   prefix,
-		Prefixes: h.cache.Prefixes(),
-		Message:  "concept cache not warm for this project",
-	})
-}
-
 // Query handles POST /api/v1/query using the request's GCS scope.
 //
 //	@Summary		Search wiki content
@@ -136,7 +91,7 @@ func (h *Handler) Query(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "concept cache is not configured"})
 		return
 	}
-	results, err := h.cache.Search(c.Request.Context(), gcsClient, searchQuery, 10)
+	results, err := h.cache.Query(c.Request.Context(), gcsClient, searchQuery, 10)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "concept cache: " + err.Error()})
 		return
@@ -173,9 +128,17 @@ func (h *Handler) Query(c *gin.Context) {
 }
 
 func cachedContexts(conceptCache *conceptcache.Cache, reader conceptcache.Reader, results []search.Result) []string {
+	entries, err := conceptCache.All(context.TODO(), reader)
+	if err != nil {
+		return nil
+	}
+	bySlug := make(map[string]conceptcache.Entry)
+	for _, e := range entries {
+		bySlug[e.Slug] = e
+	}
 	contexts := make([]string, 0, len(results))
-	for _, result := range results {
-		entry, ok := conceptCache.Entry(reader, result.Slug)
+	for _, r := range results {
+		entry, ok := bySlug[r.Slug]
 		if !ok {
 			continue
 		}
