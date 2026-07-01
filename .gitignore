@@ -1,12 +1,6 @@
-/bff
+.gocache/
+bin/
+lwc-test-server
+llm-wiki-bff
 *.exe
-*.exe~
-*.dll
-*.so
-*.dylib
-.env
 *.test
-*.out
-vendor/
-.idea/
-config.toml
