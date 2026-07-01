@@ -3,6 +3,7 @@ package v1
 import (
 	"strings"
 
+	fm "github.com/adrg/frontmatter"
 	"github.com/rayer/llm-wiki-bff/internal/search"
 )
 
@@ -96,29 +97,14 @@ func ensureBrackets(text string, results []search.Result) string {
 }
 
 func parseFrontmatter(md string) (map[string]interface{}, string) {
-	frontmatter := make(map[string]interface{})
+	result := make(map[string]interface{})
 	if !strings.HasPrefix(md, "---") {
-		return frontmatter, md
+		return result, md
 	}
 
-	end := strings.Index(md[3:], "\n---")
-	if end < 0 {
-		return frontmatter, md
+	body, err := fm.MustParse(strings.NewReader(md), &result)
+	if err != nil {
+		return make(map[string]interface{}), md
 	}
-	end += 3
-
-	for _, line := range strings.Split(md[3:end], "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		parts := strings.SplitN(line, ":", 2)
-		if len(parts) == 2 {
-			key := strings.TrimSpace(parts[0])
-			value := strings.Trim(strings.TrimSpace(parts[1]), "\"'")
-			frontmatter[key] = value
-		}
-	}
-
-	return frontmatter, md[end+3:]
+	return result, string(body)
 }

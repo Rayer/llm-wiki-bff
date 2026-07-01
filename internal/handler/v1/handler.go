@@ -1,8 +1,10 @@
 package v1
 
 import (
+	"context"
 	"fmt"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -15,30 +17,31 @@ import (
 
 // Handler holds the dependencies for the V1 API.
 type Handler struct {
-	gcs         *gcs.Client
-	firestore   *firestore.Client
-	index       *search.Index
-	cache       *conceptcache.Cache
-	llm         *llm.Client
-	expander    *llm.QueryExpander
-	defaultUser string
+	gcs       *gcs.Client
+	firestore *firestore.Client
+	index     *search.Index
+	cache     *conceptcache.Cache
+	llm       *llm.Client
+	expander  *llm.QueryExpander
 
 	httpClient       *http.Client
 	metadataTokenURL string
 	cloudRunJobURL   string
+	rebuildIndex     func(context.Context, string, string) (idMap, error)
+	idRoutingMu      sync.Mutex
+	idRoutingMaps    map[string]dualIDMap
 }
 
 // New creates a V1 Handler with the given dependencies.
-func New(gcsClient *gcs.Client, fs *firestore.Client, idx *search.Index, cache *conceptcache.Cache, llmClient *llm.Client, expander *llm.QueryExpander, defaultUser string) *Handler {
+func New(gcsClient *gcs.Client, fs *firestore.Client, idx *search.Index, cache *conceptcache.Cache, llmClient *llm.Client, expander *llm.QueryExpander) *Handler {
 	return &Handler{
-		gcs:         gcsClient,
-		firestore:   fs,
-		index:       idx,
-		cache:       cache,
-		llm:         llmClient,
-		expander:    expander,
-		defaultUser: defaultUser,
-		httpClient:  &http.Client{Timeout: 30 * time.Second},
+		gcs:        gcsClient,
+		firestore:  fs,
+		index:      idx,
+		cache:      cache,
+		llm:        llmClient,
+		expander:   expander,
+		httpClient: &http.Client{Timeout: 30 * time.Second},
 	}
 }
 

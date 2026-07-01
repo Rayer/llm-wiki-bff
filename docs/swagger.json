@@ -59,7 +59,7 @@
                 }
             }
         },
-        "/api/v1/concepts/{slug}": {
+        "/api/v1/concepts/{id}": {
             "get": {
                 "security": [
                     {
@@ -76,12 +76,12 @@
                 "tags": [
                     "concepts"
                 ],
-                "summary": "Get a concept by slug",
+                "summary": "Get a concept by ID",
                 "parameters": [
                     {
                         "type": "string",
-                        "description": "Concept slug",
-                        "name": "slug",
+                        "description": "Concept ID",
+                        "name": "id",
                         "in": "path",
                         "required": true
                     }
@@ -103,6 +103,35 @@
                         "description": "Internal Server Error",
                         "schema": {
                             "$ref": "#/definitions/handler.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/index": {
+            "get": {
+                "security": [
+                    {
+                        "DevUserAuth": []
+                    },
+                    {
+                        "ProjectHeader": []
+                    }
+                ],
+                "description": "Returns the ID map (concept and source ID-to-slug mappings).",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "index"
+                ],
+                "summary": "Get ID map",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
                         }
                     }
                 }
@@ -303,7 +332,7 @@
                 }
             }
         },
-        "/api/v1/sources/{slug}": {
+        "/api/v1/sources/{id}": {
             "get": {
                 "security": [
                     {
@@ -320,12 +349,12 @@
                 "tags": [
                     "sources"
                 ],
-                "summary": "Get a source by slug",
+                "summary": "Get a source by ID",
                 "parameters": [
                     {
                         "type": "string",
-                        "description": "Source slug",
-                        "name": "slug",
+                        "description": "Source ID",
+                        "name": "id",
                         "in": "path",
                         "required": true
                     }

@@ -3,7 +3,6 @@ package auth
 import (
 	"context"
 	"net/http"
-	"time"
 
 	"cloud.google.com/go/firestore"
 	"github.com/gin-gonic/gin"
@@ -18,8 +17,8 @@ type LoginRequest struct {
 
 // LoginResponse is the JSON response for successful authentication.
 type LoginResponse struct {
-	Token string `json:"token"`
-	User  User   `json:"user"`
+	AccessToken string `json:"access_token"`
+	User        User   `json:"user"`
 }
 
 // User contains the authenticated user's public information.
@@ -46,14 +45,20 @@ func LoginHandler(fsClient *firestore.Client, jwtSecret string) gin.HandlerFunc 
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid credentials"})
 			return
 		}
-		token, err := GenerateToken(userID, jwtSecret, 24*time.Hour)
+		accessToken, err := GenerateAccessToken(userID, jwtSecret)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate token"})
 			return
 		}
+		refreshToken, err := GenerateRefreshToken(userID, jwtSecret)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate token"})
+			return
+		}
+		setRefreshTokenCookie(c, refreshToken, int(refreshTokenTTL.Seconds()))
 		c.JSON(http.StatusOK, LoginResponse{
-			Token: token,
-			User:  User{ID: userID, Email: user.Email},
+			AccessToken: accessToken,
+			User:        User{ID: userID, Email: user.Email},
 		})
 	}
 }

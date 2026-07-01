@@ -7,9 +7,12 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"strings"
+	"time"
 
 	"cloud.google.com/go/storage"
+	fm "github.com/adrg/frontmatter"
 	"google.golang.org/api/iterator"
 )
 
@@ -24,6 +27,7 @@ type Client struct {
 type WikiPage struct {
 	Slug      string   `json:"slug"`
 	Title     string   `json:"title"`
+	ID        string   `json:"id"`
 	Path      string   `json:"path"`
 	Status    string   `json:"status"` // "published" or "draft"
 	Quality   string   `json:"quality,omitempty"`
@@ -32,17 +36,33 @@ type WikiPage struct {
 	RawSource string   `json:"raw_source,omitempty"`
 }
 
-// NewClient creates a new GCS client for the given bucket/user/project.
-func NewClient(bucket, userID, projectID string) (*Client, error) {
+// Project represents a user project discovered in GCS.
+type Project struct {
+	ID        string `json:"id"`
+	CreatedAt string `json:"created_at"`
+}
+
+// MarkdownFile is a direct markdown object under a project directory.
+type MarkdownFile struct {
+	Slug string
+	Path string
+	Data []byte
+}
+
+type wikiPageFrontmatter struct {
+	ID    string `yaml:"id"`
+	Title string `yaml:"title"`
+}
+
+// NewClient creates a new GCS client for the given bucket.
+func NewClient(bucket string) (*Client, error) {
 	ctx := context.Background()
 	client, err := storage.NewClient(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("storage client: %w", err)
 	}
 	return &Client{
-		bucket:    client.Bucket(bucket),
-		userID:    userID,
-		projectID: projectID,
+		bucket: client.Bucket(bucket),
 	}, nil
 }
 
@@ -174,6 +194,42 @@ func (c *Client) ReadFile(ctx context.Context, relPath string) ([]byte, error) {
 	return io.ReadAll(r)
 }
 
+// ListMarkdownFiles reads direct .md files under dir, relative to the
+// user/project prefix. Nested files are ignored.
+func (c *Client) ListMarkdownFiles(ctx context.Context, dir string) ([]MarkdownFile, error) {
+	prefix := fmt.Sprintf("%s/%s", c.prefix(), dir)
+	it := c.bucket.Objects(ctx, &storage.Query{Prefix: prefix})
+
+	var files []MarkdownFile
+	for {
+		attrs, err := it.Next()
+		if err != nil {
+			if errors.Is(err, iterator.Done) {
+				break
+			}
+			return nil, err
+		}
+		if !strings.HasSuffix(attrs.Name, ".md") {
+			continue
+		}
+		rel := strings.TrimPrefix(attrs.Name, prefix)
+		if rel == attrs.Name || rel == "" || strings.Contains(rel, "/") {
+			continue
+		}
+
+		data, err := c.ReadFile(ctx, dir+rel)
+		if err != nil {
+			return nil, err
+		}
+		files = append(files, MarkdownFile{
+			Slug: strings.TrimSuffix(rel, ".md"),
+			Path: dir + rel,
+			Data: data,
+		})
+	}
+	return files, nil
+}
+
 // listDir lists .md files under the given directory prefix.
 func (c *Client) listDir(ctx context.Context, dir string) ([]WikiPage, error) {
 	prefix := fmt.Sprintf("%s/%s", c.prefix(), dir)
@@ -192,13 +248,40 @@ func (c *Client) listDir(ctx context.Context, dir string) ([]WikiPage, error) {
 			continue
 		}
 		slug := strings.TrimSuffix(strings.TrimPrefix(attrs.Name, prefix), ".md")
-		pages = append(pages, WikiPage{
+		page := WikiPage{
 			Slug:  slug,
 			Title: slug,
 			Path:  fmt.Sprintf("%s%s.md", dir, slug),
-		})
+		}
+		data, err := c.ReadFile(ctx, page.Path)
+		if err != nil {
+			return nil, err
+		}
+		page, err = applyWikiPageFrontmatter(page, data)
+		if err != nil {
+			return nil, fmt.Errorf("parse %s: %w", page.Path, err)
+		}
+		pages = append(pages, page)
 	}
 	return pages, nil
+}
+
+func applyWikiPageFrontmatter(page WikiPage, data []byte) (WikiPage, error) {
+	if !strings.HasPrefix(string(data), "---") {
+		return page, nil
+	}
+
+	var matter wikiPageFrontmatter
+	if _, err := fm.MustParse(strings.NewReader(string(data)), &matter); err != nil {
+		return page, err
+	}
+	if id := strings.TrimSpace(matter.ID); id != "" {
+		page.ID = id
+	}
+	if title := strings.TrimSpace(matter.Title); title != "" {
+		page.Title = title
+	}
+	return page, nil
 }
 
 // UploadFile uploads a local file to GCS under the user/project prefix.
@@ -230,16 +313,8 @@ func (c *Client) uploadBytesWithDigest(ctx context.Context, data []byte, gcsRelP
 	path := fmt.Sprintf("%s/%s", c.prefix(), gcsRelPath)
 	obj := c.bucket.Object(path)
 
-	// Detect content type
-	contentType := "application/octet-stream"
-	if strings.HasSuffix(gcsRelPath, ".md") {
-		contentType = "text/markdown; charset=utf-8"
-	} else if strings.HasSuffix(gcsRelPath, ".db") {
-		contentType = "application/octet-stream"
-	}
-
 	w := obj.NewWriter(ctx)
-	w.ContentType = contentType
+	w.ContentType = contentTypeForPath(gcsRelPath)
 	w.Metadata = map[string]string{
 		"sha256": digest,
 	}
@@ -257,6 +332,61 @@ func (c *Client) uploadBytesWithDigest(ctx context.Context, data []byte, gcsRelP
 // SHA256 digest. gcsRelPath is relative to the prefix (e.g., "raw/my-note.md").
 func (c *Client) WriteBytes(ctx context.Context, data []byte, gcsRelPath string) (string, error) {
 	return c.uploadBytes(ctx, data, gcsRelPath)
+}
+
+// WriteBytesAtomic uploads bytes to a temporary object, then copies them to the
+// final object with a generation precondition so the final replacement is atomic.
+func (c *Client) WriteBytesAtomic(ctx context.Context, data []byte, tmpPath, finalPath string) (string, error) {
+	digest := fmt.Sprintf("%x", sha256.Sum256(data))
+	tmpFullPath := fmt.Sprintf("%s/%s", c.prefix(), tmpPath)
+	finalFullPath := fmt.Sprintf("%s/%s", c.prefix(), finalPath)
+
+	tmpObj := c.bucket.Object(tmpFullPath)
+	w := tmpObj.NewWriter(ctx)
+	w.ContentType = contentTypeForPath(finalPath)
+	w.Metadata = map[string]string{
+		"sha256": digest,
+	}
+	if _, err := w.Write(data); err != nil {
+		w.Close()
+		return "", fmt.Errorf("write %s: %w", tmpFullPath, err)
+	}
+	if err := w.Close(); err != nil {
+		return "", fmt.Errorf("close %s: %w", tmpFullPath, err)
+	}
+	tmpAttrs := w.Attrs()
+	tmpSource := tmpObj
+	if tmpAttrs != nil && tmpAttrs.Generation > 0 {
+		tmpSource = tmpObj.Generation(tmpAttrs.Generation)
+	}
+	defer func() {
+		_ = tmpObj.Delete(context.Background())
+	}()
+
+	finalObj := c.bucket.Object(finalFullPath)
+	attrs, err := finalObj.Attrs(ctx)
+	if err != nil {
+		if !errors.Is(err, storage.ErrObjectNotExist) {
+			return "", fmt.Errorf("attrs %s: %w", finalFullPath, err)
+		}
+		finalObj = finalObj.If(storage.Conditions{DoesNotExist: true})
+	} else {
+		finalObj = finalObj.If(storage.Conditions{GenerationMatch: attrs.Generation})
+	}
+	if _, err := finalObj.CopierFrom(tmpSource).Run(ctx); err != nil {
+		return "", fmt.Errorf("copy %s to %s: %w", tmpFullPath, finalFullPath, err)
+	}
+	return digest, nil
+}
+
+func contentTypeForPath(gcsRelPath string) string {
+	if strings.HasSuffix(gcsRelPath, ".md") {
+		return "text/markdown; charset=utf-8"
+	}
+	if strings.HasSuffix(gcsRelPath, ".json") {
+		return "application/json; charset=utf-8"
+	}
+	return "application/octet-stream"
 }
 
 // GetMetaSHA256 returns the SHA256 digest from GCS object metadata, or "" if the
@@ -277,6 +407,69 @@ func (c *Client) GetMetaSHA256(ctx context.Context, gcsRelPath string) (string, 
 // Prefix returns the GCS prefix for this client's user/project.
 func (c *Client) Prefix() string {
 	return c.prefix()
+}
+
+// ListProjects returns project directories under users/{userID}/projects/.
+func (c *Client) ListProjects(ctx context.Context, userID string) ([]Project, error) {
+	if c == nil || c.bucket == nil {
+		return nil, fmt.Errorf("GCS client is not configured")
+	}
+
+	basePrefix := fmt.Sprintf("users/%s/projects/", userID)
+	it := c.bucket.Objects(ctx, &storage.Query{
+		Prefix:    basePrefix,
+		Delimiter: "/",
+	})
+
+	seen := make(map[string]struct{})
+	for {
+		attrs, err := it.Next()
+		if err != nil {
+			if errors.Is(err, iterator.Done) {
+				break
+			}
+			return nil, err
+		}
+
+		prefix := attrs.Prefix
+		if prefix == "" {
+			name := strings.TrimPrefix(attrs.Name, basePrefix)
+			if name == attrs.Name || name == "" || !strings.Contains(name, "/") {
+				continue
+			}
+			prefix = basePrefix + strings.SplitN(name, "/", 2)[0] + "/"
+		}
+
+		projectID := strings.TrimSuffix(strings.TrimPrefix(prefix, basePrefix), "/")
+		if projectID == "" || strings.Contains(projectID, "/") {
+			continue
+		}
+		seen[projectID] = struct{}{}
+	}
+
+	ids := make([]string, 0, len(seen))
+	for id := range seen {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+
+	projects := make([]Project, 0, len(ids))
+	for _, id := range ids {
+		projects = append(projects, Project{
+			ID:        id,
+			CreatedAt: c.projectCreatedAt(ctx, userID, id),
+		})
+	}
+	return projects, nil
+}
+
+func (c *Client) projectCreatedAt(ctx context.Context, userID, projectID string) string {
+	path := fmt.Sprintf("users/%s/projects/%s/index.md", userID, projectID)
+	attrs, err := c.bucket.Object(path).Attrs(ctx)
+	if err != nil || attrs.Created.IsZero() {
+		return ""
+	}
+	return attrs.Created.UTC().Format(time.RFC3339)
 }
 
 // BucketStats returns object count for the user/project prefix.
@@ -322,16 +515,24 @@ func (c *Client) listConceptDir(ctx context.Context, dir, status string, directO
 		}
 
 		slug := strings.TrimSuffix(rel, ".md")
-		// Skip metadata files (TODO: move to wiki/.meta/)
 		if slug == "index" || slug == "log" {
 			continue
 		}
-		pages = append(pages, WikiPage{
+		page := WikiPage{
 			Slug:   slug,
 			Title:  slug,
 			Path:   fmt.Sprintf("%s%s.md", dir, slug),
 			Status: status,
-		})
+		}
+		data, err := c.ReadFile(ctx, page.Path)
+		if err != nil {
+			return nil, err
+		}
+		page, err = applyWikiPageFrontmatter(page, data)
+		if err != nil {
+			return nil, fmt.Errorf("parse %s: %w", page.Path, err)
+		}
+		pages = append(pages, page)
 	}
 	return pages, nil
 }

@@ -1,9 +1,12 @@
 package auth
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -15,8 +18,26 @@ import (
 // Sub is kept at the outer level for backward compatibility (claims.Sub).
 // RegisteredClaims is embedded for standard JWT fields (exp, iat, etc.).
 type Claims struct {
-	Sub string `json:"sub"`
+	Sub       string `json:"sub"`
+	TokenType string `json:"token_type,omitempty"`
 	jwt.RegisteredClaims
+}
+
+const (
+	accessTokenTTL         = 15 * time.Minute
+	refreshTokenTTL        = 7 * 24 * time.Hour
+	accessTokenType        = "access"
+	refreshTokenType       = "refresh"
+	refreshTokenCookieName = "refresh_token"
+	refreshTokenCookiePath = "/"
+	refreshTokenDomain     = "rayer.idv.tw"
+)
+
+var refreshTokenStore = struct {
+	sync.Mutex
+	active map[string]time.Time
+}{
+	active: make(map[string]time.Time),
 }
 
 // JWTAuth returns a Gin middleware that validates a JWT from the Authorization header.
@@ -27,13 +48,9 @@ func JWTAuth(cfg config.Config) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		authHeader := c.GetHeader("Authorization")
 
-		// DEV mode: inject default user when DevJWT is configured and no auth header
+		// DEV mode: inject user from X-User-ID header when DevJWT is configured and no auth header
 		if cfg.DevJWT && authHeader == "" {
-			// Allow X-User-ID header override for multi-user testing
 			userID := strings.TrimSpace(c.GetHeader("X-User-ID"))
-			if userID == "" {
-				userID = strings.TrimSpace(cfg.DefaultUserID)
-			}
 			if !ValidPathSegment(userID) {
 				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid user ID"})
 				return
@@ -55,21 +72,13 @@ func JWTAuth(cfg config.Config) gin.HandlerFunc {
 			return
 		}
 
-		tokenString := parts[1]
-		claims := &Claims{}
-		token, err := jwt.ParseWithClaims(tokenString, claims, func(token *jwt.Token) (interface{}, error) {
-			// Validate signing method is HMAC-based (HS256)
-			if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-				return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
-			}
-			return []byte(cfg.JWTSecret), nil
-		}, jwt.WithValidMethods([]string{"HS256"}))
+		claims, err := ValidateToken(parts[1], cfg.JWTSecret)
 		if err != nil {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid token"})
 			return
 		}
 		claims.Sub = strings.TrimSpace(claims.Sub)
-		if !token.Valid || !ValidPathSegment(claims.Sub) {
+		if !ValidPathSegment(claims.Sub) {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid token"})
 			return
 		}
@@ -90,15 +99,101 @@ func ValidPathSegment(value string) bool {
 // GenerateToken creates a self-signed HS256 JWT for development/testing.
 // Exported for use in tests and dev tooling. Not used in production flows.
 func GenerateToken(userID, secret string, ttl time.Duration) (string, error) {
+	return generateToken(userID, secret, ttl, "", "")
+}
+
+// GenerateAccessToken creates a short-lived HS256 JWT for API authorization.
+func GenerateAccessToken(userID, secret string) (string, error) {
+	return generateToken(userID, secret, accessTokenTTL, accessTokenType, "")
+}
+
+// GenerateRefreshToken creates and records a refresh token for cookie-based rotation.
+func GenerateRefreshToken(userID, secret string) (string, error) {
+	jti, err := randomTokenID()
+	if err != nil {
+		return "", err
+	}
+	token, err := generateToken(userID, secret, refreshTokenTTL, refreshTokenType, jti)
+	if err != nil {
+		return "", err
+	}
+	refreshTokenStore.Lock()
+	refreshTokenStore.active[jti] = time.Now().Add(refreshTokenTTL)
+	refreshTokenStore.Unlock()
+	return token, nil
+}
+
+// ValidateToken validates an HS256 access token and returns its claims.
+func ValidateToken(tokenString, secret string) (*Claims, error) {
+	claims := &Claims{}
+	token, err := jwt.ParseWithClaims(tokenString, claims, func(token *jwt.Token) (interface{}, error) {
+		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+		}
+		return []byte(secret), nil
+	}, jwt.WithValidMethods([]string{"HS256"}))
+	if err != nil {
+		return nil, err
+	}
+	if !token.Valid || claims.TokenType == refreshTokenType {
+		return nil, fmt.Errorf("invalid token")
+	}
+	return claims, nil
+}
+
+func validateRefreshToken(tokenString, secret string) (*Claims, error) {
+	claims := &Claims{}
+	token, err := jwt.ParseWithClaims(tokenString, claims, func(token *jwt.Token) (interface{}, error) {
+		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+		}
+		return []byte(secret), nil
+	}, jwt.WithValidMethods([]string{"HS256"}))
+	if err != nil {
+		return nil, err
+	}
+	if !token.Valid || claims.TokenType != refreshTokenType || claims.ID == "" {
+		return nil, fmt.Errorf("invalid refresh token")
+	}
+	now := time.Now()
+	refreshTokenStore.Lock()
+	expiresAt, ok := refreshTokenStore.active[claims.ID]
+	if ok {
+		delete(refreshTokenStore.active, claims.ID)
+	}
+	refreshTokenStore.Unlock()
+	if !ok || now.After(expiresAt) {
+		return nil, fmt.Errorf("invalid refresh token")
+	}
+	return claims, nil
+}
+
+func generateToken(userID, secret string, ttl time.Duration, tokenType, jti string) (string, error) {
 	now := time.Now()
 	claims := &Claims{
-		Sub: userID,
+		Sub:       userID,
+		TokenType: tokenType,
 		RegisteredClaims: jwt.RegisteredClaims{
 			IssuedAt:  jwt.NewNumericDate(now),
 			ExpiresAt: jwt.NewNumericDate(now.Add(ttl)),
+			ID:        jti,
 		},
 	}
 
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	return token.SignedString([]byte(secret))
+}
+
+func randomTokenID() (string, error) {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
+}
+
+func resetRefreshTokensForTest() {
+	refreshTokenStore.Lock()
+	refreshTokenStore.active = make(map[string]time.Time)
+	refreshTokenStore.Unlock()
 }

@@ -10,13 +10,10 @@ import (
 type Config struct {
 	GCPProject     string
 	Bucket         string
-	UserID         string
-	ProjectID      string
 	Port           string
 	DeepSeekAPIKey string
 	JWTSecret      string
 	DevJWT         bool
-	DefaultUserID  string
 	Users          []UserConfig
 }
 
@@ -47,13 +44,10 @@ func Load(path string) (Config, error) {
 	cfg := Config{
 		GCPProject:     v.GetString("gcp_project"),
 		Bucket:         v.GetString("bucket"),
-		UserID:         v.GetString("user_id"),
-		ProjectID:      v.GetString("project_id"),
 		Port:           v.GetString("port"),
 		DeepSeekAPIKey: v.GetString("deepseek_api_key"),
 		JWTSecret:      v.GetString("jwt_secret"),
 		DevJWT:         v.GetBool("dev_jwt"),
-		DefaultUserID:  v.GetString("default_user_id"),
 	}
 	return cfg, nil
 }

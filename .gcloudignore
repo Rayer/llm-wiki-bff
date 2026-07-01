@@ -1,0 +1,11 @@
+# GCP Cloud Build ignore — shrink archive from 1.9GB to <10MB
+.gocache/
+bin/
+lwc-test-server
+llm-wiki-bff
+backfill
+*.test
+*.out
+.DS_Store
+.idea/
+.vscode/

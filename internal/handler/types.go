@@ -18,10 +18,10 @@ type HealthResponse struct {
 
 // ReadyResponse is returned by the V1 readiness endpoint.
 type ReadyResponse struct {
-	Ready   bool     `json:"ready"`
-	Prefix  string   `json:"prefix,omitempty"`
+	Ready    bool     `json:"ready"`
+	Prefix   string   `json:"prefix,omitempty"`
 	Prefixes []string `json:"prefixes,omitempty"`
-	Message string   `json:"message,omitempty"`
+	Message  string   `json:"message,omitempty"`
 }
 
 // QueryRequest is the request body for a query endpoint.
@@ -61,6 +61,13 @@ type SourceDetailResponse struct {
 type ConceptsListResponse struct {
 	Concepts []gcs.WikiPage `json:"concepts"`
 	Count    int            `json:"count"`
+}
+
+// ProjectResponse is a project entry returned by GET /api/v1/projects.
+type ProjectResponse struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	CreatedAt string `json:"created_at"`
 }
 
 // ConceptDetailResponse is the response for a concept detail endpoint.

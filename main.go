@@ -3,9 +3,10 @@ package main
 import (
 	"context"
 	"log"
-	"net/http"
 	"strings"
+	"time"
 
+	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 	swaggerFiles "github.com/swaggo/files"
 	ginSwagger "github.com/swaggo/gin-swagger"
@@ -15,7 +16,6 @@ import (
 	"github.com/rayer/llm-wiki-bff/internal/config"
 	"github.com/rayer/llm-wiki-bff/internal/firestore"
 	"github.com/rayer/llm-wiki-bff/internal/gcs"
-	"github.com/rayer/llm-wiki-bff/internal/handler"
 	handlerv1 "github.com/rayer/llm-wiki-bff/internal/handler/v1"
 	"github.com/rayer/llm-wiki-bff/internal/llm"
 	"github.com/rayer/llm-wiki-bff/internal/middleware"
@@ -31,6 +31,12 @@ import (
 //	@contact.name	LLM Wiki Team
 //
 //	@BasePath	/
+//
+//
+//	@securityDefinitions.apikey	BearerAuth
+//	@in							header
+//	@name						Authorization
+//	@description				JWT Bearer token from /api/v1/auth/login. Format: \"Bearer <token>\".
 //
 //	@securityDefinitions.apikey	DevUserAuth
 //	@in							header
@@ -49,14 +55,14 @@ func main() {
 	}
 
 	// Init GCS client
-	gcsClient, err := gcs.NewClient(cfg.Bucket, cfg.UserID, cfg.ProjectID)
+	gcsClient, err := gcs.NewClient(cfg.Bucket)
 	if err != nil {
 		log.Fatalf("Failed to create GCS client: %v", err)
 	}
-	log.Printf("GCS client ready: gs://%s/users/%s/projects/%s/", cfg.Bucket, cfg.UserID, cfg.ProjectID)
+	log.Printf("GCS client ready: gs://%s/", cfg.Bucket)
 
 	// Init Firestore client
-	fsClient, err := firestore.NewClient(cfg.GCPProject, cfg.UserID, cfg.ProjectID)
+	fsClient, err := firestore.NewClient(cfg.GCPProject, "", "")
 	if err != nil {
 		log.Printf("WARNING: Firestore client not available: %v", err)
 	} else {
@@ -65,43 +71,12 @@ func main() {
 
 	// Search metadata index
 	idx := search.NewIndex()
-	if err := idx.Build(gcsClient); err != nil {
-		log.Printf("WARNING: Search index build failed: %v", err)
-	}
-	log.Printf("Search metadata index: %d sources, %d concepts", idx.SourceCount(), idx.ConceptCount())
-
-	// Load concept bodies for full-content grep (LWC-17 Gap 2 fix)
-	if err := idx.LoadConceptBodies(context.Background(), gcsClient); err != nil {
-		log.Printf("WARNING: Concept body loading failed: %v", err)
-	} else {
-		log.Printf("Concept bodies loaded: %d concepts", idx.ConceptCount())
-	}
+	log.Printf("Search metadata index: not yet rebuilt — call /api/v1/pipeline/rebuild-index")
+	log.Printf("Concept bodies: not yet rebuilt — call /api/v1/pipeline/rebuild-index")
 
 	// Project-scoped concept cache for the V1 query path.
 	conceptCache := conceptcache.New()
-	if entries, err := conceptCache.Build(context.Background(), gcsClient); err != nil {
-		log.Printf("WARNING: Concept cache build failed: %v", err)
-	} else {
-		log.Printf("Concept cache: %d concepts", len(entries))
-	}
-
-	// Warm concept cache for the default user scope (used by JWTAuth when no
-	// Authorization header is present). If DefaultUserID differs from UserID,
-	// the startup-built cache would miss on the first request, triggering a
-	// costly rebuild on the critical path. Building it here ensures the cache
-	// is warm for the most common request scope.
-	if cfg.DefaultUserID != "" && cfg.DefaultUserID != cfg.UserID {
-		// Build for the scope that JWTAuth will use when no Authorization
-		// header is present. If DefaultUserID differs from UserID, the
-		// startup cache key won't match request-time keys, triggering a
-		// costly rebuild on the critical path.
-		defaultScopeClient := gcsClient.WithScope(cfg.DefaultUserID, cfg.ProjectID)
-		if entries, err := conceptCache.Build(context.Background(), defaultScopeClient); err != nil {
-			log.Printf("WARNING: Default-scope concept cache build failed: %v", err)
-		} else {
-			log.Printf("Concept cache (default scope): %d concepts", len(entries))
-		}
-	}
+	log.Printf("Concept cache: not yet rebuilt — call /api/v1/pipeline/rebuild-index")
 
 	// LLM client (optional — query works without it)
 	llmClient := llm.NewClient(cfg.DeepSeekAPIKey)
@@ -119,77 +94,74 @@ func main() {
 		log.Printf("Query expander: lifestyle domain ready")
 	}
 
-		// OpenTelemetry metrics (graceful fallback)
-		provider, err := observability.InitMetrics(context.Background(), "llm-wiki-bff-dev", observability.GetProjectID())
-		if err != nil {
-			log.Printf("[observability] WARNING: metrics init failed (continuing): %v", err)
-		} else {
-			defer func() {
-				if err := provider.Shutdown(context.Background()); err != nil {
-					log.Printf("[observability] metrics shutdown error: %v", err)
-				}
-			}()
-		}
+	// OpenTelemetry metrics (graceful fallback)
+	provider, err := observability.InitMetrics(context.Background(), "llm-wiki-bff-dev", observability.GetProjectID())
+	if err != nil {
+		log.Printf("[observability] WARNING: metrics init failed (continuing): %v", err)
+	} else {
+		defer func() {
+			if err := provider.Shutdown(context.Background()); err != nil {
+				log.Printf("[observability] metrics shutdown error: %v", err)
+			}
+		}()
+	}
 
-		// Handlers
-		h := handler.New(gcsClient, fsClient, idx, llmClient, expander)
-	hV1 := handlerv1.New(gcsClient, fsClient, idx, conceptCache, llmClient, expander, cfg.DefaultUserID)
+	// Handlers
+	hV1 := handlerv1.New(gcsClient, fsClient, idx, conceptCache, llmClient, expander)
 
 	// Gin router
-		r := gin.Default()
+	r := gin.Default()
+	r.Use(middleware.SecurityHeaders(!cfg.DevJWT))
 
 	// OpenTelemetry latency middleware (per-endpoint)
 	r.Use(middleware.LatencyMiddleware())
 
 	// CORS — must be BEFORE routes
-	r.Use(corsMiddleware())
-	r.Use(defaultRequestScope(cfg))
+	r.Use(cors.New(cors.Config{
+		AllowOrigins:     []string{"https://wiki.rayer.idv.tw", "https://llm-wiki-frontend.vercel.app", "https://llm-wiki-bff-dev.rayer.idv.tw"},
+		AllowMethods:     []string{"GET", "POST", "OPTIONS"},
+		AllowHeaders:     []string{"Content-Type", "Authorization", "X-User-ID", "X-Project-ID", "Idempotency-Key"},
+		AllowCredentials: true,
+		}))
 
 	// Public auth routes (no auth middleware)
-	r.POST("/api/v1/auth/login", auth.LoginHandler(fsClient.Raw(), cfg.JWTSecret))
-	r.POST("/api/v1/auth/register", auth.RegisterHandler(fsClient.Raw(), cfg.JWTSecret))
+	authRoutes := r.Group("/api/v1/auth")
+	{
+		authRoutes.POST("/login", middleware.NewRateLimiter(10, time.Minute), auth.LoginHandler(fsClient.Raw(), cfg.JWTSecret))
+		authRoutes.POST("/register", middleware.NewRateLimiter(5, time.Minute), auth.RegisterHandler(fsClient.Raw(), cfg.JWTSecret))
+		authRoutes.POST("/refresh", auth.RefreshHandler(fsClient.Raw(), cfg.JWTSecret))
+		authRoutes.POST("/logout", auth.LogoutHandler())
+	}
 
 	// ── Swagger UI ──
 	r.GET("/swagger/*any", ginSwagger.WrapHandler(swaggerFiles.Handler))
 
-	// ── API ──
-	api := r.Group("/api")
-	{
-		api.POST("/query", h.Query)              // {"q": "...", "mode": "wiki|full"}
-		api.GET("/sources", h.ListSources)       // list compiled wiki sources
-		api.GET("/sources/:slug", h.GetSource)   // get single source content
-		api.GET("/concepts", h.ListConcepts)     // list wiki concepts (including drafts)
-		api.GET("/concepts/:slug", h.GetConcept) // get single concept
-		api.POST("/import", h.Import)            // bookmark import (placeholder)
-		api.GET("/status", h.Status)             // pipeline status
-
-		// Metrics (Grafana)
-		api.GET("/metrics", h.Metrics)         // pipeline execution metrics
-		r.GET("/metrics", h.PrometheusMetrics) // Prometheus format (root level)
-
-		// Raw content management
-		api.POST("/raw/upload", h.UploadRaw)             // upload .md file to raw/
-		api.POST("/raw/scrape", h.ScrapeRaw)             // scrape URL → raw/
-		api.POST("/raw/generate-title", h.GenerateTitle) // LLM title from content
-
-		// Pipeline
-		api.POST("/pipeline/run", h.RunPipeline) // trigger OLW pipeline
-	}
-
 	// ── API v1 (with JWT auth + project routing) ──
 	v1 := r.Group("/api/v1")
+
+	// Internal: pipeline worker calls this directly (no user JWT)
+	v1.POST("/pipeline/rebuild-index", hV1.RebuildIndex)
+
 	v1.Use(auth.JWTAuth(cfg))
-	v1.Use(auth.ProjectMiddleware())
 	{
 		v1.GET("/health", hV1.Health)
 		v1.GET("/ready", hV1.Ready)
+		v1.GET("/projects", hV1.ListProjects)
+		v1.POST("/init-project", hV1.InitProject)
+		v1.GET("/projects/:pid/status", hV1.ProjectStatus)
+	}
+	v1.Use(auth.ProjectMiddleware())
+	{
+		v1.GET("/index", hV1.Index)
 		v1.POST("/query", hV1.Query)
 		v1.GET("/sources", hV1.ListSources)
-		v1.GET("/sources/:slug", hV1.GetSource)
+		v1.GET("/sources/:id", hV1.GetSource)
 		v1.GET("/concepts", hV1.ListConcepts)
-		v1.GET("/concepts/:slug", hV1.GetConcept)
+		v1.GET("/concepts/:id", hV1.GetConcept)
 		v1.POST("/import", hV1.Import)
 		v1.POST("/pipeline/run", hV1.PipelineRun)
+		v1.GET("/pipeline/status", hV1.PipelineStatus)
+		v1.POST("/raw/upload", hV1.RawUpload)
 		v1.GET("/status", hV1.Status)
 		v1.GET("/metrics", hV1.PrometheusMetrics)
 	}
@@ -209,23 +181,4 @@ func main() {
 	log.Fatal(r.Run(":" + cfg.Port))
 }
 
-func corsMiddleware() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		c.Header("Access-Control-Allow-Origin", "*")
-		c.Header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
-		c.Header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-User-ID, X-Project-ID")
-		if c.Request.Method == "OPTIONS" {
-			c.AbortWithStatus(http.StatusNoContent)
-			return
-		}
-		c.Next()
-	}
-}
 
-func defaultRequestScope(cfg config.Config) gin.HandlerFunc {
-	return func(c *gin.Context) {
-		c.Set("userID", cfg.UserID)
-		c.Set("projectID", cfg.ProjectID)
-		c.Next()
-	}
-}

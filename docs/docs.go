@@ -66,7 +66,7 @@ const docTemplate = `{
                 }
             }
         },
-        "/api/v1/concepts/{slug}": {
+        "/api/v1/concepts/{id}": {
             "get": {
                 "security": [
                     {
@@ -87,8 +87,8 @@ const docTemplate = `{
                 "parameters": [
                     {
                         "type": "string",
-                        "description": "Concept slug",
-                        "name": "slug",
+                        "description": "Concept ID",
+                        "name": "id",
                         "in": "path",
                         "required": true
                     }
@@ -310,7 +310,7 @@ const docTemplate = `{
                 }
             }
         },
-        "/api/v1/sources/{slug}": {
+        "/api/v1/sources/{id}": {
             "get": {
                 "security": [
                     {
@@ -327,12 +327,12 @@ const docTemplate = `{
                 "tags": [
                     "sources"
                 ],
-                "summary": "Get a source by slug",
+                "summary": "Get a source by ID",
                 "parameters": [
                     {
                         "type": "string",
-                        "description": "Source slug",
-                        "name": "slug",
+                        "description": "Source ID",
+                        "name": "id",
                         "in": "path",
                         "required": true
                     }

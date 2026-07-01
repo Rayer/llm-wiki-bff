@@ -2,10 +2,13 @@ package firestore
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
 	"cloud.google.com/go/firestore"
+	"google.golang.org/api/iterator"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 // Client wraps Firestore operations for pipeline status.
@@ -56,7 +59,7 @@ func (c *Client) GetStatus(ctx context.Context) (*Status, error) {
 	if w, ok := data["worker"].(string); ok {
 		s.Worker = w
 	}
-	if t, ok := data["expires_at"].(time.Time); ok {
+	if t, ok := firestoreTimestamp(data["expires_at"]); ok {
 		s.LockExpiry = t
 	}
 
@@ -68,18 +71,19 @@ func (c *Client) GetStatus(ctx context.Context) (*Status, error) {
 // represents one running pipeline.
 func (c *Client) CountActiveLocks(ctx context.Context) (int, error) {
 	iter := c.locks.Where("status", "==", "active").Documents(ctx)
+	defer iter.Stop()
 	count := 0
 	now := time.Now()
 	for {
 		doc, err := iter.Next()
 		if err != nil {
-			if err.Error() == "iterator done" {
+			if errors.Is(err, iterator.Done) {
 				break
 			}
 			return count, err
 		}
 		data := doc.Data()
-		if t, ok := data["expires_at"].(time.Time); ok && t.After(now) {
+		if t, ok := firestoreTimestamp(data["expires_at"]); ok && t.After(now) {
 			count++
 		}
 	}
@@ -118,7 +122,7 @@ func (c *Client) WriteExecutionEnd(ctx context.Context, docID string, finishedAt
 	if err != nil {
 		return err
 	}
-	startedAt, _ := dsnap.Data()["started_at"].(time.Time)
+	startedAt, _ := firestoreTimestamp(dsnap.Data()["started_at"])
 	durationSec := finishedAt.Sub(startedAt).Seconds()
 
 	_, err = doc.Update(ctx, []firestore.Update{
@@ -135,11 +139,15 @@ func (c *Client) ListRecentExecutions(ctx context.Context, limit int) ([]Executi
 		limit = 50
 	}
 	iter := c.fs.Collection("executions").OrderBy("started_at", firestore.Desc).Limit(limit).Documents(ctx)
+	defer iter.Stop()
 	var records []ExecutionRecord
 	for {
 		doc, err := iter.Next()
 		if err != nil {
-			break
+			if errors.Is(err, iterator.Done) {
+				break
+			}
+			return records, err
 		}
 		data := doc.Data()
 		r := ExecutionRecord{}
@@ -149,10 +157,10 @@ func (c *Client) ListRecentExecutions(ctx context.Context, limit int) ([]Executi
 		if v, ok := data["project_id"].(string); ok {
 			r.ProjectID = v
 		}
-		if v, ok := data["started_at"].(time.Time); ok {
+		if v, ok := firestoreTimestamp(data["started_at"]); ok {
 			r.StartedAt = v
 		}
-		if v, ok := data["finished_at"].(time.Time); ok {
+		if v, ok := firestoreTimestamp(data["finished_at"]); ok {
 			r.FinishedAt = v
 		}
 		if v, ok := data["duration_sec"].(float64); ok {
@@ -164,6 +172,22 @@ func (c *Client) ListRecentExecutions(ctx context.Context, limit int) ([]Executi
 		records = append(records, r)
 	}
 	return records, nil
+}
+
+func firestoreTimestamp(value interface{}) (time.Time, bool) {
+	switch t := value.(type) {
+	case time.Time:
+		return t, true
+	case *timestamppb.Timestamp:
+		if t == nil {
+			return time.Time{}, false
+		}
+		return t.AsTime(), true
+	case timestamppb.Timestamp:
+		return t.AsTime(), true
+	default:
+		return time.Time{}, false
+	}
 }
 
 // Close closes the Firestore client.

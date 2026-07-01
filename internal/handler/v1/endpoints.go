@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -13,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"cloud.google.com/go/storage"
 	"github.com/gin-gonic/gin"
 	conceptcache "github.com/rayer/llm-wiki-bff/internal/cache"
 	"github.com/rayer/llm-wiki-bff/internal/gcs"
@@ -26,6 +28,8 @@ const (
 	defaultCloudRunJobURL   = "https://run.googleapis.com/v2/projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline:run"
 )
 
+var errIndexNotFound = errors.New("index not found")
+
 // Health handles GET /api/v1/health.
 //
 //	@Summary		Health check
@@ -38,6 +42,105 @@ const (
 //	@Router			/api/v1/health [get]
 func (h *Handler) Health(c *gin.Context) {
 	c.JSON(http.StatusOK, handler.HealthResponse{Status: "ok"})
+}
+
+// Index handles GET /api/v1/index.
+//
+//	@Summary		Read generated index
+//	@Description	Returns the cached ID map JSON for the request scope.
+//	@Tags			index
+//	@Produce		json
+//	@Success		200	{object}	map[string]any
+//	@Failure		404	{object}	handler.ErrorResponse
+//	@Failure		500	{object}	handler.ErrorResponse
+//	@Security		DevUserAuth
+//	@Security		ProjectHeader
+//	@Router			/api/v1/index [get]
+func (h *Handler) Index(c *gin.Context) {
+	gcsClient, err := h.GetGCSClient(c)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: err.Error()})
+		return
+	}
+
+	data, err := readIndexJSON(c.Request.Context(), gcsClient)
+	if err != nil {
+		if errors.Is(err, errIndexNotFound) {
+			c.JSON(http.StatusNotFound, handler.ErrorResponse{Error: "index not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: err.Error()})
+		return
+	}
+
+	c.Data(http.StatusOK, "application/json; charset=utf-8", data)
+}
+
+type indexReader interface {
+	ReadFile(context.Context, string) ([]byte, error)
+}
+
+func readIndexJSON(ctx context.Context, reader indexReader) ([]byte, error) {
+	data, err := reader.ReadFile(ctx, idMapPath)
+	if err != nil {
+		if errors.Is(err, storage.ErrObjectNotExist) {
+			return nil, errIndexNotFound
+		}
+		return nil, fmt.Errorf("read index: %w", err)
+	}
+	return data, nil
+}
+
+// ListProjects handles GET /api/v1/projects.
+//
+//	@Summary		List user projects
+//	@Description	Returns all projects for the authenticated user.
+//	@Tags			projects
+//	@Produce		json
+//	@Success		200	{array}		handler.ProjectResponse
+//	@Failure		401	{object}	handler.ErrorResponse
+//	@Failure		500	{object}	handler.ErrorResponse
+//	@Security		DevUserAuth
+//	@Router			/api/v1/projects [get]
+func (h *Handler) ListProjects(c *gin.Context) {
+	userID := c.GetString("userID")
+	if strings.TrimSpace(userID) == "" {
+		c.JSON(http.StatusUnauthorized, handler.ErrorResponse{Error: "user not authenticated"})
+		return
+	}
+	if h.gcs == nil {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "GCS client is not configured"})
+		return
+	}
+
+	projects, err := h.gcs.ListProjects(c.Request.Context(), userID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: err.Error()})
+		return
+	}
+
+	resp := make([]handler.ProjectResponse, 0, len(projects))
+	for _, project := range projects {
+		name := project.ID
+		if data, err := h.gcs.WithScope(userID, project.ID).ReadFile(c.Request.Context(), "index.md"); err == nil {
+			if title := projectTitleFromIndex(data); title != "" {
+				name = title
+			}
+		}
+		resp = append(resp, handler.ProjectResponse{
+			ID:        project.ID,
+			Name:      name,
+			CreatedAt: project.CreatedAt,
+		})
+	}
+
+	c.JSON(http.StatusOK, resp)
+}
+
+func projectTitleFromIndex(data []byte) string {
+	frontmatter, _ := parseFrontmatter(string(data))
+	title, _ := frontmatter["title"].(string)
+	return strings.TrimSpace(title)
 }
 
 // Ready handles GET /api/v1/ready — returns 200 when the concept cache is warm
@@ -125,8 +228,8 @@ func (h *Handler) Query(c *gin.Context) {
 	var expandResult *llm.ExpandResult
 	if h.expander != nil {
 		if result, err := h.expander.Expand(query); err != nil {
-		log.Printf("[expander] query expansion failed for %q: %v — falling back to raw query", query, err)
-	} else if result != nil {
+			log.Printf("[expander] query expansion failed for %q: %v — falling back to raw query", query, err)
+		} else if result != nil {
 			expandResult = result
 			searchQuery = strings.Join(result.Keywords, " ")
 		}
@@ -177,11 +280,16 @@ func cachedContexts(conceptCache *conceptcache.Cache, reader conceptcache.Reader
 	for _, result := range results {
 		entry, ok := conceptCache.Entry(reader, result.Slug)
 		if !ok {
+			if _, err := conceptCache.Build(context.Background(), reader); err == nil {
+				entry, ok = conceptCache.Entry(reader, result.Slug)
+			}
+		}
+		if !ok {
 			continue
 		}
 		sourceContext := "Sources: none listed"
 		if len(entry.Sources) > 0 {
-			sourceContext = "Sources: " + strings.Join(entry.Sources, ", ")
+			sourceContext = "Sources: [" + strings.Join(entry.Sources, ", ") + "]"
 		}
 		contexts = append(contexts, fmt.Sprintf(
 			"[%s] %s\n%s\n\n%s",
@@ -217,10 +325,63 @@ func (h *Handler) ListSources(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: err.Error()})
 		return
 	}
+	if err := addWikiPageIDsFromIDMap(c.Request.Context(), gcsClient, sources, "source"); err != nil {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: err.Error()})
+		return
+	}
 	if sources == nil {
 		sources = []gcs.WikiPage{}
 	}
 	c.JSON(http.StatusOK, handler.SourcesListResponse{Sources: sources, Count: len(sources)})
+}
+
+func addWikiPageIDsFromIDMap(ctx context.Context, reader indexReader, pages []gcs.WikiPage, pageType string) error {
+	data, err := reader.ReadFile(ctx, idMapPath)
+	if err != nil {
+		if errors.Is(err, storage.ErrObjectNotExist) {
+			return nil
+		}
+		return fmt.Errorf("read id map: %w", err)
+	}
+
+	var source idMap
+	if err := json.Unmarshal(data, &source); err != nil {
+		return fmt.Errorf("decode id map: %w", err)
+	}
+	switch pageType {
+	case "concept":
+		mergeWikiPageIDs(pages, source.Concept)
+	case "source":
+		mergeWikiPageIDs(pages, source.Source)
+	default:
+		return fmt.Errorf("unknown wiki page type: %s", pageType)
+	}
+	return nil
+}
+
+func mergeWikiPageIDs(pages []gcs.WikiPage, entries map[string]string) {
+	if len(pages) == 0 || len(entries) == 0 {
+		return
+	}
+
+	idsBySlug := make(map[string]string, len(entries))
+	for id, slug := range entries {
+		id = strings.TrimSpace(id)
+		slug = strings.TrimSpace(slug)
+		if id == "" || slug == "" {
+			continue
+		}
+		idsBySlug[slug] = id
+	}
+
+	for i := range pages {
+		if strings.TrimSpace(pages[i].ID) != "" {
+			continue
+		}
+		if id := idsBySlug[pages[i].Slug]; id != "" {
+			pages[i].ID = id
+		}
+	}
 }
 
 // GetSource handles GET /api/v1/sources/:slug using the request's GCS scope.
@@ -243,13 +404,21 @@ func (h *Handler) GetSource(c *gin.Context) {
 		return
 	}
 
-	slug := c.Param("slug")
+	slug := c.Param("id")
 	if decoded, err := url.PathUnescape(slug); err == nil {
 		slug = decoded
+	}
+	if h.handleIDRoutedPage(c, gcsClient, "source", slug) {
+		return
 	}
 	_, data, err := gcsClient.GetPage(c.Request.Context(), slug, "sources")
 	if err != nil {
 		c.JSON(http.StatusNotFound, handler.ErrorResponse{Error: "source not found: " + slug})
+		return
+	}
+	if rewritten, ok := h.rewriteMarkdownForResponse(c, gcsClient, data); ok {
+		data = rewritten
+	} else {
 		return
 	}
 
@@ -295,6 +464,10 @@ func (h *Handler) ListConcepts(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: err.Error()})
 		return
 	}
+	if err := addWikiPageIDsFromIDMap(c.Request.Context(), gcsClient, concepts, "concept"); err != nil {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: err.Error()})
+		return
+	}
 	if concepts == nil {
 		concepts = []gcs.WikiPage{}
 	}
@@ -321,13 +494,21 @@ func (h *Handler) GetConcept(c *gin.Context) {
 		return
 	}
 
-	slug := c.Param("slug")
+	slug := c.Param("id")
 	if decoded, err := url.PathUnescape(slug); err == nil {
 		slug = decoded
+	}
+	if h.handleIDRoutedPage(c, gcsClient, "concept", slug) {
+		return
 	}
 	page, data, err := gcsClient.GetPage(c.Request.Context(), slug, "concepts")
 	if err != nil {
 		c.JSON(http.StatusNotFound, handler.ErrorResponse{Error: "concept not found: " + slug})
+		return
+	}
+	if rewritten, ok := h.rewriteMarkdownForResponse(c, gcsClient, data); ok {
+		data = rewritten
+	} else {
 		return
 	}
 
@@ -372,20 +553,15 @@ func (h *Handler) Import(c *gin.Context) {
 
 // PipelineRun handles POST /api/v1/pipeline/run.
 func (h *Handler) PipelineRun(c *gin.Context) {
-	var req struct {
-		Project string `json:"project" binding:"required"`
-		Command string `json:"command"`
-	}
-	if err := c.ShouldBindJSON(&req); err != nil {
+	projectID := c.GetString("projectID")
+	if projectID == "" {
 		c.JSON(http.StatusBadRequest, handler.ErrorResponse{Error: "project is required"})
 		return
 	}
-	if req.Command == "" {
-		req.Command = "run"
-	}
 	userID := c.GetString("userID")
 	if userID == "" {
-		userID = h.defaultUser
+		c.JSON(http.StatusBadRequest, handler.ErrorResponse{Error: "user is required"})
+		return
 	}
 
 	token, err := h.getMetadataAccessToken(c.Request.Context())
@@ -400,10 +576,11 @@ func (h *Handler) PipelineRun(c *gin.Context) {
 		"overrides": gin.H{
 			"containerOverrides": []gin.H{
 				{
-					"args": []string{req.Command},
+					"args": []string{"run"},
 					"env": []gin.H{
 						{"name": "USER_ID", "value": userID},
-						{"name": "PROJECT_ID", "value": req.Project},
+						{"name": "PROJECT_ID", "value": projectID},
+						{"name": "TASK_TYPE", "value": "pipeline"},
 					},
 				},
 			},
@@ -443,11 +620,209 @@ func (h *Handler) PipelineRun(c *gin.Context) {
 		})
 		return
 	}
+	executionID, err := cloudRunExecutionIDFromRunResponse(responseBody)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "pipeline failed: " + err.Error()})
+		return
+	}
 
 	c.JSON(http.StatusAccepted, gin.H{
-		"status":  "accepted",
-		"command": req.Command,
-		"project": req.Project,
+		"status":       "accepted",
+		"command":      "run",
+		"project":      projectID,
+		"execution_id": executionID,
+	})
+}
+
+type cloudRunJobRunResponse struct {
+	Name     string `json:"name"`
+	Metadata struct {
+		Execution string `json:"execution"`
+		Name      string `json:"name"`
+	} `json:"metadata"`
+	Response struct {
+		Name string `json:"name"`
+	} `json:"response"`
+}
+
+type pipelineStatusResponse struct {
+	LastExecution *pipelineExecutionResponse `json:"last_execution"`
+	ProjectID     string                     `json:"project_id"`
+}
+
+type pipelineExecutionResponse struct {
+	Name      string `json:"name"`
+	Status    string `json:"status"`
+	StartTime string `json:"start_time"`
+	EndTime   string `json:"end_time"`
+	Duration  string `json:"duration"`
+}
+
+type cloudRunExecutionsResponse struct {
+	Executions []cloudRunExecution `json:"executions"`
+}
+
+type cloudRunExecution struct {
+	Name             string              `json:"name"`
+	StartTime        string              `json:"startTime"`
+	CompletionTime   string              `json:"completionTime"`
+	EndTime          string              `json:"endTime"`
+	CompletionStatus string              `json:"completionStatus"`
+	Conditions       []cloudRunCondition `json:"conditions"`
+	RunningCount     int                 `json:"runningCount"`
+	SucceededCount   int                 `json:"succeededCount"`
+	FailedCount      int                 `json:"failedCount"`
+	CancelledCount   int                 `json:"cancelledCount"`
+}
+
+type cloudRunCondition struct {
+	Type   string `json:"type"`
+	State  string `json:"state"`
+	Status string `json:"status"`
+	Reason string `json:"reason"`
+}
+
+// PipelineStatus handles GET /api/v1/pipeline/status.
+func (h *Handler) PipelineStatus(c *gin.Context) {
+	userID := strings.TrimSpace(c.GetString("userID"))
+	if userID == "" {
+		c.JSON(http.StatusUnauthorized, handler.ErrorResponse{Error: "user not authenticated"})
+		return
+	}
+	projectID := strings.TrimSpace(c.GetString("projectID"))
+	if projectID == "" {
+		c.JSON(http.StatusBadRequest, handler.ErrorResponse{Error: "project is required"})
+		return
+	}
+
+	token, err := h.getMetadataAccessToken(c.Request.Context())
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "pipeline status failed: " + err.Error()})
+		return
+	}
+
+	executionID := strings.TrimSpace(c.Query("execution_id"))
+	statusURL := h.cloudRunExecutionsURL()
+	if executionID != "" {
+		statusURL = h.cloudRunExecutionURL(executionID)
+	}
+	req, err := http.NewRequestWithContext(c.Request.Context(), http.MethodGet, statusURL, nil)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "pipeline status failed: " + err.Error()})
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := h.pipelineHTTPClient().Do(req)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "pipeline status failed: " + err.Error()})
+		return
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "pipeline status failed: " + err.Error()})
+		return
+	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "pipeline status failed: " + string(body)})
+		return
+	}
+
+	response := pipelineStatusResponse{ProjectID: projectID}
+	if executionID != "" {
+		var execution cloudRunExecution
+		if err := json.Unmarshal(body, &execution); err != nil {
+			c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "pipeline status failed: " + err.Error()})
+			return
+		}
+		response.LastExecution = newPipelineExecutionResponse(execution)
+	} else {
+		var executions cloudRunExecutionsResponse
+		if err := json.Unmarshal(body, &executions); err != nil {
+			c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "pipeline status failed: " + err.Error()})
+			return
+		}
+		if len(executions.Executions) > 0 {
+			response.LastExecution = newPipelineExecutionResponse(executions.Executions[0])
+		}
+	}
+	c.JSON(http.StatusOK, response)
+}
+
+// RebuildIndex handles POST /api/v1/pipeline/rebuild-index.
+func (h *Handler) RebuildIndex(c *gin.Context) {
+	// Header first — this route is outside JWTAuth, defaultRequestScope may set global values
+	userID := strings.TrimSpace(c.GetHeader("X-User-ID"))
+	if userID == "" {
+		userID = strings.TrimSpace(c.GetString("userID"))
+	}
+	projectID := strings.TrimSpace(c.GetHeader("X-Project-ID"))
+	if projectID == "" {
+		projectID = strings.TrimSpace(c.GetString("projectID"))
+	}
+	if userID == "" {
+		c.JSON(http.StatusUnauthorized, handler.ErrorResponse{Error: "user not authenticated"})
+		return
+	}
+	if projectID == "" {
+		c.JSON(http.StatusBadRequest, handler.ErrorResponse{Error: "project is required"})
+		return
+	}
+
+	ctx := c.Request.Context()
+	if h.rebuildIndex != nil {
+		next, err := h.rebuildIndex(ctx, userID, projectID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: err.Error()})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"status": "ok",
+			"entries": gin.H{
+				"concept": len(next.Concept),
+				"source":  len(next.Source),
+			},
+		})
+		return
+	}
+	if h.gcs == nil {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "GCS client is not configured"})
+		return
+	}
+	if h.firestore == nil || h.firestore.Raw() == nil {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "Firestore client is not configured"})
+		return
+	}
+
+	fs := h.firestore.Raw()
+	if err := acquireRebuildIndexLock(ctx, fs, userID, projectID, time.Now()); err != nil {
+		if errors.Is(err, errRebuildIndexLocked) {
+			c.JSON(http.StatusConflict, handler.ErrorResponse{Error: "rebuild index already running"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "acquire rebuild index lock: " + err.Error()})
+		return
+	}
+	defer func() {
+		if err := releaseRebuildIndexLock(context.Background(), fs, userID, projectID); err != nil {
+			log.Printf("[rebuild-index] release lock failed for %s/%s: %v", userID, projectID, err)
+		}
+	}()
+
+	gcsClient := h.gcs.WithScope(userID, projectID)
+	next, err := rebuildIndex(ctx, gcsClient)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"status": "ok",
+		"entries": gin.H{
+			"concept": len(next.Concept),
+			"source":  len(next.Source),
+		},
 	})
 }
 
@@ -492,6 +867,148 @@ func (h *Handler) pipelineHTTPClient() *http.Client {
 		return h.httpClient
 	}
 	return &http.Client{Timeout: 30 * time.Second}
+}
+
+func (h *Handler) cloudRunExecutionsURL() string {
+	runURL := h.cloudRunJobURL
+	if runURL == "" {
+		runURL = defaultCloudRunJobURL
+	}
+	baseURL := strings.TrimSuffix(runURL, ":run")
+	values := url.Values{}
+	values.Set("pageSize", "1")
+	return baseURL + "/executions?" + values.Encode()
+}
+
+func (h *Handler) cloudRunExecutionURL(executionID string) string {
+	runURL := h.cloudRunJobURL
+	if runURL == "" {
+		runURL = defaultCloudRunJobURL
+	}
+	baseURL := strings.TrimSuffix(runURL, ":run")
+	return baseURL + "/executions/" + url.PathEscape(executionID)
+}
+
+func cloudRunExecutionIDFromRunResponse(body []byte) (string, error) {
+	var runResponse cloudRunJobRunResponse
+	if err := json.Unmarshal(body, &runResponse); err != nil {
+		return "", err
+	}
+	if executionID := shortCloudRunExecutionName(runResponse.Metadata.Execution, true); executionID != "" {
+		return executionID, nil
+	}
+	if executionID := shortCloudRunExecutionName(runResponse.Metadata.Name, false); executionID != "" {
+		return executionID, nil
+	}
+	if executionID := shortCloudRunExecutionName(runResponse.Response.Name, false); executionID != "" {
+		return executionID, nil
+	}
+	if executionID := shortCloudRunExecutionName(runResponse.Name, false); executionID != "" {
+		return executionID, nil
+	}
+	return "", fmt.Errorf("Cloud Run response missing execution name")
+}
+
+func shortCloudRunExecutionName(name string, allowBare bool) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return ""
+	}
+	const marker = "/executions/"
+	if index := strings.LastIndex(name, marker); index >= 0 {
+		executionID := name[index+len(marker):]
+		if slash := strings.IndexByte(executionID, '/'); slash >= 0 {
+			executionID = executionID[:slash]
+		}
+		return strings.TrimSpace(executionID)
+	}
+	if allowBare && !strings.Contains(name, "/") {
+		return name
+	}
+	return ""
+}
+
+func newPipelineExecutionResponse(execution cloudRunExecution) *pipelineExecutionResponse {
+	endTime := execution.CompletionTime
+	if endTime == "" {
+		endTime = execution.EndTime
+	}
+	return &pipelineExecutionResponse{
+		Name:      execution.Name,
+		Status:    cloudRunExecutionStatus(execution),
+		StartTime: execution.StartTime,
+		EndTime:   endTime,
+		Duration:  executionDuration(execution.StartTime, endTime),
+	}
+}
+
+func cloudRunExecutionStatus(execution cloudRunExecution) string {
+	if execution.CompletionStatus != "" {
+		return normalizeCloudRunStatus(execution.CompletionStatus)
+	}
+	for _, condition := range execution.Conditions {
+		if condition.Type != "Completed" {
+			continue
+		}
+		if condition.State != "" {
+			return normalizeCloudRunStatus(condition.State)
+		}
+		if condition.Status != "" {
+			return normalizeCloudRunStatus(condition.Status)
+		}
+		if condition.Reason != "" {
+			return normalizeCloudRunStatus(condition.Reason)
+		}
+	}
+	if execution.FailedCount > 0 {
+		return "FAILED"
+	}
+	if execution.CancelledCount > 0 {
+		return "CANCELLED"
+	}
+	if execution.RunningCount > 0 {
+		return "RUNNING"
+	}
+	if execution.SucceededCount > 0 {
+		return "SUCCESS"
+	}
+	return "UNKNOWN"
+}
+
+func normalizeCloudRunStatus(value string) string {
+	status := strings.ToUpper(strings.TrimSpace(value))
+	status = strings.TrimPrefix(status, "CONDITION_")
+	status = strings.TrimPrefix(status, "EXECUTION_")
+	switch status {
+	case "SUCCEEDED", "TRUE":
+		return "SUCCESS"
+	case "FAILED", "FALSE":
+		return "FAILED"
+	case "CANCELLED":
+		return "CANCELLED"
+	case "PENDING", "RECONCILING", "UNKNOWN":
+		return "RUNNING"
+	default:
+		return status
+	}
+}
+
+func executionDuration(startTime, endTime string) string {
+	if startTime == "" || endTime == "" {
+		return ""
+	}
+	start, err := time.Parse(time.RFC3339Nano, startTime)
+	if err != nil {
+		return ""
+	}
+	end, err := time.Parse(time.RFC3339Nano, endTime)
+	if err != nil {
+		return ""
+	}
+	if end.Before(start) {
+		return ""
+	}
+	return end.Sub(start).String()
 }
 
 // Status handles GET /api/v1/status using the request's GCS scope.

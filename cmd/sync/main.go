@@ -94,10 +94,11 @@ func main() {
 
 	// Create GCS client
 	ctx := context.Background()
-	gcsClient, err := gcs.NewClient(cfg.Bucket, cfg.UserID, cfg.ProjectID)
+	baseGCSClient, err := gcs.NewClient(cfg.Bucket)
 	if err != nil {
 		log.Fatalf("Failed to create GCS client: %v", err)
 	}
+	gcsClient := baseGCSClient.WithScope(cfg.UserID, cfg.ProjectID)
 
 	// Run sync
 	stats, err := sync.Sync(ctx, gcsClient, vaultPath, dryRun, dirs)

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	fm "github.com/adrg/frontmatter"
 	"github.com/gin-gonic/gin"
 	"github.com/rayer/llm-wiki-bff/internal/firestore"
 	"github.com/rayer/llm-wiki-bff/internal/gcs"
@@ -398,35 +399,14 @@ func ensureBrackets(text string, results []search.Result) string {
 // parseFrontmatter extracts YAML frontmatter (between --- markers) from markdown.
 // Returns frontmatter map and body string.
 func parseFrontmatter(md string) (map[string]interface{}, string) {
-	fm := make(map[string]interface{})
+	result := make(map[string]interface{})
 	if !strings.HasPrefix(md, "---") {
-		return fm, md
+		return result, md
 	}
 
-	// Find closing ---
-	end := strings.Index(md[3:], "\n---")
-	if end < 0 {
-		return fm, md
+	body, err := fm.MustParse(strings.NewReader(md), &result)
+	if err != nil {
+		return make(map[string]interface{}), md
 	}
-	end += 3
-
-	fmRaw := md[3:end]
-	lines := strings.Split(fmRaw, "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		parts := strings.SplitN(line, ":", 2)
-		if len(parts) == 2 {
-			key := strings.TrimSpace(parts[0])
-			val := strings.TrimSpace(parts[1])
-			// Strip quotes
-			val = strings.Trim(val, "\"'")
-			fm[key] = val
-		}
-	}
-
-	body := md[end+3:]
-	return fm, body
+	return result, string(body)
 }

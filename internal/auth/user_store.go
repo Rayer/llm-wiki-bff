@@ -2,17 +2,19 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"cloud.google.com/go/firestore"
+	"google.golang.org/api/iterator"
 )
 
 // UserRecord is a user document stored in Firestore.
 type UserRecord struct {
-	Email         string `firestore:"email"`
-	PasswordHash  string `firestore:"password_hash"`
-	EmailVerified bool   `firestore:"email_verified"`
-	ProjectCount  int    `firestore:"project_count"`
+	Email          string `firestore:"email"`
+	PasswordHash   string `firestore:"password_hash"`
+	EmailVerified  bool   `firestore:"email_verified"`
+	ProjectCount   int    `firestore:"project_count"`
 	DefaultProject string `firestore:"default_project"`
 }
 
@@ -38,7 +40,10 @@ func CountProjects(ctx context.Context, fs *firestore.Client, userID string) (in
 	for {
 		_, err := iter.Next()
 		if err != nil {
-			break
+			if errors.Is(err, iterator.Done) {
+				break
+			}
+			return count, err
 		}
 		count++
 	}
