@@ -409,6 +409,24 @@ func (c *Client) Prefix() string {
 	return c.prefix()
 }
 
+func (c *Client) objectRelativePath(objectName, requestedSubPrefix string) (string, bool) {
+	basePrefix := c.prefix() + "/"
+	if !strings.HasPrefix(objectName, basePrefix) {
+		return "", false
+	}
+
+	rel := strings.TrimPrefix(objectName, basePrefix)
+	if rel == "" {
+		return "", false
+	}
+
+	subPrefix := strings.Trim(requestedSubPrefix, "/")
+	if subPrefix != "" && rel != subPrefix && !strings.HasPrefix(rel, subPrefix+"/") {
+		return "", false
+	}
+	return rel, true
+}
+
 // ListProjects returns project directories under users/{userID}/projects/.
 func (c *Client) ListProjects(ctx context.Context, userID string) ([]Project, error) {
 	if c == nil || c.bucket == nil {

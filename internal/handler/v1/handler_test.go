@@ -332,7 +332,7 @@ func TestPipelineRunExecutesCloudRunJob(t *testing.T) {
 		"overrides": map[string]any{
 			"containerOverrides": []any{
 				map[string]any{
-					"args": []any{"run"},
+					"args": []any{"run", defaultWorkerCommands},
 					"env": []any{
 						map[string]any{"name": "USER_ID", "value": "request-user"},
 						map[string]any{"name": "PROJECT_ID", "value": "demo"},
@@ -399,8 +399,96 @@ func TestPipelineRunDefaultsCommandAndUser(t *testing.T) {
 		t.Fatalf("execution_id = %q, want olw-pipeline-default", body["execution_id"])
 	}
 	override := runRequest.Overrides.ContainerOverrides[0]
-	if len(override.Args) != 1 || override.Args[0] != "run" {
-		t.Fatalf("args = %#v, want [run]", override.Args)
+	if len(override.Args) != 2 || override.Args[0] != "run" || override.Args[1] != defaultWorkerCommands {
+		t.Fatalf("args = %#v, want [run %s]", override.Args, defaultWorkerCommands)
+	}
+	if override.Env[0].Value != "request-user" || override.Env[1].Value != "demo" || override.Env[2].Value != "pipeline" {
+		t.Fatalf("env = %#v", override.Env)
+	}
+}
+
+func TestDefaultWorkerCommandsRunsPipelineWithoutInit(t *testing.T) {
+	var commands [][]string
+	if err := json.Unmarshal([]byte(defaultWorkerCommands), &commands); err != nil {
+		t.Fatalf("decode default worker commands: %v", err)
+	}
+	if len(commands) == 0 {
+		t.Fatal("default worker commands are empty")
+	}
+	want := []string{"run", "--auto-approve"}
+	if len(commands[0]) != len(want) {
+		t.Fatalf("first command = %#v, want %#v", commands[0], want)
+	}
+	for i := range want {
+		if commands[0][i] != want[i] {
+			t.Fatalf("first command = %#v, want %#v", commands[0], want)
+		}
+	}
+}
+
+func TestAdminPipelineTriggerInvokesWorkerWithoutImmediateRebuild(t *testing.T) {
+	var runRequest struct {
+		Overrides struct {
+			ContainerOverrides []struct {
+				Args []string `json:"args"`
+				Env  []struct {
+					Name  string `json:"name"`
+					Value string `json:"value"`
+				} `json:"env"`
+			} `json:"containerOverrides"`
+		} `json:"overrides"`
+	}
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/token":
+			return testHTTPResponse(http.StatusOK, `{"access_token":"test-token"}`), nil
+		case "/run":
+			if err := json.NewDecoder(r.Body).Decode(&runRequest); err != nil {
+				t.Errorf("decode run request: %v", err)
+			}
+			return testHTTPResponse(http.StatusOK, `{
+				"metadata": {
+					"execution": "projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline/executions/olw-pipeline-admin"
+				}
+			}`), nil
+		default:
+			return testHTTPResponse(http.StatusNotFound, `not found`), nil
+		}
+	})}
+
+	h := &Handler{
+		index:            search.NewIndex(),
+		httpClient:       client,
+		metadataTokenURL: "http://metadata.test/token",
+		cloudRunJobURL:   "https://run.test/run",
+		projectExists: func(context.Context, string) error {
+			return nil
+		},
+		rebuildIndex: func(context.Context, string, string) (idMap, error) {
+			t.Fatal("AdminPipelineTrigger must not rebuild index immediately")
+			return idMap{}, nil
+		},
+	}
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/api/v1/admin/projects/request-user_demo/pipeline", nil)
+	c.Params = gin.Params{{Key: "id", Value: "request-user_demo"}}
+
+	h.AdminPipelineTrigger(c)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var body map[string]string
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if body["status"] != "ok" || body["execution_id"] != "olw-pipeline-admin" {
+		t.Fatalf("body = %#v", body)
+	}
+	override := runRequest.Overrides.ContainerOverrides[0]
+	if len(override.Args) != 2 || override.Args[0] != "run" || override.Args[1] != defaultWorkerCommands {
+		t.Fatalf("args = %#v, want [run %s]", override.Args, defaultWorkerCommands)
 	}
 	if override.Env[0].Value != "request-user" || override.Env[1].Value != "demo" || override.Env[2].Value != "pipeline" {
 		t.Fatalf("env = %#v", override.Env)
