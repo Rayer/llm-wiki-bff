@@ -94,26 +94,6 @@ func TestBuildIDMapParsesIDsAndCarriesRedirects(t *testing.T) {
 	}
 }
 
-func TestWriteIDMapUsesAtomicTempWrite(t *testing.T) {
-	store := &fakeIDMapStore{}
-	next := idMap{
-		Concept:   map[string]string{"a3f7b2c01d9d": "canonical-slug"},
-		Source:    map[string]string{},
-		Redirects: map[string][]string{},
-	}
-
-	if err := writeIDMap(context.Background(), store, next); err != nil {
-		t.Fatalf("write id map: %v", err)
-	}
-
-	if len(store.tmpWrites) != 1 || store.tmpWrites[0] != "cache/id_map.json.tmp" {
-		t.Fatalf("tmp writes = %#v, want [cache/id_map.json.tmp]", store.tmpWrites)
-	}
-	if _, ok := store.atomicWrites["cache/id_map.json"]; !ok {
-		t.Fatalf("final id map was not atomically written: %#v", store.atomicWrites)
-	}
-}
-
 func TestActiveLockAcceptsProtoTimestamp(t *testing.T) {
 	now := time.Date(2026, 6, 26, 12, 0, 0, 0, time.UTC)
 	lock := map[string]interface{}{

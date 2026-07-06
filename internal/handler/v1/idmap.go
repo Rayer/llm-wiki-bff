@@ -2,37 +2,30 @@ package v1
 
 import (
 	"context"
-	"crypto/md5"
-	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	"cloud.google.com/go/firestore"
 	"cloud.google.com/go/storage"
-	fm "github.com/adrg/frontmatter"
 	"github.com/rayer/llm-wiki-bff/internal/gcs"
+	"github.com/rayer/llm-wiki-bff/internal/wikiindex"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 const (
-	idMapPath           = "cache/id_map.json"
-	idMapTempPath       = "cache/id_map.json.tmp"
+	idMapPath           = wikiindex.IDMapPath
+	idMapTempPath       = wikiindex.IDMapTempPath
+	conceptsJSONLPath   = wikiindex.ConceptsJSONLPath
 	rebuildIndexLockKey = "rebuild_index"
 	rebuildIndexTTL     = 60 * time.Second
 )
 
 var errRebuildIndexLocked = errors.New("rebuild index already running")
 
-type idMap struct {
-	Concept   map[string]string   `json:"concept"`
-	Source    map[string]string   `json:"source"`
-	Redirects map[string][]string `json:"redirects"`
-}
+type idMap = wikiindex.IDMap
 
 type idMapStore interface {
 	ListMarkdownFiles(ctx context.Context, dir string) ([]gcs.MarkdownFile, error)
@@ -48,147 +41,80 @@ type idMapReadWriter interface {
 	idMapWriter
 }
 
-type markdownMatter struct {
-	ID    string `yaml:"id"`
-	Title string `yaml:"title"`
-}
-
 func buildIDMap(ctx context.Context, store idMapStore) (idMap, error) {
-	next := idMap{
-		Concept:   map[string]string{},
-		Source:    map[string]string{},
-		Redirects: map[string][]string{},
-	}
-
-	if err := addIDMapEntries(ctx, store, "wiki/", next.Concept); err != nil {
-		return next, err
-	}
-	if err := addIDMapEntries(ctx, store, "wiki/sources/", next.Source); err != nil {
-		return next, err
-	}
-
-	old, err := readOldIDMap(ctx, store)
-	if err != nil {
-		return next, err
-	}
-	next.Redirects = cloneRedirects(old.Redirects)
-	appendChangedRedirects(next.Redirects, old.Concept, next.Concept)
-	appendChangedRedirects(next.Redirects, old.Source, next.Source)
-
-	return next, nil
+	return wikiindex.BuildIDMap(ctx, legacyWikiIndexStore{reader: store})
 }
 
 func rebuildIndex(ctx context.Context, store idMapReadWriter) (idMap, error) {
-	next, err := buildIDMap(ctx, store)
+	return wikiindex.Rebuild(ctx, legacyWikiIndexStore{reader: store, writer: store})
+}
+
+type legacyWikiIndexStore struct {
+	reader idMapStore
+	writer idMapWriter
+}
+
+func (s legacyWikiIndexStore) ListMarkdownFiles(ctx context.Context, dir string) ([]wikiindex.MarkdownFile, error) {
+	files, err := s.reader.ListMarkdownFiles(ctx, dir)
 	if err != nil {
-		return next, err
+		return nil, err
 	}
-	if err := writeIDMap(ctx, store, next); err != nil {
-		return next, err
-	}
-	return next, nil
+	return convertGCSMarkdownFiles(files), nil
 }
 
-func generateID(data []byte) string {
-	h := md5.Sum(data)
-	return hex.EncodeToString(h[:])[:12]
+func (s legacyWikiIndexStore) ReadFile(ctx context.Context, relPath string) ([]byte, error) {
+	data, err := s.reader.ReadFile(ctx, relPath)
+	if errors.Is(err, storage.ErrObjectNotExist) {
+		return nil, wikiindex.ErrNotFound
+	}
+	return data, err
 }
 
-func addIDMapEntries(ctx context.Context, store idMapStore, dir string, entries map[string]string) error {
-	files, err := store.ListMarkdownFiles(ctx, dir)
+func (s legacyWikiIndexStore) WriteBytesAtomic(ctx context.Context, data []byte, tmpPath, finalPath string) (string, error) {
+	if s.writer == nil {
+		return "", fmt.Errorf("wikiindex writer is not configured")
+	}
+	return s.writer.WriteBytesAtomic(ctx, data, tmpPath, finalPath)
+}
+
+type gcsWikiIndexStore struct {
+	client *gcs.Client
+}
+
+func newGCSWikiIndexStore(client *gcs.Client) gcsWikiIndexStore {
+	return gcsWikiIndexStore{client: client}
+}
+
+func (s gcsWikiIndexStore) ListMarkdownFiles(ctx context.Context, dir string) ([]wikiindex.MarkdownFile, error) {
+	files, err := s.client.ListMarkdownFiles(ctx, dir)
 	if err != nil {
-		return fmt.Errorf("list %s: %w", dir, err)
+		return nil, err
 	}
-	for _, file := range files {
-		matter, err := parseIDMapMatter(file.Data)
-		if err != nil {
-			return fmt.Errorf("parse %s: %w", file.Path, err)
-		}
-		id := strings.TrimSpace(matter.ID)
-		if id == "" {
-			id = generateID(file.Data)
-		}
-		entries[id] = file.Slug
-	}
-	return nil
+	return convertGCSMarkdownFiles(files), nil
 }
 
-func parseIDMapMatter(data []byte) (markdownMatter, error) {
-	var matter markdownMatter
-	if !strings.HasPrefix(string(data), "---") {
-		return matter, nil
+func (s gcsWikiIndexStore) ReadFile(ctx context.Context, relPath string) ([]byte, error) {
+	data, err := s.client.ReadFile(ctx, relPath)
+	if errors.Is(err, storage.ErrObjectNotExist) {
+		return nil, wikiindex.ErrNotFound
 	}
-	_, err := fm.MustParse(strings.NewReader(string(data)), &matter)
-	return matter, err
+	return data, err
 }
 
-func readOldIDMap(ctx context.Context, store idMapStore) (idMap, error) {
-	old := idMap{
-		Concept:   map[string]string{},
-		Source:    map[string]string{},
-		Redirects: map[string][]string{},
-	}
-	data, err := store.ReadFile(ctx, idMapPath)
-	if err != nil {
-		if errors.Is(err, storage.ErrObjectNotExist) {
-			return old, nil
-		}
-		return old, fmt.Errorf("read old id map: %w", err)
-	}
-	if len(data) == 0 {
-		return old, nil
-	}
-	if err := json.Unmarshal(data, &old); err != nil {
-		return old, fmt.Errorf("decode old id map: %w", err)
-	}
-	if old.Concept == nil {
-		old.Concept = map[string]string{}
-	}
-	if old.Source == nil {
-		old.Source = map[string]string{}
-	}
-	if old.Redirects == nil {
-		old.Redirects = map[string][]string{}
-	}
-	return old, nil
+func (s gcsWikiIndexStore) WriteBytesAtomic(ctx context.Context, data []byte, tmpPath, finalPath string) (string, error) {
+	return s.client.WriteBytesAtomic(ctx, data, tmpPath, finalPath)
 }
 
-func cloneRedirects(src map[string][]string) map[string][]string {
-	dst := make(map[string][]string, len(src))
-	for id, redirects := range src {
-		dst[id] = append([]string(nil), redirects...)
-	}
-	return dst
-}
-
-func appendChangedRedirects(redirects map[string][]string, oldEntries, newEntries map[string]string) {
-	for id, newSlug := range newEntries {
-		oldSlug := strings.TrimSpace(oldEntries[id])
-		if oldSlug == "" || oldSlug == newSlug || containsString(redirects[id], oldSlug) {
-			continue
-		}
-		redirects[id] = append(redirects[id], oldSlug)
-	}
-}
-
-func containsString(values []string, needle string) bool {
-	for _, value := range values {
-		if value == needle {
-			return true
+func convertGCSMarkdownFiles(files []gcs.MarkdownFile) []wikiindex.MarkdownFile {
+	converted := make([]wikiindex.MarkdownFile, len(files))
+	for i, file := range files {
+		converted[i] = wikiindex.MarkdownFile{
+			Slug: file.Slug,
+			Path: file.Path,
+			Data: file.Data,
 		}
 	}
-	return false
-}
-
-func writeIDMap(ctx context.Context, writer idMapWriter, next idMap) error {
-	data, err := json.MarshalIndent(next, "", "  ")
-	if err != nil {
-		return fmt.Errorf("encode id map: %w", err)
-	}
-	if _, err := writer.WriteBytesAtomic(ctx, data, idMapTempPath, idMapPath); err != nil {
-		return fmt.Errorf("write id map: %w", err)
-	}
-	return nil
+	return converted
 }
 
 func acquireRebuildIndexLock(ctx context.Context, fs *firestore.Client, uid, pid string, now time.Time) error {
