@@ -1,5 +1,0 @@
-./checked.pb.go
-./eval.pb.go
-./explain.pb.go
-./syntax.pb.go
-./value.pb.go

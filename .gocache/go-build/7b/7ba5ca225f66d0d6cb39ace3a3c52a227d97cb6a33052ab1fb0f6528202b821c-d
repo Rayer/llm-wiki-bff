@@ -1,8 +1,0 @@
-./call_option.go
-./content_type.go
-./feature.go
-./gax.go
-./header.go
-./invoke.go
-./proto_json_stream.go
-./telemetry.go

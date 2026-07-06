@@ -1,6 +1,0 @@
-./cloudmonitoring.go
-./constants.go
-./error.go
-./metric.go
-./option.go
-./version.go
