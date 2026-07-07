@@ -8,3 +8,6 @@ llm-wiki-bff
 .idea/
 local-data/
 .ai/
+docs/docs.go
+docs/swagger.json
+docs/swagger.yaml
