@@ -1,0 +1,147 @@
+package cache
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"strings"
+	"testing"
+
+	"github.com/rayer/llm-wiki-bff/internal/gcs"
+)
+
+type fakeReader struct {
+	concepts []gcs.WikiPage
+	pages    map[string]string
+	errs     map[string]error
+	jsonl    string // pre-built JSONL for ReadFile
+}
+
+func (f *fakeReader) ReadFile(_ context.Context, _ string) ([]byte, error) {
+	if f.jsonl == "" {
+		return nil, errors.New("not found")
+	}
+	return []byte(f.jsonl), nil
+}
+
+func (f *fakeReader) ListConcepts(_ context.Context, _ bool) ([]gcs.WikiPage, error) {
+	return f.concepts, nil
+}
+
+func (f *fakeReader) GetPage(_ context.Context, slug, category string) (*gcs.WikiPage, []byte, error) {
+	if category != "concepts" {
+		return nil, nil, errors.New("unexpected category")
+	}
+	if err := f.errs[slug]; err != nil {
+		return nil, nil, err
+	}
+	return &gcs.WikiPage{Slug: slug, Title: slug}, []byte(f.pages[slug]), nil
+}
+
+func (f *fakeReader) WriteBytes(_ context.Context, data []byte, _ string) (string, error) {
+	f.jsonl = string(data)
+	return "ok", nil
+}
+
+func makeJSONL(entries []Entry) string {
+	var buf strings.Builder
+	for _, e := range entries {
+		b, _ := json.Marshal(e)
+		buf.WriteString(string(b) + "\n")
+	}
+	return buf.String()
+}
+
+func TestQueryReadsJSONLAndReturnsRankedResults(t *testing.T) {
+	entries := []Entry{
+		{Slug: "alpha", Title: "Alpha", Body: "shared topic alpha"},
+		{Slug: "beta", Title: "Beta shared", Body: "body"},
+		{Slug: "gamma", Title: "Gamma", Body: "shared idea"},
+	}
+	reader := &fakeReader{jsonl: makeJSONL(entries)}
+
+	results, err := New().Query(context.Background(), reader, "shared", 2)
+	if err != nil {
+		t.Fatalf("Query() error = %v", err)
+	}
+	if got, want := len(results), 2; got != want {
+		t.Fatalf("len(results) = %d, want %d", got, want)
+	}
+	if results[0].Slug == results[1].Slug {
+		t.Fatal("Query() returned duplicate slug")
+	}
+	for _, r := range results {
+		if r.Type != "concept" {
+			t.Fatalf("result.Type = %q, want concept", r.Type)
+		}
+		if r.Snippet == "" {
+			t.Fatalf("result.Snippet is empty")
+		}
+	}
+}
+
+func TestQueryBuildsOnCacheMiss(t *testing.T) {
+	reader := &fakeReader{
+		concepts: []gcs.WikiPage{
+			{Slug: "alpha", Title: "alpha"},
+			{Slug: "broken", Title: "broken"},
+		},
+		pages: map[string]string{
+			"alpha": "---\ntitle: Alpha Concept\nsources: [Source One, Source Two]\ntags: [one, two]\n---\nAlpha body text.",
+		},
+		errs: map[string]error{"broken": errors.New("read failed")},
+	}
+
+	results, err := New().Query(context.Background(), reader, "Alpha", 10)
+	if err != nil {
+		t.Fatalf("Query() error = %v", err)
+	}
+	if len(results) != 1 || results[0].Slug != "alpha" {
+		t.Fatalf("results = %#v, want alpha only", results)
+	}
+	// Verify JSONL was persisted
+	if reader.jsonl == "" {
+		t.Fatal("JSONL was not persisted after build")
+	}
+}
+
+func TestAllReturnsAllEntries(t *testing.T) {
+	reader := &fakeReader{
+		concepts: []gcs.WikiPage{{Slug: "a"}, {Slug: "b"}},
+		pages: map[string]string{
+			"a": "---\ntitle: A\ntags: [x]\n---\nbody A",
+			"b": "---\ntitle: B\ntags: [y]\n---\nbody B",
+		},
+	}
+
+	entries, err := New().All(context.Background(), reader)
+	if err != nil {
+		t.Fatalf("All() error = %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("len(entries) = %d, want 2", len(entries))
+	}
+	bySlug := map[string]Entry{}
+	for _, e := range entries {
+		bySlug[e.Slug] = e
+	}
+	if bySlug["a"].Title != "A" || bySlug["b"].Title != "B" {
+		t.Fatalf("entries = %#v", entries)
+	}
+}
+
+func TestQueryEmptyJSONLFallsBackToBuild(t *testing.T) {
+	reader := &fakeReader{
+		jsonl:    "", // empty/missing
+		concepts: []gcs.WikiPage{{Slug: "x"}},
+		pages:    map[string]string{"x": "---\ntitle: X\n---\ncontent with keyword"},
+	}
+
+	results, err := New().Query(context.Background(), reader, "keyword", 10)
+	if err != nil {
+		t.Fatalf("Query() error = %v", err)
+	}
+	if len(results) != 1 || results[0].Slug != "x" {
+		t.Fatalf("results = %#v, want x", results)
+	}
+}

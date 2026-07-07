@@ -1,0 +1,10 @@
+[llm]
+provider = "deepseek"
+model = "deepseek-chat"
+
+[project]
+name = "Local Development Demo"
+language = "en"
+
+[pipeline]
+auto_approve = true

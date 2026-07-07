@@ -6,6 +6,8 @@ definitions:
         items:
           type: string
         type: array
+      id:
+        type: string
       path:
         type: string
       quality:
@@ -54,6 +56,11 @@ definitions:
       error:
         type: string
     type: object
+  handler.HealthResponse:
+    properties:
+      status:
+        type: string
+    type: object
   handler.ImportRequest:
     properties:
       urls:
@@ -74,9 +81,20 @@ definitions:
           type: string
         type: array
     type: object
+  handler.ProjectResponse:
+    properties:
+      created_at:
+        type: string
+      id:
+        type: string
+      name:
+        type: string
+    type: object
   handler.QueryRequest:
     properties:
       mode:
+        type: string
+      project:
         type: string
       q:
         type: string
@@ -99,6 +117,19 @@ definitions:
         items:
           $ref: '#/definitions/search.Result'
         type: array
+    type: object
+  handler.ReadyResponse:
+    properties:
+      message:
+        type: string
+      prefix:
+        type: string
+      prefixes:
+        items:
+          type: string
+        type: array
+      ready:
+        type: boolean
     type: object
   handler.SourceDetailResponse:
     properties:
@@ -200,7 +231,363 @@ info:
   title: LLM Wiki BFF API
   version: "1.0"
 paths:
-  /api/concepts:
+  /api/v1/admin/projects:
+    get:
+      consumes:
+      - application/json
+      description: Returns all projects from Firestore. Supports optional ?user_id
+        query filter.
+      parameters:
+      - description: Filter by user ID
+        in: query
+        name: user_id
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties: true
+            type: object
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+      security:
+      - BearerAuth: []
+      summary: List all projects (admin)
+      tags:
+      - admin
+  /api/v1/admin/projects/{id}:
+    delete:
+      consumes:
+      - application/json
+      description: 'Deletes a project: removes GCS data, Firestore project doc, and
+        lock doc.'
+      parameters:
+      - description: Project doc ID ({userID}_{projectID})
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties: true
+            type: object
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+      security:
+      - BearerAuth: []
+      summary: Delete a project (admin)
+      tags:
+      - admin
+    patch:
+      consumes:
+      - application/json
+      description: Updates the name field on a Firestore project document.
+      parameters:
+      - description: Project doc ID ({userID}_{projectID})
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: New project name
+        in: body
+        name: body
+        required: true
+        schema:
+          properties:
+            name:
+              type: string
+          type: object
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties: true
+            type: object
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+      security:
+      - BearerAuth: []
+      summary: Rename a project (admin)
+      tags:
+      - admin
+  /api/v1/admin/projects/{id}/pipeline:
+    post:
+      consumes:
+      - application/json
+      description: Invokes the Cloud Run worker job for the specified project, then
+        rebuilds the search index.
+      parameters:
+      - description: Project doc ID ({userID}_{projectID})
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties: true
+            type: object
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+        "409":
+          description: Conflict
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+      security:
+      - BearerAuth: []
+      summary: Trigger pipeline + rebuild for a project (admin)
+      tags:
+      - admin
+  /api/v1/admin/projects/{id}/rebuild-index:
+    post:
+      consumes:
+      - application/json
+      description: Triggers an index rebuild for the specified project using GCS-scoped
+        data.
+      parameters:
+      - description: Project doc ID ({userID}_{projectID})
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties: true
+            type: object
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+        "409":
+          description: Conflict
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+      security:
+      - BearerAuth: []
+      summary: Rebuild index for a project (admin)
+      tags:
+      - admin
+  /api/v1/admin/users:
+    get:
+      consumes:
+      - application/json
+      description: Returns all users from Firestore. Supports optional ?role=admin
+        query filter.
+      parameters:
+      - description: Filter by role (e.g. admin)
+        in: query
+        name: role
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties: true
+            type: object
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+      security:
+      - BearerAuth: []
+      summary: List all users (admin)
+      tags:
+      - admin
+  /api/v1/admin/users/{id}:
+    delete:
+      consumes:
+      - application/json
+      description: Deletes a user and all their projects (GCS data + Firestore docs
+        + locks).
+      parameters:
+      - description: User ID
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties: true
+            type: object
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+      security:
+      - BearerAuth: []
+      summary: Delete a user (admin)
+      tags:
+      - admin
+    patch:
+      consumes:
+      - application/json
+      description: Updates a user's role in Firestore.
+      parameters:
+      - description: User ID
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: New role (e.g. admin)
+        in: body
+        name: body
+        required: true
+        schema:
+          properties:
+            role:
+              type: string
+          type: object
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties: true
+            type: object
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+      security:
+      - BearerAuth: []
+      summary: Update a user (admin)
+      tags:
+      - admin
+  /api/v1/concepts:
     get:
       description: Returns published wiki concepts by default. Set include_drafts=true
         to include draft concepts.
@@ -225,10 +612,13 @@ paths:
           description: Internal Server Error
           schema:
             $ref: '#/definitions/handler.ErrorResponse'
+      security:
+      - DevUserAuth: []
+      - ProjectHeader: []
       summary: List wiki concepts
       tags:
       - concepts
-  /api/concepts/{slug}:
+  /api/v1/concepts/{slug}:
     get:
       description: Returns full content (frontmatter + body) for a wiki concept.
       parameters:
@@ -248,10 +638,33 @@ paths:
           description: Not Found
           schema:
             $ref: '#/definitions/handler.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+      security:
+      - DevUserAuth: []
+      - ProjectHeader: []
       summary: Get a concept by slug
       tags:
       - concepts
-  /api/import:
+  /api/v1/health:
+    get:
+      description: Returns the V1 API health status.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/handler.HealthResponse'
+      security:
+      - DevUserAuth: []
+      - ProjectHeader: []
+      summary: Health check
+      tags:
+      - health
+  /api/v1/import:
     post:
       consumes:
       - application/json
@@ -274,10 +687,82 @@ paths:
           description: Bad Request
           schema:
             $ref: '#/definitions/handler.ErrorResponse'
+      security:
+      - DevUserAuth: []
+      - ProjectHeader: []
       summary: Import bookmarks
       tags:
       - import
-  /api/query:
+  /api/v1/index:
+    get:
+      description: Returns the cached ID map JSON for the request scope.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties: true
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+      security:
+      - DevUserAuth: []
+      - ProjectHeader: []
+      summary: Read generated index
+      tags:
+      - index
+  /api/v1/metrics:
+    get:
+      description: Returns scoped wiki statistics in Prometheus exposition format.
+      produces:
+      - text/plain
+      responses:
+        "200":
+          description: OK
+          schema:
+            type: string
+        "500":
+          description: Internal Server Error
+          schema:
+            type: string
+      security:
+      - ProjectHeader: []
+      summary: Prometheus metrics
+      tags:
+      - metrics
+  /api/v1/projects:
+    get:
+      description: Returns all projects for the authenticated user.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            items:
+              $ref: '#/definitions/handler.ProjectResponse'
+            type: array
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+      security:
+      - DevUserAuth: []
+      summary: List user projects
+      tags:
+      - projects
+  /api/v1/query:
     post:
       consumes:
       - application/json
@@ -301,10 +786,38 @@ paths:
           description: Bad Request
           schema:
             $ref: '#/definitions/handler.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+      security:
+      - DevUserAuth: []
+      - ProjectHeader: []
       summary: Search wiki content
       tags:
       - search
-  /api/sources:
+  /api/v1/ready:
+    get:
+      description: Returns 200 when the concept cache is warm for the request scope.
+        Returns 503 if the cache is not ready.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/handler.ReadyResponse'
+        "503":
+          description: Service Unavailable
+          schema:
+            $ref: '#/definitions/handler.ReadyResponse'
+      security:
+      - DevUserAuth: []
+      - ProjectHeader: []
+      summary: Readiness check
+      tags:
+      - health
+  /api/v1/sources:
     get:
       description: Returns all compiled wiki sources.
       produces:
@@ -318,10 +831,13 @@ paths:
           description: Internal Server Error
           schema:
             $ref: '#/definitions/handler.ErrorResponse'
+      security:
+      - DevUserAuth: []
+      - ProjectHeader: []
       summary: List wiki sources
       tags:
       - sources
-  /api/sources/{slug}:
+  /api/v1/sources/{slug}:
     get:
       description: Returns full content (frontmatter + body) for a wiki source.
       parameters:
@@ -341,10 +857,17 @@ paths:
           description: Not Found
           schema:
             $ref: '#/definitions/handler.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+      security:
+      - DevUserAuth: []
+      - ProjectHeader: []
       summary: Get a source by slug
       tags:
       - sources
-  /api/status:
+  /api/v1/status:
     get:
       description: Returns counts and lock status from GCS, search index, and Firestore.
       produces:
@@ -354,7 +877,30 @@ paths:
           description: OK
           schema:
             $ref: '#/definitions/handler.StatusResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+      security:
+      - DevUserAuth: []
+      - ProjectHeader: []
       summary: Pipeline status
       tags:
       - status
+securityDefinitions:
+  BearerAuth:
+    description: 'JWT Bearer token from /api/v1/auth/login. Format: \"Bearer <token>\".'
+    in: header
+    name: Authorization
+    type: apiKey
+  DevUserAuth:
+    description: DEV mode user identity header. Required when dev_jwt=true.
+    in: header
+    name: X-User-ID
+    type: apiKey
+  ProjectHeader:
+    description: Project identifier header.
+    in: header
+    name: X-Project-ID
+    type: apiKey
 swagger: "2.0"

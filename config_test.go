@@ -12,9 +12,8 @@ func TestLoadConfigReadsTOMLFile(t *testing.T) {
 	if err := os.WriteFile(configPath, []byte(`
 gcp_project = "wiki-gcp"
 bucket = "wiki-bucket"
-user_id = "user-123"
-project_id = "project-456"
 port = "9090"
+dev_jwt = true
 `), 0o600); err != nil {
 		t.Fatalf("write config file: %v", err)
 	}
@@ -30,12 +29,6 @@ port = "9090"
 	if cfg.Bucket != "wiki-bucket" {
 		t.Fatalf("Bucket = %q, want %q", cfg.Bucket, "wiki-bucket")
 	}
-	if cfg.UserID != "user-123" {
-		t.Fatalf("UserID = %q, want %q", cfg.UserID, "user-123")
-	}
-	if cfg.ProjectID != "project-456" {
-		t.Fatalf("ProjectID = %q, want %q", cfg.ProjectID, "project-456")
-	}
 	if cfg.Port != "9090" {
 		t.Fatalf("Port = %q, want %q", cfg.Port, "9090")
 	}
@@ -47,8 +40,7 @@ func TestLoadConfigDefaultsPortAndAllowsEnvOverride(t *testing.T) {
 	if err := os.WriteFile(configPath, []byte(`
 gcp_project = "wiki-gcp"
 bucket = "wiki-bucket"
-user_id = "user-123"
-project_id = "project-456"
+dev_jwt = true
 `), 0o600); err != nil {
 		t.Fatalf("write config file: %v", err)
 	}

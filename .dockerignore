@@ -1,0 +1,9 @@
+.gocache/
+bin/
+lwc-test-server
+llm-wiki-bff
+backfill
+*.test
+*.out
+.git/
+.DS_Store

@@ -14,6 +14,17 @@ type Config struct {
 	ProjectID      string
 	Port           string
 	DeepSeekAPIKey string
+	JWTSecret      string
+	DevJWT         bool
+	LocalDataDir   string
+	Users          []UserConfig
+}
+
+// UserConfig holds a hardcoded user for authentication.
+type UserConfig struct {
+	ID           string
+	Email        string
+	PasswordHash string
 }
 
 // Load reads config.toml from the given path and returns a Config.
@@ -33,12 +44,16 @@ func Load(path string) (Config, error) {
 		}
 	}
 
-	return Config{
+	cfg := Config{
 		GCPProject:     v.GetString("gcp_project"),
 		Bucket:         v.GetString("bucket"),
 		UserID:         v.GetString("user_id"),
 		ProjectID:      v.GetString("project_id"),
 		Port:           v.GetString("port"),
 		DeepSeekAPIKey: v.GetString("deepseek_api_key"),
-	}, nil
+		JWTSecret:      v.GetString("jwt_secret"),
+		DevJWT:         v.GetBool("dev_jwt"),
+		LocalDataDir:   v.GetString("local_data_dir"),
+	}
+	return cfg, nil
 }
