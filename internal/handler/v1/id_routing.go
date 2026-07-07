@@ -11,8 +11,8 @@ import (
 
 	"cloud.google.com/go/storage"
 	"github.com/gin-gonic/gin"
-	"github.com/rayer/llm-wiki-bff/internal/gcs"
 	"github.com/rayer/llm-wiki-bff/internal/handler"
+	store "github.com/rayer/llm-wiki-bff/internal/storage"
 )
 
 var (
@@ -156,7 +156,7 @@ func entryIDSlug(entry idRouteEntry) string {
 	return entry.ID + "-" + entry.Slug
 }
 
-func (h *Handler) getIDRoutingMap(ctx context.Context, gcsClient *gcs.Client) (dualIDMap, error) {
+func (h *Handler) getIDRoutingMap(ctx context.Context, gcsClient store.Store) (dualIDMap, error) {
 	prefix := gcsClient.Prefix()
 
 	h.idRoutingMu.Lock()
@@ -176,7 +176,7 @@ func (h *Handler) getIDRoutingMap(ctx context.Context, gcsClient *gcs.Client) (d
 	return dual, nil
 }
 
-func (h *Handler) rewriteMarkdownForResponse(c *gin.Context, gcsClient *gcs.Client, data []byte) ([]byte, bool) {
+func (h *Handler) rewriteMarkdownForResponse(c *gin.Context, gcsClient store.Store, data []byte) ([]byte, bool) {
 	dual, err := h.getIDRoutingMap(c.Request.Context(), gcsClient)
 	if err != nil {
 		status := http.StatusInternalServerError
@@ -191,7 +191,7 @@ func (h *Handler) rewriteMarkdownForResponse(c *gin.Context, gcsClient *gcs.Clie
 	return []byte(rewriteWikilinks(string(data), dual)), true
 }
 
-func (h *Handler) handleIDRoutedPage(c *gin.Context, gcsClient *gcs.Client, currentType, idSlug string) bool {
+func (h *Handler) handleIDRoutedPage(c *gin.Context, gcsClient store.Store, currentType, idSlug string) bool {
 	if _, _, ok := idFromPathValue(idSlug); !ok {
 		return false
 	}

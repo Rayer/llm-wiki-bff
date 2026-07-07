@@ -10,15 +10,15 @@ import (
 	"github.com/gin-gonic/gin"
 	conceptcache "github.com/rayer/llm-wiki-bff/internal/cache"
 	"github.com/rayer/llm-wiki-bff/internal/firestore"
-	"github.com/rayer/llm-wiki-bff/internal/gcs"
 	"github.com/rayer/llm-wiki-bff/internal/llm"
 	"github.com/rayer/llm-wiki-bff/internal/search"
+	store "github.com/rayer/llm-wiki-bff/internal/storage"
 	"github.com/rayer/llm-wiki-bff/internal/wikiindex"
 )
 
 // Handler holds the dependencies for the V1 API.
 type Handler struct {
-	gcs       *gcs.Client
+	store     store.RootStore
 	firestore *firestore.Client
 	index     *search.Index
 	cache     *conceptcache.Cache
@@ -39,14 +39,14 @@ type Handler struct {
 }
 
 type cachedLists struct {
-	concepts []gcs.WikiPage
-	sources  []gcs.WikiPage
+	concepts []store.WikiPage
+	sources  []store.WikiPage
 }
 
 // New creates a V1 Handler with the given dependencies.
-func New(gcsClient *gcs.Client, fs *firestore.Client, idx *search.Index, cache *conceptcache.Cache, llmClient *llm.Client, expander *llm.QueryExpander) *Handler {
+func New(wikiStore store.RootStore, fs *firestore.Client, idx *search.Index, cache *conceptcache.Cache, llmClient *llm.Client, expander *llm.QueryExpander) *Handler {
 	return &Handler{
-		gcs:           gcsClient,
+		store:         wikiStore,
 		firestore:     fs,
 		index:         idx,
 		cache:         cache,
@@ -58,20 +58,26 @@ func New(gcsClient *gcs.Client, fs *firestore.Client, idx *search.Index, cache *
 	}
 }
 
-// GetGCSClient returns the request-scoped GCS client.
-func (h *Handler) GetGCSClient(c *gin.Context) (*gcs.Client, error) {
+// GetStore returns the request-scoped wiki store.
+func (h *Handler) GetStore(c *gin.Context) (store.Store, error) {
 	userID := c.GetString("userID")
 	projectID := c.GetString("projectID")
 	if userID == "" && projectID == "" {
-		return h.gcs, nil
+		return h.store, nil
 	}
 	if userID == "" || projectID == "" {
-		return nil, fmt.Errorf("incomplete GCS request scope")
+		return nil, fmt.Errorf("incomplete storage request scope")
 	}
-	if h.gcs == nil {
-		return nil, fmt.Errorf("GCS client is not configured")
+	if h.store == nil {
+		return nil, fmt.Errorf("wiki storage is not configured")
 	}
-	return h.gcs.WithScope(userID, projectID), nil
+	return h.store.Scope(userID, projectID), nil
+}
+
+// GetGCSClient is kept as a compatibility wrapper while handlers migrate to
+// storage-neutral naming.
+func (h *Handler) GetGCSClient(c *gin.Context) (store.Store, error) {
+	return h.GetStore(c)
 }
 
 // ── List cache helpers ──
@@ -96,11 +102,11 @@ func (h *Handler) listCacheInvalidate(key string) {
 	delete(h.listCache, key)
 }
 
-func cloneWikiPages(src []gcs.WikiPage) []gcs.WikiPage {
+func cloneWikiPages(src []store.WikiPage) []store.WikiPage {
 	if src == nil {
 		return nil
 	}
-	dst := make([]gcs.WikiPage, len(src))
+	dst := make([]store.WikiPage, len(src))
 	copy(dst, src)
 	return dst
 }

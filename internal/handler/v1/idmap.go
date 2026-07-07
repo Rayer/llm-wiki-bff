@@ -8,7 +8,7 @@ import (
 
 	"cloud.google.com/go/firestore"
 	"cloud.google.com/go/storage"
-	"github.com/rayer/llm-wiki-bff/internal/gcs"
+	store "github.com/rayer/llm-wiki-bff/internal/storage"
 	"github.com/rayer/llm-wiki-bff/internal/wikiindex"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -28,7 +28,7 @@ var errRebuildIndexLocked = errors.New("rebuild index already running")
 type idMap = wikiindex.IDMap
 
 type idMapStore interface {
-	ListMarkdownFiles(ctx context.Context, dir string) ([]gcs.MarkdownFile, error)
+	ListMarkdownFiles(ctx context.Context, dir string) ([]store.MarkdownFile, error)
 	ReadFile(ctx context.Context, relPath string) ([]byte, error)
 }
 
@@ -59,7 +59,7 @@ func (s legacyWikiIndexStore) ListMarkdownFiles(ctx context.Context, dir string)
 	if err != nil {
 		return nil, err
 	}
-	return convertGCSMarkdownFiles(files), nil
+	return convertMarkdownFiles(files), nil
 }
 
 func (s legacyWikiIndexStore) ReadFile(ctx context.Context, relPath string) ([]byte, error) {
@@ -77,23 +77,23 @@ func (s legacyWikiIndexStore) WriteBytesAtomic(ctx context.Context, data []byte,
 	return s.writer.WriteBytesAtomic(ctx, data, tmpPath, finalPath)
 }
 
-type gcsWikiIndexStore struct {
-	client *gcs.Client
+type wikiIndexStore struct {
+	client store.Store
 }
 
-func newGCSWikiIndexStore(client *gcs.Client) gcsWikiIndexStore {
-	return gcsWikiIndexStore{client: client}
+func newWikiIndexStore(client store.Store) wikiIndexStore {
+	return wikiIndexStore{client: client}
 }
 
-func (s gcsWikiIndexStore) ListMarkdownFiles(ctx context.Context, dir string) ([]wikiindex.MarkdownFile, error) {
+func (s wikiIndexStore) ListMarkdownFiles(ctx context.Context, dir string) ([]wikiindex.MarkdownFile, error) {
 	files, err := s.client.ListMarkdownFiles(ctx, dir)
 	if err != nil {
 		return nil, err
 	}
-	return convertGCSMarkdownFiles(files), nil
+	return convertMarkdownFiles(files), nil
 }
 
-func (s gcsWikiIndexStore) ReadFile(ctx context.Context, relPath string) ([]byte, error) {
+func (s wikiIndexStore) ReadFile(ctx context.Context, relPath string) ([]byte, error) {
 	data, err := s.client.ReadFile(ctx, relPath)
 	if errors.Is(err, storage.ErrObjectNotExist) {
 		return nil, wikiindex.ErrNotFound
@@ -101,11 +101,11 @@ func (s gcsWikiIndexStore) ReadFile(ctx context.Context, relPath string) ([]byte
 	return data, err
 }
 
-func (s gcsWikiIndexStore) WriteBytesAtomic(ctx context.Context, data []byte, tmpPath, finalPath string) (string, error) {
+func (s wikiIndexStore) WriteBytesAtomic(ctx context.Context, data []byte, tmpPath, finalPath string) (string, error) {
 	return s.client.WriteBytesAtomic(ctx, data, tmpPath, finalPath)
 }
 
-func convertGCSMarkdownFiles(files []gcs.MarkdownFile) []wikiindex.MarkdownFile {
+func convertMarkdownFiles(files []store.MarkdownFile) []wikiindex.MarkdownFile {
 	converted := make([]wikiindex.MarkdownFile, len(files))
 	for i, file := range files {
 		converted[i] = wikiindex.MarkdownFile{
