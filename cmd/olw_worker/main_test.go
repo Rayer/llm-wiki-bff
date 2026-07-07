@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -136,7 +137,7 @@ func TestRunWorkerBatchPassesIsolatedOLWEnvironment(t *testing.T) {
 
 	vault := t.TempDir()
 	var gotEnv []string
-	execOLW = func(_ context.Context, _ string, _ []string, env []string) error {
+	execOLW = func(_ context.Context, _ string, _ []string, env []string, _, _ io.Writer) error {
 		gotEnv = append([]string(nil), env...)
 		return nil
 	}
@@ -161,7 +162,7 @@ func TestRunWorkerBatchCanInitializeVaultBeforeCommands(t *testing.T) {
 
 	vault := t.TempDir()
 	var ran [][]string
-	execOLW = func(_ context.Context, _ string, command []string, _ []string) error {
+	execOLW = func(_ context.Context, _ string, command []string, _ []string, _, _ io.Writer) error {
 		ran = append(ran, append([]string(nil), command...))
 		return nil
 	}
@@ -188,7 +189,7 @@ func TestRunWorkerBatchDoesNotInitializeVaultByDefault(t *testing.T) {
 
 	vault := t.TempDir()
 	var ran [][]string
-	execOLW = func(_ context.Context, _ string, command []string, _ []string) error {
+	execOLW = func(_ context.Context, _ string, command []string, _ []string, _, _ io.Writer) error {
 		ran = append(ran, append([]string(nil), command...))
 		return nil
 	}
@@ -208,7 +209,7 @@ func TestRunOLWBatchStopsOnFirstFailure(t *testing.T) {
 
 	failErr := errors.New("failed")
 	var ran [][]string
-	execOLW = func(_ context.Context, _ string, command []string, _ []string) error {
+	execOLW = func(_ context.Context, _ string, command []string, _ []string, _, _ io.Writer) error {
 		ran = append(ran, append([]string(nil), command...))
 		if command[0] == "fail" {
 			return failErr
@@ -216,7 +217,7 @@ func TestRunOLWBatchStopsOnFirstFailure(t *testing.T) {
 		return nil
 	}
 
-	err := runOLWBatch(context.Background(), t.TempDir(), [][]string{{"fail"}, {"second"}}, true, nil)
+	err := runOLWBatch(context.Background(), t.TempDir(), [][]string{{"fail"}, {"second"}}, true, nil, nil, nil)
 	if !errors.Is(err, failErr) {
 		t.Fatalf("runOLWBatch() error = %v, want %v", err, failErr)
 	}
@@ -230,7 +231,7 @@ func TestRunOLWBatchContinuesWhenStopOnErrorFalse(t *testing.T) {
 	defer func() { execOLW = old }()
 
 	var ran [][]string
-	execOLW = func(_ context.Context, _ string, command []string, _ []string) error {
+	execOLW = func(_ context.Context, _ string, command []string, _ []string, _, _ io.Writer) error {
 		ran = append(ran, append([]string(nil), command...))
 		if command[0] == "fail" {
 			return errors.New("failed")
@@ -238,12 +239,48 @@ func TestRunOLWBatchContinuesWhenStopOnErrorFalse(t *testing.T) {
 		return nil
 	}
 
-	err := runOLWBatch(context.Background(), t.TempDir(), [][]string{{"fail"}, {"second"}}, false, nil)
+	err := runOLWBatch(context.Background(), t.TempDir(), [][]string{{"fail"}, {"second"}}, false, nil, nil, nil)
 	if err == nil {
 		t.Fatal("runOLWBatch() error = nil, want error")
 	}
 	if len(ran) != 2 {
 		t.Fatalf("ran %d commands, want 2: %#v", len(ran), ran)
+	}
+}
+
+func TestRunWorkerBatchWritesPipelineLogForExecution(t *testing.T) {
+	old := execOLW
+	defer func() { execOLW = old }()
+
+	vault := t.TempDir()
+	execOLW = func(_ context.Context, _ string, _ []string, _ []string, stdout, stderr io.Writer) error {
+		if _, err := stdout.Write([]byte("stdout line\n")); err != nil {
+			t.Fatalf("write stdout: %v", err)
+		}
+		if _, err := stderr.Write([]byte("stderr line\n")); err != nil {
+			t.Fatalf("write stderr: %v", err)
+		}
+		return nil
+	}
+
+	cfg := workerConfig{VaultPath: vault, APIKey: "secret", ExecutionID: "olw-pipeline-abc123", Postprocess: false, StopOnError: true}
+	if err := runWorkerBatch(context.Background(), cfg, `[["run","--auto-approve"]]`); err != nil {
+		t.Fatalf("runWorkerBatch() error = %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(vault, "cache", "pipeline-olw-pipeline-abc123.log"))
+	if err != nil {
+		t.Fatalf("read pipeline log: %v", err)
+	}
+	text := string(data)
+	if !strings.Contains(text, "stdout line\n") || !strings.Contains(text, "stderr line\n") {
+		t.Fatalf("log = %q, want stdout and stderr", text)
+	}
+}
+
+func TestPipelineLogPathRejectsUnsafeExecutionID(t *testing.T) {
+	if _, err := pipelineLogPath(t.TempDir(), "../escape"); err == nil {
+		t.Fatal("pipelineLogPath() error = nil, want error")
 	}
 }
 

@@ -1,4 +1,4 @@
-//go:generate swag init -g main.go -o docs/
+//go:generate go run github.com/swaggo/swag/cmd/swag@v1.16.4 init -g main.go -o docs/
 
 package main
 
@@ -218,6 +218,7 @@ func main() {
 		v1.POST("/import", hV1.Import)
 		v1.POST("/pipeline/run", hV1.PipelineRun)
 		v1.GET("/pipeline/status", hV1.PipelineStatus)
+		v1.GET("/pipeline/log", hV1.PipelineLog)
 		v1.POST("/raw/upload", hV1.RawUpload)
 		v1.GET("/status", hV1.Status)
 		v1.GET("/metrics", hV1.PrometheusMetrics)
