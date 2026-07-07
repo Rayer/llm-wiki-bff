@@ -11,10 +11,11 @@ import (
 )
 
 type fakeReader struct {
-	concepts []gcs.WikiPage
-	pages    map[string]string
-	errs     map[string]error
-	jsonl    string // pre-built JSONL for ReadFile
+	concepts     []gcs.WikiPage
+	pages        map[string]string
+	errs         map[string]error
+	jsonl        string // pre-built JSONL for ReadFile
+	getPageCalls int
 }
 
 func (f *fakeReader) ReadFile(_ context.Context, _ string) ([]byte, error) {
@@ -29,6 +30,7 @@ func (f *fakeReader) ListConcepts(_ context.Context, _ bool) ([]gcs.WikiPage, er
 }
 
 func (f *fakeReader) GetPage(_ context.Context, slug, category string) (*gcs.WikiPage, []byte, error) {
+	f.getPageCalls++
 	if category != "concepts" {
 		return nil, nil, errors.New("unexpected category")
 	}
@@ -127,6 +129,50 @@ func TestAllReturnsAllEntries(t *testing.T) {
 	}
 	if bySlug["a"].Title != "A" || bySlug["b"].Title != "B" {
 		t.Fatalf("entries = %#v", entries)
+	}
+}
+
+func TestBuildReadsJSONLWithoutGetPage(t *testing.T) {
+	entries := []Entry{
+		{Slug: "alpha", Title: "Alpha", Body: "alpha body"},
+	}
+	reader := &fakeReader{
+		jsonl:    makeJSONL(entries),
+		concepts: []gcs.WikiPage{{Slug: "alpha"}, {Slug: "beta"}},
+		pages:    map[string]string{"alpha": "should not be read"},
+	}
+
+	got, err := New().Build(context.Background(), reader)
+	if err != nil {
+		t.Fatalf("Build() error = %v", err)
+	}
+	if len(got) != 1 || got[0].Slug != "alpha" || got[0].Body != "alpha body" {
+		t.Fatalf("entries = %#v", got)
+	}
+	if reader.getPageCalls != 0 {
+		t.Fatalf("GetPage called %d times, want 0", reader.getPageCalls)
+	}
+}
+
+func TestSearchUsesJSONLOnColdStart(t *testing.T) {
+	entries := []Entry{
+		{Slug: "keyword-slug", Title: "Keyword Title", Body: "content with keyword"},
+	}
+	reader := &fakeReader{
+		jsonl:    makeJSONL(entries),
+		concepts: []gcs.WikiPage{{Slug: "keyword-slug"}},
+		pages:    map[string]string{"keyword-slug": "should not be read"},
+	}
+
+	results, err := New().Search(context.Background(), reader, "keyword", 10)
+	if err != nil {
+		t.Fatalf("Search() error = %v", err)
+	}
+	if len(results) != 1 || results[0].Slug != "keyword-slug" {
+		t.Fatalf("results = %#v", results)
+	}
+	if reader.getPageCalls != 0 {
+		t.Fatalf("GetPage called %d times, want 0", reader.getPageCalls)
 	}
 }
 
