@@ -123,7 +123,7 @@ func (h *Handler) UploadRaw(c *gin.Context) {
 	log.Printf("Raw uploaded: %s (digest=%s, bytes=%d)", safeFilename, digest, len(data))
 
 	c.JSON(http.StatusOK, RawUploadResponse{
-		Message:  "File uploaded to raw/. It will be processed on the next pipeline run.",
+		Message:  "File uploaded to raw/. It will be processed after a pipeline run is triggered.",
 		Filename: safeFilename,
 		Path:     gcsRelPath,
 		Digest:   digest,
@@ -197,47 +197,12 @@ func (h *Handler) ScrapeRaw(c *gin.Context) {
 	log.Printf("Scraped and uploaded: %s → %s (title=%s, bytes=%d)", req.URL, filename, title, len(data))
 
 	c.JSON(http.StatusOK, ScrapeResponse{
-		Message:  "URL scraped and saved to raw/. It will be processed on the next pipeline run.",
+		Message:  "URL scraped and saved to raw/. It will be processed after a pipeline run is triggered.",
 		Filename: filename,
 		Path:     gcsRelPath,
 		Title:    title,
 		Digest:   digest,
 		Bytes:    int64(len(data)),
-	})
-}
-
-// ═══════════════ PIPELINE TRIGGER ═══════════════
-
-// PipelineRunResponse is the response for POST /api/pipeline/run.
-type PipelineRunResponse struct {
-	Message   string `json:"message"`
-	RawFiles  int    `json:"raw_files"`
-	Scheduled bool   `json:"scheduled"`
-}
-
-// RunPipeline handles POST /api/pipeline/run — triggers the OLW pipeline.
-func (h *Handler) RunPipeline(c *gin.Context) {
-	ctx := c.Request.Context()
-
-	// Count raw files in GCS for reporting
-	sources, _ := h.gcs.ListSources(ctx)
-	rawCount := len(sources)
-
-	// Write a trigger file to raw/ to signal the pipeline worker
-	timestamp := time.Now().Format("2006-01-02T15:04:05")
-	triggerContent := fmt.Sprintf("---\ntrigger: true\ntimestamp: %s\n---\n\n# Pipeline Trigger\n\nThis file was created to request a pipeline run.\n", timestamp)
-	_, err := h.gcs.WriteBytes(ctx, []byte(triggerContent), "raw/_pipeline_trigger.md")
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, ErrorResponse{Error: fmt.Sprintf("trigger write failed: %v", err)})
-		return
-	}
-
-	log.Printf("Pipeline trigger written: raw/_pipeline_trigger.md at %s (raw files: %d)", timestamp, rawCount)
-
-	c.JSON(http.StatusOK, PipelineRunResponse{
-		Message:   "Pipeline trigger created. The Cloud Run worker will process on its next scheduled run. Raw files in GCS will be ingested and compiled.",
-		RawFiles:  rawCount,
-		Scheduled: true,
 	})
 }
 
