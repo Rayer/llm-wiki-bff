@@ -117,6 +117,17 @@ func (h *Handler) ListProjects(c *gin.Context) {
 		c.JSON(http.StatusUnauthorized, handler.ErrorResponse{Error: "user not authenticated"})
 		return
 	}
+	if h.firestore != nil && h.firestore.Raw() != nil {
+		resp, err := h.listFirestoreProjects(c.Request.Context(), userID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: err.Error()})
+			return
+		}
+		if len(resp) > 0 {
+			c.JSON(http.StatusOK, resp)
+			return
+		}
+	}
 	if h.gcs == nil {
 		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "GCS client is not configured"})
 		return
@@ -154,6 +165,69 @@ func (h *Handler) ListProjects(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, resp)
+}
+
+func (h *Handler) listFirestoreProjects(ctx context.Context, userID string) ([]handler.ProjectResponse, error) {
+	iter := h.firestore.Raw().Collection("projects").Documents(ctx)
+	defer iter.Stop()
+
+	resp := make([]handler.ProjectResponse, 0)
+	for {
+		doc, err := iter.Next()
+		if err != nil {
+			if errors.Is(err, iterator.Done) {
+				break
+			}
+			return nil, fmt.Errorf("list projects: %w", err)
+		}
+		project, uid, ok := projectResponseFromFirestoreDoc(doc.Ref.ID, doc.Data())
+		if !ok || uid != userID {
+			continue
+		}
+		resp = append(resp, project)
+	}
+	return resp, nil
+}
+
+func projectResponseFromFirestoreDoc(docID string, data map[string]interface{}) (handler.ProjectResponse, string, bool) {
+	userID, docProjectID := splitProjectDocID(docID)
+	if userID == "" {
+		return handler.ProjectResponse{}, "", false
+	}
+	projectID, _ := data["project_id"].(string)
+	projectID = strings.TrimSpace(projectID)
+	if projectID == "" {
+		projectID = strings.TrimSpace(docProjectID)
+	}
+	if projectID == "" {
+		return handler.ProjectResponse{}, "", false
+	}
+
+	name, _ := data["name"].(string)
+	name = strings.TrimSpace(name)
+	if name == "" {
+		name = projectID
+	}
+
+	return handler.ProjectResponse{
+		ID:        projectID,
+		Name:      name,
+		CreatedAt: firestoreCreatedAt(data["created_at"]),
+	}, userID, true
+}
+
+func firestoreCreatedAt(value interface{}) string {
+	switch v := value.(type) {
+	case time.Time:
+		if !v.IsZero() {
+			return v.UTC().Format(time.RFC3339)
+		}
+	case *time.Time:
+		if v != nil && !v.IsZero() {
+			return v.UTC().Format(time.RFC3339)
+		}
+	}
+	return ""
 }
 
 func projectTitleFromIndex(data []byte) string {
@@ -495,7 +569,6 @@ func (h *Handler) ListConcepts(c *gin.Context) {
 	if concepts == nil {
 		concepts = []gcs.WikiPage{}
 	}
-
 
 	c.JSON(http.StatusOK, handler.ConceptsListResponse{Concepts: concepts, Count: len(concepts)})
 }
