@@ -794,6 +794,7 @@ type pipelineExecutionResponse struct {
 	StartTime string `json:"start_time"`
 	EndTime   string `json:"end_time"`
 	Duration  string `json:"duration"`
+	LogURL    string `json:"log_url,omitempty"`
 }
 
 type cloudRunExecutionsResponse struct {
@@ -821,6 +822,19 @@ type cloudRunCondition struct {
 }
 
 // PipelineStatus handles GET /api/v1/pipeline/status.
+//
+//	@Summary		Pipeline execution status
+//	@Description	Returns the latest Cloud Run pipeline execution for the current project. Pass execution_id to fetch a specific execution. When an execution is available, last_execution.log_url points to the authenticated log endpoint.
+//	@Tags			pipeline
+//	@Produce		json
+//	@Param			execution_id	query		string	false	"Cloud Run execution ID"
+//	@Success		200				{object}	pipelineStatusResponse
+//	@Failure		400				{object}	handler.ErrorResponse
+//	@Failure		401				{object}	handler.ErrorResponse
+//	@Failure		500				{object}	handler.ErrorResponse
+//	@Security		DevUserAuth
+//	@Security		ProjectHeader
+//	@Router			/api/v1/pipeline/status [get]
 func (h *Handler) PipelineStatus(c *gin.Context) {
 	userID := strings.TrimSpace(c.GetString("userID"))
 	if userID == "" {
@@ -1077,7 +1091,78 @@ func newPipelineExecutionResponse(execution cloudRunExecution) *pipelineExecutio
 		StartTime: execution.StartTime,
 		EndTime:   endTime,
 		Duration:  executionDuration(execution.StartTime, endTime),
+		LogURL:    pipelineLogURLForExecution(execution),
 	}
+}
+
+func pipelineLogURLForExecution(execution cloudRunExecution) string {
+	executionID := shortCloudRunExecutionName(execution.Name, true)
+	if executionID == "" {
+		return ""
+	}
+	return "/api/v1/pipeline/log?execution_id=" + url.QueryEscape(executionID)
+}
+
+// PipelineLog handles GET /api/v1/pipeline/log.
+//
+//	@Summary		Read pipeline log
+//	@Description	Returns the stdout and stderr log captured by the pipeline worker for the current project execution.
+//	@Tags			pipeline
+//	@Produce		plain
+//	@Param			execution_id	query		string	true	"Cloud Run execution ID"
+//	@Success		200				{string}	string
+//	@Failure		400				{object}	handler.ErrorResponse
+//	@Failure		401				{object}	handler.ErrorResponse
+//	@Failure		404				{object}	handler.ErrorResponse
+//	@Failure		500				{object}	handler.ErrorResponse
+//	@Security		DevUserAuth
+//	@Security		ProjectHeader
+//	@Router			/api/v1/pipeline/log [get]
+func (h *Handler) PipelineLog(c *gin.Context) {
+	userID := strings.TrimSpace(c.GetString("userID"))
+	if userID == "" {
+		c.JSON(http.StatusUnauthorized, handler.ErrorResponse{Error: "user not authenticated"})
+		return
+	}
+	projectID := strings.TrimSpace(c.GetString("projectID"))
+	if projectID == "" {
+		c.JSON(http.StatusBadRequest, handler.ErrorResponse{Error: "project is required"})
+		return
+	}
+
+	executionID := strings.TrimSpace(c.Query("execution_id"))
+	logPath, err := pipelineLogPath(executionID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, handler.ErrorResponse{Error: err.Error()})
+		return
+	}
+
+	wikiStore, err := h.GetStore(c)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: err.Error()})
+		return
+	}
+	data, err := wikiStore.ReadFile(c.Request.Context(), logPath)
+	if err != nil {
+		if errors.Is(err, storage.ErrObjectNotExist) {
+			c.JSON(http.StatusNotFound, handler.ErrorResponse{Error: "pipeline log not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "read pipeline log: " + err.Error()})
+		return
+	}
+	c.Data(http.StatusOK, "text/plain; charset=utf-8", data)
+}
+
+func pipelineLogPath(executionID string) (string, error) {
+	executionID = strings.TrimSpace(executionID)
+	if executionID == "" {
+		return "", errors.New("execution_id is required")
+	}
+	if strings.ContainsAny(executionID, `/\`+"\x00") || executionID == "." || executionID == ".." || strings.Contains(executionID, "..") {
+		return "", fmt.Errorf("unsafe execution_id: %s", executionID)
+	}
+	return "cache/pipeline-" + executionID + ".log", nil
 }
 
 func cloudRunExecutionStatus(execution cloudRunExecution) string {

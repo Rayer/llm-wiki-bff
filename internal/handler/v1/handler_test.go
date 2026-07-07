@@ -7,6 +7,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -15,6 +17,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	conceptcache "github.com/rayer/llm-wiki-bff/internal/cache"
 	"github.com/rayer/llm-wiki-bff/internal/gcs"
+	"github.com/rayer/llm-wiki-bff/internal/localfs"
 	"github.com/rayer/llm-wiki-bff/internal/search"
 )
 
@@ -715,6 +718,7 @@ func TestPipelineStatusReturnsLatestExecution(t *testing.T) {
 			StartTime string `json:"start_time"`
 			EndTime   string `json:"end_time"`
 			Duration  string `json:"duration"`
+			LogURL    string `json:"log_url"`
 		} `json:"last_execution"`
 	}
 	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
@@ -788,6 +792,7 @@ func TestPipelineStatusReturnsSpecificExecution(t *testing.T) {
 			StartTime string `json:"start_time"`
 			EndTime   string `json:"end_time"`
 			Duration  string `json:"duration"`
+			LogURL    string `json:"log_url"`
 		} `json:"last_execution"`
 	}
 	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
@@ -805,6 +810,54 @@ func TestPipelineStatusReturnsSpecificExecution(t *testing.T) {
 		body.LastExecution.EndTime != "2026-06-29T02:00:07Z" ||
 		body.LastExecution.Duration != "7s" {
 		t.Fatalf("last_execution = %#v", body.LastExecution)
+	}
+	if body.LastExecution.LogURL != "/api/v1/pipeline/log?execution_id=olw-pipeline-abc123" {
+		t.Fatalf("log_url = %q, want pipeline log URL", body.LastExecution.LogURL)
+	}
+}
+
+func TestPipelineLogReturnsProjectScopedLog(t *testing.T) {
+	root := t.TempDir()
+	logPath := filepath.Join(root, "users", "request-user", "projects", "demo-project", "cache", "pipeline-olw-pipeline-abc123.log")
+	if err := os.MkdirAll(filepath.Dir(logPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(logPath, []byte("pipeline output\nstderr output\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	h := New(localfs.New(root), nil, search.NewIndex(), conceptcache.New(), nil, nil)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/api/v1/pipeline/log?execution_id=olw-pipeline-abc123", nil)
+	c.Set("userID", "request-user")
+	c.Set("projectID", "demo-project")
+
+	h.PipelineLog(c)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	if contentType := recorder.Header().Get("Content-Type"); !strings.HasPrefix(contentType, "text/plain") {
+		t.Fatalf("Content-Type = %q, want text/plain", contentType)
+	}
+	if body := recorder.Body.String(); body != "pipeline output\nstderr output\n" {
+		t.Fatalf("body = %q", body)
+	}
+}
+
+func TestPipelineLogRejectsUnsafeExecutionID(t *testing.T) {
+	h := New(localfs.New(t.TempDir()), nil, search.NewIndex(), conceptcache.New(), nil, nil)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/api/v1/pipeline/log?execution_id=../escape", nil)
+	c.Set("userID", "request-user")
+	c.Set("projectID", "demo-project")
+
+	h.PipelineLog(c)
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusBadRequest, recorder.Body.String())
 	}
 }
 
@@ -1016,11 +1069,12 @@ func TestHandlersMatchGinHandlerSignature(t *testing.T) {
 		h.PrometheusMetrics,
 		h.PipelineRun,
 		h.PipelineStatus,
+		h.PipelineLog,
 		h.RebuildIndex,
 		h.InitProject,
 		h.ProjectStatus,
 	}
-	if len(handlers) != 14 {
-		t.Fatalf("handler count = %d, want 14", len(handlers))
+	if len(handlers) != 15 {
+		t.Fatalf("handler count = %d, want 15", len(handlers))
 	}
 }

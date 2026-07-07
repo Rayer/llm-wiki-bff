@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -22,13 +23,14 @@ type workerConfig struct {
 	DataDir     string
 	UserID      string
 	ProjectID   string
+	ExecutionID string
 	APIKey      string
 	InitVault   bool
 	Postprocess bool
 	StopOnError bool
 }
 
-type execOLWFunc func(ctx context.Context, vault string, command []string, env []string) error
+type execOLWFunc func(ctx context.Context, vault string, command []string, env []string, stdout, stderr io.Writer) error
 
 var execOLW execOLWFunc = execOLWCommand
 
@@ -50,6 +52,7 @@ func newRootCommand() *cobra.Command {
 	rootCmd.PersistentFlags().StringVar(&cfg.DataDir, "data-dir", envOr("DATA_DIR", "/data"), "mounted data root")
 	rootCmd.PersistentFlags().StringVar(&cfg.UserID, "user-id", envOr("USER_ID", ""), "user id")
 	rootCmd.PersistentFlags().StringVar(&cfg.ProjectID, "project-id", envOr("PROJECT_ID", ""), "project id")
+	rootCmd.PersistentFlags().StringVar(&cfg.ExecutionID, "execution-id", envOr("EXECUTION_ID", envOr("CLOUD_RUN_EXECUTION", "")), "Cloud Run execution id for pipeline log")
 	rootCmd.PersistentFlags().StringVar(&cfg.APIKey, "api-key", envOr("LLM_API_KEY", ""), "LLM API key")
 	rootCmd.PersistentFlags().BoolVar(&cfg.StopOnError, "stop-on-error", true, "stop on first failed OLW command")
 
@@ -107,7 +110,14 @@ func runWorkerBatch(ctx context.Context, cfg workerConfig, rawCommands string) e
 	if err != nil {
 		return err
 	}
-	if err := runOLWBatch(ctx, vault, commands, cfg.StopOnError, olwEnv); err != nil {
+
+	stdout, stderr, closeLog, err := pipelineLogWriters(vault, cfg.ExecutionID)
+	if err != nil {
+		return err
+	}
+	defer closeLog()
+
+	if err := runOLWBatch(ctx, vault, commands, cfg.StopOnError, olwEnv, stdout, stderr); err != nil {
 		return err
 	}
 	if cfg.Postprocess {
@@ -204,11 +214,17 @@ func prepareOLWEnvironment(cfg workerConfig) ([]string, error) {
 	return env, nil
 }
 
-func runOLWBatch(ctx context.Context, vault string, commands [][]string, stopOnError bool, env []string) error {
+func runOLWBatch(ctx context.Context, vault string, commands [][]string, stopOnError bool, env []string, stdout, stderr io.Writer) error {
+	if stdout == nil {
+		stdout = os.Stdout
+	}
+	if stderr == nil {
+		stderr = os.Stderr
+	}
 	var batchErr error
 	for i, command := range commands {
 		log.Printf("[%d/%d] olw %v", i+1, len(commands), command)
-		if err := execOLW(ctx, vault, command, env); err != nil {
+		if err := execOLW(ctx, vault, command, env, stdout, stderr); err != nil {
 			wrapped := fmt.Errorf("olw %v: %w", command, err)
 			if stopOnError {
 				return wrapped
@@ -220,13 +236,47 @@ func runOLWBatch(ctx context.Context, vault string, commands [][]string, stopOnE
 	return batchErr
 }
 
-func execOLWCommand(ctx context.Context, vault string, command []string, env []string) error {
+func execOLWCommand(ctx context.Context, vault string, command []string, env []string, stdout, stderr io.Writer) error {
 	cmd := exec.CommandContext(ctx, "olw", command...)
 	cmd.Dir = vault
 	cmd.Env = append(os.Environ(), env...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
 	return cmd.Run()
+}
+
+func pipelineLogWriters(vault, executionID string) (io.Writer, io.Writer, func(), error) {
+	if strings.TrimSpace(executionID) == "" {
+		return os.Stdout, os.Stderr, func() {}, nil
+	}
+	path, err := pipelineLogPath(vault, executionID)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, nil, nil, fmt.Errorf("mkdir pipeline log dir: %w", err)
+	}
+	file, err := os.Create(path)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("create pipeline log: %w", err)
+	}
+	closeLog := func() {
+		if err := file.Close(); err != nil {
+			log.Printf("close pipeline log: %v", err)
+		}
+	}
+	return io.MultiWriter(os.Stdout, file), io.MultiWriter(os.Stderr, file), closeLog, nil
+}
+
+func pipelineLogPath(vault, executionID string) (string, error) {
+	executionID = strings.TrimSpace(executionID)
+	if executionID == "" {
+		return "", errors.New("execution id is required")
+	}
+	if strings.ContainsAny(executionID, `/\`+"\x00") || executionID == "." || executionID == ".." || strings.Contains(executionID, "..") {
+		return "", fmt.Errorf("unsafe execution id: %s", executionID)
+	}
+	return filepath.Join(vault, "cache", "pipeline-"+executionID+".log"), nil
 }
 
 func cleanStaleLock(vault string, maxAge time.Duration) error {
