@@ -15,6 +15,7 @@ import (
 
 	"cloud.google.com/go/storage"
 	fm "github.com/adrg/frontmatter"
+	store "github.com/rayer/llm-wiki-bff/internal/storage"
 	"google.golang.org/api/iterator"
 )
 
@@ -25,31 +26,9 @@ type Client struct {
 	projectID string
 }
 
-// WikiPage represents a wiki source or concept page.
-type WikiPage struct {
-	Slug      string   `json:"slug"`
-	Title     string   `json:"title"`
-	ID        string   `json:"id"`
-	Path      string   `json:"path"`
-	Status    string   `json:"status"` // "published" or "draft"
-	Quality   string   `json:"quality,omitempty"`
-	Concepts  []string `json:"concepts,omitempty"`
-	SourceURL string   `json:"source_url,omitempty"`
-	RawSource string   `json:"raw_source,omitempty"`
-}
-
-// Project represents a user project discovered in GCS.
-type Project struct {
-	ID        string `json:"id"`
-	CreatedAt string `json:"created_at"`
-}
-
-// MarkdownFile is a direct markdown object under a project directory.
-type MarkdownFile struct {
-	Slug string
-	Path string
-	Data []byte
-}
+type WikiPage = store.WikiPage
+type Project = store.Project
+type MarkdownFile = store.MarkdownFile
 
 type wikiPageFrontmatter struct {
 	ID    string `yaml:"id"`
@@ -91,6 +70,12 @@ func (c *Client) WithScope(userID, projectID string) *Client {
 		userID:    userID,
 		projectID: projectID,
 	}
+}
+
+// Scope returns a project-scoped storage interface while preserving the
+// concrete WithScope API used by GCS-specific tools.
+func (c *Client) Scope(userID, projectID string) store.Store {
+	return c.WithScope(userID, projectID)
 }
 
 // NewScopedClient returns a client that shares the bucket connection but uses
@@ -151,7 +136,7 @@ func (c *Client) ListConceptsFromCache(ctx context.Context) ([]WikiPage, error) 
 	if err != nil {
 		return nil, err
 	}
-	return wikiPagesFromConceptsJSONL(data)
+	return WikiPagesFromConceptsJSONL(data)
 }
 
 // ListSourcesFromCache returns wiki sources from the generated ID map cache.
@@ -160,7 +145,7 @@ func (c *Client) ListSourcesFromCache(ctx context.Context) ([]WikiPage, error) {
 	if err != nil {
 		return nil, err
 	}
-	return wikiPagesFromSourceIDMap(data)
+	return WikiPagesFromSourceIDMap(data)
 }
 
 // GetPage reads a wiki page by slug from sources or concepts.
@@ -327,7 +312,7 @@ func applyWikiPageFrontmatter(page WikiPage, data []byte) (WikiPage, error) {
 	return page, nil
 }
 
-func wikiPagesFromConceptsJSONL(data []byte) ([]WikiPage, error) {
+func WikiPagesFromConceptsJSONL(data []byte) ([]WikiPage, error) {
 	scanner := bufio.NewScanner(strings.NewReader(string(data)))
 	scanner.Buffer(make([]byte, 64*1024), 16*1024*1024)
 	pages := make([]WikiPage, 0)
@@ -365,7 +350,7 @@ func wikiPagesFromConceptsJSONL(data []byte) ([]WikiPage, error) {
 	return pages, nil
 }
 
-func wikiPagesFromSourceIDMap(data []byte) ([]WikiPage, error) {
+func WikiPagesFromSourceIDMap(data []byte) ([]WikiPage, error) {
 	var source wikiIDMap
 	if err := json.Unmarshal(data, &source); err != nil {
 		return nil, fmt.Errorf("decode source id map: %w", err)
