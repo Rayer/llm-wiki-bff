@@ -93,12 +93,10 @@ func (c *Client) ListSources(ctx context.Context) ([]WikiPage, error) {
 
 // ListConcepts returns wiki concepts. Drafts are included when includeDrafts is true.
 func (c *Client) ListConcepts(ctx context.Context, includeDrafts bool) ([]WikiPage, error) {
-	published, err := c.listConceptDir(ctx, "wiki/", "published", true)
+	// Always list both dirs to work around GCS iterator issue with directOnly
+	published, err := c.listConceptDir(ctx, "wiki/", "published", false)
 	if err != nil {
 		return nil, err
-	}
-	if !includeDrafts {
-		return published, nil
 	}
 
 	seen := make(map[string]struct{}, len(published))
@@ -116,6 +114,16 @@ func (c *Client) ListConcepts(ctx context.Context, includeDrafts bool) ([]WikiPa
 		}
 		published = append(published, page)
 		seen[page.Slug] = struct{}{}
+	}
+
+	if !includeDrafts {
+		result := make([]WikiPage, 0, len(published))
+		for _, p := range published {
+			if p.Status == "published" {
+				result = append(result, p)
+			}
+		}
+		return result, nil
 	}
 	return published, nil
 }

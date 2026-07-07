@@ -334,16 +334,6 @@ func cachedContexts(conceptCache *conceptcache.Cache, reader conceptcache.Reader
 //	@Router			/api/v1/sources [get]
 func (h *Handler) ListSources(c *gin.Context) {
 	ctx := c.Request.Context()
-	uid := c.GetString("userID")
-	pid := c.GetString("projectID")
-	cacheKey := uid + "_" + pid
-
-	// Check list cache first
-	if cl := h.listCacheGet(cacheKey); cl.sources != nil {
-		srcs := cloneWikiPages(cl.sources)
-		c.JSON(http.StatusOK, handler.SourcesListResponse{Sources: srcs, Count: len(srcs)})
-		return
-	}
 
 	gcsClient, err := h.GetGCSClient(c)
 	if err != nil {
@@ -363,9 +353,6 @@ func (h *Handler) ListSources(c *gin.Context) {
 	if sources == nil {
 		sources = []gcs.WikiPage{}
 	}
-
-	// Cache the result
-	h.listCacheSet(cacheKey, func(cl *cachedLists) { cl.sources = cloneWikiPages(sources) })
 
 	c.JSON(http.StatusOK, handler.SourcesListResponse{Sources: sources, Count: len(sources)})
 }
@@ -483,23 +470,11 @@ func (h *Handler) GetSource(c *gin.Context) {
 //	@Router			/api/v1/concepts [get]
 func (h *Handler) ListConcepts(c *gin.Context) {
 	ctx := c.Request.Context()
-	uid := c.GetString("userID")
-	pid := c.GetString("projectID")
-	cacheKey := uid + "_" + pid
 
 	includeDrafts, err := strconv.ParseBool(c.DefaultQuery("include_drafts", "false"))
 	if err != nil {
 		c.JSON(http.StatusBadRequest, handler.ErrorResponse{Error: "include_drafts must be a boolean"})
 		return
-	}
-
-	// Check list cache first (only for non-draft queries)
-	if !includeDrafts {
-		if cl := h.listCacheGet(cacheKey); cl.concepts != nil {
-			cc := cloneWikiPages(cl.concepts)
-			c.JSON(http.StatusOK, handler.ConceptsListResponse{Concepts: cc, Count: len(cc)})
-			return
-		}
 	}
 
 	gcsClient, err := h.GetGCSClient(c)
@@ -521,10 +496,6 @@ func (h *Handler) ListConcepts(c *gin.Context) {
 		concepts = []gcs.WikiPage{}
 	}
 
-	// Cache non-draft results
-	if !includeDrafts {
-		h.listCacheSet(cacheKey, func(cl *cachedLists) { cl.concepts = cloneWikiPages(concepts) })
-	}
 
 	c.JSON(http.StatusOK, handler.ConceptsListResponse{Concepts: concepts, Count: len(concepts)})
 }
@@ -839,7 +810,6 @@ func (h *Handler) RebuildIndex(c *gin.Context) {
 				"source":  len(next.Source),
 			},
 		})
-		h.listCacheInvalidate(userID + "_" + projectID)
 		return
 	}
 	if h.gcs == nil {
@@ -872,8 +842,6 @@ func (h *Handler) RebuildIndex(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: err.Error()})
 		return
 	}
-
-	h.listCacheInvalidate(userID + "_" + projectID)
 
 	c.JSON(http.StatusOK, gin.H{
 		"status": "ok",
@@ -1466,8 +1434,6 @@ func (h *Handler) AdminRebuildIndex(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: err.Error()})
 		return
 	}
-
-	h.listCacheInvalidate(uid + "_" + pid)
 
 	c.JSON(http.StatusOK, gin.H{
 		"status": "ok",
