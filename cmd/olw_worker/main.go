@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"io/fs"
 	"log"
 	"os"
 	"os/exec"
@@ -18,19 +20,26 @@ import (
 )
 
 type workerConfig struct {
-	VaultPath   string
-	DataDir     string
-	UserID      string
-	ProjectID   string
-	APIKey      string
-	InitVault   bool
-	Postprocess bool
-	StopOnError bool
+	VaultPath       string
+	DataDir         string
+	UserID          string
+	ProjectID       string
+	APIKey          string
+	InitVault       bool
+	Postprocess     bool
+	StopOnError     bool
+	UseWorkspace    bool
+	WorkspaceParent string
 }
 
 type execOLWFunc func(ctx context.Context, vault string, command []string, env []string) error
 
 var execOLW execOLWFunc = execOLWCommand
+
+type workspaceVault struct {
+	original string
+	path     string
+}
 
 func main() {
 	if err := newRootCommand().Execute(); err != nil {
@@ -52,6 +61,8 @@ func newRootCommand() *cobra.Command {
 	rootCmd.PersistentFlags().StringVar(&cfg.ProjectID, "project-id", envOr("PROJECT_ID", ""), "project id")
 	rootCmd.PersistentFlags().StringVar(&cfg.APIKey, "api-key", envOr("LLM_API_KEY", ""), "LLM API key")
 	rootCmd.PersistentFlags().BoolVar(&cfg.StopOnError, "stop-on-error", true, "stop on first failed OLW command")
+	rootCmd.PersistentFlags().BoolVar(&cfg.UseWorkspace, "workspace", envBool("WORKSPACE", false), "run OLW in a temporary workspace and sync durable outputs back")
+	rootCmd.PersistentFlags().StringVar(&cfg.WorkspaceParent, "workspace-dir", envOr("WORKSPACE_DIR", ""), "parent directory for temporary OLW workspaces")
 
 	runCmd := &cobra.Command{
 		Use:   "run <json array of arrays>",
@@ -103,6 +114,19 @@ func runWorkerBatch(ctx context.Context, cfg workerConfig, rawCommands string) e
 	if err := ensureWikiTOML(vault, cfg); err != nil {
 		return err
 	}
+	var workspace *workspaceVault
+	if cfg.UseWorkspace {
+		workspace, err = prepareWorkspace(vault, cfg.WorkspaceParent)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			if err := workspace.cleanup(); err != nil {
+				log.Printf("cleanup workspace %q: %v", workspace.path, err)
+			}
+		}()
+		vault = workspace.path
+	}
 	olwEnv, err := prepareOLWEnvironment(cfg)
 	if err != nil {
 		return err
@@ -112,6 +136,11 @@ func runWorkerBatch(ctx context.Context, cfg workerConfig, rawCommands string) e
 	}
 	if cfg.Postprocess {
 		if err := runPostprocess(ctx, vault); err != nil {
+			return err
+		}
+	}
+	if workspace != nil {
+		if err := workspace.syncBack(); err != nil {
 			return err
 		}
 	}
@@ -204,6 +233,80 @@ func prepareOLWEnvironment(cfg workerConfig) ([]string, error) {
 	return env, nil
 }
 
+func prepareWorkspace(originalVault string, parent string) (*workspaceVault, error) {
+	if strings.TrimSpace(parent) == "" {
+		parent = os.TempDir()
+	}
+	path, err := os.MkdirTemp(parent, "olw-workspace-*")
+	if err != nil {
+		return nil, fmt.Errorf("create workspace: %w", err)
+	}
+	workspace := &workspaceVault{original: originalVault, path: path}
+	cleanupOnErr := true
+	defer func() {
+		if cleanupOnErr {
+			_ = workspace.cleanup()
+		}
+	}()
+
+	raw := filepath.Join(originalVault, "raw")
+	if exists, err := pathExists(raw); err != nil {
+		return nil, fmt.Errorf("stat raw: %w", err)
+	} else if exists {
+		if err := os.Symlink(raw, filepath.Join(path, "raw")); err != nil {
+			return nil, fmt.Errorf("symlink raw: %w", err)
+		}
+	}
+
+	for _, dir := range []string{"wiki", "cache", ".olw"} {
+		src := filepath.Join(originalVault, dir)
+		if exists, err := pathExists(src); err != nil {
+			return nil, fmt.Errorf("stat %s: %w", dir, err)
+		} else if exists {
+			if err := copyDir(src, filepath.Join(path, dir), nil); err != nil {
+				return nil, fmt.Errorf("copy %s to workspace: %w", dir, err)
+			}
+		}
+	}
+
+	if err := copyFileIfExists(filepath.Join(originalVault, "wiki.toml"), filepath.Join(path, "wiki.toml")); err != nil {
+		return nil, fmt.Errorf("copy wiki.toml to workspace: %w", err)
+	}
+
+	cleanupOnErr = false
+	return workspace, nil
+}
+
+func (w *workspaceVault) syncBack() error {
+	for _, dir := range []string{"wiki", "cache"} {
+		src := filepath.Join(w.path, dir)
+		if exists, err := pathExists(src); err != nil {
+			return fmt.Errorf("stat workspace %s: %w", dir, err)
+		} else if exists {
+			if err := replaceDir(src, filepath.Join(w.original, dir), nil); err != nil {
+				return fmt.Errorf("sync %s back: %w", dir, err)
+			}
+		}
+	}
+
+	src := filepath.Join(w.path, ".olw")
+	if exists, err := pathExists(src); err != nil {
+		return fmt.Errorf("stat workspace .olw: %w", err)
+	} else if exists {
+		exclude := func(rel string, _ fs.DirEntry) bool {
+			return filepath.ToSlash(rel) == "pipeline.lock"
+		}
+		if err := replaceDir(src, filepath.Join(w.original, ".olw"), exclude); err != nil {
+			return fmt.Errorf("sync .olw back: %w", err)
+		}
+	}
+	return nil
+}
+
+func (w *workspaceVault) cleanup() error {
+	return os.RemoveAll(w.path)
+}
+
 func runOLWBatch(ctx context.Context, vault string, commands [][]string, stopOnError bool, env []string) error {
 	var batchErr error
 	for i, command := range commands {
@@ -266,9 +369,120 @@ func requireExistingDir(path string) error {
 	return nil
 }
 
+func pathExists(path string) (bool, error) {
+	if _, err := os.Lstat(path); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+func copyFileIfExists(src string, dst string) error {
+	if exists, err := pathExists(src); err != nil {
+		return err
+	} else if !exists {
+		return nil
+	}
+	info, err := os.Lstat(src)
+	if err != nil {
+		return err
+	}
+	return copyFile(src, dst, info.Mode())
+}
+
+func replaceDir(src string, dst string, exclude func(string, fs.DirEntry) bool) error {
+	if err := os.RemoveAll(dst); err != nil {
+		return err
+	}
+	return copyDir(src, dst, exclude)
+}
+
+func copyDir(src string, dst string, exclude func(string, fs.DirEntry) bool) error {
+	return filepath.WalkDir(src, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		rel, err := filepath.Rel(src, path)
+		if err != nil {
+			return err
+		}
+		if rel == "." {
+			info, err := entry.Info()
+			if err != nil {
+				return err
+			}
+			return os.MkdirAll(dst, info.Mode().Perm())
+		}
+		if exclude != nil && exclude(rel, entry) {
+			if entry.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+
+		target := filepath.Join(dst, rel)
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if entry.Type()&os.ModeSymlink != 0 {
+			linkTarget, err := os.Readlink(path)
+			if err != nil {
+				return err
+			}
+			return os.Symlink(linkTarget, target)
+		}
+		if entry.IsDir() {
+			return os.MkdirAll(target, info.Mode().Perm())
+		}
+		if !entry.Type().IsRegular() {
+			return nil
+		}
+		return copyFile(path, target, info.Mode())
+	})
+}
+
+func copyFile(src string, dst string, mode fs.FileMode) error {
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return err
+	}
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode.Perm())
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		_ = out.Close()
+		return err
+	}
+	return out.Close()
+}
+
 func envOr(key, def string) string {
 	if value := os.Getenv(key); value != "" {
 		return value
 	}
 	return def
+}
+
+func envBool(key string, def bool) bool {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return def
+	}
+	switch strings.ToLower(value) {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return def
+	}
 }

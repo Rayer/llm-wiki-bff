@@ -7,7 +7,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -o /out/worker ./cmd/olw_worker
 
 FROM python:3.12-slim AS worker
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates git \
+    && apt-get install -y --no-install-recommends ca-certificates git rsync \
     && rm -rf /var/lib/apt/lists/* \
     && pip install --no-cache-dir obsidian-llm-wiki
 

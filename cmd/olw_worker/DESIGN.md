@@ -82,12 +82,40 @@ The worker resolves the vault in this order:
 4. Ensure `wiki.toml` exists. Existing config is never overwritten.
 5. Run each OLW command in order.
 6. If all OLW commands succeed and postprocess is enabled, rebuild BFF artifacts.
+7. If workspace mode is enabled, sync durable workspace outputs back to the
+   mounted vault after successful OLW and postprocess completion.
 
 `--stop-on-error` defaults to true. When false, the worker continues through the
 batch, records failures, skips postprocess if any command failed, and exits
 non-zero at the end.
 
 `--no-postprocess` skips artifact generation after a successful batch.
+
+## Tmpfs Workspace Mode
+
+Workspace mode is optional and is enabled with either:
+
+```bash
+worker --workspace run '[["run","--auto-approve"],["approve","--all"]]'
+WORKSPACE=true worker run '[["run","--auto-approve"],["approve","--all"]]'
+```
+
+`--workspace-dir` or `WORKSPACE_DIR` can override the temporary workspace parent
+directory. When unset, the worker uses the OS temp directory, which is `/tmp` in
+the Cloud Run worker image.
+
+Workspace preparation keeps read-only and write-heavy paths separate:
+
+- `raw/` is a symlink to the mounted vault because OLW only reads raw inputs.
+- `wiki/` is copied to the workspace and synced back with delete semantics.
+- `cache/` is copied to the workspace and synced back with delete semantics.
+- `.olw/` is copied to the workspace and synced back with delete semantics, but
+  `.olw/pipeline.lock` is never synced back.
+- `wiki.toml` is created in the original vault if missing, then copied into the
+  workspace.
+
+If OLW or postprocess fails, workspace outputs are not synced back. The temporary
+workspace is removed at the end of the run.
 
 ## Generated Artifacts
 
@@ -144,11 +172,12 @@ BFF invokes the Cloud Run Job with:
 
 ```json
 {
-  "args": ["run", "[[\"run\",\"--auto-approve\"]]"],
+  "args": ["run", "[[\"run\",\"--auto-approve\"],[\"approve\",\"--all\"]]"],
   "env": [
     {"name": "USER_ID", "value": "..."},
     {"name": "PROJECT_ID", "value": "..."},
-    {"name": "TASK_TYPE", "value": "pipeline"}
+    {"name": "TASK_TYPE", "value": "pipeline"},
+    {"name": "WORKSPACE", "value": "true"}
   ]
 }
 ```
@@ -219,7 +248,7 @@ Local checks:
 
 ```bash
 go test ./...
-docker build --target worker -t llm-wiki-bff-olw-worker:test .
+docker build -f cmd/olw_worker/Dockerfile --target worker -t llm-wiki-bff-olw-worker:test .
 ```
 
 Docker smoke test:
@@ -262,12 +291,10 @@ concepts.jsonl: 420 lines
   was truncated at `max_tokens=2400`. This is an OLW/model output limit issue,
   not a worker startup or deployment failure.
 - gcsfuse logs repeated SQLite journal warnings for `.olw/state.db`, including
-  out-of-order writes. The successful run shows this is not immediately fatal,
-  but it is a durability/performance risk.
-- gcsfuse also logs unsupported hard link operations during git activity. The
-  job still completed successfully.
-- Long-term, `.olw/state.db` and git operations should probably run on local
-  scratch storage, then sync only durable vault/artifact outputs back to GCS.
+  out-of-order writes. Workspace mode mitigates this by running `.olw` writes on
+  local scratch storage, then syncing durable state back after success.
+- gcsfuse also logs unsupported hard link operations during git activity.
+  Workspace mode mitigates this for write-heavy OLW activity.
 - Full project pipeline runs are long. The verified demo run needed about
   43 minutes after prior partial progress. Keep the Cloud Run Job timeout above
   the expected full-project runtime or split OLW work into smaller batches.

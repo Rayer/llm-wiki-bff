@@ -451,6 +451,7 @@ func TestPipelineRunExecutesCloudRunJob(t *testing.T) {
 						map[string]any{"name": "USER_ID", "value": "request-user"},
 						map[string]any{"name": "PROJECT_ID", "value": "demo"},
 						map[string]any{"name": "TASK_TYPE", "value": "pipeline"},
+						map[string]any{"name": "WORKSPACE", "value": "true"},
 					},
 				},
 			},
@@ -516,7 +517,7 @@ func TestPipelineRunDefaultsCommandAndUser(t *testing.T) {
 	if len(override.Args) != 2 || override.Args[0] != "run" || override.Args[1] != defaultWorkerCommands {
 		t.Fatalf("args = %#v, want [run %s]", override.Args, defaultWorkerCommands)
 	}
-	if override.Env[0].Value != "request-user" || override.Env[1].Value != "demo" || override.Env[2].Value != "pipeline" {
+	if override.Env[0].Value != "request-user" || override.Env[1].Value != "demo" || override.Env[2].Value != "pipeline" || override.Env[3].Value != "true" {
 		t.Fatalf("env = %#v", override.Env)
 	}
 }
@@ -604,7 +605,7 @@ func TestAdminPipelineTriggerInvokesWorkerWithoutImmediateRebuild(t *testing.T) 
 	if len(override.Args) != 2 || override.Args[0] != "run" || override.Args[1] != defaultWorkerCommands {
 		t.Fatalf("args = %#v, want [run %s]", override.Args, defaultWorkerCommands)
 	}
-	if override.Env[0].Value != "request-user" || override.Env[1].Value != "demo" || override.Env[2].Value != "pipeline" {
+	if override.Env[0].Value != "request-user" || override.Env[1].Value != "demo" || override.Env[2].Value != "pipeline" || override.Env[3].Value != "true" {
 		t.Fatalf("env = %#v", override.Env)
 	}
 }
