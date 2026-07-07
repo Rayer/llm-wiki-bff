@@ -536,6 +536,10 @@ func (c *Client) listConceptDir(ctx context.Context, dir, status string, directO
 		if rel == attrs.Name || rel == "" {
 			continue
 		}
+		// Skip source articles when listing concepts from wiki/
+		if dir == "wiki/" && strings.Contains(rel, "sources/") {
+			continue
+		}
 		if directOnly && strings.Contains(rel, "/") {
 			continue
 		}

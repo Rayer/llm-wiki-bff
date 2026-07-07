@@ -4,8 +4,9 @@ FROM golang:1.26-alpine AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
+RUN go install github.com/swaggo/swag/cmd/swag@latest
 COPY . .
-RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /bff .
+RUN go generate ./... && CGO_ENABLED=0 go build -ldflags="-s -w" -o /bff .
 
 # Runtime
 FROM gcr.io/distroless/static-debian12:nonroot

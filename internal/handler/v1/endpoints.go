@@ -532,6 +532,12 @@ func (h *Handler) GetConcept(c *gin.Context) {
 		c.JSON(http.StatusNotFound, handler.ErrorResponse{Error: "concept not found: " + slug})
 		return
 	}
+	// Set ID from id_map
+	if page.ID == "" {
+		pages := []gcs.WikiPage{*page}
+		_ = addWikiPageIDsFromIDMap(c.Request.Context(), gcsClient, pages, "concept")
+		page.ID = pages[0].ID
+	}
 	if rewritten, ok := h.rewriteMarkdownForResponse(c, gcsClient, data); ok {
 		data = rewritten
 	} else {
@@ -541,6 +547,7 @@ func (h *Handler) GetConcept(c *gin.Context) {
 	frontmatter, body := parseFrontmatter(string(data))
 	c.JSON(http.StatusOK, handler.ConceptDetailResponse{
 		Slug:        slug,
+		ID:          page.ID,
 		Title:       slug,
 		Type:        "concept",
 		Status:      page.Status,

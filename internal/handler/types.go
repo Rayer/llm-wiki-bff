@@ -73,6 +73,7 @@ type ProjectResponse struct {
 // ConceptDetailResponse is the response for a concept detail endpoint.
 type ConceptDetailResponse struct {
 	Slug        string                 `json:"slug"`
+	ID          string                 `json:"id,omitempty"`
 	Title       string                 `json:"title"`
 	Type        string                 `json:"type"`
 	Status      string                 `json:"status"`
