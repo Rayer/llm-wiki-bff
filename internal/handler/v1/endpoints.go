@@ -415,7 +415,7 @@ func (h *Handler) ListSources(c *gin.Context) {
 		return
 	}
 
-	sources, err := gcsClient.ListSources(ctx)
+	sources, err := listSourcesCacheFirst(ctx, gcsClient)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: err.Error()})
 		return
@@ -429,6 +429,38 @@ func (h *Handler) ListSources(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, handler.SourcesListResponse{Sources: sources, Count: len(sources)})
+}
+
+type sourceListReader interface {
+	ListSourcesFromCache(context.Context) ([]gcs.WikiPage, error)
+	ListSources(context.Context) ([]gcs.WikiPage, error)
+}
+
+type conceptListReader interface {
+	ListConceptsFromCache(context.Context) ([]gcs.WikiPage, error)
+	ListConcepts(context.Context, bool) ([]gcs.WikiPage, error)
+}
+
+func listSourcesCacheFirst(ctx context.Context, reader sourceListReader) ([]gcs.WikiPage, error) {
+	sources, err := reader.ListSourcesFromCache(ctx)
+	if err == nil {
+		return sources, nil
+	}
+	if errors.Is(err, storage.ErrObjectNotExist) {
+		return reader.ListSources(ctx)
+	}
+	return nil, err
+}
+
+func listConceptsCacheFirst(ctx context.Context, reader conceptListReader, includeDrafts bool) ([]gcs.WikiPage, error) {
+	concepts, err := reader.ListConceptsFromCache(ctx)
+	if err == nil {
+		return concepts, nil
+	}
+	if errors.Is(err, storage.ErrObjectNotExist) {
+		return reader.ListConcepts(ctx, includeDrafts)
+	}
+	return nil, err
 }
 
 func addWikiPageIDsFromIDMap(ctx context.Context, reader indexReader, pages []gcs.WikiPage, pageType string) error {
@@ -557,7 +589,7 @@ func (h *Handler) ListConcepts(c *gin.Context) {
 		return
 	}
 
-	concepts, err := gcsClient.ListConcepts(ctx, includeDrafts)
+	concepts, err := listConceptsCacheFirst(ctx, gcsClient, includeDrafts)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: err.Error()})
 		return
@@ -1136,8 +1168,8 @@ func (h *Handler) Status(c *gin.Context) {
 	}
 
 	ctx := c.Request.Context()
-	sources, _ := gcsClient.ListSources(ctx)
-	concepts, _ := gcsClient.ListConcepts(ctx, true)
+	sources, _ := listSourcesCacheFirst(ctx, gcsClient)
+	concepts, _ := listConceptsCacheFirst(ctx, gcsClient, true)
 
 	resp := handler.StatusResponse{
 		SourcesCount:  len(sources),

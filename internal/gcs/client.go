@@ -1,8 +1,10 @@
 package gcs
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -52,6 +54,21 @@ type MarkdownFile struct {
 type wikiPageFrontmatter struct {
 	ID    string `yaml:"id"`
 	Title string `yaml:"title"`
+}
+
+const (
+	conceptsCachePath = "cache/concepts.jsonl"
+	idMapCachePath    = "cache/id_map.json"
+)
+
+type conceptCacheEntry struct {
+	Slug        string                 `json:"slug"`
+	Title       string                 `json:"title"`
+	Frontmatter map[string]interface{} `json:"frontmatter"`
+}
+
+type wikiIDMap struct {
+	Source map[string]string `json:"source"`
 }
 
 // NewClient creates a new GCS client for the given bucket.
@@ -126,6 +143,24 @@ func (c *Client) ListConcepts(ctx context.Context, includeDrafts bool) ([]WikiPa
 		return result, nil
 	}
 	return published, nil
+}
+
+// ListConceptsFromCache returns wiki concepts from the generated JSONL cache.
+func (c *Client) ListConceptsFromCache(ctx context.Context) ([]WikiPage, error) {
+	data, err := c.ReadFile(ctx, conceptsCachePath)
+	if err != nil {
+		return nil, err
+	}
+	return wikiPagesFromConceptsJSONL(data)
+}
+
+// ListSourcesFromCache returns wiki sources from the generated ID map cache.
+func (c *Client) ListSourcesFromCache(ctx context.Context) ([]WikiPage, error) {
+	data, err := c.ReadFile(ctx, idMapCachePath)
+	if err != nil {
+		return nil, err
+	}
+	return wikiPagesFromSourceIDMap(data)
 }
 
 // GetPage reads a wiki page by slug from sources or concepts.
@@ -290,6 +325,86 @@ func applyWikiPageFrontmatter(page WikiPage, data []byte) (WikiPage, error) {
 		page.Title = title
 	}
 	return page, nil
+}
+
+func wikiPagesFromConceptsJSONL(data []byte) ([]WikiPage, error) {
+	scanner := bufio.NewScanner(strings.NewReader(string(data)))
+	scanner.Buffer(make([]byte, 64*1024), 16*1024*1024)
+	pages := make([]WikiPage, 0)
+	lineNumber := 0
+	for scanner.Scan() {
+		lineNumber++
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+
+		var entry conceptCacheEntry
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			return nil, fmt.Errorf("decode concepts cache line %d: %w", lineNumber, err)
+		}
+		slug := strings.TrimSpace(entry.Slug)
+		if slug == "" {
+			continue
+		}
+		title := strings.TrimSpace(entry.Title)
+		if title == "" {
+			title = slug
+		}
+		pages = append(pages, WikiPage{
+			Slug:   slug,
+			Title:  title,
+			ID:     frontmatterStringValue(entry.Frontmatter, "id"),
+			Path:   fmt.Sprintf("wiki/%s.md", slug),
+			Status: "published",
+		})
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("scan concepts cache: %w", err)
+	}
+	return pages, nil
+}
+
+func wikiPagesFromSourceIDMap(data []byte) ([]WikiPage, error) {
+	var source wikiIDMap
+	if err := json.Unmarshal(data, &source); err != nil {
+		return nil, fmt.Errorf("decode source id map: %w", err)
+	}
+
+	pages := make([]WikiPage, 0, len(source.Source))
+	for id, slug := range source.Source {
+		id = strings.TrimSpace(id)
+		slug = strings.TrimSpace(slug)
+		if id == "" || slug == "" {
+			continue
+		}
+		pages = append(pages, WikiPage{
+			Slug:  slug,
+			Title: slug,
+			ID:    id,
+			Path:  fmt.Sprintf("wiki/sources/%s.md", slug),
+		})
+	}
+	sort.Slice(pages, func(i, j int) bool {
+		return pages[i].Slug < pages[j].Slug
+	})
+	return pages, nil
+}
+
+func frontmatterStringValue(frontmatter map[string]interface{}, key string) string {
+	if len(frontmatter) == 0 {
+		return ""
+	}
+	value, ok := frontmatter[key]
+	if !ok {
+		return ""
+	}
+	switch typed := value.(type) {
+	case string:
+		return strings.TrimSpace(typed)
+	default:
+		return strings.TrimSpace(fmt.Sprint(typed))
+	}
 }
 
 // UploadFile uploads a local file to GCS under the user/project prefix.
