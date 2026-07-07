@@ -22,6 +22,8 @@ var (
 	wikilinkRE       = regexp.MustCompile(`\[\[([^\[\]\n]+)\]\]`)
 )
 
+const idRouteRedirectStatus = http.StatusFound
+
 type idRouteEntry struct {
 	ID   string
 	Slug string
@@ -79,6 +81,13 @@ func rewriteWikilinks(markdownContent string, dual dualIDMap) string {
 		base, anchor, hasAnchor := strings.Cut(target, "#")
 		base = strings.TrimSpace(base)
 		if strings.HasPrefix(base, "concepts/") || strings.HasPrefix(base, "sources/") {
+			idx := strings.Index(base, "/")
+			idSlug := strings.TrimSpace(base[idx+1:])
+			if id, _, ok := idFromPathValue(idSlug); ok {
+				if entry, exists := dual.byID[id]; exists {
+					return canonicalWikilinkTarget(entry, anchor, hasAnchor, alias, hasAlias)
+				}
+			}
 			return link
 		}
 
@@ -87,15 +96,20 @@ func rewriteWikilinks(markdownContent string, dual dualIDMap) string {
 			return link
 		}
 		entry := entries[0]
-		nextTarget := routePrefix(entry.Type) + "/" + entryIDSlug(entry)
-		if hasAnchor {
-			nextTarget += "#" + anchor
-		}
-		if hasAlias {
-			return "[[" + nextTarget + "|" + alias + "]]"
-		}
-		return "[[" + nextTarget + "]]"
+		return canonicalWikilinkTarget(entry, anchor, hasAnchor, alias, hasAlias)
 	})
+}
+
+func canonicalWikilinkTarget(entry idRouteEntry, anchor string, hasAnchor bool, alias string, hasAlias bool) string {
+	target := routePrefix(entry.Type) + "/" + entryIDSlug(entry)
+	if hasAnchor {
+		target += "#" + anchor
+	}
+	label := entry.Slug
+	if hasAlias {
+		label = alias
+	}
+	return "[[" + target + "|" + label + "]]"
 }
 
 func parseIDSlug(value string) (string, string, bool) {
@@ -201,7 +215,7 @@ func (h *Handler) handleIDRoutedPage(c *gin.Context, gcsClient *gcs.Client, curr
 		return true
 	}
 	if target, ok := canonicalIDRoute(currentType, idSlug, dual); ok {
-		c.Redirect(http.StatusMovedPermanently, requestRelativeIDRoute(c, target))
+		c.Redirect(idRouteRedirectStatus, requestRelativeIDRoute(c, target))
 		return true
 	}
 

@@ -3,6 +3,7 @@ package v1
 import (
 	"context"
 	"errors"
+	"net/http"
 	"testing"
 
 	"cloud.google.com/go/storage"
@@ -36,7 +37,7 @@ func TestBuildDualIDMapPrefersConceptForDuplicateSlug(t *testing.T) {
 	}
 }
 
-func TestRewriteWikilinksCanonicalizesKnownSlugs(t *testing.T) {
+func TestRewriteWikilinksEmitsCanonicalTargetsWithSlugLabels(t *testing.T) {
 	dual := buildDualIDMap(idMap{
 		Concept: map[string]string{
 			"a3f7b2c01d9d": "alpha",
@@ -47,13 +48,19 @@ func TestRewriteWikilinksCanonicalizesKnownSlugs(t *testing.T) {
 			"d4c8f9b0a177": "shared",
 		},
 	})
-	input := "[[alpha]] [[alpha|Alias]] [[alpha#part|Section]] [[source-one]] [[missing]] [[concepts/a3f7b2c01d9d-alpha|Already]] [[shared|Shared]]"
+	input := "[[alpha]] [[alpha|Alias]] [[alpha#part|Section]] [[source-one]] [[missing]] [[concepts/a3f7b2c01d9d-alpha|Already]] [[sources/c5d9e3f1a028-source-one]] [[shared|Shared]]"
 
 	got := rewriteWikilinks(input, dual)
 
-	want := "[[concepts/a3f7b2c01d9d-alpha]] [[concepts/a3f7b2c01d9d-alpha|Alias]] [[concepts/a3f7b2c01d9d-alpha#part|Section]] [[sources/c5d9e3f1a028-source-one]] [[missing]] [[concepts/a3f7b2c01d9d-alpha|Already]] [[concepts/b7e2c9a4d113-shared|Shared]]"
+	want := "[[concepts/a3f7b2c01d9d-alpha|alpha]] [[concepts/a3f7b2c01d9d-alpha|Alias]] [[concepts/a3f7b2c01d9d-alpha#part|Section]] [[sources/c5d9e3f1a028-source-one|source-one]] [[missing]] [[concepts/a3f7b2c01d9d-alpha|Already]] [[sources/c5d9e3f1a028-source-one|source-one]] [[concepts/b7e2c9a4d113-shared|Shared]]"
 	if got != want {
 		t.Fatalf("rewriteWikilinks = %q, want %q", got, want)
+	}
+}
+
+func TestIDRouteRedirectStatusIsTemporary(t *testing.T) {
+	if idRouteRedirectStatus != http.StatusFound {
+		t.Fatalf("idRouteRedirectStatus = %d, want %d", idRouteRedirectStatus, http.StatusFound)
 	}
 }
 
