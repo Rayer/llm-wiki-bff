@@ -1,6 +1,0 @@
-./endpoints.go
-./handler.go
-./helpers.go
-./id_routing.go
-./idmap.go
-./metrics.go

@@ -87,15 +87,14 @@ func rewriteWikilinks(markdownContent string, dual dualIDMap) string {
 			return link
 		}
 		entry := entries[0]
-		nextTarget := "/" + routePrefix(entry.Type) + "/" + entry.ID
+		nextTarget := routePrefix(entry.Type) + "/" + entryIDSlug(entry)
 		if hasAnchor {
 			nextTarget += "#" + anchor
 		}
-		name := alias
-		if !hasAlias {
-			name = base
+		if hasAlias {
+			return "[[" + nextTarget + "|" + alias + "]]"
 		}
-		return "[" + name + "](" + nextTarget + ")"
+		return "[[" + nextTarget + "]]"
 	})
 }
 
@@ -126,10 +125,10 @@ func canonicalIDRoute(currentType, idSlug string, dual dualIDMap) (string, bool)
 	if !ok {
 		return "", false
 	}
-	if entry.Type == currentType && (slug == "" || slug == entry.Slug) {
+	if entry.Type == currentType && slug == entry.Slug {
 		return "", false
 	}
-	return "/" + routePrefix(entry.Type) + "/" + entry.ID, true
+	return "/" + routePrefix(entry.Type) + "/" + entryIDSlug(entry), true
 }
 
 func routePrefix(entryType string) string {
@@ -137,6 +136,10 @@ func routePrefix(entryType string) string {
 		return "sources"
 	}
 	return "concepts"
+}
+
+func entryIDSlug(entry idRouteEntry) string {
+	return entry.ID + "-" + entry.Slug
 }
 
 func (h *Handler) getIDRoutingMap(ctx context.Context, gcsClient *gcs.Client) (dualIDMap, error) {

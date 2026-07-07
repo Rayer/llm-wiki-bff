@@ -1,5 +1,0 @@
-./config.go
-./logging.go
-./picker.go
-./ring.go
-./ringhash.go

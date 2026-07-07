@@ -45,7 +45,6 @@ func NewClient(project, userID, projectID string) (*Client, error) {
 func (c *Client) GetStatus(ctx context.Context) (*Status, error) {
 	doc, err := c.locks.Doc(c.lockID).Get(ctx)
 	if err != nil {
-		// No lock document = not locked
 		return &Status{Locked: false}, nil
 	}
 
@@ -66,9 +65,7 @@ func (c *Client) GetStatus(ctx context.Context) (*Status, error) {
 	return s, nil
 }
 
-// CountActiveLocks returns the number of active (running) pipeline locks
-// across all users/projects. Each lock with status="active" and expires_at > now
-// represents one running pipeline.
+// CountActiveLocks returns the number of active pipeline locks.
 func (c *Client) CountActiveLocks(ctx context.Context) (int, error) {
 	iter := c.locks.Where("status", "==", "active").Documents(ctx)
 	defer iter.Stop()
@@ -82,8 +79,7 @@ func (c *Client) CountActiveLocks(ctx context.Context) (int, error) {
 			}
 			return count, err
 		}
-		data := doc.Data()
-		if t, ok := firestoreTimestamp(data["expires_at"]); ok && t.After(now) {
+		if _, ok := activeLockUntil(doc.Data(), now); ok {
 			count++
 		}
 	}
@@ -97,7 +93,7 @@ type ExecutionRecord struct {
 	StartedAt   time.Time `json:"started_at"`
 	FinishedAt  time.Time `json:"finished_at,omitempty"`
 	DurationSec float64   `json:"duration_sec,omitempty"`
-	Status      string    `json:"status"` // "running", "completed", "failed"
+	Status      string    `json:"status"`
 }
 
 // WriteExecutionStart records a pipeline execution start.
@@ -172,6 +168,18 @@ func (c *Client) ListRecentExecutions(ctx context.Context, limit int) ([]Executi
 		records = append(records, r)
 	}
 	return records, nil
+}
+
+func activeLockUntil(data map[string]interface{}, now time.Time) (time.Time, bool) {
+	status, _ := data["status"].(string)
+	if status != "active" {
+		return time.Time{}, false
+	}
+	expiresAt, ok := firestoreTimestamp(data["expires_at"])
+	if !ok || !expiresAt.After(now) {
+		return time.Time{}, false
+	}
+	return expiresAt, true
 }
 
 func firestoreTimestamp(value interface{}) (time.Time, bool) {

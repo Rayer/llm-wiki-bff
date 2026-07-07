@@ -1,6 +1,0 @@
-./app_engine.go
-./bms.go
-./detector.go
-./faas.go
-./gce.go
-./gke.go

@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"cloud.google.com/go/firestore"
 	"cloud.google.com/go/storage"
 	"github.com/gin-gonic/gin"
 	conceptcache "github.com/rayer/llm-wiki-bff/internal/cache"
@@ -21,14 +22,22 @@ import (
 	"github.com/rayer/llm-wiki-bff/internal/handler"
 	"github.com/rayer/llm-wiki-bff/internal/llm"
 	"github.com/rayer/llm-wiki-bff/internal/search"
+	"github.com/rayer/llm-wiki-bff/internal/wikiindex"
+	"google.golang.org/api/iterator"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 const (
 	defaultMetadataTokenURL = "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token"
 	defaultCloudRunJobURL   = "https://run.googleapis.com/v2/projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline:run"
+	defaultWorkerCommands   = `[["run","--auto-approve"]]`
 )
 
-var errIndexNotFound = errors.New("index not found")
+var (
+	errIndexNotFound          = errors.New("index not found")
+	errFirestoreNotConfigured = errors.New("Firestore client is not configured")
+)
 
 // Health handles GET /api/v1/health.
 //
@@ -122,9 +131,19 @@ func (h *Handler) ListProjects(c *gin.Context) {
 	resp := make([]handler.ProjectResponse, 0, len(projects))
 	for _, project := range projects {
 		name := project.ID
+		// Try GCS index.md title first
 		if data, err := h.gcs.WithScope(userID, project.ID).ReadFile(c.Request.Context(), "index.md"); err == nil {
 			if title := projectTitleFromIndex(data); title != "" {
 				name = title
+			}
+		}
+		// If still using project ID, try Firestore for the actual name
+		if name == project.ID && h.firestore != nil && h.firestore.Raw() != nil {
+			docID := userID + "_" + project.ID
+			if doc, err := h.firestore.Raw().Collection("projects").Doc(docID).Get(c.Request.Context()); err == nil {
+				if fsName, ok := doc.Data()["name"].(string); ok && strings.TrimSpace(fsName) != "" {
+					name = fsName
+				}
 			}
 		}
 		resp = append(resp, handler.ProjectResponse{
@@ -314,24 +333,40 @@ func cachedContexts(conceptCache *conceptcache.Cache, reader conceptcache.Reader
 //	@Security		ProjectHeader
 //	@Router			/api/v1/sources [get]
 func (h *Handler) ListSources(c *gin.Context) {
+	ctx := c.Request.Context()
+	uid := c.GetString("userID")
+	pid := c.GetString("projectID")
+	cacheKey := uid + "_" + pid
+
+	// Check list cache first
+	if cl := h.listCacheGet(cacheKey); cl.sources != nil {
+		srcs := cloneWikiPages(cl.sources)
+		c.JSON(http.StatusOK, handler.SourcesListResponse{Sources: srcs, Count: len(srcs)})
+		return
+	}
+
 	gcsClient, err := h.GetGCSClient(c)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: err.Error()})
 		return
 	}
 
-	sources, err := gcsClient.ListSources(c.Request.Context())
+	sources, err := gcsClient.ListSources(ctx)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: err.Error()})
 		return
 	}
-	if err := addWikiPageIDsFromIDMap(c.Request.Context(), gcsClient, sources, "source"); err != nil {
+	if err := addWikiPageIDsFromIDMap(ctx, gcsClient, sources, "source"); err != nil {
 		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: err.Error()})
 		return
 	}
 	if sources == nil {
 		sources = []gcs.WikiPage{}
 	}
+
+	// Cache the result
+	h.listCacheSet(cacheKey, func(cl *cachedLists) { cl.sources = cloneWikiPages(sources) })
+
 	c.JSON(http.StatusOK, handler.SourcesListResponse{Sources: sources, Count: len(sources)})
 }
 
@@ -447,11 +482,10 @@ func (h *Handler) GetSource(c *gin.Context) {
 //	@Security		ProjectHeader
 //	@Router			/api/v1/concepts [get]
 func (h *Handler) ListConcepts(c *gin.Context) {
-	gcsClient, err := h.GetGCSClient(c)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: err.Error()})
-		return
-	}
+	ctx := c.Request.Context()
+	uid := c.GetString("userID")
+	pid := c.GetString("projectID")
+	cacheKey := uid + "_" + pid
 
 	includeDrafts, err := strconv.ParseBool(c.DefaultQuery("include_drafts", "false"))
 	if err != nil {
@@ -459,18 +493,39 @@ func (h *Handler) ListConcepts(c *gin.Context) {
 		return
 	}
 
-	concepts, err := gcsClient.ListConcepts(c.Request.Context(), includeDrafts)
+	// Check list cache first (only for non-draft queries)
+	if !includeDrafts {
+		if cl := h.listCacheGet(cacheKey); cl.concepts != nil {
+			cc := cloneWikiPages(cl.concepts)
+			c.JSON(http.StatusOK, handler.ConceptsListResponse{Concepts: cc, Count: len(cc)})
+			return
+		}
+	}
+
+	gcsClient, err := h.GetGCSClient(c)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: err.Error()})
 		return
 	}
-	if err := addWikiPageIDsFromIDMap(c.Request.Context(), gcsClient, concepts, "concept"); err != nil {
+
+	concepts, err := gcsClient.ListConcepts(ctx, includeDrafts)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: err.Error()})
+		return
+	}
+	if err := addWikiPageIDsFromIDMap(ctx, gcsClient, concepts, "concept"); err != nil {
 		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: err.Error()})
 		return
 	}
 	if concepts == nil {
 		concepts = []gcs.WikiPage{}
 	}
+
+	// Cache non-draft results
+	if !includeDrafts {
+		h.listCacheSet(cacheKey, func(cl *cachedLists) { cl.concepts = cloneWikiPages(concepts) })
+	}
+
 	c.JSON(http.StatusOK, handler.ConceptsListResponse{Concepts: concepts, Count: len(concepts)})
 }
 
@@ -576,7 +631,7 @@ func (h *Handler) PipelineRun(c *gin.Context) {
 		"overrides": gin.H{
 			"containerOverrides": []gin.H{
 				{
-					"args": []string{"run"},
+					"args": []string{"run", defaultWorkerCommands},
 					"env": []gin.H{
 						{"name": "USER_ID", "value": userID},
 						{"name": "PROJECT_ID", "value": projectID},
@@ -784,6 +839,7 @@ func (h *Handler) RebuildIndex(c *gin.Context) {
 				"source":  len(next.Source),
 			},
 		})
+		h.listCacheInvalidate(userID + "_" + projectID)
 		return
 	}
 	if h.gcs == nil {
@@ -811,11 +867,13 @@ func (h *Handler) RebuildIndex(c *gin.Context) {
 	}()
 
 	gcsClient := h.gcs.WithScope(userID, projectID)
-	next, err := rebuildIndex(ctx, gcsClient)
+	next, err := wikiindex.Rebuild(ctx, newGCSWikiIndexStore(gcsClient))
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: err.Error()})
 		return
 	}
+
+	h.listCacheInvalidate(userID + "_" + projectID)
 
 	c.JSON(http.StatusOK, gin.H{
 		"status": "ok",
@@ -1054,4 +1112,709 @@ func (h *Handler) Status(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, resp)
+}
+
+// splitProjectDocID parses a Firestore doc ID in the format "{userID}_{projectID}".
+func splitProjectDocID(docID string) (userID, projectID string) {
+	if len(docID) < 14 {
+		return docID, ""
+	}
+	lastUnderscore := strings.LastIndex(docID, "_")
+	if lastUnderscore < 0 || lastUnderscore == len(docID)-1 {
+		return docID, ""
+	}
+	return docID[:lastUnderscore], docID[lastUnderscore+1:]
+}
+
+func (h *Handler) verifyAdminProjectExists(ctx context.Context, docID string) error {
+	if h.projectExists != nil {
+		return h.projectExists(ctx, docID)
+	}
+	if h.firestore == nil || h.firestore.Raw() == nil {
+		return errFirestoreNotConfigured
+	}
+	_, err := h.firestore.Raw().Collection("projects").Doc(docID).Get(ctx)
+	return err
+}
+
+// AdminProjects handles GET /admin/projects.
+//
+//	@Summary		List all projects (admin)
+//	@Description	Returns all projects from Firestore. Supports optional ?user_id query filter.
+//	@Tags			admin
+//	@Accept			json
+//	@Produce		json
+//	@Param			user_id	query		string	false	"Filter by user ID"
+//	@Success		200		{object}	map[string]any
+//	@Failure		401		{object}	handler.ErrorResponse
+//	@Failure		403		{object}	handler.ErrorResponse
+//	@Failure		500		{object}	handler.ErrorResponse
+//	@Security		BearerAuth
+//	@Router			/api/v1/admin/projects [get]
+func (h *Handler) AdminProjects(c *gin.Context) {
+	if h.firestore == nil || h.firestore.Raw() == nil {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "Firestore client is not configured"})
+		return
+	}
+
+	fs := h.firestore.Raw()
+	ctx := c.Request.Context()
+	filterUserID := strings.TrimSpace(c.Query("user_id"))
+
+	iter := fs.Collection("projects").Documents(ctx)
+	defer iter.Stop()
+
+	type projectEntry struct {
+		ID        string `json:"id"`
+		Name      string `json:"name"`
+		UserID    string `json:"user_id"`
+		UserName  string `json:"user_name"`
+		UserEmail string `json:"user_email"`
+		ProjectID string `json:"project_id"`
+	}
+
+	type rawProject struct {
+		id   string
+		name string
+		uid  string
+		pid  string
+	}
+
+	rawProjects := make([]rawProject, 0)
+	userIDs := make(map[string]bool)
+
+	for {
+		doc, err := iter.Next()
+		if err != nil {
+			if status.Code(err) == codes.NotFound || errors.Is(err, iterator.Done) {
+				break
+			}
+			c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "list projects: " + err.Error()})
+			return
+		}
+		uid, pid := splitProjectDocID(doc.Ref.ID)
+
+		if filterUserID != "" && uid != filterUserID {
+			continue
+		}
+
+		data := doc.Data()
+		name, _ := data["name"].(string)
+		rawProjects = append(rawProjects, rawProject{doc.Ref.ID, name, uid, pid})
+		userIDs[uid] = true
+	}
+
+	// Batch-fetch user names and emails
+	userMap := make(map[string]struct{ name, email string })
+	for uid := range userIDs {
+		userDoc, err := fs.Collection("users").Doc(uid).Get(ctx)
+		if err != nil {
+			continue // user might be deleted
+		}
+		data := userDoc.Data()
+		name, _ := data["name"].(string)
+		email, _ := data["email"].(string)
+		if name == "" && email != "" {
+			if at := strings.Index(email, "@"); at > 0 {
+				name = email[:at]
+			}
+		}
+		userMap[uid] = struct{ name, email string }{name, email}
+	}
+
+	projects := make([]projectEntry, 0, len(rawProjects))
+	for _, rp := range rawProjects {
+		u := userMap[rp.uid]
+		projects = append(projects, projectEntry{
+			ID:        rp.id,
+			Name:      rp.name,
+			UserID:    rp.uid,
+			UserName:  u.name,
+			UserEmail: u.email,
+			ProjectID: rp.pid,
+		})
+	}
+
+	c.JSON(http.StatusOK, gin.H{"projects": projects})
+}
+
+// AdminDeleteProject handles DELETE /admin/projects/{id}.
+//
+//	@Summary		Delete a project (admin)
+//	@Description	Deletes a project: removes GCS data, Firestore project doc, and lock doc.
+//	@Tags			admin
+//	@Accept			json
+//	@Produce		json
+//	@Param			id	path		string	true	"Project doc ID ({userID}_{projectID})"
+//	@Success		200	{object}	map[string]any
+//	@Failure		401	{object}	handler.ErrorResponse
+//	@Failure		403	{object}	handler.ErrorResponse
+//	@Failure		404	{object}	handler.ErrorResponse
+//	@Failure		500	{object}	handler.ErrorResponse
+//	@Security		BearerAuth
+//	@Router			/api/v1/admin/projects/{id} [delete]
+func (h *Handler) AdminDeleteProject(c *gin.Context) {
+	docID := c.Param("id")
+	uid, pid := splitProjectDocID(docID)
+	if pid == "" {
+		c.JSON(http.StatusBadRequest, handler.ErrorResponse{Error: "invalid project doc ID"})
+		return
+	}
+	if h.firestore == nil || h.firestore.Raw() == nil {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "Firestore client is not configured"})
+		return
+	}
+
+	fs := h.firestore.Raw()
+	ctx := c.Request.Context()
+
+	docRef := fs.Collection("projects").Doc(docID)
+	dsnap, err := docRef.Get(ctx)
+	if err != nil {
+		if status.Code(err) == codes.NotFound {
+			c.JSON(http.StatusNotFound, handler.ErrorResponse{Error: "project not found: " + docID})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "read project: " + err.Error()})
+		return
+	}
+
+	data := dsnap.Data()
+	name, _ := data["name"].(string)
+
+	// Delete GCS data
+	if h.gcs != nil {
+		prefix := fmt.Sprintf("users/%s/projects/%s/", uid, pid)
+		if err := deleteGCSPrefix(ctx, h.gcs, prefix); err != nil {
+			log.Printf("[admin] GCS cleanup warning for %s: %v", docID, err)
+		}
+	}
+
+	// Delete lock doc
+	lockRef := fs.Collection("locks").Doc(fmt.Sprintf("%s__%s", uid, pid))
+	if _, err := lockRef.Delete(ctx); err != nil && status.Code(err) != codes.NotFound {
+		log.Printf("[admin] lock cleanup warning for %s: %v", docID, err)
+	}
+
+	// Delete project doc
+	if _, err := docRef.Delete(ctx); err != nil {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "delete project: " + err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"status":  "deleted",
+		"id":      docID,
+		"user_id": uid,
+		"name":    name,
+	})
+}
+
+// AdminRenameProject handles PATCH /admin/projects/{id}.
+//
+//	@Summary		Rename a project (admin)
+//	@Description	Updates the name field on a Firestore project document.
+//	@Tags			admin
+//	@Accept			json
+//	@Produce		json
+//	@Param			id		path		string	true	"Project doc ID ({userID}_{projectID})"
+//	@Param			body	body		object{name=string}	true	"New project name"
+//	@Success		200		{object}	map[string]any
+//	@Failure		400		{object}	handler.ErrorResponse
+//	@Failure		401		{object}	handler.ErrorResponse
+//	@Failure		403		{object}	handler.ErrorResponse
+//	@Failure		404		{object}	handler.ErrorResponse
+//	@Failure		500		{object}	handler.ErrorResponse
+//	@Security		BearerAuth
+//	@Router			/api/v1/admin/projects/{id} [patch]
+func (h *Handler) AdminRenameProject(c *gin.Context) {
+	docID := c.Param("id")
+	uid, pid := splitProjectDocID(docID)
+	if pid == "" {
+		c.JSON(http.StatusBadRequest, handler.ErrorResponse{Error: "invalid project doc ID"})
+		return
+	}
+
+	var body struct {
+		Name string `json:"name"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, handler.ErrorResponse{Error: "invalid JSON: " + err.Error()})
+		return
+	}
+	if strings.TrimSpace(body.Name) == "" {
+		c.JSON(http.StatusBadRequest, handler.ErrorResponse{Error: "name is required"})
+		return
+	}
+	if h.firestore == nil || h.firestore.Raw() == nil {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "Firestore client is not configured"})
+		return
+	}
+
+	fs := h.firestore.Raw()
+	ctx := c.Request.Context()
+
+	docRef := fs.Collection("projects").Doc(docID)
+	_, err := docRef.Get(ctx)
+	if err != nil {
+		if status.Code(err) == codes.NotFound {
+			c.JSON(http.StatusNotFound, handler.ErrorResponse{Error: "project not found: " + docID})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "read project: " + err.Error()})
+		return
+	}
+
+	if _, err := docRef.Update(ctx, []firestore.Update{
+		{Path: "name", Value: body.Name},
+	}); err != nil {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "update project: " + err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"id":      docID,
+		"name":    body.Name,
+		"user_id": uid,
+	})
+}
+
+// AdminRebuildIndex handles POST /admin/projects/{id}/rebuild-index.
+//
+//	@Summary		Rebuild index for a project (admin)
+//	@Description	Triggers an index rebuild for the specified project using GCS-scoped data.
+//	@Tags			admin
+//	@Accept			json
+//	@Produce		json
+//	@Param			id	path		string	true	"Project doc ID ({userID}_{projectID})"
+//	@Success		200	{object}	map[string]any
+//	@Failure		400	{object}	handler.ErrorResponse
+//	@Failure		401	{object}	handler.ErrorResponse
+//	@Failure		403	{object}	handler.ErrorResponse
+//	@Failure		404	{object}	handler.ErrorResponse
+//	@Failure		409	{object}	handler.ErrorResponse
+//	@Failure		500	{object}	handler.ErrorResponse
+//	@Security		BearerAuth
+//	@Router			/api/v1/admin/projects/{id}/rebuild-index [post]
+func (h *Handler) AdminRebuildIndex(c *gin.Context) {
+	docID := c.Param("id")
+	uid, pid := splitProjectDocID(docID)
+	if pid == "" {
+		c.JSON(http.StatusBadRequest, handler.ErrorResponse{Error: "invalid project doc ID"})
+		return
+	}
+	ctx := c.Request.Context()
+	if err := h.verifyAdminProjectExists(ctx, docID); err != nil {
+		if errors.Is(err, errFirestoreNotConfigured) {
+			c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: err.Error()})
+			return
+		}
+		if status.Code(err) == codes.NotFound {
+			c.JSON(http.StatusNotFound, handler.ErrorResponse{Error: "project not found: " + docID})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "read project: " + err.Error()})
+		return
+	}
+
+	// Use injected rebuildIndex if available
+	if h.rebuildIndex != nil {
+		next, err := h.rebuildIndex(ctx, uid, pid)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: err.Error()})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"status": "ok",
+			"entries": gin.H{
+				"concept": len(next.Concept),
+				"source":  len(next.Source),
+			},
+		})
+		h.listCacheInvalidate(uid + "_" + pid)
+		return
+	}
+
+	if h.firestore == nil || h.firestore.Raw() == nil {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "Firestore client is not configured"})
+		return
+	}
+	if h.gcs == nil {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "GCS client is not configured"})
+		return
+	}
+	fs := h.firestore.Raw()
+
+	// Acquire lock
+	if err := acquireRebuildIndexLock(ctx, fs, uid, pid, time.Now()); err != nil {
+		if errors.Is(err, errRebuildIndexLocked) {
+			c.JSON(http.StatusConflict, handler.ErrorResponse{Error: "rebuild index already running"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "acquire rebuild index lock: " + err.Error()})
+		return
+	}
+	defer func() {
+		if err := releaseRebuildIndexLock(context.Background(), fs, uid, pid); err != nil {
+			log.Printf("[admin] release rebuild index lock failed for %s/%s: %v", uid, pid, err)
+		}
+	}()
+
+	gcsClient := h.gcs.WithScope(uid, pid)
+	next, err := wikiindex.Rebuild(ctx, newGCSWikiIndexStore(gcsClient))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: err.Error()})
+		return
+	}
+
+	h.listCacheInvalidate(uid + "_" + pid)
+
+	c.JSON(http.StatusOK, gin.H{
+		"status": "ok",
+		"entries": gin.H{
+			"concept": len(next.Concept),
+			"source":  len(next.Source),
+		},
+	})
+}
+
+// AdminPipelineTrigger handles POST /admin/projects/{id}/pipeline.
+//
+//	@Summary		Trigger pipeline + rebuild for a project (admin)
+//	@Description	Invokes the Cloud Run worker job for the specified project, then rebuilds the search index.
+//	@Tags			admin
+//	@Accept			json
+//	@Produce		json
+//	@Param			id	path		string	true	"Project doc ID ({userID}_{projectID})"
+//	@Success		200	{object}	map[string]any
+//	@Failure		400	{object}	handler.ErrorResponse
+//	@Failure		401	{object}	handler.ErrorResponse
+//	@Failure		403	{object}	handler.ErrorResponse
+//	@Failure		404	{object}	handler.ErrorResponse
+//	@Failure		409	{object}	handler.ErrorResponse
+//	@Failure		500	{object}	handler.ErrorResponse
+//	@Security		BearerAuth
+//	@Router			/api/v1/admin/projects/{id}/pipeline [post]
+func (h *Handler) AdminPipelineTrigger(c *gin.Context) {
+	docID := c.Param("id")
+	uid, pid := splitProjectDocID(docID)
+	if pid == "" {
+		c.JSON(http.StatusBadRequest, handler.ErrorResponse{Error: "invalid project doc ID"})
+		return
+	}
+	ctx := c.Request.Context()
+	if err := h.verifyAdminProjectExists(ctx, docID); err != nil {
+		if errors.Is(err, errFirestoreNotConfigured) {
+			c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: err.Error()})
+			return
+		}
+		if status.Code(err) == codes.NotFound {
+			c.JSON(http.StatusNotFound, handler.ErrorResponse{Error: "project not found: " + docID})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "read project: " + err.Error()})
+		return
+	}
+
+	// Get metadata access token for Cloud Run Jobs API
+	mdToken, err := h.getMetadataAccessToken(ctx)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "auth: " + err.Error()})
+		return
+	}
+
+	// Invoke Cloud Run worker job with user/project overrides
+	body, err := json.Marshal(gin.H{
+		"overrides": gin.H{
+			"containerOverrides": []gin.H{
+				{
+					"args": []string{"run", defaultWorkerCommands},
+					"env": []gin.H{
+						{"name": "USER_ID", "value": uid},
+						{"name": "PROJECT_ID", "value": pid},
+						{"name": "TASK_TYPE", "value": "pipeline"},
+					},
+				},
+			},
+		},
+	})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "marshal: " + err.Error()})
+		return
+	}
+
+	runURL := h.cloudRunJobURL
+	if runURL == "" {
+		runURL = defaultCloudRunJobURL
+	}
+	runReq, err := http.NewRequestWithContext(ctx, http.MethodPost, runURL, bytes.NewReader(body))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "request: " + err.Error()})
+		return
+	}
+	runReq.Header.Set("Authorization", "Bearer "+mdToken)
+	runReq.Header.Set("Content-Type", "application/json")
+
+	resp, err := h.pipelineHTTPClient().Do(runReq)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "invoke: " + err.Error()})
+		return
+	}
+	defer resp.Body.Close()
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "read: " + err.Error()})
+		return
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "invoke failed: " + string(respBody)})
+		return
+	}
+	executionID, err := cloudRunExecutionIDFromRunResponse(respBody)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "invoke failed: " + err.Error()})
+		return
+	}
+	log.Printf("Admin pipeline triggered: %s/%s execution=%s", uid, pid, executionID)
+
+	c.JSON(http.StatusOK, gin.H{
+		"status":       "ok",
+		"execution_id": executionID,
+	})
+}
+
+// AdminListUsers handles GET /admin/users.
+//
+//	@Summary		List all users (admin)
+//	@Description	Returns all users from Firestore. Supports optional ?role=admin query filter.
+//	@Tags			admin
+//	@Accept			json
+//	@Produce		json
+//	@Param			role	query		string	false	"Filter by role (e.g. admin)"
+//	@Success		200		{object}	map[string]any
+//	@Failure		401		{object}	handler.ErrorResponse
+//	@Failure		403		{object}	handler.ErrorResponse
+//	@Failure		500		{object}	handler.ErrorResponse
+//	@Security		BearerAuth
+//	@Router			/api/v1/admin/users [get]
+func (h *Handler) AdminListUsers(c *gin.Context) {
+	if h.firestore == nil || h.firestore.Raw() == nil {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "Firestore client is not configured"})
+		return
+	}
+
+	fs := h.firestore.Raw()
+	ctx := c.Request.Context()
+	filterRole := strings.TrimSpace(c.Query("role"))
+
+	var iter *firestore.DocumentIterator
+	if filterRole != "" {
+		iter = fs.Collection("users").Where("role", "==", filterRole).Documents(ctx)
+	} else {
+		iter = fs.Collection("users").Documents(ctx)
+	}
+	defer iter.Stop()
+
+	type userEntry struct {
+		ID    string `json:"id"`
+		Name  string `json:"name"`
+		Email string `json:"email"`
+		Role  string `json:"role"`
+	}
+
+	users := make([]userEntry, 0)
+	for {
+		doc, err := iter.Next()
+		if err != nil {
+			if status.Code(err) == codes.NotFound || errors.Is(err, iterator.Done) {
+				break
+			}
+			c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "list users: " + err.Error()})
+			return
+		}
+		data := doc.Data()
+		name, _ := data["name"].(string)
+		email, _ := data["email"].(string)
+		role, _ := data["role"].(string)
+		// Fallback: derive display name from email if name is empty
+		if name == "" && email != "" {
+			if at := strings.Index(email, "@"); at > 0 {
+				name = email[:at]
+			} else {
+				name = email
+			}
+		}
+		users = append(users, userEntry{
+			ID:    doc.Ref.ID,
+			Name:  name,
+			Email: email,
+			Role:  role,
+		})
+	}
+
+	c.JSON(http.StatusOK, gin.H{"users": users})
+}
+
+// AdminUpdateUser handles PATCH /admin/users/{id}.
+//
+//	@Summary		Update a user (admin)
+//	@Description	Updates a user's role in Firestore.
+//	@Tags			admin
+//	@Accept			json
+//	@Produce		json
+//	@Param			id		path		string	true	"User ID"
+//	@Param			body	body		object{role=string}	true	"New role (e.g. admin)"
+//	@Success		200		{object}	map[string]any
+//	@Failure		400		{object}	handler.ErrorResponse
+//	@Failure		401		{object}	handler.ErrorResponse
+//	@Failure		403		{object}	handler.ErrorResponse
+//	@Failure		404		{object}	handler.ErrorResponse
+//	@Failure		500		{object}	handler.ErrorResponse
+//	@Security		BearerAuth
+//	@Router			/api/v1/admin/users/{id} [patch]
+func (h *Handler) AdminUpdateUser(c *gin.Context) {
+	if h.firestore == nil || h.firestore.Raw() == nil {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "Firestore client is not configured"})
+		return
+	}
+
+	userID := c.Param("id")
+
+	var body struct {
+		Role string `json:"role"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, handler.ErrorResponse{Error: "invalid JSON: " + err.Error()})
+		return
+	}
+	if strings.TrimSpace(body.Role) == "" {
+		c.JSON(http.StatusBadRequest, handler.ErrorResponse{Error: "role is required"})
+		return
+	}
+
+	fs := h.firestore.Raw()
+	ctx := c.Request.Context()
+
+	docRef := fs.Collection("users").Doc(userID)
+	_, err := docRef.Get(ctx)
+	if err != nil {
+		if status.Code(err) == codes.NotFound {
+			c.JSON(http.StatusNotFound, handler.ErrorResponse{Error: "user not found: " + userID})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "read user: " + err.Error()})
+		return
+	}
+
+	if _, err := docRef.Update(ctx, []firestore.Update{
+		{Path: "role", Value: body.Role},
+	}); err != nil {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "update user: " + err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"status": "updated",
+		"id":     userID,
+	})
+}
+
+// AdminDeleteUser handles DELETE /admin/users/{id}.
+//
+//	@Summary		Delete a user (admin)
+//	@Description	Deletes a user and all their projects (GCS data + Firestore docs + locks).
+//	@Tags			admin
+//	@Accept			json
+//	@Produce		json
+//	@Param			id	path		string	true	"User ID"
+//	@Success		200	{object}	map[string]any
+//	@Failure		401	{object}	handler.ErrorResponse
+//	@Failure		403	{object}	handler.ErrorResponse
+//	@Failure		404	{object}	handler.ErrorResponse
+//	@Failure		500	{object}	handler.ErrorResponse
+//	@Security		BearerAuth
+//	@Router			/api/v1/admin/users/{id} [delete]
+func (h *Handler) AdminDeleteUser(c *gin.Context) {
+	if h.firestore == nil || h.firestore.Raw() == nil {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "Firestore client is not configured"})
+		return
+	}
+
+	userID := c.Param("id")
+	fs := h.firestore.Raw()
+	ctx := c.Request.Context()
+
+	// Verify user exists
+	_, err := fs.Collection("users").Doc(userID).Get(ctx)
+	if err != nil {
+		if status.Code(err) == codes.NotFound {
+			c.JSON(http.StatusNotFound, handler.ErrorResponse{Error: "user not found: " + userID})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "read user: " + err.Error()})
+		return
+	}
+
+	// Find and delete all projects belonging to this user
+	iter := fs.Collection("projects").Documents(ctx)
+	defer iter.Stop()
+
+	for {
+		doc, err := iter.Next()
+		if err != nil {
+			if status.Code(err) == codes.NotFound || errors.Is(err, iterator.Done) {
+				break
+			}
+			c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "list projects: " + err.Error()})
+			return
+		}
+
+		uid, pid := splitProjectDocID(doc.Ref.ID)
+		if uid != userID {
+			continue
+		}
+
+		// Delete GCS data
+		if h.gcs != nil && pid != "" {
+			prefix := fmt.Sprintf("users/%s/projects/%s/", userID, pid)
+			if err := deleteGCSPrefix(ctx, h.gcs, prefix); err != nil {
+				log.Printf("[admin] GCS cleanup warning for %s/%s: %v", userID, pid, err)
+			}
+		}
+
+		// Delete lock doc
+		lockRef := fs.Collection("locks").Doc(fmt.Sprintf("%s__%s", userID, pid))
+		if _, err := lockRef.Delete(ctx); err != nil && status.Code(err) != codes.NotFound {
+			log.Printf("[admin] lock cleanup warning for %s/%s: %v", userID, pid, err)
+		}
+
+		// Delete project doc
+		if _, err := doc.Ref.Delete(ctx); err != nil {
+			log.Printf("[admin] project delete warning for %s: %v", doc.Ref.ID, err)
+		}
+	}
+
+	// Delete user doc
+	if _, err := fs.Collection("users").Doc(userID).Delete(ctx); err != nil {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "delete user: " + err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"status": "deleted",
+		"id":     userID,
+	})
+}
+
+type gcsPrefixDeleter interface {
+	DeletePrefix(context.Context, string) (int, error)
+}
+
+func deleteGCSPrefix(ctx context.Context, client any, prefix string) error {
+	deleter, ok := client.(gcsPrefixDeleter)
+	if !ok {
+		return nil
+	}
+	_, err := deleter.DeletePrefix(ctx, prefix)
+	return err
 }
