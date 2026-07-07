@@ -23,6 +23,7 @@ type workerConfig struct {
 	UserID      string
 	ProjectID   string
 	APIKey      string
+	InitVault   bool
 	Postprocess bool
 	StopOnError bool
 }
@@ -64,6 +65,7 @@ func newRootCommand() *cobra.Command {
 			return runWorkerBatch(cmd.Context(), runCfg, args[0])
 		},
 	}
+	runCmd.Flags().BoolVar(&cfg.InitVault, "init", false, "run 'olw init .' before the command batch")
 	runCmd.Flags().BoolVar(&cfg.Postprocess, "postprocess", true, "run postprocess after successful batch")
 	runCmd.Flags().BoolVar(&noPostprocess, "no-postprocess", false, "skip postprocess after batch")
 
@@ -84,6 +86,9 @@ func runWorkerBatch(ctx context.Context, cfg workerConfig, rawCommands string) e
 	commands, err := parseCommandBatch(rawCommands)
 	if err != nil {
 		return err
+	}
+	if cfg.InitVault {
+		commands = append([][]string{{"init", "."}}, commands...)
 	}
 	vault, err := resolveVaultPath(cfg)
 	if err != nil {

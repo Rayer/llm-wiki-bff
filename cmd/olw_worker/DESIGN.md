@@ -50,6 +50,15 @@ Postprocess-only command:
 worker postprocess --vault /path/to/project
 ```
 
+Local bootstrap command:
+
+```bash
+worker run '[["run","--auto-approve"]]' --vault /path/to/project --init
+```
+
+`--init` prepends `olw init .` before the command batch. It exists for local
+bootstrap safety when a developer is starting from an empty vault directory.
+
 `olw init` is intentionally not part of the default Cloud Run command batch.
 OLW 0.8.5 requires `olw init <VAULT_PATH>`, and `olw init .` overwrites
 `wiki.toml` with local Ollama defaults. The worker instead ensures a suitable
@@ -269,6 +278,8 @@ Please review these points before merge:
 
 - The active design is direct Cloud Run Job invocation, not trigger-file polling.
 - The default worker command intentionally excludes `olw init`.
+- `--init` is available for local bootstrap only. Do not add it to the Cloud Run
+  default job args unless OLW init no longer overwrites provider config.
 - Existing `wiki.toml` files are preserved. If a project vault already contains
   local Ollama config, it must be migrated to DeepSeek manually or through a
   separate repair task.

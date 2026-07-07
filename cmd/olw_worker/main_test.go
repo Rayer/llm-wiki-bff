@@ -155,6 +155,53 @@ func TestRunWorkerBatchPassesIsolatedOLWEnvironment(t *testing.T) {
 	}
 }
 
+func TestRunWorkerBatchCanInitializeVaultBeforeCommands(t *testing.T) {
+	old := execOLW
+	defer func() { execOLW = old }()
+
+	vault := t.TempDir()
+	var ran [][]string
+	execOLW = func(_ context.Context, _ string, command []string, _ []string) error {
+		ran = append(ran, append([]string(nil), command...))
+		return nil
+	}
+
+	cfg := workerConfig{VaultPath: vault, APIKey: "secret", InitVault: true, Postprocess: false, StopOnError: true}
+	if err := runWorkerBatch(context.Background(), cfg, `[["run","--auto-approve"]]`); err != nil {
+		t.Fatalf("runWorkerBatch() error = %v", err)
+	}
+
+	want := [][]string{{"init", "."}, {"run", "--auto-approve"}}
+	if len(ran) != len(want) {
+		t.Fatalf("ran = %#v, want %#v", ran, want)
+	}
+	for i := range want {
+		if strings.Join(ran[i], "\x00") != strings.Join(want[i], "\x00") {
+			t.Fatalf("ran = %#v, want %#v", ran, want)
+		}
+	}
+}
+
+func TestRunWorkerBatchDoesNotInitializeVaultByDefault(t *testing.T) {
+	old := execOLW
+	defer func() { execOLW = old }()
+
+	vault := t.TempDir()
+	var ran [][]string
+	execOLW = func(_ context.Context, _ string, command []string, _ []string) error {
+		ran = append(ran, append([]string(nil), command...))
+		return nil
+	}
+
+	cfg := workerConfig{VaultPath: vault, APIKey: "secret", Postprocess: false, StopOnError: true}
+	if err := runWorkerBatch(context.Background(), cfg, `[["run","--auto-approve"]]`); err != nil {
+		t.Fatalf("runWorkerBatch() error = %v", err)
+	}
+	if len(ran) != 1 || strings.Join(ran[0], "\x00") != "run\x00--auto-approve" {
+		t.Fatalf("ran = %#v, want only run command", ran)
+	}
+}
+
 func TestRunOLWBatchStopsOnFirstFailure(t *testing.T) {
 	old := execOLW
 	defer func() { execOLW = old }()
