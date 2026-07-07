@@ -7,3 +7,4 @@ llm-wiki-bff
 .worktrees/
 .idea/
 local-data/
+.ai/
