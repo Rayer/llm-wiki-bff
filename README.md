@@ -47,6 +47,15 @@ make dev
 
 BFF listens on `http://localhost:8080`. Frontend listens on `http://localhost:3000`.
 
+Local frontend login is enabled in BFF local mode:
+
+```text
+email: demo@llm-wiki.dev
+password: demo123456
+```
+
+The frontend "Try demo" button uses these credentials.
+
 Local scoped API calls require dev headers:
 
 ```text
@@ -57,6 +66,9 @@ X-Project-ID: demo
 Example smoke checks:
 
 ```sh
+curl -X POST http://localhost:8080/api/v1/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"demo@llm-wiki.dev","password":"demo123456"}'
 curl -H 'X-User-ID: local-user' http://localhost:8080/api/v1/projects
 curl -H 'X-User-ID: local-user' -H 'X-Project-ID: demo' http://localhost:8080/api/v1/concepts
 curl -H 'X-User-ID: local-user' -H 'X-Project-ID: demo' http://localhost:8080/api/v1/sources

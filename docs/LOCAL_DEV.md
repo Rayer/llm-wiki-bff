@@ -65,6 +65,17 @@ NEXT_PUBLIC_DEV_USER_ID=local-user
 NEXT_PUBLIC_DEV_PROJECT_ID=demo
 ```
 
+## Frontend Login
+
+BFF local mode supports a local-only demo account so the frontend login flow can be tested without Firestore:
+
+```text
+email: demo@llm-wiki.dev
+password: demo123456
+```
+
+The frontend "Try demo" button uses the same credentials. After login, the access token identifies `local-user`, so project listing reads `local-data/users/local-user/projects/demo`.
+
 ## Troubleshooting
 
 - Port `8080` is busy: run `lsof -i :8080`.
@@ -73,4 +84,5 @@ NEXT_PUBLIC_DEV_PROJECT_ID=demo
 - Projects return unauthorized: include `X-User-ID: local-user`.
 - Scoped endpoints fail: include `X-Project-ID: demo`.
 - Concepts or sources are empty: verify `local-data/users/local-user/projects/demo/cache`.
-- Auth endpoints return 503 in local mode: use DEV JWT headers instead of login/register.
+- Login fails in local mode: use `demo@llm-wiki.dev` / `demo123456`.
+- Register returns 503 in local mode: registration still requires the production Firestore-backed path.

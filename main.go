@@ -153,8 +153,12 @@ func main() {
 	r.Use(middleware.LatencyMiddleware())
 
 	// CORS — must be BEFORE routes
+	allowOrigins := []string{"https://wiki.rayer.idv.tw", "https://llm-wiki-frontend.vercel.app", "https://llm-wiki-bff-dev.rayer.idv.tw"}
+	if localMode {
+		allowOrigins = append(allowOrigins, "http://localhost:3000", "http://127.0.0.1:3000")
+	}
 	r.Use(cors.New(cors.Config{
-		AllowOrigins:     []string{"https://wiki.rayer.idv.tw", "https://llm-wiki-frontend.vercel.app", "https://llm-wiki-bff-dev.rayer.idv.tw"},
+		AllowOrigins:     allowOrigins,
 		AllowMethods:     []string{"GET", "POST", "OPTIONS"},
 		AllowHeaders:     []string{"Content-Type", "Authorization", "X-User-ID", "X-Project-ID", "Idempotency-Key"},
 		AllowCredentials: true,
@@ -163,9 +167,16 @@ func main() {
 	// Public auth routes (no auth middleware)
 	authRoutes := r.Group("/api/v1/auth")
 	{
-		if fsClient == nil || fsClient.Raw() == nil {
+		if localMode {
+			authRoutes.POST("/login", middleware.NewRateLimiter(10, time.Minute), auth.LocalDevLoginHandler(cfg.JWTSecret))
+			authRoutes.POST("/register", func(c *gin.Context) {
+				c.JSON(http.StatusServiceUnavailable, gin.H{"error": "registration is disabled in local mode; use demo@llm-wiki.dev / demo123456"})
+			})
+			authRoutes.POST("/refresh", auth.LocalDevRefreshHandler(cfg.JWTSecret))
+			authRoutes.POST("/logout", auth.LogoutHandler())
+		} else if fsClient == nil || fsClient.Raw() == nil {
 			unavailable := func(c *gin.Context) {
-				c.JSON(http.StatusServiceUnavailable, gin.H{"error": "auth routes require Firestore; use DEV_JWT headers in local mode"})
+				c.JSON(http.StatusServiceUnavailable, gin.H{"error": "auth routes require Firestore"})
 			}
 			authRoutes.POST("/login", unavailable)
 			authRoutes.POST("/register", unavailable)
