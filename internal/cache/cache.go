@@ -16,7 +16,7 @@ import (
 	"github.com/rayer/llm-wiki-bff/internal/search"
 )
 
-// GCSPath is reserved for a future persisted JSONL cache.
+// GCSPath is the persisted JSONL concept cache written by the pipeline.
 const GCSPath = "cache/concepts.jsonl"
 
 // Entry is the cached representation of a concept page.
@@ -59,14 +59,25 @@ func New() *Cache {
 	}
 }
 
-// Build reads all published concepts for a project and replaces that project's
-// in-memory cache. Individual page failures are skipped unless every listed
-// concept fails.
+// Build loads the project concept cache, preferring the persisted JSONL file.
+// When JSONL is unavailable it falls back to reading each concept page from
+// storage. Individual page failures are skipped unless every listed concept
+// fails.
 func (c *Cache) Build(ctx context.Context, reader conceptReader) ([]Entry, error) {
 	if reader == nil {
 		return nil, fmt.Errorf("concept cache reader is nil")
 	}
 
+	if err := c.loadJSONL(ctx, reader); err == nil {
+		if project, ok := c.project(reader); ok {
+			return cloneEntries(project.entries), nil
+		}
+	}
+
+	return c.buildFromPages(ctx, reader)
+}
+
+func (c *Cache) buildFromPages(ctx context.Context, reader conceptReader) ([]Entry, error) {
 	concepts, err := reader.ListConcepts(ctx, false)
 	if err != nil {
 		return nil, fmt.Errorf("list concepts: %w", err)
@@ -154,16 +165,18 @@ func (c *Cache) Prefixes() []string {
 	return prefixes
 }
 
-// Search finds matching concepts in a project cache. The project is built on
-// first use with a 10-second timeout, then results are sampled without
-// replacement using match score as the weight.
+// Search finds matching concepts in a project cache. The project is loaded from
+// JSONL or built on first use with a 10-second timeout, then results are
+// sampled without replacement using match score as the weight.
 func (c *Cache) Search(ctx context.Context, reader conceptReader, query string, limit int) ([]search.Result, error) {
 	project, ok := c.project(reader)
 	if !ok {
-		buildCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		defer cancel()
-		if _, err := c.Build(buildCtx, reader); err != nil {
-			return nil, fmt.Errorf("concept cache build for %q: %w", prefixForReader(reader), err)
+		if err := c.loadJSONL(ctx, reader); err != nil {
+			buildCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			defer cancel()
+			if _, err := c.Build(buildCtx, reader); err != nil {
+				return nil, fmt.Errorf("concept cache build for %q: %w", prefixForReader(reader), err)
+			}
 		}
 		project, _ = c.project(reader)
 	}
