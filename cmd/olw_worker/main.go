@@ -27,7 +27,9 @@ type workerConfig struct {
 	StopOnError bool
 }
 
-var execOLW = execOLWCommand
+type execOLWFunc func(ctx context.Context, vault string, command []string, env []string) error
+
+var execOLW execOLWFunc = execOLWCommand
 
 func main() {
 	if err := newRootCommand().Execute(); err != nil {
@@ -96,7 +98,11 @@ func runWorkerBatch(ctx context.Context, cfg workerConfig, rawCommands string) e
 	if err := ensureWikiTOML(vault, cfg); err != nil {
 		return err
 	}
-	if err := runOLWBatch(ctx, vault, commands, cfg.StopOnError); err != nil {
+	olwEnv, err := prepareOLWEnvironment(cfg)
+	if err != nil {
+		return err
+	}
+	if err := runOLWBatch(ctx, vault, commands, cfg.StopOnError, olwEnv); err != nil {
 		return err
 	}
 	if cfg.Postprocess {
@@ -181,11 +187,23 @@ ingest_parallel = false
 	return nil
 }
 
-func runOLWBatch(ctx context.Context, vault string, commands [][]string, stopOnError bool) error {
+func prepareOLWEnvironment(cfg workerConfig) ([]string, error) {
+	configHome, err := os.MkdirTemp("", "olw-config-*")
+	if err != nil {
+		return nil, fmt.Errorf("create isolated OLW config dir: %w", err)
+	}
+	env := []string{"XDG_CONFIG_HOME=" + configHome}
+	if strings.TrimSpace(cfg.APIKey) != "" {
+		env = append(env, "LLM_API_KEY="+cfg.APIKey, "DEEPSEEK_API_KEY="+cfg.APIKey)
+	}
+	return env, nil
+}
+
+func runOLWBatch(ctx context.Context, vault string, commands [][]string, stopOnError bool, env []string) error {
 	var batchErr error
 	for i, command := range commands {
 		log.Printf("[%d/%d] olw %v", i+1, len(commands), command)
-		if err := execOLW(ctx, vault, command); err != nil {
+		if err := execOLW(ctx, vault, command, env); err != nil {
 			wrapped := fmt.Errorf("olw %v: %w", command, err)
 			if stopOnError {
 				return wrapped
@@ -197,9 +215,10 @@ func runOLWBatch(ctx context.Context, vault string, commands [][]string, stopOnE
 	return batchErr
 }
 
-func execOLWCommand(ctx context.Context, vault string, command []string) error {
+func execOLWCommand(ctx context.Context, vault string, command []string, env []string) error {
 	cmd := exec.CommandContext(ctx, "olw", command...)
 	cmd.Dir = vault
+	cmd.Env = append(os.Environ(), env...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()

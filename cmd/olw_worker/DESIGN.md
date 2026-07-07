@@ -116,6 +116,12 @@ API keys are not written into `wiki.toml`. OLW resolves the DeepSeek key from
 `DEEPSEEK_API_KEY`; the worker also accepts `LLM_API_KEY` only as a guard for
 creating `wiki.toml`.
 
+The worker isolates OLW global configuration for every run by setting
+`XDG_CONFIG_HOME` to a private temporary directory before invoking `olw`. This
+prevents OLW from reading `/root/.config/olw/config.toml` in Cloud Run or a
+developer's `~/.config/olw/config.toml` during Docker smoke tests. Do not mount
+host OLW config into the worker container.
+
 Cloud Run should provide the existing Secret Manager secret as both env vars:
 
 ```text
@@ -212,7 +218,8 @@ Docker smoke test:
 - mounted a temporary host directory into `/data`
 - ran `olw init`
 - copied three Helios raw files into `raw/`
-- mounted local OLW config
+- passed `LLM_API_KEY` or `DEEPSEEK_API_KEY` through env/Secret Manager only
+- did not mount host `~/.config/olw`
 - ran ingest, compile, and worker postprocess successfully
 
 Cloud Run test:
@@ -267,5 +274,7 @@ Please review these points before merge:
   separate repair task.
 - Secrets should stay in Secret Manager env vars and should not be persisted
   into vault config.
+- Smoke tests must not mount developer OLW config. Use explicit env vars and
+  rely on the worker's isolated `XDG_CONFIG_HOME`.
 - The legacy raw trigger-file path has been removed from code, but callers must
   use the v1 pipeline endpoints.

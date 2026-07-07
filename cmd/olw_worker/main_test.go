@@ -108,13 +108,60 @@ func TestEnsureWikiTOMLRequiresAPIKeyWhenMissing(t *testing.T) {
 	}
 }
 
+func TestPrepareOLWEnvironmentIsolatesConfigAndMapsDeepSeekKey(t *testing.T) {
+	env, err := prepareOLWEnvironment(workerConfig{APIKey: "secret"})
+	if err != nil {
+		t.Fatalf("prepareOLWEnvironment() error = %v", err)
+	}
+
+	values := envMap(env)
+	configHome := values["XDG_CONFIG_HOME"]
+	if configHome == "" {
+		t.Fatalf("XDG_CONFIG_HOME missing from env: %#v", env)
+	}
+	if strings.Contains(configHome, ".config/olw") {
+		t.Fatalf("XDG_CONFIG_HOME points at host/global olw config: %q", configHome)
+	}
+	if _, err := os.Stat(configHome); err != nil {
+		t.Fatalf("XDG_CONFIG_HOME dir was not created: %v", err)
+	}
+	if values["DEEPSEEK_API_KEY"] != "secret" {
+		t.Fatalf("DEEPSEEK_API_KEY = %q, want secret", values["DEEPSEEK_API_KEY"])
+	}
+}
+
+func TestRunWorkerBatchPassesIsolatedOLWEnvironment(t *testing.T) {
+	old := execOLW
+	defer func() { execOLW = old }()
+
+	vault := t.TempDir()
+	var gotEnv []string
+	execOLW = func(_ context.Context, _ string, _ []string, env []string) error {
+		gotEnv = append([]string(nil), env...)
+		return nil
+	}
+
+	cfg := workerConfig{VaultPath: vault, APIKey: "secret", Postprocess: false, StopOnError: true}
+	if err := runWorkerBatch(context.Background(), cfg, `[["run","--auto-approve"]]`); err != nil {
+		t.Fatalf("runWorkerBatch() error = %v", err)
+	}
+
+	values := envMap(gotEnv)
+	if values["XDG_CONFIG_HOME"] == "" {
+		t.Fatalf("exec env missing XDG_CONFIG_HOME: %#v", gotEnv)
+	}
+	if values["DEEPSEEK_API_KEY"] != "secret" {
+		t.Fatalf("DEEPSEEK_API_KEY = %q, want secret", values["DEEPSEEK_API_KEY"])
+	}
+}
+
 func TestRunOLWBatchStopsOnFirstFailure(t *testing.T) {
 	old := execOLW
 	defer func() { execOLW = old }()
 
 	failErr := errors.New("failed")
 	var ran [][]string
-	execOLW = func(_ context.Context, _ string, command []string) error {
+	execOLW = func(_ context.Context, _ string, command []string, _ []string) error {
 		ran = append(ran, append([]string(nil), command...))
 		if command[0] == "fail" {
 			return failErr
@@ -122,7 +169,7 @@ func TestRunOLWBatchStopsOnFirstFailure(t *testing.T) {
 		return nil
 	}
 
-	err := runOLWBatch(context.Background(), t.TempDir(), [][]string{{"fail"}, {"second"}}, true)
+	err := runOLWBatch(context.Background(), t.TempDir(), [][]string{{"fail"}, {"second"}}, true, nil)
 	if !errors.Is(err, failErr) {
 		t.Fatalf("runOLWBatch() error = %v, want %v", err, failErr)
 	}
@@ -136,7 +183,7 @@ func TestRunOLWBatchContinuesWhenStopOnErrorFalse(t *testing.T) {
 	defer func() { execOLW = old }()
 
 	var ran [][]string
-	execOLW = func(_ context.Context, _ string, command []string) error {
+	execOLW = func(_ context.Context, _ string, command []string, _ []string) error {
 		ran = append(ran, append([]string(nil), command...))
 		if command[0] == "fail" {
 			return errors.New("failed")
@@ -144,11 +191,22 @@ func TestRunOLWBatchContinuesWhenStopOnErrorFalse(t *testing.T) {
 		return nil
 	}
 
-	err := runOLWBatch(context.Background(), t.TempDir(), [][]string{{"fail"}, {"second"}}, false)
+	err := runOLWBatch(context.Background(), t.TempDir(), [][]string{{"fail"}, {"second"}}, false, nil)
 	if err == nil {
 		t.Fatal("runOLWBatch() error = nil, want error")
 	}
 	if len(ran) != 2 {
 		t.Fatalf("ran %d commands, want 2: %#v", len(ran), ran)
 	}
+}
+
+func envMap(env []string) map[string]string {
+	out := make(map[string]string, len(env))
+	for _, entry := range env {
+		key, value, ok := strings.Cut(entry, "=")
+		if ok {
+			out[key] = value
+		}
+	}
+	return out
 }
