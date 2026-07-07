@@ -31,7 +31,7 @@ import (
 const (
 	defaultMetadataTokenURL = "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token"
 	defaultCloudRunJobURL   = "https://run.googleapis.com/v2/projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline:run"
-	defaultWorkerCommands   = `[["run","--auto-approve"]]`
+	defaultWorkerCommands   = `[["run","--auto-approve"],["approve","--all"]]`
 )
 
 var (
