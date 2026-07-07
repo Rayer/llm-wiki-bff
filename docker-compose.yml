@@ -1,0 +1,48 @@
+version: "3.8"
+
+services:
+  bff:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        - BUILDKIT=1
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./local-data:/data
+    environment:
+      - GCP_PROJECT=local
+      - BUCKET=local-data
+      - DATA_DIR=/data
+      - JWT_SECRET=dev-secret
+      - DEV_JWT=true
+      - VAULT_PATH=/data/users/local-user/projects/demo
+    command: ["/bff"]
+
+  frontend:
+    build:
+      context: /Users/rayer/Documents/Develop/llm-wiki-frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8080
+    depends_on:
+      - bff
+
+  worker:
+    build:
+      context: .
+      dockerfile: cmd/olw_worker/Dockerfile
+    profiles:
+      - pipeline
+    volumes:
+      - ./local-data:/data
+    environment:
+      - USER_ID=local-user
+      - PROJECT_ID=demo
+      - DATA_DIR=/data
+      - LLM_API_KEY=${DEEPSEEK_API_KEY}
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+    command: ["run", '[["run","--auto-approve"],["approve","--all"]]']
