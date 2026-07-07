@@ -102,6 +102,26 @@ func TestListProjectsRequiresUserID(t *testing.T) {
 	}
 }
 
+func TestProjectResponseFromFirestoreDocUsesProjectIDField(t *testing.T) {
+	resp, uid, ok := projectResponseFromFirestoreDoc("user-1_Human Project Name", map[string]interface{}{
+		"project_id": "project-123",
+		"name":       "Human Project Name",
+	})
+
+	if !ok {
+		t.Fatal("projectResponseFromFirestoreDoc returned ok=false")
+	}
+	if uid != "user-1" {
+		t.Fatalf("uid = %q, want user-1", uid)
+	}
+	if resp.ID != "project-123" {
+		t.Fatalf("id = %q, want project-123", resp.ID)
+	}
+	if resp.Name != "Human Project Name" {
+		t.Fatalf("name = %q, want Human Project Name", resp.Name)
+	}
+}
+
 func TestProjectTitleFromIndexReadsFrontmatterTitle(t *testing.T) {
 	data := []byte("---\ntitle: Project Name\n---\nProject overview.")
 
