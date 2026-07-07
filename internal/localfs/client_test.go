@@ -1,0 +1,153 @@
+package localfs
+
+import (
+	"context"
+	"errors"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"cloud.google.com/go/storage"
+)
+
+func TestRejectsUnsafeRelativePaths(t *testing.T) {
+	client := New(t.TempDir()).WithScope("u", "p")
+	ctx := context.Background()
+
+	if _, err := client.ReadFile(ctx, "../secret.md"); err == nil {
+		t.Fatal("ReadFile allowed traversal path")
+	}
+	if _, err := client.ReadFile(ctx, "/tmp/secret.md"); err == nil {
+		t.Fatal("ReadFile allowed absolute path")
+	}
+	if _, err := client.WriteBytes(ctx, []byte("x"), "wiki/../../secret.md"); err == nil {
+		t.Fatal("WriteBytes allowed traversal path")
+	}
+}
+
+func TestListProjectsScansIndexFiles(t *testing.T) {
+	root := t.TempDir()
+	mustWrite(t, root, "users/u/projects/demo/index.md", "# Demo")
+	mustWrite(t, root, "users/u/projects/second/index.md", "# Second")
+	mustWrite(t, root, "users/u/projects/no-index/wiki/a.md", "# A")
+
+	projects, err := New(root).ListProjects(context.Background(), "u")
+	if err != nil {
+		t.Fatalf("ListProjects() error = %v", err)
+	}
+	if len(projects) != 2 || projects[0].ID != "demo" || projects[1].ID != "second" {
+		t.Fatalf("projects = %#v, want demo and second", projects)
+	}
+}
+
+func TestCacheAndPageReads(t *testing.T) {
+	root := t.TempDir()
+	mustWrite(t, root, "users/u/projects/p/cache/concepts.jsonl", `{"slug":"local-concept","title":"Local Concept","frontmatter":{"id":"c1"}}`+"\n")
+	mustWrite(t, root, "users/u/projects/p/cache/id_map.json", `{"source":{"s1":"source-one"}}`)
+	mustWrite(t, root, "users/u/projects/p/wiki/local-concept.md", "---\nid: c1\ntitle: Local Concept\n---\nBody")
+	mustWrite(t, root, "users/u/projects/p/wiki/sources/source-one.md", "---\nid: s1\ntitle: Source One\n---\nSource")
+
+	client := New(root).WithScope("u", "p")
+	concepts, err := client.ListConceptsFromCache(context.Background())
+	if err != nil {
+		t.Fatalf("ListConceptsFromCache() error = %v", err)
+	}
+	if len(concepts) != 1 || concepts[0].Slug != "local-concept" || concepts[0].ID != "c1" {
+		t.Fatalf("concepts = %#v", concepts)
+	}
+
+	sources, err := client.ListSourcesFromCache(context.Background())
+	if err != nil {
+		t.Fatalf("ListSourcesFromCache() error = %v", err)
+	}
+	if len(sources) != 1 || sources[0].Slug != "source-one" || sources[0].ID != "s1" {
+		t.Fatalf("sources = %#v", sources)
+	}
+
+	page, data, err := client.GetPage(context.Background(), "local-concept", "concepts")
+	if err != nil {
+		t.Fatalf("GetPage() error = %v", err)
+	}
+	if page.Title != "Local Concept" || string(data) == "" {
+		t.Fatalf("page = %#v data=%q", page, string(data))
+	}
+}
+
+func TestMarkdownFallbackListing(t *testing.T) {
+	root := t.TempDir()
+	mustWrite(t, root, "users/u/projects/p/wiki/published.md", "---\nid: c1\ntitle: Published\n---\nBody")
+	mustWrite(t, root, "users/u/projects/p/wiki/index.md", "# Index")
+	mustWrite(t, root, "users/u/projects/p/wiki/sources/source-one.md", "---\nid: s1\ntitle: Source One\n---\nSource")
+	mustWrite(t, root, "users/u/projects/p/wiki/.drafts/draft.md", "---\nid: d1\ntitle: Draft\n---\nDraft")
+
+	client := New(root).WithScope("u", "p")
+	concepts, err := client.ListConcepts(context.Background(), false)
+	if err != nil {
+		t.Fatalf("ListConcepts(false) error = %v", err)
+	}
+	if len(concepts) != 1 || concepts[0].Slug != "published" || concepts[0].Status != "published" {
+		t.Fatalf("published concepts = %#v", concepts)
+	}
+
+	concepts, err = client.ListConcepts(context.Background(), true)
+	if err != nil {
+		t.Fatalf("ListConcepts(true) error = %v", err)
+	}
+	if len(concepts) != 2 || concepts[1].Slug != "draft" || concepts[1].Status != "draft" {
+		t.Fatalf("all concepts = %#v", concepts)
+	}
+
+	sources, err := client.ListSources(context.Background())
+	if err != nil {
+		t.Fatalf("ListSources() error = %v", err)
+	}
+	if len(sources) != 1 || sources[0].Slug != "source-one" || sources[0].ID != "s1" {
+		t.Fatalf("sources = %#v", sources)
+	}
+}
+
+func TestWritesStatsAndDigest(t *testing.T) {
+	client := New(t.TempDir()).WithScope("u", "p")
+	ctx := context.Background()
+
+	digest, err := client.WriteBytes(ctx, []byte("body"), "raw/note.md")
+	if err != nil {
+		t.Fatalf("WriteBytes() error = %v", err)
+	}
+	gotDigest, err := client.GetMetaSHA256(ctx, "raw/note.md")
+	if err != nil {
+		t.Fatalf("GetMetaSHA256() error = %v", err)
+	}
+	if gotDigest != digest {
+		t.Fatalf("digest = %q, want %q", gotDigest, digest)
+	}
+
+	if _, err := client.WriteBytesAtomic(ctx, []byte("atomic"), "cache/out.tmp", "cache/out.txt"); err != nil {
+		t.Fatalf("WriteBytesAtomic() error = %v", err)
+	}
+	bytes, files, err := client.BucketStats(ctx)
+	if err != nil {
+		t.Fatalf("BucketStats() error = %v", err)
+	}
+	if bytes == 0 || files != 2 {
+		t.Fatalf("BucketStats() bytes=%d files=%d, want nonzero bytes and 2 files", bytes, files)
+	}
+}
+
+func TestMissingFileUsesStorageNotFound(t *testing.T) {
+	_, err := New(t.TempDir()).WithScope("u", "p").ReadFile(context.Background(), "wiki/missing.md")
+	if !errors.Is(err, storage.ErrObjectNotExist) {
+		t.Fatalf("ReadFile() error = %v, want storage.ErrObjectNotExist", err)
+	}
+}
+
+func mustWrite(t *testing.T, root, rel, content string) {
+	t.Helper()
+	path := filepath.Join(root, filepath.FromSlash(rel))
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("mkdir %s: %v", path, err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+}

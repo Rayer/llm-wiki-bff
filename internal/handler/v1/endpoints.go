@@ -128,12 +128,12 @@ func (h *Handler) ListProjects(c *gin.Context) {
 			return
 		}
 	}
-	if h.gcs == nil {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "GCS client is not configured"})
+	if h.store == nil {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "wiki storage is not configured"})
 		return
 	}
 
-	projects, err := h.gcs.ListProjects(c.Request.Context(), userID)
+	projects, err := h.store.ListProjects(c.Request.Context(), userID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: err.Error()})
 		return
@@ -142,8 +142,8 @@ func (h *Handler) ListProjects(c *gin.Context) {
 	resp := make([]handler.ProjectResponse, 0, len(projects))
 	for _, project := range projects {
 		name := project.ID
-		// Try GCS index.md title first
-		if data, err := h.gcs.WithScope(userID, project.ID).ReadFile(c.Request.Context(), "index.md"); err == nil {
+		// Try project index.md title first
+		if data, err := h.store.Scope(userID, project.ID).ReadFile(c.Request.Context(), "index.md"); err == nil {
 			if title := projectTitleFromIndex(data); title != "" {
 				name = title
 			}
@@ -924,8 +924,8 @@ func (h *Handler) RebuildIndex(c *gin.Context) {
 		})
 		return
 	}
-	if h.gcs == nil {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "GCS client is not configured"})
+	if h.store == nil {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "wiki storage is not configured"})
 		return
 	}
 	if h.firestore == nil || h.firestore.Raw() == nil {
@@ -948,8 +948,8 @@ func (h *Handler) RebuildIndex(c *gin.Context) {
 		}
 	}()
 
-	gcsClient := h.gcs.WithScope(userID, projectID)
-	next, err := wikiindex.Rebuild(ctx, newGCSWikiIndexStore(gcsClient))
+	wikiStore := h.store.Scope(userID, projectID)
+	next, err := wikiindex.Rebuild(ctx, newWikiIndexStore(wikiStore))
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: err.Error()})
 		return
@@ -1363,9 +1363,9 @@ func (h *Handler) AdminDeleteProject(c *gin.Context) {
 	name, _ := data["name"].(string)
 
 	// Delete GCS data
-	if h.gcs != nil {
+	if h.store != nil {
 		prefix := fmt.Sprintf("users/%s/projects/%s/", uid, pid)
-		if err := deleteGCSPrefix(ctx, h.gcs, prefix); err != nil {
+		if err := deleteGCSPrefix(ctx, h.store, prefix); err != nil {
 			log.Printf("[admin] GCS cleanup warning for %s: %v", docID, err)
 		}
 	}
@@ -1519,8 +1519,8 @@ func (h *Handler) AdminRebuildIndex(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "Firestore client is not configured"})
 		return
 	}
-	if h.gcs == nil {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "GCS client is not configured"})
+	if h.store == nil {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "wiki storage is not configured"})
 		return
 	}
 	fs := h.firestore.Raw()
@@ -1540,8 +1540,8 @@ func (h *Handler) AdminRebuildIndex(c *gin.Context) {
 		}
 	}()
 
-	gcsClient := h.gcs.WithScope(uid, pid)
-	next, err := wikiindex.Rebuild(ctx, newGCSWikiIndexStore(gcsClient))
+	wikiStore := h.store.Scope(uid, pid)
+	next, err := wikiindex.Rebuild(ctx, newWikiIndexStore(wikiStore))
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: err.Error()})
 		return
@@ -1853,9 +1853,9 @@ func (h *Handler) AdminDeleteUser(c *gin.Context) {
 		}
 
 		// Delete GCS data
-		if h.gcs != nil && pid != "" {
+		if h.store != nil && pid != "" {
 			prefix := fmt.Sprintf("users/%s/projects/%s/", userID, pid)
-			if err := deleteGCSPrefix(ctx, h.gcs, prefix); err != nil {
+			if err := deleteGCSPrefix(ctx, h.store, prefix); err != nil {
 				log.Printf("[admin] GCS cleanup warning for %s/%s: %v", userID, pid, err)
 			}
 		}

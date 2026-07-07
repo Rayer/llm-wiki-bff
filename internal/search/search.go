@@ -7,13 +7,13 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/rayer/llm-wiki-bff/internal/gcs"
+	store "github.com/rayer/llm-wiki-bff/internal/storage"
 )
 
 // Index provides in-memory search over wiki metadata.
 type Index struct {
-	sources       []gcs.WikiPage
-	concepts      []gcs.WikiPage
+	sources       []store.WikiPage
+	concepts      []store.WikiPage
 	entries       map[string]indexedPage
 	conceptBodies map[string]string // slug → body text (for full-content grep)
 }
@@ -55,22 +55,22 @@ func (idx *Index) SourceCount() int { return len(idx.sources) }
 // ConceptCount returns the number of indexed concepts.
 func (idx *Index) ConceptCount() int { return len(idx.concepts) }
 
-// Build loads the generated metadata index from GCS.
-func (idx *Index) Build(gcsClient *gcs.Client) error {
+// Build loads the generated metadata index from wiki storage.
+func (idx *Index) Build(reader store.Store) error {
 	ctx := context.Background()
 
-	raw, err := gcsClient.ReadMetaIndex(ctx)
+	raw, err := reader.ReadFile(ctx, "meta/index.md")
 	if err != nil {
 		return err
 	}
 
-	idx.sources, idx.concepts, idx.entries = parseMetaIndex(raw)
+	idx.sources, idx.concepts, idx.entries = parseMetaIndex(string(raw))
 	return nil
 }
 
-// LoadConceptBodies fetches all concept bodies from GCS for full-content grep.
+// LoadConceptBodies fetches all concept bodies from wiki storage for full-content grep.
 // Individual fetch failures are logged and skipped — only returns error if ALL fail.
-func (idx *Index) LoadConceptBodies(ctx context.Context, gcsClient *gcs.Client) error {
+func (idx *Index) LoadConceptBodies(ctx context.Context, reader store.Store) error {
 	if idx.conceptBodies == nil {
 		idx.conceptBodies = make(map[string]string)
 	}
@@ -87,7 +87,7 @@ func (idx *Index) LoadConceptBodies(ctx context.Context, gcsClient *gcs.Client) 
 		sem <- struct{}{}
 		go func(slug string) {
 			defer func() { <-sem }()
-			_, data, err := gcsClient.GetPage(ctx, slug, "concepts")
+			_, data, err := reader.GetPage(ctx, slug, "concepts")
 			if err != nil {
 				return
 			}
@@ -216,9 +216,9 @@ func interleaveResults(sources, concepts []scoredResult, limit int) []Result {
 	return results
 }
 
-func parseMetaIndex(raw string) ([]gcs.WikiPage, []gcs.WikiPage, map[string]indexedPage) {
-	var sources []gcs.WikiPage
-	var concepts []gcs.WikiPage
+func parseMetaIndex(raw string) ([]store.WikiPage, []store.WikiPage, map[string]indexedPage) {
+	var sources []store.WikiPage
+	var concepts []store.WikiPage
 	entries := make(map[string]indexedPage)
 	section := ""
 	inFrontmatter := false
@@ -251,7 +251,7 @@ func parseMetaIndex(raw string) ([]gcs.WikiPage, []gcs.WikiPage, map[string]inde
 		if !ok {
 			continue
 		}
-		page := gcs.WikiPage{Slug: slug, Title: title}
+		page := store.WikiPage{Slug: slug, Title: title}
 		key := indexKey(pageType, slug)
 		entries[key] = indexedPage{title: title, description: description}
 		if pageType == "source" {
