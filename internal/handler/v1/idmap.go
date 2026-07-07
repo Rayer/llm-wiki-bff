@@ -49,6 +49,12 @@ func rebuildIndex(ctx context.Context, store idMapReadWriter) (idMap, error) {
 	return wikiindex.Rebuild(ctx, legacyWikiIndexStore{reader: store, writer: store})
 }
 
+// RebuildIndexForStore rebuilds index artifacts through the storage-neutral
+// adapter. It is used by local mode to avoid Firestore lock dependencies.
+func RebuildIndexForStore(ctx context.Context, wikiStore store.Store) (wikiindex.IDMap, error) {
+	return wikiindex.Rebuild(ctx, newWikiIndexStore(wikiStore))
+}
+
 type legacyWikiIndexStore struct {
 	reader idMapStore
 	writer idMapWriter

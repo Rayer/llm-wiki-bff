@@ -16,6 +16,7 @@ type Config struct {
 	DeepSeekAPIKey string
 	JWTSecret      string
 	DevJWT         bool
+	LocalDataDir   string
 	Users          []UserConfig
 }
 
@@ -52,6 +53,7 @@ func Load(path string) (Config, error) {
 		DeepSeekAPIKey: v.GetString("deepseek_api_key"),
 		JWTSecret:      v.GetString("jwt_secret"),
 		DevJWT:         v.GetBool("dev_jwt"),
+		LocalDataDir:   v.GetString("local_data_dir"),
 	}
 	return cfg, nil
 }

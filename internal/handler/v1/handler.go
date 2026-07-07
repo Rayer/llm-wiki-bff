@@ -58,6 +58,12 @@ func New(wikiStore store.RootStore, fs *firestore.Client, idx *search.Index, cac
 	}
 }
 
+// SetRebuildIndexFunc overrides rebuild behavior for environments that do not
+// use Firestore locks, such as local filesystem development mode.
+func (h *Handler) SetRebuildIndexFunc(fn func(context.Context, string, string) (wikiindex.IDMap, error)) {
+	h.rebuildIndex = fn
+}
+
 // GetStore returns the request-scoped wiki store.
 func (h *Handler) GetStore(c *gin.Context) (store.Store, error) {
 	userID := c.GetString("userID")
