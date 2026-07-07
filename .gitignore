@@ -5,3 +5,4 @@ llm-wiki-bff
 *.exe
 *.test
 .worktrees/
+local-data/

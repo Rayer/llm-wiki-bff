@@ -1,6 +1,6 @@
 IMAGE := gcr.io/llm-wiki-cloud/llm-wiki-bff
 
-.PHONY: docker-build docker-push deploy all build-sync
+.PHONY: docker-build docker-push deploy all build-sync seed dev bff-local clean-local
 
 docker-build:
 	docker build -t $(IMAGE) .
@@ -15,3 +15,16 @@ all: docker-build docker-push deploy
 
 build-sync:
 	go build -o lwc-sync ./cmd/sync/
+
+seed:
+	rm -rf local-data
+	cp -R demo local-data
+
+dev:
+	docker compose up --build
+
+bff-local:
+	LOCAL_DATA_DIR=./local-data DEV_JWT=true JWT_SECRET=dev-secret go run . --local ./local-data
+
+clean-local:
+	rm -rf local-data
