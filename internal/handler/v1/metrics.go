@@ -30,8 +30,8 @@ func (h *Handler) PrometheusMetrics(c *gin.Context) {
 	var sourcesCount, conceptsCount int
 	var gcsFiles, gcsBytes int64
 	if gcsClient != nil {
-		sources, _ := gcsClient.ListSources(ctx)
-		concepts, _ := gcsClient.ListConcepts(ctx, true)
+		sources, _ := listSourcesCacheFirst(ctx, gcsClient)
+		concepts, _ := listConceptsCacheFirst(ctx, gcsClient, true)
 		sourcesCount = len(sources)
 		conceptsCount = len(concepts)
 		gcsBytes, gcsFiles, _ = gcsClient.BucketStats(ctx)

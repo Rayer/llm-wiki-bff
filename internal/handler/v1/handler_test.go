@@ -297,6 +297,100 @@ func TestCachedContextsIncludeConceptSources(t *testing.T) {
 	}
 }
 
+type fakeWikiListReader struct {
+	cacheConcepts []gcs.WikiPage
+	gcsConcepts   []gcs.WikiPage
+	cacheSources  []gcs.WikiPage
+	gcsSources    []gcs.WikiPage
+
+	cacheConceptsErr error
+	gcsConceptsErr   error
+	cacheSourcesErr  error
+	gcsSourcesErr    error
+
+	cacheConceptCalls int
+	gcsConceptCalls   int
+	cacheSourceCalls  int
+	gcsSourceCalls    int
+}
+
+func (r *fakeWikiListReader) ListConceptsFromCache(context.Context) ([]gcs.WikiPage, error) {
+	r.cacheConceptCalls++
+	return r.cacheConcepts, r.cacheConceptsErr
+}
+
+func (r *fakeWikiListReader) ListConcepts(context.Context, bool) ([]gcs.WikiPage, error) {
+	r.gcsConceptCalls++
+	return r.gcsConcepts, r.gcsConceptsErr
+}
+
+func (r *fakeWikiListReader) ListSourcesFromCache(context.Context) ([]gcs.WikiPage, error) {
+	r.cacheSourceCalls++
+	return r.cacheSources, r.cacheSourcesErr
+}
+
+func (r *fakeWikiListReader) ListSources(context.Context) ([]gcs.WikiPage, error) {
+	r.gcsSourceCalls++
+	return r.gcsSources, r.gcsSourcesErr
+}
+
+func TestListConceptsCacheFirstUsesCacheWithoutFallback(t *testing.T) {
+	reader := &fakeWikiListReader{
+		cacheConcepts: []gcs.WikiPage{{Slug: "cached-concept"}},
+		gcsConcepts:   []gcs.WikiPage{{Slug: "gcs-concept"}},
+	}
+
+	pages, err := listConceptsCacheFirst(context.Background(), reader, true)
+	if err != nil {
+		t.Fatalf("listConceptsCacheFirst: %v", err)
+	}
+
+	if len(pages) != 1 || pages[0].Slug != "cached-concept" {
+		t.Fatalf("pages = %#v, want cached concept", pages)
+	}
+	if reader.cacheConceptCalls != 1 || reader.gcsConceptCalls != 0 {
+		t.Fatalf("cache calls = %d, gcs calls = %d; want 1, 0", reader.cacheConceptCalls, reader.gcsConceptCalls)
+	}
+}
+
+func TestListConceptsCacheFirstFallsBackWhenCacheMissing(t *testing.T) {
+	reader := &fakeWikiListReader{
+		cacheConceptsErr: storage.ErrObjectNotExist,
+		gcsConcepts:      []gcs.WikiPage{{Slug: "gcs-concept"}},
+	}
+
+	pages, err := listConceptsCacheFirst(context.Background(), reader, true)
+	if err != nil {
+		t.Fatalf("listConceptsCacheFirst: %v", err)
+	}
+
+	if len(pages) != 1 || pages[0].Slug != "gcs-concept" {
+		t.Fatalf("pages = %#v, want GCS fallback concept", pages)
+	}
+	if reader.cacheConceptCalls != 1 || reader.gcsConceptCalls != 1 {
+		t.Fatalf("cache calls = %d, gcs calls = %d; want 1, 1", reader.cacheConceptCalls, reader.gcsConceptCalls)
+	}
+}
+
+func TestListSourcesCacheFirstFallsBackWhenCacheMissing(t *testing.T) {
+	reader := &fakeWikiListReader{
+		cacheSourcesErr: storage.ErrObjectNotExist,
+		gcsSources:      []gcs.WikiPage{{Slug: "gcs-source"}},
+	}
+
+	pages, err := listSourcesCacheFirst(context.Background(), reader)
+	if err != nil {
+		t.Fatalf("listSourcesCacheFirst: %v", err)
+	}
+
+	if len(pages) != 1 || pages[0].Slug != "gcs-source" {
+		t.Fatalf("pages = %#v, want GCS fallback source", pages)
+	}
+	if reader.cacheSourceCalls != 1 || reader.gcsSourceCalls != 1 {
+		t.Fatalf("cache calls = %d, gcs calls = %d; want 1, 1", reader.cacheSourceCalls, reader.gcsSourceCalls)
+	}
+}
+
 func TestPipelineRunExecutesCloudRunJob(t *testing.T) {
 	var runRequest map[string]any
 	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
