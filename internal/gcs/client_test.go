@@ -52,7 +52,7 @@ func TestWikiPagesFromConceptsJSONLReturnsConceptPages(t *testing.T) {
 		``,
 	}, "\n"))
 
-	pages, err := wikiPagesFromConceptsJSONL(data)
+	pages, err := WikiPagesFromConceptsJSONL(data)
 	if err != nil {
 		t.Fatalf("wikiPagesFromConceptsJSONL: %v", err)
 	}
@@ -71,7 +71,7 @@ func TestWikiPagesFromConceptsJSONLReturnsConceptPages(t *testing.T) {
 func TestWikiPagesFromSourceIDMapReturnsSourcePages(t *testing.T) {
 	data := []byte(`{"concept":{"concept-id":"alpha"},"source":{"source-id":"source-one","":"ignored-empty-id","blank-slug":" "}}`)
 
-	pages, err := wikiPagesFromSourceIDMap(data)
+	pages, err := WikiPagesFromSourceIDMap(data)
 	if err != nil {
 		t.Fatalf("wikiPagesFromSourceIDMap: %v", err)
 	}

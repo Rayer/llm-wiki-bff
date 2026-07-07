@@ -6,3 +6,4 @@ llm-wiki-bff
 *.test
 .worktrees/
 .idea/
+local-data/
