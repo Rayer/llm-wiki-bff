@@ -784,17 +784,8 @@ type cloudRunJobRunResponse struct {
 }
 
 type pipelineStatusResponse struct {
-	LastExecution *pipelineExecutionResponse `json:"last_execution"`
-	ProjectID     string                     `json:"project_id"`
-}
-
-type pipelineExecutionResponse struct {
-	Name      string `json:"name"`
-	Status    string `json:"status"`
-	StartTime string `json:"start_time"`
-	EndTime   string `json:"end_time"`
-	Duration  string `json:"duration"`
-	LogURL    string `json:"log_url,omitempty"`
+	LastExecution *handler.PipelineExecutionResponse `json:"last_execution"`
+	ProjectID     string                             `json:"project_id"`
 }
 
 type cloudRunExecutionsResponse struct {
@@ -847,58 +838,14 @@ func (h *Handler) PipelineStatus(c *gin.Context) {
 		return
 	}
 
-	token, err := h.getMetadataAccessToken(c.Request.Context())
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "pipeline status failed: " + err.Error()})
-		return
-	}
-
 	executionID := strings.TrimSpace(c.Query("execution_id"))
-	statusURL := h.cloudRunExecutionsURL()
-	if executionID != "" {
-		statusURL = h.cloudRunExecutionURL(executionID)
-	}
-	req, err := http.NewRequestWithContext(c.Request.Context(), http.MethodGet, statusURL, nil)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "pipeline status failed: " + err.Error()})
-		return
-	}
-	req.Header.Set("Authorization", "Bearer "+token)
-
-	resp, err := h.pipelineHTTPClient().Do(req)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "pipeline status failed: " + err.Error()})
-		return
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "pipeline status failed: " + err.Error()})
-		return
-	}
-	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "pipeline status failed: " + string(body)})
-		return
-	}
-
 	response := pipelineStatusResponse{ProjectID: projectID}
-	if executionID != "" {
-		var execution cloudRunExecution
-		if err := json.Unmarshal(body, &execution); err != nil {
-			c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "pipeline status failed: " + err.Error()})
-			return
-		}
-		response.LastExecution = newPipelineExecutionResponse(execution)
-	} else {
-		var executions cloudRunExecutionsResponse
-		if err := json.Unmarshal(body, &executions); err != nil {
-			c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "pipeline status failed: " + err.Error()})
-			return
-		}
-		if len(executions.Executions) > 0 {
-			response.LastExecution = newPipelineExecutionResponse(executions.Executions[0])
-		}
+	lastExecution, err := h.pipelineExecutionStatus(c.Request.Context(), executionID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "pipeline status failed: " + err.Error()})
+		return
 	}
+	response.LastExecution = lastExecution
 	c.JSON(http.StatusOK, response)
 }
 
@@ -1080,12 +1027,59 @@ func shortCloudRunExecutionName(name string, allowBare bool) string {
 	return ""
 }
 
-func newPipelineExecutionResponse(execution cloudRunExecution) *pipelineExecutionResponse {
+func (h *Handler) pipelineExecutionStatus(ctx context.Context, executionID string) (*handler.PipelineExecutionResponse, error) {
+	token, err := h.getMetadataAccessToken(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	statusURL := h.cloudRunExecutionsURL()
+	if executionID != "" {
+		statusURL = h.cloudRunExecutionURL(executionID)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, statusURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := h.pipelineHTTPClient().Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return nil, fmt.Errorf("%s", string(body))
+	}
+
+	if executionID != "" {
+		var execution cloudRunExecution
+		if err := json.Unmarshal(body, &execution); err != nil {
+			return nil, err
+		}
+		return newPipelineExecutionResponse(execution), nil
+	}
+
+	var executions cloudRunExecutionsResponse
+	if err := json.Unmarshal(body, &executions); err != nil {
+		return nil, err
+	}
+	if len(executions.Executions) == 0 {
+		return nil, nil
+	}
+	return newPipelineExecutionResponse(executions.Executions[0]), nil
+}
+
+func newPipelineExecutionResponse(execution cloudRunExecution) *handler.PipelineExecutionResponse {
 	endTime := execution.CompletionTime
 	if endTime == "" {
 		endTime = execution.EndTime
 	}
-	return &pipelineExecutionResponse{
+	return &handler.PipelineExecutionResponse{
 		Name:      execution.Name,
 		Status:    cloudRunExecutionStatus(execution),
 		StartTime: execution.StartTime,
@@ -1261,6 +1255,10 @@ func (h *Handler) Status(c *gin.Context) {
 		ConceptsCount: len(concepts),
 		IndexSources:  h.index.SourceCount(),
 		IndexConcepts: h.index.ConceptCount(),
+	}
+
+	if lastExecution, err := h.pipelineExecutionStatus(ctx, ""); err == nil {
+		resp.LastExecution = lastExecution
 	}
 
 	if h.firestore != nil {

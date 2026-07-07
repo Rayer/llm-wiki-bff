@@ -96,14 +96,25 @@ type ImportResponse struct {
 
 // StatusResponse is the response for a status endpoint.
 type StatusResponse struct {
-	SourcesCount     int    `json:"sources_count"`
-	ConceptsCount    int    `json:"concepts_count"`
-	IndexSources     int    `json:"index_sources"`
-	IndexConcepts    int    `json:"index_concepts"`
-	RunningPipelines int    `json:"running_pipelines"`
-	Locked           bool   `json:"locked,omitempty"`
-	LockWorker       string `json:"lock_worker,omitempty"`
-	LockExpiry       string `json:"lock_expiry,omitempty"`
+	SourcesCount     int                        `json:"sources_count"`
+	ConceptsCount    int                        `json:"concepts_count"`
+	IndexSources     int                        `json:"index_sources"`
+	IndexConcepts    int                        `json:"index_concepts"`
+	RunningPipelines int                        `json:"running_pipelines"`
+	LastExecution    *PipelineExecutionResponse `json:"last_execution,omitempty"`
+	Locked           bool                       `json:"locked,omitempty"`
+	LockWorker       string                     `json:"lock_worker,omitempty"`
+	LockExpiry       string                     `json:"lock_expiry,omitempty"`
+}
+
+// PipelineExecutionResponse is a normalized Cloud Run execution summary.
+type PipelineExecutionResponse struct {
+	Name      string `json:"name"`
+	Status    string `json:"status"`
+	StartTime string `json:"start_time"`
+	EndTime   string `json:"end_time"`
+	Duration  string `json:"duration"`
+	LogURL    string `json:"log_url,omitempty"`
 }
 
 // MetricsResponse is for GET /api/metrics (Grafana).

@@ -891,6 +891,92 @@ func TestPipelineStatusReturnsNullWhenNoExecutions(t *testing.T) {
 	}
 }
 
+func TestStatusIncludesLatestPipelineExecutionWhenAvailable(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "users", "request-user", "projects", "demo-project"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/token":
+			return testHTTPResponse(http.StatusOK, `{"access_token":"test-token"}`), nil
+		case "/v2/projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline/executions":
+			return testHTTPResponse(http.StatusOK, `{
+				"executions": [{
+					"name": "projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline/executions/exec-1",
+					"startTime": "2026-06-29T01:02:03Z",
+					"completionTime": "2026-06-29T01:02:13Z",
+					"completionStatus": "EXECUTION_SUCCEEDED"
+				}]
+			}`), nil
+		default:
+			return testHTTPResponse(http.StatusNotFound, `not found`), nil
+		}
+	})}
+	h := New(localfs.New(root), nil, search.NewIndex(), conceptcache.New(), nil, nil)
+	h.httpClient = client
+	h.metadataTokenURL = "http://metadata.test/token"
+	h.cloudRunJobURL = "https://run.googleapis.com/v2/projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline:run"
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/api/v1/status", nil)
+	c.Set("userID", "request-user")
+	c.Set("projectID", "demo-project")
+
+	h.Status(c)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var body struct {
+		LastExecution *struct {
+			Status string `json:"status"`
+			LogURL string `json:"log_url"`
+		} `json:"last_execution"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if body.LastExecution == nil {
+		t.Fatal("last_execution = nil, want latest execution")
+	}
+	if body.LastExecution.Status != "SUCCESS" || body.LastExecution.LogURL != "/api/v1/pipeline/log?execution_id=exec-1" {
+		t.Fatalf("last_execution = %#v", body.LastExecution)
+	}
+}
+
+func TestStatusIgnoresPipelineExecutionLookupFailure(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "users", "request-user", "projects", "demo-project"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == "/token" {
+			return testHTTPResponse(http.StatusInternalServerError, `metadata unavailable`), nil
+		}
+		return testHTTPResponse(http.StatusNotFound, `not found`), nil
+	})}
+	h := New(localfs.New(root), nil, search.NewIndex(), conceptcache.New(), nil, nil)
+	h.httpClient = client
+	h.metadataTokenURL = "http://metadata.test/token"
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/api/v1/status", nil)
+	c.Set("userID", "request-user")
+	c.Set("projectID", "demo-project")
+
+	h.Status(c)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	if body := recorder.Body.String(); strings.Contains(body, "last_execution") {
+		t.Fatalf("body should omit last_execution on lookup failure: %s", body)
+	}
+}
+
 func TestBuildInitProjectRunBody(t *testing.T) {
 	body, err := buildInitProjectRunBody("user-1", "a1b2c3d4e5f6", "Demo Project")
 	if err != nil {
