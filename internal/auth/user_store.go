@@ -13,6 +13,7 @@ import (
 type UserRecord struct {
 	Email          string `firestore:"email"`
 	PasswordHash   string `firestore:"password_hash"`
+	Role           string `firestore:"role,omitempty"`
 	EmailVerified  bool   `firestore:"email_verified"`
 	ProjectCount   int    `firestore:"project_count"`
 	DefaultProject string `firestore:"default_project"`

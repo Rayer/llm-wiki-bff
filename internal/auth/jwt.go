@@ -19,6 +19,7 @@ import (
 // RegisteredClaims is embedded for standard JWT fields (exp, iat, etc.).
 type Claims struct {
 	Sub       string `json:"sub"`
+	Role      string `json:"role,omitempty"`
 	TokenType string `json:"token_type,omitempty"`
 	jwt.RegisteredClaims
 }
@@ -55,7 +56,12 @@ func JWTAuth(cfg config.Config) gin.HandlerFunc {
 				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid user ID"})
 				return
 			}
+			userRole := strings.TrimSpace(c.GetHeader("X-User-Role"))
+			if userRole == "" {
+				userRole = "admin"
+			}
 			c.Set("userID", userID)
+			c.Set("userRole", userRole)
 			c.Next()
 			return
 		}
@@ -84,6 +90,18 @@ func JWTAuth(cfg config.Config) gin.HandlerFunc {
 		}
 
 		c.Set("userID", claims.Sub)
+		c.Set("userRole", claims.Role)
+		c.Next()
+	}
+}
+
+// AdminOnly returns a Gin middleware that allows only users with the admin role.
+func AdminOnly() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if c.GetString("userRole") != "admin" {
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "admin role required"})
+			return
+		}
 		c.Next()
 	}
 }
@@ -99,21 +117,26 @@ func ValidPathSegment(value string) bool {
 // GenerateToken creates a self-signed HS256 JWT for development/testing.
 // Exported for use in tests and dev tooling. Not used in production flows.
 func GenerateToken(userID, secret string, ttl time.Duration) (string, error) {
-	return generateToken(userID, secret, ttl, "", "")
+	return GenerateTokenWithRole(userID, "", secret, ttl)
+}
+
+// GenerateTokenWithRole creates a self-signed HS256 JWT with a role claim.
+func GenerateTokenWithRole(userID, role, secret string, ttl time.Duration) (string, error) {
+	return generateToken(userID, role, secret, ttl, "", "")
 }
 
 // GenerateAccessToken creates a short-lived HS256 JWT for API authorization.
-func GenerateAccessToken(userID, secret string) (string, error) {
-	return generateToken(userID, secret, accessTokenTTL, accessTokenType, "")
+func GenerateAccessToken(userID, role, secret string) (string, error) {
+	return generateToken(userID, role, secret, accessTokenTTL, accessTokenType, "")
 }
 
 // GenerateRefreshToken creates and records a refresh token for cookie-based rotation.
-func GenerateRefreshToken(userID, secret string) (string, error) {
+func GenerateRefreshToken(userID, role, secret string) (string, error) {
 	jti, err := randomTokenID()
 	if err != nil {
 		return "", err
 	}
-	token, err := generateToken(userID, secret, refreshTokenTTL, refreshTokenType, jti)
+	token, err := generateToken(userID, role, secret, refreshTokenTTL, refreshTokenType, jti)
 	if err != nil {
 		return "", err
 	}
@@ -168,10 +191,11 @@ func validateRefreshToken(tokenString, secret string) (*Claims, error) {
 	return claims, nil
 }
 
-func generateToken(userID, secret string, ttl time.Duration, tokenType, jti string) (string, error) {
+func generateToken(userID, role, secret string, ttl time.Duration, tokenType, jti string) (string, error) {
 	now := time.Now()
 	claims := &Claims{
 		Sub:       userID,
+		Role:      role,
 		TokenType: tokenType,
 		RegisteredClaims: jwt.RegisteredClaims{
 			IssuedAt:  jwt.NewNumericDate(now),

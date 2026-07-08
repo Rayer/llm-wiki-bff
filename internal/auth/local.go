@@ -10,6 +10,7 @@ import (
 const (
 	localDevUserID   = "local-user"
 	localDevEmail    = "demo@llm-wiki.dev"
+	localDevRole     = "admin"
 	localDevPassword = "demo123456"
 )
 
@@ -28,12 +29,12 @@ func LocalDevLoginHandler(jwtSecret string) gin.HandlerFunc {
 			return
 		}
 
-		accessToken, err := GenerateAccessToken(localDevUserID, jwtSecret)
+		accessToken, err := GenerateAccessToken(localDevUserID, localDevRole, jwtSecret)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate token"})
 			return
 		}
-		refreshToken, err := GenerateRefreshToken(localDevUserID, jwtSecret)
+		refreshToken, err := GenerateRefreshToken(localDevUserID, localDevRole, jwtSecret)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate token"})
 			return
@@ -41,7 +42,7 @@ func LocalDevLoginHandler(jwtSecret string) gin.HandlerFunc {
 		setLocalRefreshTokenCookie(c, refreshToken, int(refreshTokenTTL.Seconds()))
 		c.JSON(http.StatusOK, LoginResponse{
 			AccessToken: accessToken,
-			User:        User{ID: localDevUserID, Email: localDevEmail},
+			User:        User{ID: localDevUserID, Email: localDevEmail, Role: localDevRole},
 		})
 	}
 }
@@ -61,12 +62,12 @@ func LocalDevRefreshHandler(jwtSecret string) gin.HandlerFunc {
 			return
 		}
 
-		accessToken, err := GenerateAccessToken(localDevUserID, jwtSecret)
+		accessToken, err := GenerateAccessToken(localDevUserID, localDevRole, jwtSecret)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate token"})
 			return
 		}
-		refreshToken, err := GenerateRefreshToken(localDevUserID, jwtSecret)
+		refreshToken, err := GenerateRefreshToken(localDevUserID, localDevRole, jwtSecret)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate token"})
 			return
@@ -74,7 +75,7 @@ func LocalDevRefreshHandler(jwtSecret string) gin.HandlerFunc {
 		setLocalRefreshTokenCookie(c, refreshToken, int(refreshTokenTTL.Seconds()))
 		c.JSON(http.StatusOK, RefreshResponse{
 			AccessToken: accessToken,
-			User:        User{ID: localDevUserID, Email: localDevEmail},
+			User:        User{ID: localDevUserID, Email: localDevEmail, Role: localDevRole},
 		})
 	}
 }

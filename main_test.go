@@ -7,6 +7,9 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/rayer/llm-wiki-bff/internal/auth"
+	"github.com/rayer/llm-wiki-bff/internal/config"
+	handlerv1 "github.com/rayer/llm-wiki-bff/internal/handler/v1"
 	"github.com/rayer/llm-wiki-bff/internal/middleware"
 )
 
@@ -77,4 +80,57 @@ func TestAuthRateLimitBlocksAfterLimit(t *testing.T) {
 	if !rateLimited {
 		t.Fatal("expected 429 after repeated requests, never blocked")
 	}
+}
+
+func TestAdminProjectsRouteRequiresAdminRole(t *testing.T) {
+	router := newAdminRouteTestRouter(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/projects", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("missing auth status = %d, want %d", rec.Code, http.StatusUnauthorized)
+	}
+
+	userToken, err := auth.GenerateAccessToken("user-123", "", "test-secret")
+	if err != nil {
+		t.Fatalf("generate user token: %v", err)
+	}
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/admin/projects", nil)
+	req.Header.Set("Authorization", "Bearer "+userToken)
+	rec = httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("non-admin status = %d, want %d", rec.Code, http.StatusForbidden)
+	}
+}
+
+func TestAdminProjectsRouteDoesNotRequireProjectHeader(t *testing.T) {
+	router := newAdminRouteTestRouter(t)
+	adminToken, err := auth.GenerateAccessToken("admin-user", "admin", "test-secret")
+	if err != nil {
+		t.Fatalf("generate admin token: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/projects", nil)
+	req.Header.Set("Authorization", "Bearer "+adminToken)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code == http.StatusBadRequest {
+		t.Fatalf("admin route was blocked by project middleware: %s", rec.Body.String())
+	}
+	if rec.Code == http.StatusNotFound || rec.Code == http.StatusUnauthorized || rec.Code == http.StatusForbidden {
+		t.Fatalf("admin route status = %d, want registered route after admin auth", rec.Code)
+	}
+}
+
+func newAdminRouteTestRouter(t *testing.T) *gin.Engine {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+
+	router := gin.New()
+	handler := handlerv1.New(nil, nil, nil, nil, nil, nil)
+	registerAdminRoutes(router, config.Config{JWTSecret: "test-secret"}, handler)
+	return router
 }

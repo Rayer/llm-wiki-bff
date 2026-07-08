@@ -25,6 +25,7 @@ type LoginResponse struct {
 type User struct {
 	ID    string `json:"id"`
 	Email string `json:"email"`
+	Role  string `json:"role,omitempty"`
 }
 
 // LoginHandler returns a Gin handler that validates credentials against Firestore and issues a JWT.
@@ -45,12 +46,12 @@ func LoginHandler(fsClient *firestore.Client, jwtSecret string) gin.HandlerFunc 
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid credentials"})
 			return
 		}
-		accessToken, err := GenerateAccessToken(userID, jwtSecret)
+		accessToken, err := GenerateAccessToken(userID, user.Role, jwtSecret)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate token"})
 			return
 		}
-		refreshToken, err := GenerateRefreshToken(userID, jwtSecret)
+		refreshToken, err := GenerateRefreshToken(userID, user.Role, jwtSecret)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate token"})
 			return
@@ -58,7 +59,7 @@ func LoginHandler(fsClient *firestore.Client, jwtSecret string) gin.HandlerFunc 
 		setRefreshTokenCookie(c, refreshToken, int(refreshTokenTTL.Seconds()))
 		c.JSON(http.StatusOK, LoginResponse{
 			AccessToken: accessToken,
-			User:        User{ID: userID, Email: user.Email},
+			User:        User{ID: userID, Email: user.Email, Role: user.Role},
 		})
 	}
 }

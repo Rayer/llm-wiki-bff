@@ -159,8 +159,8 @@ func main() {
 	}
 	r.Use(cors.New(cors.Config{
 		AllowOrigins:     allowOrigins,
-		AllowMethods:     []string{"GET", "POST", "OPTIONS"},
-		AllowHeaders:     []string{"Content-Type", "Authorization", "X-User-ID", "X-Project-ID", "Idempotency-Key"},
+		AllowMethods:     []string{"GET", "POST", "PATCH", "DELETE", "OPTIONS"},
+		AllowHeaders:     []string{"Content-Type", "Authorization", "X-User-ID", "X-User-Role", "X-Project-ID", "Idempotency-Key"},
 		AllowCredentials: true,
 	}))
 
@@ -207,6 +207,9 @@ func main() {
 		v1.POST("/init-project", hV1.InitProject)
 		v1.GET("/projects/:pid/status", hV1.ProjectStatus)
 	}
+
+	registerAdminRoutes(r, cfg, hV1)
+
 	v1.Use(auth.ProjectMiddleware())
 	{
 		v1.GET("/index", hV1.Index)
@@ -237,4 +240,19 @@ func main() {
 	log.Printf("BFF listening on :%s", cfg.Port)
 	log.Printf("Swagger UI: http://localhost:%s/swagger/index.html", cfg.Port)
 	log.Fatal(r.Run(":" + cfg.Port))
+}
+
+func registerAdminRoutes(r *gin.Engine, cfg config.Config, hV1 *handlerv1.Handler) {
+	admin := r.Group("/api/v1/admin")
+	admin.Use(auth.JWTAuth(cfg), auth.AdminOnly())
+	{
+		admin.GET("/projects", hV1.AdminProjects)
+		admin.PATCH("/projects/:id", hV1.AdminRenameProject)
+		admin.DELETE("/projects/:id", hV1.AdminDeleteProject)
+		admin.POST("/projects/:id/pipeline", hV1.AdminPipelineTrigger)
+		admin.POST("/projects/:id/rebuild-index", hV1.AdminRebuildIndex)
+		admin.GET("/users", hV1.AdminListUsers)
+		admin.PATCH("/users/:id", hV1.AdminUpdateUser)
+		admin.DELETE("/users/:id", hV1.AdminDeleteUser)
+	}
 }
