@@ -1187,7 +1187,7 @@ func cloudRunExecutionStatus(execution cloudRunExecution) string {
 		return "RUNNING"
 	}
 	if execution.SucceededCount > 0 {
-		return "SUCCESS"
+		return "SUCCEEDED"
 	}
 	return "UNKNOWN"
 }
@@ -1198,7 +1198,7 @@ func normalizeCloudRunStatus(value string) string {
 	status = strings.TrimPrefix(status, "EXECUTION_")
 	switch status {
 	case "SUCCEEDED", "TRUE":
-		return "SUCCESS"
+		return "SUCCEEDED"
 	case "FAILED", "FALSE":
 		return "FAILED"
 	case "CANCELLED":

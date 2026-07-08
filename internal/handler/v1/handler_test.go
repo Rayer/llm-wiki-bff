@@ -731,7 +731,7 @@ func TestPipelineStatusReturnsLatestExecution(t *testing.T) {
 		t.Fatalf("last_execution = nil, want execution")
 	}
 	if body.LastExecution.Name != "projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline/executions/exec-1" ||
-		body.LastExecution.Status != "SUCCESS" ||
+		body.LastExecution.Status != "SUCCEEDED" ||
 		body.LastExecution.StartTime != "2026-06-29T01:02:03Z" ||
 		body.LastExecution.EndTime != "2026-06-29T01:02:13Z" ||
 		body.LastExecution.Duration != "10s" {
@@ -805,7 +805,7 @@ func TestPipelineStatusReturnsSpecificExecution(t *testing.T) {
 		t.Fatalf("last_execution = nil, want execution")
 	}
 	if body.LastExecution.Name != "projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline/executions/olw-pipeline-abc123" ||
-		body.LastExecution.Status != "SUCCESS" ||
+		body.LastExecution.Status != "SUCCEEDED" ||
 		body.LastExecution.StartTime != "2026-06-29T02:00:00Z" ||
 		body.LastExecution.EndTime != "2026-06-29T02:00:07Z" ||
 		body.LastExecution.Duration != "7s" {
@@ -941,7 +941,7 @@ func TestStatusIncludesLatestPipelineExecutionWhenAvailable(t *testing.T) {
 	if body.LastExecution == nil {
 		t.Fatal("last_execution = nil, want latest execution")
 	}
-	if body.LastExecution.Status != "SUCCESS" || body.LastExecution.LogURL != "/api/v1/pipeline/log?execution_id=exec-1" {
+	if body.LastExecution.Status != "SUCCEEDED" || body.LastExecution.LogURL != "/api/v1/pipeline/log?execution_id=exec-1" {
 		t.Fatalf("last_execution = %#v", body.LastExecution)
 	}
 }
