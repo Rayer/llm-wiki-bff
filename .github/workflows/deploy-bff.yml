@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - develop/1.0
+  workflow_dispatch:
 
 env:
   PROJECT_ID: llm-wiki-cloud
@@ -28,7 +29,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.23'
+          go-version: '1.26'
           cache: true
 
       - name: Run Go tests
@@ -51,7 +52,7 @@ jobs:
           SHORT_SHA=$(git rev-parse --short HEAD)
           IMAGE="${{ env.AR_REPO }}/${{ env.SERVICE_NAME }}:$SHORT_SHA"
           echo "Building $IMAGE…"
-          gcloud builds submit --tag "$IMAGE" --timeout=600s --quiet
+          gcloud builds submit --tag "$IMAGE" --timeout=600s --suppress-logs --quiet
           echo "Deploying $IMAGE…"
           gcloud run deploy ${{ env.SERVICE_NAME }} \
             --image "$IMAGE" \
