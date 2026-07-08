@@ -42,7 +42,7 @@ func TestLocalDevLoginAcceptsFrontendDemoAccount(t *testing.T) {
 
 func TestLocalDevRefreshReturnsLocalUser(t *testing.T) {
 	resetRefreshTokensForTest()
-	token, err := GenerateRefreshToken("local-user", "test-secret")
+	token, err := GenerateRefreshToken("local-user", localDevRole, "test-secret")
 	if err != nil {
 		t.Fatalf("generate refresh token: %v", err)
 	}

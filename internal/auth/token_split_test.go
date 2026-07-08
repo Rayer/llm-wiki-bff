@@ -14,7 +14,7 @@ import (
 )
 
 func TestGenerateAccessTokenExpiresIn15Minutes(t *testing.T) {
-	tokenString, err := GenerateAccessToken("user-123", "test-secret")
+	tokenString, err := GenerateAccessToken("user-123", "", "test-secret")
 	if err != nil {
 		t.Fatalf("generate access token: %v", err)
 	}
@@ -25,7 +25,7 @@ func TestGenerateAccessTokenExpiresIn15Minutes(t *testing.T) {
 
 func TestGenerateRefreshTokenExpiresIn7Days(t *testing.T) {
 	resetRefreshTokensForTest()
-	tokenString, err := GenerateRefreshToken("user-123", "test-secret")
+	tokenString, err := GenerateRefreshToken("user-123", "", "test-secret")
 	if err != nil {
 		t.Fatalf("generate refresh token: %v", err)
 	}
@@ -36,7 +36,7 @@ func TestGenerateRefreshTokenExpiresIn7Days(t *testing.T) {
 
 func TestRefreshHandlerRotatesRefreshToken(t *testing.T) {
 	resetRefreshTokensForTest()
-	oldToken, err := GenerateRefreshToken("user-123", "test-secret")
+	oldToken, err := GenerateRefreshToken("user-123", "", "test-secret")
 	if err != nil {
 		t.Fatalf("generate refresh token: %v", err)
 	}
