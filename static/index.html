@@ -13,13 +13,37 @@
   }
   * { margin:0; padding:0; box-sizing:border-box; }
   body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-    background: var(--bg); color: var(--text); display: flex; height: 100vh; }
+    background: var(--bg); color: var(--text); display: flex; height: 100dvh; overflow: hidden; }
+
+  button, input, textarea, a { touch-action: manipulation; }
+
+  .mobile-header {
+    display: none; align-items: center; justify-content: space-between; gap: 12px;
+    min-height: 56px; padding: 8px 16px; background: var(--surface);
+    border-bottom: 1px solid var(--border);
+  }
+  .brand-title { font-size: 16px; font-weight: 600; color: var(--text); }
+  .icon-btn {
+    display: inline-flex; align-items: center; justify-content: center;
+    min-width: 44px; min-height: 44px; border: 1px solid var(--border);
+    border-radius: 6px; background: var(--surface); color: var(--text);
+    cursor: pointer;
+  }
+  .icon-btn:hover { background: var(--border); }
+  .icon-btn:focus-visible, .btn:focus-visible, .mode-group button:focus-visible,
+  .query-bar input:focus-visible, .sidebar-nav a:focus-visible {
+    outline: 2px solid var(--accent); outline-offset: 2px;
+  }
+  .drawer-scrim {
+    display: none; position: fixed; inset: 0; z-index: 30; border: 0;
+    background: rgba(0, 0, 0, .56); cursor: pointer;
+  }
 
   /* Sidebar */
-  aside {
+  .sidebar-shell {
     width: 280px; min-width: 280px; background: var(--surface);
     border-right: 1px solid var(--border); display: flex; flex-direction: column;
-    overflow: hidden;
+    overflow: hidden; z-index: 40;
   }
   .sidebar-header { padding: 20px; border-bottom: 1px solid var(--border); }
   .sidebar-header h1 { font-size: 16px; margin-bottom: 4px; }
@@ -31,7 +55,7 @@
     color: var(--muted); margin-bottom: 8px; padding: 0 8px;
   }
   .sidebar-nav .entry, .sidebar-nav .concept {
-    display: block; padding: 6px 8px; border-radius: 4px; font-size: 13px;
+    display: flex; align-items: center; padding: 6px 8px; border-radius: 4px; font-size: 13px;
     cursor: pointer; color: var(--text); text-decoration: none;
     transition: background .1s; white-space: nowrap; overflow: hidden;
     text-overflow: ellipsis;
@@ -54,7 +78,7 @@
   .query-bar input {
     flex:1; padding: 10px 16px; background: var(--bg);
     border: 1px solid var(--border); border-radius: var(--radius);
-    color: var(--text); font-size: 14px;
+    color: var(--text); font-size: 16px; min-height: 44px;
   }
   .query-bar input:focus { outline: none; border-color: var(--accent); }
   .query-bar input::placeholder { color: var(--muted); }
@@ -64,13 +88,14 @@
   .mode-group button {
     padding: 8px 12px; border: none; background: var(--bg); color: var(--muted);
     cursor: pointer; font-size: 12px; border-right: 1px solid var(--border);
+    min-height: 44px;
   }
   .mode-group button:last-child { border-right: none; }
   .mode-group button.active { background: #1b3a3f; color: var(--accent); }
   .btn {
     padding: 8px 16px; border-radius: 6px; border: 1px solid var(--border);
     background: var(--surface); color: var(--text); cursor: pointer; font-size: 13px;
-    white-space: nowrap;
+    white-space: nowrap; min-height: 44px;
   }
   .btn:hover { background: var(--border); }
   .btn.primary { background: #1f6feb; border-color: #1f6feb; color: #fff; }
@@ -150,36 +175,72 @@
   @keyframes spin { to { transform: rotate(360deg); } }
 
   @media (max-width: 768px) {
-    body { flex-direction: column; }
-    aside { width: 100%; min-width: 0; max-height: 40vh; }
+    body { display: block; }
+    body.nav-open { overflow: hidden; }
+    .mobile-header { display: flex; }
+    .drawer-scrim { display: none; }
+    body.nav-open .drawer-scrim { display: block; }
+    .sidebar-shell {
+      position: fixed; top: 0; bottom: 0; left: 0; width: min(320px, 86vw);
+      min-width: 0; border-right: 1px solid var(--border);
+      transform: translateX(-100%); transition: transform .18s ease-out;
+      box-shadow: 24px 0 48px rgba(0, 0, 0, .35);
+    }
+    body.nav-open .sidebar-shell { transform: translateX(0); }
+    main { min-height: calc(100dvh - 56px); }
+    .query-bar {
+      display: grid; grid-template-columns: 1fr auto; gap: 8px;
+      padding: 12px 16px;
+    }
+    .query-bar input { grid-column: 1 / -1; width: 100%; }
+    .mode-group { grid-column: 1; min-width: 0; }
+    .mode-group button { flex: 1; padding-inline: 10px; }
+    .btn.primary { grid-column: 2; }
+    .content { padding: 16px; }
+    .sidebar-nav .entry, .sidebar-nav .concept { min-height: 44px; padding: 10px 12px; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .sidebar-shell { transition: none; }
   }
 </style>
 </head>
 <body>
 
+<header class="mobile-header">
+  <button class="icon-btn" id="mobile-menu-toggle" type="button" aria-label="Open navigation"
+    aria-controls="sidebar-shell" aria-expanded="false" onclick="toggleMobileNav()">
+    <svg width="22" height="22" viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M4 7h16M4 12h16M4 17h16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+    </svg>
+  </button>
+  <div class="brand-title">LLM Wiki</div>
+</header>
+<button class="drawer-scrim" type="button" aria-label="Close navigation" onclick="closeMobileNav()"></button>
+
 <!-- ═══════════════ SIDEBAR ═══════════════ -->
-<aside>
+<aside class="sidebar-shell" id="sidebar-shell">
   <div class="sidebar-header">
-    <h1>🧠 LLM Wiki</h1>
+    <h1>LLM Wiki</h1>
     <div class="project" id="sidebar-project">...</div>
   </div>
-  <div class="sidebar-nav" id="sidebar">
+  <nav class="sidebar-nav" id="sidebar" aria-label="Wiki navigation">
     <!-- Compiled sources -->
     <div class="section">
-      <div class="section-title">📚 Compiled Sources <span id="sources-count" style="color:var(--green)">(...)</span></div>
+      <div class="section-title">Compiled Sources <span id="sources-count" style="color:var(--green)">(...)</span></div>
       <div id="sources-list"></div>
     </div>
     <!-- Wiki concepts -->
     <div class="section">
-      <div class="section-title">🏷️ Wiki Concepts <span id="concepts-count" style="color:var(--yellow)">(...)</span></div>
+      <div class="section-title">Wiki Concepts <span id="concepts-count" style="color:var(--yellow)">(...)</span></div>
       <div id="concepts-list"></div>
     </div>
     <!-- Bookmark import -->
     <div class="section">
-      <div class="section-title">📥 Import</div>
-      <a class="entry" onclick="showImport(event)" style="color:var(--accent); cursor:pointer;">+ Import Bookmarks</a>
+      <div class="section-title">Import</div>
+      <a class="entry" id="import-nav-item" onclick="showImport(event)" style="color:var(--accent); cursor:pointer;">+ Import Bookmarks</a>
     </div>
-  </div>
+  </nav>
 </aside>
 
 <!-- ═══════════════ MAIN ═══════════════ -->
@@ -203,7 +264,7 @@
     </div>
 
     <!-- Wiki content view -->
-    <div id="wiki-view" style="display:none;" class="wiki-render"></div>
+    <article id="wiki-view" style="display:none;" class="wiki-render"></article>
 
     <!-- Query results view -->
     <div id="query-view" style="display:none;" class="query-results"></div>
@@ -235,15 +296,25 @@ let sourcesData = {};
 let conceptsData = {};
 let wikiPageCache = {};   // slug -> { title, type, frontmatter, body }
 let sidebarBuilt = false;
+let lastFocusedBeforeDrawer = null;
+const API_BASE = '/api/v1';
+const DEV_API_HEADERS = {
+  'X-User-ID': 'local-user',
+  'X-Project-ID': 'demo',
+};
+
+function apiHeaders(extra) {
+  return Object.assign({}, DEV_API_HEADERS, extra || {});
+}
 
 // ═══ Init: load sidebar data ═══
 async function init() {
   document.getElementById('sidebar-project').textContent = 'loading...';
   try {
     const [sourcesRes, conceptsRes, statusRes] = await Promise.all([
-      fetch('/api/sources'),
-      fetch('/api/concepts'),
-      fetch('/api/status'),
+      fetch(API_BASE + '/sources', { headers: apiHeaders() }),
+      fetch(API_BASE + '/concepts', { headers: apiHeaders() }),
+      fetch(API_BASE + '/status', { headers: apiHeaders() }),
     ]);
 
     if (sourcesRes.ok) {
@@ -282,8 +353,8 @@ function buildSidebar() {
   if (sourcesData.length === 0) {
     sourcesList.innerHTML = '<div style="font-size:12px;color:var(--muted);padding:4px 8px;">No compiled sources yet</div>';
   } else {
-    sourcesList.innerHTML = sourcesData.map((s, i) =>
-      `<a class="entry${i === 0 ? ' active' : ''}" data-slug="${escapeAttr(s.slug)}" data-type="source"
+    sourcesList.innerHTML = sourcesData.map(s =>
+      `<a class="entry" data-slug="${escapeAttr(s.slug)}" data-type="source"
         onclick="showWiki(event,'source','${escapeAttr(s.slug)}')">${escapeHtml(s.title || s.slug)}</a>`
     ).join('');
   }
@@ -313,7 +384,11 @@ async function doQuery() {
   container.innerHTML = '<div class="loading"><div class="spinner"></div><p>Searching wiki...</p></div>';
 
   try {
-    const res = await fetch('/api/query?q=' + encodeURIComponent(query) + '&mode=' + queryMode);
+    const res = await fetch(API_BASE + '/query', {
+      method: 'POST',
+      headers: apiHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ q: query, mode: queryMode }),
+    });
     if (!res.ok) {
       container.innerHTML = '<div style="text-align:center;padding:40px;color:var(--muted);"><p>Search error: ' + res.status + '</p></div>';
       return;
@@ -366,6 +441,7 @@ async function doQuery() {
 // ═══ Wiki Render (API-backed) ═══
 async function showWiki(event, type, slug) {
   if (event) event.preventDefault();
+  closeMobileNav();
 
   // Update sidebar active
   document.querySelectorAll('.entry, .concept').forEach(e => e.classList.remove('active'));
@@ -386,8 +462,8 @@ async function showWiki(event, type, slug) {
   container.innerHTML = '<div class="loading"><div class="spinner"></div><p>Loading page...</p></div>';
 
   try {
-    const endpoint = type === 'source' ? '/api/sources/' : '/api/concepts/';
-    const res = await fetch(endpoint + encodeURIComponent(slug));
+    const endpoint = type === 'source' ? API_BASE + '/sources/' : API_BASE + '/concepts/';
+    const res = await fetch(endpoint + encodeURIComponent(slug), { headers: apiHeaders() });
     if (!res.ok) {
       container.innerHTML = '<div style="padding:40px;color:var(--muted);text-align:center;"><p>Page not found: ' + slug + '</p></div>';
       return;
@@ -622,6 +698,10 @@ function inlineMarkdown(text) {
 // ═══ Import View ═══
 function showImport(event) {
   if (event) event.preventDefault();
+  closeMobileNav();
+  document.querySelectorAll('.entry, .concept').forEach(e => e.classList.remove('active'));
+  const importLink = document.getElementById('import-nav-item');
+  if (importLink) importLink.classList.add('active');
   showView('import');
 }
 
@@ -644,9 +724,9 @@ async function doImport() {
   result.textContent = '';
 
   try {
-    const res = await fetch('/api/import', {
+    const res = await fetch(API_BASE + '/import', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: apiHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({ urls }),
     });
 
@@ -681,6 +761,48 @@ function setMode(event, mode) {
   document.querySelectorAll('#mode-group button').forEach(b => b.classList.remove('active'));
   event.target.classList.add('active');
 }
+
+function toggleMobileNav() {
+  if (document.body.classList.contains('nav-open')) {
+    closeMobileNav();
+  } else {
+    openMobileNav();
+  }
+}
+
+function openMobileNav() {
+  lastFocusedBeforeDrawer = document.activeElement;
+  document.body.classList.add('nav-open');
+  const toggle = document.getElementById('mobile-menu-toggle');
+  if (toggle) {
+    toggle.setAttribute('aria-expanded', 'true');
+    toggle.setAttribute('aria-label', 'Close navigation');
+  }
+  const firstNavItem = document.querySelector('#sidebar a');
+  if (firstNavItem) firstNavItem.focus();
+}
+
+function closeMobileNav() {
+  if (!document.body.classList.contains('nav-open')) return;
+  document.body.classList.remove('nav-open');
+  const toggle = document.getElementById('mobile-menu-toggle');
+  if (toggle) {
+    toggle.setAttribute('aria-expanded', 'false');
+    toggle.setAttribute('aria-label', 'Open navigation');
+  }
+  if (lastFocusedBeforeDrawer && typeof lastFocusedBeforeDrawer.focus === 'function') {
+    lastFocusedBeforeDrawer.focus();
+  }
+  lastFocusedBeforeDrawer = null;
+}
+
+document.addEventListener('keydown', function(event) {
+  if (event.key === 'Escape') closeMobileNav();
+});
+
+window.addEventListener('resize', function() {
+  if (window.innerWidth > 768) closeMobileNav();
+});
 
 function escapeHtml(s) {
   if (!s) return '';
