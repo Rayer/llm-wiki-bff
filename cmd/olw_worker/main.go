@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,9 +11,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
+	"github.com/rayer/llm-wiki-bff/internal/rawstatus"
+	"github.com/rayer/llm-wiki-bff/internal/storage"
 	"github.com/rayer/llm-wiki-bff/internal/wikiindex"
 	"github.com/rayer/llm-wiki-bff/internal/wikiindex/fsstore"
 	"github.com/spf13/cobra"
@@ -302,7 +306,74 @@ func runPostprocess(ctx context.Context, vault string) error {
 	if _, err := wikiindex.Rebuild(ctx, store); err != nil {
 		return fmt.Errorf("postprocess: %w", err)
 	}
+	if err := writeRawStatus(ctx, vault); err != nil {
+		return fmt.Errorf("postprocess raw status: %w", err)
+	}
 	return nil
+}
+
+func writeRawStatus(ctx context.Context, vault string) error {
+	files, err := listVaultRawFiles(ctx, vault)
+	if err != nil {
+		return fmt.Errorf("list raw files: %w", err)
+	}
+	artifact, err := rawstatus.BuildFromStateDB(ctx, rawstatus.StateDBPath(vault), files, time.Now())
+	if err != nil {
+		return fmt.Errorf("build raw status: %w", err)
+	}
+	data, err := json.MarshalIndent(artifact, "", "  ")
+	if err != nil {
+		return err
+	}
+	store := fsstore.New(vault)
+	if _, err := store.WriteBytesAtomic(ctx, data, "cache/raw_status.json.tmp", rawstatus.Path); err != nil {
+		return fmt.Errorf("write raw status: %w", err)
+	}
+	return nil
+}
+
+func listVaultRawFiles(ctx context.Context, vault string) ([]storage.RawFile, error) {
+	rawDir := filepath.Join(vault, "raw")
+	entries, err := os.ReadDir(rawDir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return []storage.RawFile{}, nil
+		}
+		return nil, err
+	}
+	files := make([]storage.RawFile, 0, len(entries))
+	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if entry.IsDir() {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return nil, err
+		}
+		if !info.Mode().IsRegular() {
+			continue
+		}
+		rel := filepath.ToSlash(filepath.Join("raw", entry.Name()))
+		data, err := os.ReadFile(filepath.Join(rawDir, entry.Name()))
+		if err != nil {
+			return nil, err
+		}
+		sum := sha256.Sum256(data)
+		files = append(files, storage.RawFile{
+			Name:    entry.Name(),
+			Path:    rel,
+			Size:    info.Size(),
+			Updated: info.ModTime().UTC(),
+			SHA256:  fmt.Sprintf("%x", sum[:]),
+		})
+	}
+	sort.Slice(files, func(i, j int) bool {
+		return files[i].Name < files[j].Name
+	})
+	return files, nil
 }
 
 func requireExistingDir(path string) error {
