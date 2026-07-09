@@ -98,6 +98,7 @@ type ImportResponse struct {
 type StatusResponse struct {
 	SourcesCount     int                        `json:"sources_count"`
 	ConceptsCount    int                        `json:"concepts_count"`
+	RawCount         int                        `json:"raw_count"`
 	IndexSources     int                        `json:"index_sources"`
 	IndexConcepts    int                        `json:"index_concepts"`
 	RunningPipelines int                        `json:"running_pipelines"`

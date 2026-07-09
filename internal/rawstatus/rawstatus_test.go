@@ -53,3 +53,23 @@ func TestDecodeRejectsMalformedJSON(t *testing.T) {
 		t.Fatal("Decode() error = nil, want malformed JSON error")
 	}
 }
+
+func TestDecodeInfersFileCountFromFilesMap(t *testing.T) {
+	artifact, err := Decode([]byte(`{"version":1,"files":{"a.md":{"path":"raw/a.md"},"b.md":{"path":"raw/b.md"}}}`))
+	if err != nil {
+		t.Fatalf("Decode() error = %v", err)
+	}
+	if artifact.FileCount != 2 {
+		t.Fatalf("FileCount = %d, want 2", artifact.FileCount)
+	}
+	if Count(artifact) != 2 {
+		t.Fatalf("Count() = %d, want 2", Count(artifact))
+	}
+}
+
+func TestCountPrefersExplicitFileCount(t *testing.T) {
+	artifact := Artifact{FileCount: 3, Files: map[string]FileStatus{}}
+	if Count(artifact) != 3 {
+		t.Fatalf("Count() = %d, want 3", Count(artifact))
+	}
+}

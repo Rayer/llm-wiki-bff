@@ -21,7 +21,9 @@ import (
 	"github.com/rayer/llm-wiki-bff/internal/gcs"
 	"github.com/rayer/llm-wiki-bff/internal/handler"
 	"github.com/rayer/llm-wiki-bff/internal/llm"
+	"github.com/rayer/llm-wiki-bff/internal/rawstatus"
 	"github.com/rayer/llm-wiki-bff/internal/search"
+	store "github.com/rayer/llm-wiki-bff/internal/storage"
 	"github.com/rayer/llm-wiki-bff/internal/wikiindex"
 	"google.golang.org/api/iterator"
 	"google.golang.org/grpc/codes"
@@ -1253,6 +1255,7 @@ func (h *Handler) Status(c *gin.Context) {
 	resp := handler.StatusResponse{
 		SourcesCount:  len(sources),
 		ConceptsCount: len(concepts),
+		RawCount:      rawFileCount(ctx, gcsClient),
 		IndexSources:  h.index.SourceCount(),
 		IndexConcepts: h.index.ConceptCount(),
 	}
@@ -1275,6 +1278,27 @@ func (h *Handler) Status(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, resp)
+}
+
+// rawFileCount reads cache/raw_status.json file_count (written by pipeline postprocess).
+// Falls back to listing raw/ when the artifact is missing. Decode/read errors yield 0.
+func rawFileCount(ctx context.Context, wikiStore store.Store) int {
+	data, err := wikiStore.ReadFile(ctx, rawstatus.Path)
+	if err != nil {
+		if errors.Is(err, storage.ErrObjectNotExist) {
+			files, listErr := wikiStore.ListRawFiles(ctx)
+			if listErr != nil {
+				return 0
+			}
+			return len(files)
+		}
+		return 0
+	}
+	artifact, err := rawstatus.Decode(data)
+	if err != nil {
+		return 0
+	}
+	return rawstatus.Count(artifact)
 }
 
 // splitProjectDocID parses a Firestore doc ID in the format "{userID}_{projectID}".
