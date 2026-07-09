@@ -2,6 +2,7 @@ package v1
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"errors"
 	"fmt"
@@ -11,19 +12,24 @@ import (
 	"regexp"
 	"strings"
 
+	"cloud.google.com/go/storage"
 	"github.com/gin-gonic/gin"
 	"github.com/rayer/llm-wiki-bff/internal/handler"
+	store "github.com/rayer/llm-wiki-bff/internal/storage"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
 
 const (
-	maxRawUploadSize          = 5 << 20
-	maxRawUploadRequestSize   = maxRawUploadSize + (1 << 20)
-	rawUploadRelativeDir      = "raw"
-	rawUploadReadyStatus      = "ready"
-	rawUploadMarkdownSuffix   = ".md"
-	rawUploadMaxFilenameBytes = 512
+	maxRawUploadSize              = 5 << 20
+	maxRawUploadRequestSize       = maxRawUploadSize + (1 << 20)
+	rawUploadRelativeDir          = "raw"
+	rawUploadReadyStatus          = "ready"
+	rawUploadMarkdownSuffix       = ".md"
+	rawUploadMaxFilenameBytes     = 512
+	rawUploadStatusCreated        = "created"
+	rawUploadStatusAlreadyExists  = "already_exists"
+	rawUploadConflictErrorMessage = "filename already exists with different content"
 )
 
 var (
@@ -37,6 +43,7 @@ type rawUploadResponse struct {
 	Path     string `json:"path"`
 	Bytes    int64  `json:"bytes"`
 	SHA256   string `json:"sha256"`
+	Status   string `json:"status"`
 }
 
 // RawUpload handles POST /api/v1/raw/upload.
@@ -108,18 +115,31 @@ func (h *Handler) RawUpload(c *gin.Context) {
 		return
 	}
 
-	gcsClient, err := h.GetGCSClient(c)
+	wikiStore, err := h.GetGCSClient(c)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: err.Error()})
 		return
 	}
 	relPath := rawUploadRelativePath(filename)
-	if _, err := gcsClient.WriteBytes(c.Request.Context(), data, relPath); err != nil {
+	existingDigest, exists, err := resolveExistingRawDigest(c.Request.Context(), wikiStore, relPath)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "check existing raw file: " + err.Error()})
+		return
+	}
+	if exists {
+		if existingDigest == digest {
+			c.JSON(http.StatusOK, newRawUploadResponse(userID, projectID, filename, size, digest, rawUploadStatusAlreadyExists))
+			return
+		}
+		c.JSON(http.StatusConflict, handler.ErrorResponse{Error: rawUploadConflictErrorMessage})
+		return
+	}
+	if _, err := wikiStore.WriteBytes(c.Request.Context(), data, relPath); err != nil {
 		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "upload to GCS: " + err.Error()})
 		return
 	}
 
-	c.JSON(http.StatusCreated, newRawUploadResponse(userID, projectID, filename, size, digest))
+	c.JSON(http.StatusCreated, newRawUploadResponse(userID, projectID, filename, size, digest, rawUploadStatusCreated))
 }
 
 func (h *Handler) rawUploadProjectReady(c *gin.Context, userID, projectID string) (bool, error) {
@@ -190,11 +210,35 @@ func rawUploadRelativePath(filename string) string {
 	return rawUploadRelativeDir + "/" + filename
 }
 
-func newRawUploadResponse(userID, projectID, filename string, bytes int64, digest string) rawUploadResponse {
+// resolveExistingRawDigest returns the existing object digest and whether the
+// object exists. Prefer metadata SHA256; fall back to reading file bytes when
+// metadata is missing (legacy GCS objects) or when the store hashes on read.
+func resolveExistingRawDigest(ctx context.Context, wikiStore store.Store, relPath string) (string, bool, error) {
+	meta, err := wikiStore.GetMetaSHA256(ctx, relPath)
+	if err != nil {
+		return "", false, err
+	}
+	if meta != "" {
+		return meta, true, nil
+	}
+
+	data, err := wikiStore.ReadFile(ctx, relPath)
+	if err != nil {
+		if errors.Is(err, storage.ErrObjectNotExist) {
+			return "", false, nil
+		}
+		return "", false, err
+	}
+	sum := sha256.Sum256(data)
+	return fmt.Sprintf("%x", sum), true, nil
+}
+
+func newRawUploadResponse(userID, projectID, filename string, bytes int64, digest, uploadStatus string) rawUploadResponse {
 	return rawUploadResponse{
 		Filename: filename,
 		Path:     fmt.Sprintf("users/%s/projects/%s/%s", userID, projectID, rawUploadRelativePath(filename)),
 		Bytes:    bytes,
 		SHA256:   digest,
+		Status:   uploadStatus,
 	}
 }
