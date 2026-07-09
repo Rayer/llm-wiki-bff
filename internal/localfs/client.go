@@ -45,7 +45,7 @@ func (c *Client) Scope(userID, projectID string) store.Store {
 }
 
 func (c *Client) Prefix() string {
-	return fmt.Sprintf("users/%s/projects/%s", c.userID, c.projectID)
+	return store.ProjectPrefix(c.userID, c.projectID)
 }
 
 func (c *Client) ReadFile(ctx context.Context, relPath string) ([]byte, error) {

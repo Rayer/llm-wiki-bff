@@ -13,7 +13,7 @@ import (
 
 func seedRebuildCaches(h *Handler, uid, pid string) {
 	h.idRoutingMaps = map[string]dualIDMap{
-		projectStoragePrefix(uid, pid): buildDualIDMap(idMap{
+		store.ProjectPrefix(uid, pid): buildDualIDMap(idMap{
 			Concept: map[string]string{"a3f7b2c01d9d": "stale-slug"},
 		}),
 		"users/other-user/projects/other": buildDualIDMap(idMap{
@@ -32,8 +32,8 @@ func seedRebuildCaches(h *Handler, uid, pid string) {
 
 func assertProjectCachesCleared(t *testing.T, h *Handler, uid, pid string) {
 	t.Helper()
-	if _, ok := h.idRoutingMaps[projectStoragePrefix(uid, pid)]; ok {
-		t.Fatalf("idRoutingMaps still has key %q", projectStoragePrefix(uid, pid))
+	if _, ok := h.idRoutingMaps[store.ProjectPrefix(uid, pid)]; ok {
+		t.Fatalf("idRoutingMaps still has key %q", store.ProjectPrefix(uid, pid))
 	}
 	if _, ok := h.listCache[uid+"_"+pid]; ok {
 		t.Fatalf("listCache still has key %q", uid+"_"+pid)

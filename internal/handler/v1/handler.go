@@ -108,14 +108,10 @@ func (h *Handler) listCacheInvalidate(key string) {
 	delete(h.listCache, key)
 }
 
-func projectStoragePrefix(uid, pid string) string {
-	return fmt.Sprintf("users/%s/projects/%s", uid, pid)
-}
-
 func (h *Handler) idRoutingCacheInvalidateForProject(uid, pid string) {
 	h.idRoutingMu.Lock()
 	defer h.idRoutingMu.Unlock()
-	delete(h.idRoutingMaps, projectStoragePrefix(uid, pid))
+	delete(h.idRoutingMaps, store.ProjectPrefix(uid, pid))
 }
 
 func (h *Handler) invalidateCachesAfterRebuild(uid, pid string) {

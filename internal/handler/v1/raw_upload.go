@@ -236,7 +236,7 @@ func resolveExistingRawDigest(ctx context.Context, wikiStore store.Store, relPat
 func newRawUploadResponse(userID, projectID, filename string, bytes int64, digest, uploadStatus string) rawUploadResponse {
 	return rawUploadResponse{
 		Filename: filename,
-		Path:     fmt.Sprintf("users/%s/projects/%s/%s", userID, projectID, rawUploadRelativePath(filename)),
+		Path:     store.ProjectObjectPath(userID, projectID, rawUploadRelativePath(filename)),
 		Bytes:    bytes,
 		SHA256:   digest,
 		Status:   uploadStatus,

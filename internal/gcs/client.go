@@ -85,7 +85,7 @@ func (c *Client) NewScopedClient(userID, projectID string) *Client {
 }
 
 func (c *Client) prefix() string {
-	return fmt.Sprintf("users/%s/projects/%s", c.userID, c.projectID)
+	return store.ProjectPrefix(c.userID, c.projectID)
 }
 
 // ListSources returns all compiled wiki sources.
@@ -584,7 +584,7 @@ func (c *Client) ListProjects(ctx context.Context, userID string) ([]Project, er
 		return nil, fmt.Errorf("GCS client is not configured")
 	}
 
-	basePrefix := fmt.Sprintf("users/%s/projects/", userID)
+	basePrefix := store.UserProjectsPrefix(userID)
 	it := c.bucket.Objects(ctx, &storage.Query{
 		Prefix:    basePrefix,
 		Delimiter: "/",
@@ -633,7 +633,7 @@ func (c *Client) ListProjects(ctx context.Context, userID string) ([]Project, er
 }
 
 func (c *Client) projectCreatedAt(ctx context.Context, userID, projectID string) string {
-	path := fmt.Sprintf("users/%s/projects/%s/index.md", userID, projectID)
+	path := store.ProjectObjectPath(userID, projectID, "index.md")
 	attrs, err := c.bucket.Object(path).Attrs(ctx)
 	if err != nil || attrs.Created.IsZero() {
 		return ""
