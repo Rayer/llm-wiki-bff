@@ -126,6 +126,56 @@ func TestProjectResponseFromFirestoreDocUsesProjectIDField(t *testing.T) {
 	}
 }
 
+func TestProjectResponseFromFirestoreDocSkipsIdempotencyCacheDoc(t *testing.T) {
+	// init-project stores a cache doc at {userID}_{idempotencyKey} that points at
+	// the real project via project_id. Listing must not emit that project twice.
+	_, _, ok := projectResponseFromFirestoreDoc("user-1_idem-key-1", map[string]interface{}{
+		"project_id":      "project-123",
+		"name":            "Human Project Name",
+		"status":          "ready",
+		"status_url":      "/api/v1/projects/project-123/status",
+		"idempotency_key": "idem-key-1",
+	})
+	if ok {
+		t.Fatal("idempotency cache doc must not be treated as a listable project")
+	}
+}
+
+func TestProjectResponseFromFirestoreDocKeepsRealProjectWithIdempotencyKey(t *testing.T) {
+	resp, uid, ok := projectResponseFromFirestoreDoc("user-1_project-123", map[string]interface{}{
+		"project_id":      "project-123",
+		"name":            "Human Project Name",
+		"status":          "ready",
+		"idempotency_key": "idem-key-1",
+	})
+	if !ok {
+		t.Fatal("real project doc must still be listable when it records an idempotency_key")
+	}
+	if uid != "user-1" || resp.ID != "project-123" {
+		t.Fatalf("got uid=%q id=%q", uid, resp.ID)
+	}
+}
+
+func TestIsIdempotencyCacheDoc(t *testing.T) {
+	if !isIdempotencyCacheDoc("user-1_idem-key-1", map[string]interface{}{
+		"project_id":      "project-123",
+		"idempotency_key": "idem-key-1",
+	}) {
+		t.Fatal("expected cache doc detection")
+	}
+	if isIdempotencyCacheDoc("user-1_project-123", map[string]interface{}{
+		"project_id":      "project-123",
+		"idempotency_key": "idem-key-1",
+	}) {
+		t.Fatal("real project must not be treated as cache doc")
+	}
+	if isIdempotencyCacheDoc("user-1_project-123", map[string]interface{}{
+		"project_id": "project-123",
+	}) {
+		t.Fatal("doc without idempotency_key is not a cache doc")
+	}
+}
+
 func TestProjectTitleFromIndexReadsFrontmatterTitle(t *testing.T) {
 	data := []byte("---\ntitle: Project Name\n---\nProject overview.")
 
@@ -429,8 +479,8 @@ func TestPipelineRunExecutesCloudRunJob(t *testing.T) {
 	}
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
-	c.Request = httptest.NewRequest(http.MethodPost, "/api/v1/pipeline/run", strings.NewReader(`{"project":"demo","command":"sync"}`))
-	c.Request.Header.Set("Content-Type", "application/json")
+	// Project comes from ProjectMiddleware context (X-Project-ID), not request body.
+	c.Request = httptest.NewRequest(http.MethodPost, "/api/v1/pipeline/run", nil)
 	c.Set("userID", "request-user")
 	c.Set("projectID", "demo")
 
@@ -443,8 +493,11 @@ func TestPipelineRunExecutesCloudRunJob(t *testing.T) {
 	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	if body["status"] != "accepted" || body["command"] != "run" || body["project"] != "demo" || body["execution_id"] != "olw-pipeline-abc123" {
+	if body["status"] != "accepted" || body["command"] != "run" || body["project_id"] != "demo" || body["execution_id"] != "olw-pipeline-abc123" {
 		t.Fatalf("body = %#v", body)
+	}
+	if _, hasLegacyProject := body["project"]; hasLegacyProject {
+		t.Fatalf("body still has legacy project field: %#v", body)
 	}
 	want := map[string]any{
 		"overrides": map[string]any{
@@ -499,8 +552,7 @@ func TestPipelineRunDefaultsCommandAndUser(t *testing.T) {
 	}
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
-	c.Request = httptest.NewRequest(http.MethodPost, "/api/v1/pipeline/run", strings.NewReader(`{"project":"demo"}`))
-	c.Request.Header.Set("Content-Type", "application/json")
+	c.Request = httptest.NewRequest(http.MethodPost, "/api/v1/pipeline/run", nil)
 	c.Set("projectID", "demo")
 	c.Set("userID", "request-user")
 
@@ -515,6 +567,9 @@ func TestPipelineRunDefaultsCommandAndUser(t *testing.T) {
 	}
 	if body["execution_id"] != "olw-pipeline-default" {
 		t.Fatalf("execution_id = %q, want olw-pipeline-default", body["execution_id"])
+	}
+	if body["project_id"] != "demo" {
+		t.Fatalf("project_id = %q, want demo", body["project_id"])
 	}
 	override := runRequest.Overrides.ContainerOverrides[0]
 	if len(override.Args) != 2 || override.Args[0] != "run" || override.Args[1] != defaultWorkerCommands {
@@ -646,8 +701,7 @@ func TestPipelineRunReturnsCloudRunResponseOnFailure(t *testing.T) {
 	}
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
-	c.Request = httptest.NewRequest(http.MethodPost, "/api/v1/pipeline/run", strings.NewReader(`{"project":"demo"}`))
-	c.Request.Header.Set("Content-Type", "application/json")
+	c.Request = httptest.NewRequest(http.MethodPost, "/api/v1/pipeline/run", nil)
 	c.Set("projectID", "demo")
 	c.Set("userID", "request-user")
 

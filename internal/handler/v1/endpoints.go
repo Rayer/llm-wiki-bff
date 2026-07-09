@@ -196,6 +196,11 @@ func projectResponseFromFirestoreDoc(docID string, data map[string]interface{}) 
 	if userID == "" {
 		return handler.ProjectResponse{}, "", false
 	}
+	// Idempotency cache docs live in the same collection and share project_id with
+	// the real project; skip them so list endpoints do not emit duplicate IDs.
+	if isIdempotencyCacheDoc(docID, data) {
+		return handler.ProjectResponse{}, "", false
+	}
 	projectID, _ := data["project_id"].(string)
 	projectID = strings.TrimSpace(projectID)
 	if projectID == "" {
@@ -216,6 +221,19 @@ func projectResponseFromFirestoreDoc(docID string, data map[string]interface{}) 
 		Name:      name,
 		CreatedAt: firestoreCreatedAt(data["created_at"]),
 	}, userID, true
+}
+
+// isIdempotencyCacheDoc reports whether a Firestore projects collection document is
+// the init-project idempotency cache entry rather than the real project.
+// Cache docs are stored at {userID}_{idempotencyKey} and still carry project_id.
+func isIdempotencyCacheDoc(docID string, data map[string]interface{}) bool {
+	key, _ := data["idempotency_key"].(string)
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return false
+	}
+	_, docSuffix := splitProjectDocID(docID)
+	return strings.TrimSpace(docSuffix) == key
 }
 
 func firestoreCreatedAt(value interface{}) string {
@@ -769,7 +787,7 @@ func (h *Handler) PipelineRun(c *gin.Context) {
 	c.JSON(http.StatusAccepted, gin.H{
 		"status":       "accepted",
 		"command":      "run",
-		"project":      projectID,
+		"project_id":   projectID,
 		"execution_id": executionID,
 	})
 }
@@ -1386,6 +1404,9 @@ func (h *Handler) AdminProjects(c *gin.Context) {
 		}
 
 		data := doc.Data()
+		if isIdempotencyCacheDoc(doc.Ref.ID, data) {
+			continue
+		}
 		name, _ := data["name"].(string)
 		rawProjects = append(rawProjects, rawProject{doc.Ref.ID, name, uid, pid})
 		userIDs[uid] = true
