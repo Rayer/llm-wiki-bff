@@ -222,6 +222,7 @@ func main() {
 		v1.POST("/pipeline/run", hV1.PipelineRun)
 		v1.GET("/pipeline/status", hV1.PipelineStatus)
 		v1.GET("/pipeline/log", hV1.PipelineLog)
+		v1.GET("/raw", hV1.RawList)
 		v1.POST("/raw/upload", hV1.RawUpload)
 		v1.GET("/status", hV1.Status)
 		v1.GET("/metrics", hV1.PrometheusMetrics)

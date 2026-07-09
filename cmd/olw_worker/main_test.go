@@ -284,6 +284,24 @@ func TestPipelineLogPathRejectsUnsafeExecutionID(t *testing.T) {
 	}
 }
 
+func TestRunPostprocessWritesEmptyRawStatusWhenStateDBMissing(t *testing.T) {
+	vault := t.TempDir()
+	mustWriteFile(t, filepath.Join(vault, "raw", "seed.md"), []byte("seed"))
+	mustWriteFile(t, filepath.Join(vault, "wiki", "alpha.md"), []byte("---\nid: concept-id\ntitle: Alpha\n---\nAlpha"))
+
+	if err := runPostprocess(context.Background(), vault); err != nil {
+		t.Fatalf("runPostprocess() error = %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(vault, "cache", "raw_status.json"))
+	if err != nil {
+		t.Fatalf("read raw_status.json: %v", err)
+	}
+	if !strings.Contains(string(data), `"files": {}`) {
+		t.Fatalf("raw_status.json = %s, want empty files object", data)
+	}
+}
+
 func envMap(env []string) map[string]string {
 	out := make(map[string]string, len(env))
 	for _, entry := range env {
@@ -293,4 +311,14 @@ func envMap(env []string) map[string]string {
 		}
 	}
 	return out
+}
+
+func mustWriteFile(t *testing.T, path string, data []byte) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
 }
