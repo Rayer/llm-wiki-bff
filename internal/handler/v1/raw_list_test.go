@@ -96,6 +96,47 @@ func TestRawListMalformedStatusReturns500(t *testing.T) {
 	}
 }
 
+func TestRawPreviewReturnsMarkdownTextContent(t *testing.T) {
+	root := t.TempDir()
+	mustWriteHandlerFile(t, root, "users/request-user/projects/demo/raw/seed.md", "# Seed\n")
+
+	h := New(localfs.New(root), nil, search.NewIndex(), nil, nil, nil)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/api/v1/raw/seed.md?preview=true", nil)
+	c.Params = gin.Params{{Key: "filename", Value: "seed.md"}}
+	c.Set("userID", "request-user")
+	c.Set("projectID", "demo")
+
+	h.RawPreview(c)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if got := recorder.Body.String(); got != "# Seed\n" {
+		t.Fatalf("body = %q, want raw markdown", got)
+	}
+	if got := recorder.Header().Get("Content-Type"); got != "text/markdown; charset=utf-8" {
+		t.Fatalf("Content-Type = %q, want markdown text", got)
+	}
+}
+
+func TestRawPreviewRejectsUnsafeFilename(t *testing.T) {
+	h := New(localfs.New(t.TempDir()), nil, search.NewIndex(), nil, nil, nil)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/api/v1/raw/../secret.md?preview=true", nil)
+	c.Params = gin.Params{{Key: "filename", Value: "../secret.md"}}
+	c.Set("userID", "request-user")
+	c.Set("projectID", "demo")
+
+	h.RawPreview(c)
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
 func mustWriteHandlerFile(t *testing.T, root, rel, content string) {
 	t.Helper()
 	path := filepath.Join(root, filepath.FromSlash(rel))
