@@ -1,14 +1,11 @@
 package v1
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -94,12 +91,7 @@ func (h *Handler) InitProject(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "generate project ID: " + err.Error()})
 		return
 	}
-	resp := initProjectResponse{
-		ProjectID: projectID,
-		Name:      name,
-		Status:    "initializing",
-		StatusURL: "/api/v1/projects/" + projectID + "/status",
-	}
+	resp := newInitProjectResponse(projectID, name)
 
 	if err := createInitProjectDocs(ctx, fs, projects, userID, projectID, name, idempotencyKey, resp); err != nil {
 		if errors.Is(err, errIdempotencyConflict) {
@@ -117,46 +109,6 @@ func (h *Handler) InitProject(c *gin.Context) {
 			return
 		}
 		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: err.Error()})
-		return
-	}
-
-	token, err := h.getMetadataAccessToken(ctx)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: fmt.Sprintf("init project failed: %s", err)})
-		return
-	}
-	body, err := buildInitProjectRunBody(userID, projectID, name)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "init project failed: " + err.Error()})
-		return
-	}
-	runURL := h.cloudRunJobURL
-	if runURL == "" {
-		runURL = defaultCloudRunJobURL
-	}
-	runReq, err := http.NewRequestWithContext(ctx, http.MethodPost, runURL, bytes.NewReader(body))
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "init project failed: " + err.Error()})
-		return
-	}
-	runReq.Header.Set("Authorization", "Bearer "+token)
-	runReq.Header.Set("Content-Type", "application/json")
-
-	runResp, err := h.pipelineHTTPClient().Do(runReq)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "init project failed: " + err.Error()})
-		return
-	}
-	defer runResp.Body.Close()
-	responseBody, err := io.ReadAll(runResp.Body)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "init project failed: " + err.Error()})
-		return
-	}
-	if runResp.StatusCode < http.StatusOK || runResp.StatusCode >= http.StatusMultipleChoices {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{
-			Error: fmt.Sprintf("init project failed: %s", string(responseBody)),
-		})
 		return
 	}
 
@@ -203,23 +155,6 @@ func (h *Handler) ProjectStatus(c *gin.Context) {
 	c.JSON(http.StatusOK, resp)
 }
 
-func buildInitProjectRunBody(userID, projectID, projectName string) ([]byte, error) {
-	return json.Marshal(gin.H{
-		"overrides": gin.H{
-			"containerOverrides": []gin.H{
-				{
-					"env": []gin.H{
-						{"name": "TASK_TYPE", "value": "init"},
-						{"name": "USER_ID", "value": userID},
-						{"name": "PROJECT_ID", "value": projectID},
-						{"name": "PROJECT_NAME", "value": projectName},
-					},
-				},
-			},
-		},
-	})
-}
-
 func generateProjectID() (string, error) {
 	var b [6]byte
 	if _, err := rand.Read(b[:]); err != nil {
@@ -236,15 +171,7 @@ var errIdempotencyConflict = errors.New("idempotency conflict")
 
 func createInitProjectDocs(ctx context.Context, fs *firestore.Client, projects *firestore.CollectionRef, userID, projectID, name, idempotencyKey string, resp initProjectResponse) error {
 	now := time.Now()
-	projectData := map[string]interface{}{
-		"project_id": projectID,
-		"name":       name,
-		"status":     "initializing",
-		"created_at": now,
-	}
-	if idempotencyKey != "" {
-		projectData["idempotency_key"] = idempotencyKey
-	}
+	projectData := initProjectData(projectID, name, idempotencyKey, now)
 
 	projectRef := projects.Doc(projectDocID(userID, projectID))
 	if idempotencyKey == "" {
@@ -267,10 +194,33 @@ func createInitProjectDocs(ctx context.Context, fs *firestore.Client, projects *
 			"project_id":      resp.ProjectID,
 			"status":          resp.Status,
 			"status_url":      resp.StatusURL,
+			"name":            resp.Name,
 			"created_at":      now,
 			"idempotency_key": idempotencyKey,
 		})
 	})
+}
+
+func newInitProjectResponse(projectID, name string) initProjectResponse {
+	return initProjectResponse{
+		ProjectID: projectID,
+		Name:      name,
+		Status:    "ready",
+		StatusURL: "/api/v1/projects/" + projectID + "/status",
+	}
+}
+
+func initProjectData(projectID, name, idempotencyKey string, now time.Time) map[string]interface{} {
+	projectData := map[string]interface{}{
+		"project_id": projectID,
+		"name":       name,
+		"status":     "ready",
+		"created_at": now,
+	}
+	if idempotencyKey != "" {
+		projectData["idempotency_key"] = idempotencyKey
+	}
+	return projectData
 }
 
 func initProjectResponseFromData(data map[string]interface{}) (initProjectResponse, error) {
