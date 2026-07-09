@@ -896,6 +896,7 @@ func (h *Handler) RebuildIndex(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: err.Error()})
 			return
 		}
+		h.invalidateCachesAfterRebuild(userID, projectID)
 		c.JSON(http.StatusOK, gin.H{
 			"status": "ok",
 			"entries": gin.H{
@@ -936,6 +937,7 @@ func (h *Handler) RebuildIndex(c *gin.Context) {
 		return
 	}
 
+	h.invalidateCachesAfterRebuild(userID, projectID)
 	c.JSON(http.StatusOK, gin.H{
 		"status": "ok",
 		"entries": gin.H{
@@ -1632,6 +1634,7 @@ func (h *Handler) AdminRebuildIndex(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: err.Error()})
 			return
 		}
+		h.invalidateCachesAfterRebuild(uid, pid)
 		c.JSON(http.StatusOK, gin.H{
 			"status": "ok",
 			"entries": gin.H{
@@ -1639,7 +1642,6 @@ func (h *Handler) AdminRebuildIndex(c *gin.Context) {
 				"source":  len(next.Source),
 			},
 		})
-		h.listCacheInvalidate(uid + "_" + pid)
 		return
 	}
 
@@ -1675,6 +1677,7 @@ func (h *Handler) AdminRebuildIndex(c *gin.Context) {
 		return
 	}
 
+	h.invalidateCachesAfterRebuild(uid, pid)
 	c.JSON(http.StatusOK, gin.H{
 		"status": "ok",
 		"entries": gin.H{
