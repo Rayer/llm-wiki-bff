@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"cloud.google.com/go/storage"
 	"github.com/gin-gonic/gin"
@@ -977,28 +978,21 @@ func TestStatusIgnoresPipelineExecutionLookupFailure(t *testing.T) {
 	}
 }
 
-func TestBuildInitProjectRunBody(t *testing.T) {
-	body, err := buildInitProjectRunBody("user-1", "a1b2c3d4e5f6", "Demo Project")
-	if err != nil {
-		t.Fatalf("buildInitProjectRunBody: %v", err)
+func TestInitProjectReadyDefaults(t *testing.T) {
+	resp := newInitProjectResponse("a1b2c3d4e5f6", "Demo Project")
+	if resp.Status != "ready" {
+		t.Fatalf("response status = %q, want ready", resp.Status)
+	}
+	if resp.StatusURL != "/api/v1/projects/a1b2c3d4e5f6/status" {
+		t.Fatalf("status URL = %q", resp.StatusURL)
 	}
 
-	want := map[string]any{
-		"overrides": map[string]any{
-			"containerOverrides": []any{
-				map[string]any{
-					"env": []any{
-						map[string]any{"name": "TASK_TYPE", "value": "init"},
-						map[string]any{"name": "USER_ID", "value": "user-1"},
-						map[string]any{"name": "PROJECT_ID", "value": "a1b2c3d4e5f6"},
-						map[string]any{"name": "PROJECT_NAME", "value": "Demo Project"},
-					},
-				},
-			},
-		},
+	data := initProjectData("a1b2c3d4e5f6", "Demo Project", "idem-1", time.Unix(1, 0))
+	if data["status"] != "ready" {
+		t.Fatalf("project data status = %q, want ready", data["status"])
 	}
-	if string(body) != mustJSON(t, want) {
-		t.Fatalf("body = %s, want %s", body, mustJSON(t, want))
+	if data["idempotency_key"] != "idem-1" {
+		t.Fatalf("idempotency key = %q", data["idempotency_key"])
 	}
 }
 
