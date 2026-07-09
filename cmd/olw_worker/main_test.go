@@ -300,6 +300,9 @@ func TestRunPostprocessWritesEmptyRawStatusWhenStateDBMissing(t *testing.T) {
 	if !strings.Contains(string(data), `"files": {}`) {
 		t.Fatalf("raw_status.json = %s, want empty files object", data)
 	}
+	if !strings.Contains(string(data), `"file_count": 1`) {
+		t.Fatalf("raw_status.json = %s, want file_count 1 for seed.md", data)
+	}
 }
 
 func envMap(env []string) map[string]string {

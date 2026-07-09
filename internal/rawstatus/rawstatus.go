@@ -12,6 +12,7 @@ const Path = "cache/raw_status.json"
 type Artifact struct {
 	Version     int                   `json:"version"`
 	GeneratedAt string                `json:"generated_at"`
+	FileCount   int                   `json:"file_count"`
 	Files       map[string]FileStatus `json:"files"`
 }
 
@@ -36,6 +37,7 @@ func EmptyArtifact(now time.Time) Artifact {
 	return Artifact{
 		Version:     1,
 		GeneratedAt: now.UTC().Format(time.RFC3339),
+		FileCount:   0,
 		Files:       map[string]FileStatus{},
 	}
 }
@@ -48,7 +50,19 @@ func Decode(data []byte) (Artifact, error) {
 	if artifact.Files == nil {
 		artifact.Files = map[string]FileStatus{}
 	}
+	// Older artifacts omit file_count; fall back to map size.
+	if artifact.FileCount == 0 && len(artifact.Files) > 0 {
+		artifact.FileCount = len(artifact.Files)
+	}
 	return artifact, nil
+}
+
+// Count returns the number of raw files recorded on the artifact.
+func Count(artifact Artifact) int {
+	if artifact.FileCount > 0 {
+		return artifact.FileCount
+	}
+	return len(artifact.Files)
 }
 
 func Apply(files []store.RawFile, artifact Artifact) []File {

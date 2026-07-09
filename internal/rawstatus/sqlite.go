@@ -19,6 +19,7 @@ func StateDBPath(vault string) string {
 
 func BuildFromStateDB(ctx context.Context, dbPath string, files []store.RawFile, now time.Time) (Artifact, error) {
 	artifact := EmptyArtifact(now)
+	artifact.FileCount = len(files)
 	if _, err := os.Stat(dbPath); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return artifact, nil

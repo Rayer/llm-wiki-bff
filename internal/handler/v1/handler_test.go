@@ -947,6 +947,40 @@ func TestStatusIncludesLatestPipelineExecutionWhenAvailable(t *testing.T) {
 	}
 }
 
+func TestStatusIncludesRawCountFromArtifact(t *testing.T) {
+	root := t.TempDir()
+	projectRoot := filepath.Join(root, "users", "request-user", "projects", "demo-project")
+	if err := os.MkdirAll(filepath.Join(projectRoot, "cache"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	statusJSON := `{"version":1,"generated_at":"2026-07-09T10:00:00Z","file_count":2,"files":{}}`
+	if err := os.WriteFile(filepath.Join(projectRoot, "cache", "raw_status.json"), []byte(statusJSON), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	h := New(localfs.New(root), nil, search.NewIndex(), conceptcache.New(), nil, nil)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/api/v1/status", nil)
+	c.Set("userID", "request-user")
+	c.Set("projectID", "demo-project")
+
+	h.Status(c)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var body struct {
+		RawCount int `json:"raw_count"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if body.RawCount != 2 {
+		t.Fatalf("raw_count = %d, want 2", body.RawCount)
+	}
+}
+
 func TestStatusIgnoresPipelineExecutionLookupFailure(t *testing.T) {
 	root := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(root, "users", "request-user", "projects", "demo-project"), 0o755); err != nil {
