@@ -258,6 +258,49 @@ func (c *Client) ListMarkdownFiles(ctx context.Context, dir string) ([]MarkdownF
 	return files, nil
 }
 
+func (c *Client) ListRawFiles(ctx context.Context) ([]store.RawFile, error) {
+	prefix := c.prefix() + "/raw/"
+	it := c.bucket.Objects(ctx, &storage.Query{Prefix: prefix})
+
+	files := make([]store.RawFile, 0)
+	for {
+		attrs, err := it.Next()
+		if err != nil {
+			if errors.Is(err, iterator.Done) {
+				break
+			}
+			return nil, err
+		}
+		name, ok := c.rawFileNameFromObject(attrs.Name)
+		if !ok {
+			continue
+		}
+		files = append(files, store.RawFile{
+			Name:    name,
+			Path:    "raw/" + name,
+			Size:    attrs.Size,
+			Updated: attrs.Updated.UTC(),
+			SHA256:  attrs.Metadata["sha256"],
+		})
+	}
+	sort.Slice(files, func(i, j int) bool {
+		return files[i].Name < files[j].Name
+	})
+	return files, nil
+}
+
+func (c *Client) rawFileNameFromObject(objectName string) (string, bool) {
+	prefix := c.prefix() + "/raw/"
+	if !strings.HasPrefix(objectName, prefix) {
+		return "", false
+	}
+	name := strings.TrimPrefix(objectName, prefix)
+	if name == "" || strings.Contains(name, "/") {
+		return "", false
+	}
+	return name, true
+}
+
 // listDir lists .md files under the given directory prefix.
 func (c *Client) listDir(ctx context.Context, dir string) ([]WikiPage, error) {
 	prefix := fmt.Sprintf("%s/%s", c.prefix(), dir)

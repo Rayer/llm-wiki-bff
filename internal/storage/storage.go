@@ -1,6 +1,9 @@
 package storage
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 // WikiPage represents a wiki source or concept page.
 type WikiPage struct {
@@ -28,6 +31,15 @@ type MarkdownFile struct {
 	Data []byte
 }
 
+// RawFile is a direct file under a project's raw/ directory.
+type RawFile struct {
+	Name    string
+	Path    string
+	Size    int64
+	Updated time.Time
+	SHA256  string
+}
+
 // Store is the project-scoped wiki storage contract used by BFF read/write paths.
 type Store interface {
 	Prefix() string
@@ -41,6 +53,7 @@ type Store interface {
 	ListSourcesFromCache(ctx context.Context) ([]WikiPage, error)
 	GetPage(ctx context.Context, slug, category string) (*WikiPage, []byte, error)
 	ListMarkdownFiles(ctx context.Context, dir string) ([]MarkdownFile, error)
+	ListRawFiles(ctx context.Context) ([]RawFile, error)
 	BucketStats(ctx context.Context) (int64, int64, error)
 	GetMetaSHA256(ctx context.Context, relPath string) (string, error)
 }

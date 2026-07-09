@@ -134,6 +134,39 @@ func TestWritesStatsAndDigest(t *testing.T) {
 	}
 }
 
+func TestListRawFilesReturnsDirectRawMetadata(t *testing.T) {
+	root := t.TempDir()
+	mustWrite(t, root, "users/u/projects/p/raw/beta.md", "beta")
+	mustWrite(t, root, "users/u/projects/p/raw/alpha.txt", "alpha")
+	mustWrite(t, root, "users/u/projects/p/raw/nested/ignored.md", "ignored")
+
+	client := New(root).WithScope("u", "p")
+	files, err := client.ListRawFiles(context.Background())
+	if err != nil {
+		t.Fatalf("ListRawFiles() error = %v", err)
+	}
+
+	if len(files) != 2 {
+		t.Fatalf("len(files) = %d, want 2: %#v", len(files), files)
+	}
+	if files[0].Name != "alpha.txt" || files[0].Path != "raw/alpha.txt" || files[0].Size != int64(len("alpha")) || files[0].SHA256 == "" || files[0].Updated.IsZero() {
+		t.Fatalf("files[0] = %#v", files[0])
+	}
+	if files[1].Name != "beta.md" || files[1].Path != "raw/beta.md" || files[1].Size != int64(len("beta")) || files[1].SHA256 == "" || files[1].Updated.IsZero() {
+		t.Fatalf("files[1] = %#v", files[1])
+	}
+}
+
+func TestListRawFilesMissingDirectoryReturnsEmpty(t *testing.T) {
+	files, err := New(t.TempDir()).WithScope("u", "p").ListRawFiles(context.Background())
+	if err != nil {
+		t.Fatalf("ListRawFiles() error = %v", err)
+	}
+	if len(files) != 0 {
+		t.Fatalf("len(files) = %d, want 0", len(files))
+	}
+}
+
 func TestMissingFileUsesStorageNotFound(t *testing.T) {
 	_, err := New(t.TempDir()).WithScope("u", "p").ReadFile(context.Background(), "wiki/missing.md")
 	if !errors.Is(err, storage.ErrObjectNotExist) {
