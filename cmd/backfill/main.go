@@ -17,6 +17,7 @@ import (
 
 	"cloud.google.com/go/storage"
 	"github.com/rayer/llm-wiki-bff/internal/config"
+	wikistorage "github.com/rayer/llm-wiki-bff/internal/storage"
 	"google.golang.org/api/iterator"
 )
 
@@ -65,7 +66,7 @@ func main() {
 	defer storageClient.Close()
 
 	bucket := storageClient.Bucket(cfg.Bucket)
-	projectPrefix := fmt.Sprintf("users/%s/projects/%s/", cfg.UserID, cfg.ProjectID)
+	projectPrefix := wikistorage.ProjectPrefixWithSlash(cfg.UserID, cfg.ProjectID)
 
 	log.Printf("GCS: gs://%s/%s", cfg.Bucket, projectPrefix)
 	if dryRun {

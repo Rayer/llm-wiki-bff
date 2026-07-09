@@ -108,6 +108,17 @@ func (h *Handler) listCacheInvalidate(key string) {
 	delete(h.listCache, key)
 }
 
+func (h *Handler) idRoutingCacheInvalidateForProject(uid, pid string) {
+	h.idRoutingMu.Lock()
+	defer h.idRoutingMu.Unlock()
+	delete(h.idRoutingMaps, store.ProjectPrefix(uid, pid))
+}
+
+func (h *Handler) invalidateCachesAfterRebuild(uid, pid string) {
+	h.idRoutingCacheInvalidateForProject(uid, pid)
+	h.listCacheInvalidate(uid + "_" + pid)
+}
+
 func cloneWikiPages(src []store.WikiPage) []store.WikiPage {
 	if src == nil {
 		return nil

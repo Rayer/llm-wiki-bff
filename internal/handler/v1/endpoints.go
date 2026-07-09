@@ -896,6 +896,7 @@ func (h *Handler) RebuildIndex(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: err.Error()})
 			return
 		}
+		h.invalidateCachesAfterRebuild(userID, projectID)
 		c.JSON(http.StatusOK, gin.H{
 			"status": "ok",
 			"entries": gin.H{
@@ -936,6 +937,7 @@ func (h *Handler) RebuildIndex(c *gin.Context) {
 		return
 	}
 
+	h.invalidateCachesAfterRebuild(userID, projectID)
 	c.JSON(http.StatusOK, gin.H{
 		"status": "ok",
 		"entries": gin.H{
@@ -1492,7 +1494,7 @@ func (h *Handler) AdminDeleteProject(c *gin.Context) {
 
 	// Delete GCS data
 	if h.store != nil {
-		prefix := fmt.Sprintf("users/%s/projects/%s/", uid, pid)
+		prefix := store.ProjectPrefixWithSlash(uid, pid)
 		if err := deleteGCSPrefix(ctx, h.store, prefix); err != nil {
 			log.Printf("[admin] GCS cleanup warning for %s: %v", docID, err)
 		}
@@ -1632,6 +1634,7 @@ func (h *Handler) AdminRebuildIndex(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: err.Error()})
 			return
 		}
+		h.invalidateCachesAfterRebuild(uid, pid)
 		c.JSON(http.StatusOK, gin.H{
 			"status": "ok",
 			"entries": gin.H{
@@ -1639,7 +1642,6 @@ func (h *Handler) AdminRebuildIndex(c *gin.Context) {
 				"source":  len(next.Source),
 			},
 		})
-		h.listCacheInvalidate(uid + "_" + pid)
 		return
 	}
 
@@ -1675,6 +1677,7 @@ func (h *Handler) AdminRebuildIndex(c *gin.Context) {
 		return
 	}
 
+	h.invalidateCachesAfterRebuild(uid, pid)
 	c.JSON(http.StatusOK, gin.H{
 		"status": "ok",
 		"entries": gin.H{
@@ -1982,7 +1985,7 @@ func (h *Handler) AdminDeleteUser(c *gin.Context) {
 
 		// Delete GCS data
 		if h.store != nil && pid != "" {
-			prefix := fmt.Sprintf("users/%s/projects/%s/", userID, pid)
+			prefix := store.ProjectPrefixWithSlash(userID, pid)
 			if err := deleteGCSPrefix(ctx, h.store, prefix); err != nil {
 				log.Printf("[admin] GCS cleanup warning for %s/%s: %v", userID, pid, err)
 			}
