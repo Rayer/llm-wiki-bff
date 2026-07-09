@@ -67,7 +67,7 @@ func Apply(files []store.RawFile, artifact Artifact) []File {
 }
 
 func isIngested(raw store.RawFile, status FileStatus) bool {
-	if raw.SHA256 == "" || status.SHA256 != raw.SHA256 || status.Error != "" || !status.Ingested {
+	if raw.SHA256 == "" || status.SHA256 != raw.SHA256 || status.Error != "" {
 		return false
 	}
 	return status.OLWStatus == "ingested" || status.OLWStatus == "compiled"
