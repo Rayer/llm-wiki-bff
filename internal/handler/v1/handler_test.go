@@ -1001,15 +1001,24 @@ func TestStatusIncludesLatestPipelineExecutionWhenAvailable(t *testing.T) {
 	}
 }
 
-func TestStatusIncludesRawCountFromArtifact(t *testing.T) {
+func TestStatusRawCountUsesLiveRawListing(t *testing.T) {
 	root := t.TempDir()
 	projectRoot := filepath.Join(root, "users", "request-user", "projects", "demo-project")
+	if err := os.MkdirAll(filepath.Join(projectRoot, "raw"), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.MkdirAll(filepath.Join(projectRoot, "cache"), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	// Stale artifact must not win over live raw/ files (LWC-129).
 	statusJSON := `{"version":1,"generated_at":"2026-07-09T10:00:00Z","file_count":2,"files":{}}`
 	if err := os.WriteFile(filepath.Join(projectRoot, "cache", "raw_status.json"), []byte(statusJSON), 0o644); err != nil {
 		t.Fatal(err)
+	}
+	for _, name := range []string{"a.md", "b.md", "c.md"} {
+		if err := os.WriteFile(filepath.Join(projectRoot, "raw", name), []byte("# "+name+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	h := New(localfs.New(root), nil, search.NewIndex(), conceptcache.New(), nil, nil)
@@ -1030,8 +1039,8 @@ func TestStatusIncludesRawCountFromArtifact(t *testing.T) {
 	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	if body.RawCount != 2 {
-		t.Fatalf("raw_count = %d, want 2", body.RawCount)
+	if body.RawCount != 3 {
+		t.Fatalf("raw_count = %d, want 3 (live list, not artifact file_count=2)", body.RawCount)
 	}
 }
 
