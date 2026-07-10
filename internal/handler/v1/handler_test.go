@@ -1026,6 +1026,69 @@ func TestPipelineStatusIncludesQuota(t *testing.T) {
 	}
 }
 
+func TestPipelineStatusAlreadyRunningFalseAfterSucceeded(t *testing.T) {
+	stub := &stubQuotaStore{
+		runsToday: 0,
+		dayKey:    "2026-07-10",
+	}
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/token":
+			return testHTTPResponse(http.StatusOK, `{"access_token":"test-token"}`), nil
+		case "/v2/projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline/executions":
+			return testHTTPResponse(http.StatusOK, `{
+				"executions": [{
+					"name": "projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline/executions/exec-done",
+					"startTime": "2026-06-29T01:02:03Z",
+					"completionTime": "2026-06-29T01:02:13Z",
+					"conditions": [{"type": "Completed", "state": "CONDITION_SUCCEEDED"}]
+				}]
+			}`), nil
+		default:
+			return testHTTPResponse(http.StatusNotFound, `not found`), nil
+		}
+	})}
+
+	h := &Handler{
+		index:            search.NewIndex(),
+		httpClient:       client,
+		metadataTokenURL: "http://metadata.test/token",
+		cloudRunJobURL:   "https://run.googleapis.com/v2/projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline:run",
+	}
+	h.SetPipelineQuotaConfig(2, 3600, 1, nil)
+	h.SetPipelineQuotaStore(stub)
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/api/v1/pipeline/status", nil)
+	c.Set("userID", "request-user")
+	c.Set("projectID", "demo-project")
+
+	h.PipelineStatus(c)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var body struct {
+		LastExecution *struct {
+			Status string `json:"status"`
+		} `json:"last_execution"`
+		Quota *pipelinequota.Snapshot `json:"quota"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body.LastExecution == nil || body.LastExecution.Status != "SUCCEEDED" {
+		t.Fatalf("last_execution = %#v", body.LastExecution)
+	}
+	if body.Quota == nil {
+		t.Fatal("quota is nil")
+	}
+	if body.Quota.AlreadyRunning {
+		t.Fatalf("quota.already_running must be false after SUCCEEDED, got %+v", body.Quota)
+	}
+}
+
 func TestAdminPipelineTriggerBlocksAlreadyRunning(t *testing.T) {
 	var runHits int
 	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {

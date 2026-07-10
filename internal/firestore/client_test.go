@@ -61,3 +61,21 @@ func TestActiveLockUntilIgnoresReleasedOrExpiredLocks(t *testing.T) {
 		})
 	}
 }
+
+func TestLockDataActiveMatchesActiveLockUntil(t *testing.T) {
+	now := time.Date(2026, 7, 6, 12, 0, 0, 0, time.UTC)
+	active := map[string]interface{}{
+		"status":     "active",
+		"expires_at": timestamppb.New(now.Add(time.Minute)),
+	}
+	if !LockDataActive(active, now) {
+		t.Fatal("LockDataActive = false, want true for active unexpired lock")
+	}
+	expired := map[string]interface{}{
+		"status":     "active",
+		"expires_at": timestamppb.New(now.Add(-time.Minute)),
+	}
+	if LockDataActive(expired, now) {
+		t.Fatal("LockDataActive = true, want false for expired lock")
+	}
+}
