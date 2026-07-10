@@ -983,6 +983,92 @@ func TestPipelineRunRefundsOnInvokeFailure(t *testing.T) {
 	}
 }
 
+func TestPipelineStatusIncludesSuggestedQueries(t *testing.T) {
+	root := t.TempDir()
+	projectRoot := filepath.Join(root, "users", "request-user", "projects", "demo-project")
+	if err := os.MkdirAll(filepath.Join(projectRoot, "cache"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	queriesJSON := `{"queries":["Beta","Alpha"],"updated_at":"2026-07-10T00:00:00Z"}`
+	if err := os.WriteFile(filepath.Join(projectRoot, "cache", "suggested_queries.json"), []byte(queriesJSON), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == "/token" {
+			return testHTTPResponse(http.StatusOK, `{"access_token":"test-token"}`), nil
+		}
+		return testHTTPResponse(http.StatusOK, `{}`), nil
+	})}
+	h := New(localfs.New(root), nil, search.NewIndex(), conceptcache.New(), nil, nil)
+	h.httpClient = client
+	h.metadataTokenURL = "http://metadata.test/token"
+	h.cloudRunJobURL = "https://run.googleapis.com/v2/projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline:run"
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/api/v1/pipeline/status", nil)
+	c.Set("userID", "request-user")
+	c.Set("projectID", "demo-project")
+
+	h.PipelineStatus(c)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var body struct {
+		SuggestedQueries []string `json:"suggested_queries"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(body.SuggestedQueries) != 2 || body.SuggestedQueries[0] != "Beta" {
+		t.Fatalf("suggested_queries = %#v, want [Beta Alpha]", body.SuggestedQueries)
+	}
+}
+
+func TestPipelineStatusReturnsEmptySuggestedQueriesWhenArtifactMissing(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "users", "request-user", "projects", "demo-project"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == "/token" {
+			return testHTTPResponse(http.StatusOK, `{"access_token":"test-token"}`), nil
+		}
+		return testHTTPResponse(http.StatusOK, `{}`), nil
+	})}
+	h := New(localfs.New(root), nil, search.NewIndex(), conceptcache.New(), nil, nil)
+	h.httpClient = client
+	h.metadataTokenURL = "http://metadata.test/token"
+	h.cloudRunJobURL = "https://run.googleapis.com/v2/projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline:run"
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/api/v1/pipeline/status", nil)
+	c.Set("userID", "request-user")
+	c.Set("projectID", "demo-project")
+
+	h.PipelineStatus(c)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var body struct {
+		SuggestedQueries []string `json:"suggested_queries"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body.SuggestedQueries == nil {
+		t.Fatal("suggested_queries = nil, want empty slice")
+	}
+	if len(body.SuggestedQueries) != 0 {
+		t.Fatalf("suggested_queries = %#v, want []", body.SuggestedQueries)
+	}
+}
+
 func TestPipelineStatusIncludesQuota(t *testing.T) {
 	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		if r.URL.Path == "/token" {

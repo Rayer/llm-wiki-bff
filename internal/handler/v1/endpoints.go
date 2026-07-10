@@ -23,6 +23,7 @@ import (
 	"github.com/rayer/llm-wiki-bff/internal/llm"
 	"github.com/rayer/llm-wiki-bff/internal/pipelinequota"
 	"github.com/rayer/llm-wiki-bff/internal/search"
+	"github.com/rayer/llm-wiki-bff/internal/suggestedqueries"
 	store "github.com/rayer/llm-wiki-bff/internal/storage"
 	"github.com/rayer/llm-wiki-bff/internal/wikiindex"
 	"google.golang.org/api/iterator"
@@ -833,9 +834,10 @@ type cloudRunJobRunResponse struct {
 }
 
 type pipelineStatusResponse struct {
-	LastExecution *handler.PipelineExecutionResponse `json:"last_execution"`
-	ProjectID     string                             `json:"project_id"`
-	Quota         *pipelinequota.Snapshot            `json:"quota,omitempty"`
+	LastExecution    *handler.PipelineExecutionResponse `json:"last_execution"`
+	ProjectID        string                             `json:"project_id"`
+	Quota            *pipelinequota.Snapshot            `json:"quota,omitempty"`
+	SuggestedQueries []string                           `json:"suggested_queries"`
 }
 
 type cloudRunExecutionsResponse struct {
@@ -890,7 +892,10 @@ func (h *Handler) PipelineStatus(c *gin.Context) {
 
 	ctx := c.Request.Context()
 	executionID := strings.TrimSpace(c.Query("execution_id"))
-	response := pipelineStatusResponse{ProjectID: projectID}
+	response := pipelineStatusResponse{
+		ProjectID:        projectID,
+		SuggestedQueries: h.loadSuggestedQueries(ctx, c),
+	}
 	lastExecution, err := h.pipelineExecutionStatus(ctx, executionID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "pipeline status failed: " + err.Error()})
@@ -1337,6 +1342,22 @@ func (h *Handler) Status(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, resp)
+}
+
+func (h *Handler) loadSuggestedQueries(ctx context.Context, c *gin.Context) []string {
+	wikiStore, err := h.GetStore(c)
+	if err != nil {
+		return []string{}
+	}
+	data, err := wikiStore.ReadFile(ctx, suggestedqueries.Path)
+	if err != nil {
+		return []string{}
+	}
+	artifact, err := suggestedqueries.Decode(data)
+	if err != nil {
+		return []string{}
+	}
+	return suggestedqueries.Queries(artifact)
 }
 
 // rawFileCount returns the live number of files under project raw/ (ListRawFiles).

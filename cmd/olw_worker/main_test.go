@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -281,6 +282,37 @@ func TestRunWorkerBatchWritesPipelineLogForExecution(t *testing.T) {
 func TestPipelineLogPathRejectsUnsafeExecutionID(t *testing.T) {
 	if _, err := pipelineLogPath(t.TempDir(), "../escape"); err == nil {
 		t.Fatal("pipelineLogPath() error = nil, want error")
+	}
+}
+
+func TestRunPostprocessWritesSuggestedQueriesFromConcepts(t *testing.T) {
+	vault := t.TempDir()
+	mustWriteFile(t, filepath.Join(vault, "wiki", "alpha.md"), []byte("---\nid: alpha-id\ntitle: Alpha\nupdated: 2026-07-01T00:00:00Z\n---\nAlpha"))
+	mustWriteFile(t, filepath.Join(vault, "wiki", "beta.md"), []byte("---\nid: beta-id\ntitle: Beta\nupdated: 2026-07-10T00:00:00Z\n---\nBeta"))
+
+	if err := runPostprocess(context.Background(), vault); err != nil {
+		t.Fatalf("runPostprocess() error = %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(vault, "cache", "suggested_queries.json"))
+	if err != nil {
+		t.Fatalf("read suggested_queries.json: %v", err)
+	}
+	var artifact struct {
+		Queries   []string `json:"queries"`
+		UpdatedAt string   `json:"updated_at"`
+	}
+	if err := json.Unmarshal(data, &artifact); err != nil {
+		t.Fatalf("decode suggested_queries.json: %v", err)
+	}
+	if len(artifact.Queries) != 2 {
+		t.Fatalf("queries = %#v, want 2 entries", artifact.Queries)
+	}
+	if artifact.Queries[0] != "Beta" {
+		t.Fatalf("queries[0] = %q, want Beta", artifact.Queries[0])
+	}
+	if artifact.UpdatedAt == "" {
+		t.Fatal("updated_at is empty")
 	}
 }
 
