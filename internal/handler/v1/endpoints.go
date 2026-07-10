@@ -21,6 +21,7 @@ import (
 	"github.com/rayer/llm-wiki-bff/internal/gcs"
 	"github.com/rayer/llm-wiki-bff/internal/handler"
 	"github.com/rayer/llm-wiki-bff/internal/llm"
+	"github.com/rayer/llm-wiki-bff/internal/pipelinequota"
 	"github.com/rayer/llm-wiki-bff/internal/search"
 	store "github.com/rayer/llm-wiki-bff/internal/storage"
 	"github.com/rayer/llm-wiki-bff/internal/wikiindex"
@@ -721,12 +722,55 @@ func (h *Handler) PipelineRun(c *gin.Context) {
 		return
 	}
 
-	token, err := h.getMetadataAccessToken(c.Request.Context())
+	ctx := c.Request.Context()
+	snap, reserved, prev, err := h.evaluateQuota(ctx, userID, projectID, true)
 	if err != nil {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{
+			Error: "pipeline failed: " + err.Error(),
+		})
+		return
+	}
+	// Post-reserve snapshots re-evaluate the *next* run and often have Allowed=false
+	// (cooldown). Use reserved for the accept path; only block when nothing was reserved
+	// and the pre-reserve evaluation denied the run. Unenforced (no store) is Allowed + !reserved.
+	if !reserved && !snap.Allowed {
+		c.JSON(httpStatusForReason(snap.Reason), gin.H{
+			"error": fmt.Sprintf("pipeline blocked: %s", snap.Reason),
+			"quota": snap,
+		})
+		return
+	}
+
+	executionID, err := h.invokePipelineJob(ctx, userID, projectID)
+	if err != nil {
+		if reserved {
+			if qs := h.effectiveQuotaStore(); qs != nil {
+				if refundErr := qs.RefundQuotaPrev(ctx, userID, projectID, prev); refundErr != nil {
+					log.Printf("pipeline quota refund failed for %s/%s: %v", userID, projectID, refundErr)
+				}
+			}
+		}
 		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{
 			Error: fmt.Sprintf("pipeline failed: %s", err),
 		})
 		return
+	}
+
+	c.JSON(http.StatusAccepted, gin.H{
+		"status":       "accepted",
+		"command":      "run",
+		"project_id":   projectID,
+		"execution_id": executionID,
+		"quota":        snap,
+	})
+}
+
+// invokePipelineJob starts the shared Cloud Run pipeline job for userID/projectID.
+// Used by both user PipelineRun and AdminPipelineTrigger.
+func (h *Handler) invokePipelineJob(ctx context.Context, userID, projectID string) (executionID string, err error) {
+	token, err := h.getMetadataAccessToken(ctx)
+	if err != nil {
+		return "", err
 	}
 
 	body, err := json.Marshal(gin.H{
@@ -744,51 +788,37 @@ func (h *Handler) PipelineRun(c *gin.Context) {
 		},
 	})
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "pipeline failed: " + err.Error()})
-		return
+		return "", err
 	}
 
 	runURL := h.cloudRunJobURL
 	if runURL == "" {
 		runURL = defaultCloudRunJobURL
 	}
-	runReq, err := http.NewRequestWithContext(c.Request.Context(), http.MethodPost, runURL, bytes.NewReader(body))
+	runReq, err := http.NewRequestWithContext(ctx, http.MethodPost, runURL, bytes.NewReader(body))
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "pipeline failed: " + err.Error()})
-		return
+		return "", err
 	}
 	runReq.Header.Set("Authorization", "Bearer "+token)
 	runReq.Header.Set("Content-Type", "application/json")
 
 	resp, err := h.pipelineHTTPClient().Do(runReq)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "pipeline failed: " + err.Error()})
-		return
+		return "", err
 	}
 	defer resp.Body.Close()
 	responseBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "pipeline failed: " + err.Error()})
-		return
+		return "", err
 	}
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{
-			Error: fmt.Sprintf("pipeline failed: %s", string(responseBody)),
-		})
-		return
+		return "", fmt.Errorf("%s", string(responseBody))
 	}
-	executionID, err := cloudRunExecutionIDFromRunResponse(responseBody)
+	executionID, err = cloudRunExecutionIDFromRunResponse(responseBody)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "pipeline failed: " + err.Error()})
-		return
+		return "", err
 	}
-
-	c.JSON(http.StatusAccepted, gin.H{
-		"status":       "accepted",
-		"command":      "run",
-		"project_id":   projectID,
-		"execution_id": executionID,
-	})
+	return executionID, nil
 }
 
 type cloudRunJobRunResponse struct {
@@ -805,6 +835,7 @@ type cloudRunJobRunResponse struct {
 type pipelineStatusResponse struct {
 	LastExecution *handler.PipelineExecutionResponse `json:"last_execution"`
 	ProjectID     string                             `json:"project_id"`
+	Quota         *pipelinequota.Snapshot            `json:"quota,omitempty"`
 }
 
 type cloudRunExecutionsResponse struct {
@@ -857,14 +888,23 @@ func (h *Handler) PipelineStatus(c *gin.Context) {
 		return
 	}
 
+	ctx := c.Request.Context()
 	executionID := strings.TrimSpace(c.Query("execution_id"))
 	response := pipelineStatusResponse{ProjectID: projectID}
-	lastExecution, err := h.pipelineExecutionStatus(c.Request.Context(), executionID)
+	lastExecution, err := h.pipelineExecutionStatus(ctx, executionID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "pipeline status failed: " + err.Error()})
 		return
 	}
 	response.LastExecution = lastExecution
+
+	// Evaluate-only quota snapshot for frontend Run-button gating (never mutates).
+	snap, _, _, err := h.evaluateQuota(ctx, userID, projectID, false)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "pipeline status failed: " + err.Error()})
+		return
+	}
+	response.Quota = &snap
 	c.JSON(http.StatusOK, response)
 }
 
@@ -1714,61 +1754,18 @@ func (h *Handler) AdminPipelineTrigger(c *gin.Context) {
 		return
 	}
 
-	// Get metadata access token for Cloud Run Jobs API
-	mdToken, err := h.getMetadataAccessToken(ctx)
+	// Admin bypasses daily/cooldown/new-raw/demo quota but still blocks concurrent runs.
+	alreadyRunning, err := h.isPipelineRunning(ctx, uid, pid)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "auth: " + err.Error()})
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "pipeline status: " + err.Error()})
+		return
+	}
+	if alreadyRunning {
+		c.JSON(http.StatusConflict, handler.ErrorResponse{Error: "pipeline is already running"})
 		return
 	}
 
-	// Invoke Cloud Run worker job with user/project overrides
-	body, err := json.Marshal(gin.H{
-		"overrides": gin.H{
-			"containerOverrides": []gin.H{
-				{
-					"args": []string{"run", defaultWorkerCommands},
-					"env": []gin.H{
-						{"name": "USER_ID", "value": uid},
-						{"name": "PROJECT_ID", "value": pid},
-						{"name": "TASK_TYPE", "value": "pipeline"},
-					},
-				},
-			},
-		},
-	})
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "marshal: " + err.Error()})
-		return
-	}
-
-	runURL := h.cloudRunJobURL
-	if runURL == "" {
-		runURL = defaultCloudRunJobURL
-	}
-	runReq, err := http.NewRequestWithContext(ctx, http.MethodPost, runURL, bytes.NewReader(body))
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "request: " + err.Error()})
-		return
-	}
-	runReq.Header.Set("Authorization", "Bearer "+mdToken)
-	runReq.Header.Set("Content-Type", "application/json")
-
-	resp, err := h.pipelineHTTPClient().Do(runReq)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "invoke: " + err.Error()})
-		return
-	}
-	defer resp.Body.Close()
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "read: " + err.Error()})
-		return
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "invoke failed: " + string(respBody)})
-		return
-	}
-	executionID, err := cloudRunExecutionIDFromRunResponse(respBody)
+	executionID, err := h.invokePipelineJob(ctx, uid, pid)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "invoke failed: " + err.Error()})
 		return
