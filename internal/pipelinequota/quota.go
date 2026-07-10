@@ -1,0 +1,134 @@
+package pipelinequota
+
+import (
+	"fmt"
+	"time"
+)
+
+type Reason string
+
+const (
+	ReasonNone           Reason = ""
+	ReasonDemo           Reason = "demo"
+	ReasonDailyLimit     Reason = "daily_limit"
+	ReasonCooldown       Reason = "cooldown"
+	ReasonAlreadyRunning Reason = "already_running"
+	ReasonNoNewRaw       Reason = "no_new_raw"
+)
+
+type Limits struct {
+	DailyLimit int
+	Cooldown   time.Duration
+	MinNewRaw  int
+}
+
+type Input struct {
+	Now            time.Time
+	Limits         Limits
+	IsDemo         bool
+	AlreadyRunning bool
+	RunsToday      int
+	DayKey         string // UTC YYYY-MM-DD stored on doc
+	LastRunAt      time.Time
+	NewRawFiles    int
+	Enforced       bool // if false, always allow (local no firestore)
+}
+
+type Snapshot struct {
+	Enforced       bool       `json:"enforced"`
+	Allowed        bool       `json:"allowed"`
+	Reason         Reason     `json:"reason,omitempty"`
+	Message        string     `json:"message,omitempty"`
+	RunsToday      int        `json:"runs_today"`
+	DailyLimit     int        `json:"daily_limit"`
+	CooldownUntil  *time.Time `json:"cooldown_until,omitempty"`
+	NextReset      time.Time  `json:"next_reset"`
+	NewRawFiles    int        `json:"new_raw_files"`
+	MinNewRaw      int        `json:"min_new_raw"`
+	AlreadyRunning bool       `json:"already_running"`
+}
+
+func DayKeyUTC(t time.Time) string {
+	return t.UTC().Format("2006-01-02")
+}
+
+func NextResetUTC(t time.Time) time.Time {
+	u := t.UTC()
+	return time.Date(u.Year(), u.Month(), u.Day()+1, 0, 0, 0, 0, time.UTC)
+}
+
+func CountNewRaw(updatedTimes []time.Time, lastRunAt time.Time) int {
+	if lastRunAt.IsZero() {
+		return len(updatedTimes)
+	}
+	n := 0
+	for _, u := range updatedTimes {
+		if u.After(lastRunAt) {
+			n++
+		}
+	}
+	return n
+}
+
+func Evaluate(in Input) Snapshot {
+	lim := in.Limits
+	if lim.DailyLimit <= 0 {
+		lim.DailyLimit = 2
+	}
+	if lim.Cooldown <= 0 {
+		lim.Cooldown = time.Hour
+	}
+	if lim.MinNewRaw <= 0 {
+		lim.MinNewRaw = 1
+	}
+	now := in.Now.UTC()
+	today := DayKeyUTC(now)
+	runs := in.RunsToday
+	if in.DayKey != today {
+		runs = 0
+	}
+	snap := Snapshot{
+		Enforced:       in.Enforced,
+		RunsToday:      runs,
+		DailyLimit:     lim.DailyLimit,
+		NextReset:      NextResetUTC(now),
+		NewRawFiles:    in.NewRawFiles,
+		MinNewRaw:      lim.MinNewRaw,
+		AlreadyRunning: in.AlreadyRunning,
+	}
+	if !in.Enforced {
+		snap.Allowed = true
+		return snap
+	}
+	// priority
+	if in.IsDemo {
+		return block(snap, ReasonDemo, "Demo sessions cannot run the pipeline")
+	}
+	if in.AlreadyRunning {
+		return block(snap, ReasonAlreadyRunning, "A pipeline is already running for this project")
+	}
+	if runs >= lim.DailyLimit {
+		return block(snap, ReasonDailyLimit, fmt.Sprintf("Daily limit reached (%d/%d)", runs, lim.DailyLimit))
+	}
+	if !in.LastRunAt.IsZero() {
+		until := in.LastRunAt.UTC().Add(lim.Cooldown)
+		if now.Before(until) {
+			snap.CooldownUntil = &until
+			mins := int(until.Sub(now).Minutes()) + 1
+			return block(snap, ReasonCooldown, fmt.Sprintf("Cooldown active; try again in %d minutes", mins))
+		}
+		snap.CooldownUntil = &until
+	}
+	if in.NewRawFiles < lim.MinNewRaw {
+		return block(snap, ReasonNoNewRaw, "Upload at least one new or modified raw file before running")
+	}
+	snap.Allowed = true
+	return snap
+}
+
+func block(s Snapshot, r Reason, msg string) Snapshot {
+	s.Allowed = false
+	s.Reason = r
+	s.Message = msg
+	return s
+}
