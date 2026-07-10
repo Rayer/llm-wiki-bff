@@ -139,6 +139,12 @@ func main() {
 
 	// Handlers
 	hV1 := handlerv1.New(wikiStore, fsClient, idx, conceptCache, llmClient, expander)
+	hV1.SetPipelineQuotaConfig(
+		cfg.PipelineDailyLimit,
+		cfg.PipelineCooldownSeconds,
+		cfg.PipelineMinNewRaw,
+		cfg.PipelineDemoUserIDs,
+	)
 	if localMode {
 		hV1.SetRebuildIndexFunc(func(ctx context.Context, userID, projectID string) (wikiindex.IDMap, error) {
 			return handlerv1.RebuildIndexForStore(ctx, wikiStore.Scope(userID, projectID))

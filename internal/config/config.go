@@ -2,8 +2,16 @@ package config
 
 import (
 	"errors"
+	"strings"
 
 	"github.com/spf13/viper"
+)
+
+// Default pipeline quota limits (LWC-138).
+const (
+	DefaultPipelineDailyLimit      = 2
+	DefaultPipelineCooldownSeconds = 3600
+	DefaultPipelineMinNewRaw       = 1
 )
 
 // Config holds application configuration loaded from config.toml.
@@ -18,6 +26,13 @@ type Config struct {
 	DevJWT         bool
 	LocalDataDir   string
 	Users          []UserConfig
+
+	// Pipeline quota (LWC-138). Env: PIPELINE_DAILY_LIMIT, PIPELINE_COOLDOWN_SECONDS,
+	// PIPELINE_MIN_NEW_RAW, PIPELINE_DEMO_USER_IDS (comma-separated).
+	PipelineDailyLimit      int
+	PipelineCooldownSeconds int
+	PipelineMinNewRaw       int
+	PipelineDemoUserIDs     []string
 }
 
 // UserConfig holds a hardcoded user for authentication.
@@ -34,8 +49,15 @@ func Load(path string) (Config, error) {
 	v.SetConfigType("toml")
 	v.AddConfigPath(path)
 	v.SetDefault("port", "8080")
+	v.SetDefault("pipeline_daily_limit", DefaultPipelineDailyLimit)
+	v.SetDefault("pipeline_cooldown_seconds", DefaultPipelineCooldownSeconds)
+	v.SetDefault("pipeline_min_new_raw", DefaultPipelineMinNewRaw)
 	v.AutomaticEnv()
 	v.BindEnv("deepseek_api_key")
+	v.BindEnv("pipeline_daily_limit", "PIPELINE_DAILY_LIMIT")
+	v.BindEnv("pipeline_cooldown_seconds", "PIPELINE_COOLDOWN_SECONDS")
+	v.BindEnv("pipeline_min_new_raw", "PIPELINE_MIN_NEW_RAW")
+	v.BindEnv("pipeline_demo_user_ids", "PIPELINE_DEMO_USER_IDS")
 
 	if err := v.ReadInConfig(); err != nil {
 		var notFound viper.ConfigFileNotFoundError
@@ -44,16 +66,52 @@ func Load(path string) (Config, error) {
 		}
 	}
 
+	dailyLimit := v.GetInt("pipeline_daily_limit")
+	if dailyLimit <= 0 {
+		dailyLimit = DefaultPipelineDailyLimit
+	}
+	cooldownSeconds := v.GetInt("pipeline_cooldown_seconds")
+	if cooldownSeconds <= 0 {
+		cooldownSeconds = DefaultPipelineCooldownSeconds
+	}
+	minNewRaw := v.GetInt("pipeline_min_new_raw")
+	if minNewRaw <= 0 {
+		minNewRaw = DefaultPipelineMinNewRaw
+	}
+
 	cfg := Config{
-		GCPProject:     v.GetString("gcp_project"),
-		Bucket:         v.GetString("bucket"),
-		UserID:         v.GetString("user_id"),
-		ProjectID:      v.GetString("project_id"),
-		Port:           v.GetString("port"),
-		DeepSeekAPIKey: v.GetString("deepseek_api_key"),
-		JWTSecret:      v.GetString("jwt_secret"),
-		DevJWT:         v.GetBool("dev_jwt"),
-		LocalDataDir:   v.GetString("local_data_dir"),
+		GCPProject:              v.GetString("gcp_project"),
+		Bucket:                  v.GetString("bucket"),
+		UserID:                  v.GetString("user_id"),
+		ProjectID:               v.GetString("project_id"),
+		Port:                    v.GetString("port"),
+		DeepSeekAPIKey:          v.GetString("deepseek_api_key"),
+		JWTSecret:               v.GetString("jwt_secret"),
+		DevJWT:                  v.GetBool("dev_jwt"),
+		LocalDataDir:            v.GetString("local_data_dir"),
+		PipelineDailyLimit:      dailyLimit,
+		PipelineCooldownSeconds: cooldownSeconds,
+		PipelineMinNewRaw:       minNewRaw,
+		PipelineDemoUserIDs:     splitCommaList(v.GetString("pipeline_demo_user_ids")),
 	}
 	return cfg, nil
+}
+
+func splitCommaList(raw string) []string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
