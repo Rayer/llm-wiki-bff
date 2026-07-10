@@ -80,8 +80,13 @@ func Apply(files []store.RawFile, artifact Artifact) []File {
 	return out
 }
 
-func isIngested(raw store.RawFile, status FileStatus) bool {
-	if raw.SHA256 == "" || status.SHA256 != raw.SHA256 || status.Error != "" {
+func isIngested(_ store.RawFile, status FileStatus) bool {
+	// Trust OLW state.db status for the UI badge.
+	// Do NOT require list-time SHA256 == OLW content_hash:
+	// - GCS ListRawFiles often has empty metadata sha256
+	// - OLW content_hash may not equal raw file sha256 / upload metadata
+	// Those mismatches previously marked pipeline-complete files as pending.
+	if status.Error != "" {
 		return false
 	}
 	return status.OLWStatus == "ingested" || status.OLWStatus == "compiled"
