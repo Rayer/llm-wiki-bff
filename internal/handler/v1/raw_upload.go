@@ -58,6 +58,10 @@ func (h *Handler) RawUpload(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, handler.ErrorResponse{Error: "project ID is required"})
 		return
 	}
+	if h.isDemoUser(userID) {
+		c.JSON(http.StatusForbidden, handler.ErrorResponse{Error: "demo users cannot upload raw files"})
+		return
+	}
 	if h.firestore == nil || h.firestore.Raw() == nil {
 		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "Firestore client is not configured"})
 		return
