@@ -49,20 +49,22 @@ func (c *Client) GetStatus(ctx context.Context) (*Status, error) {
 	}
 
 	data := doc.Data()
-	status, _ := data["status"].(string)
-	if status != "active" {
+	expiresAt, ok := activeLockUntil(data, time.Now())
+	if !ok {
 		return &Status{Locked: false}, nil
 	}
 
-	s := &Status{Locked: true}
+	s := &Status{Locked: true, LockExpiry: expiresAt}
 	if w, ok := data["worker"].(string); ok {
 		s.Worker = w
 	}
-	if t, ok := firestoreTimestamp(data["expires_at"]); ok {
-		s.LockExpiry = t
-	}
-
 	return s, nil
+}
+
+// LockDataActive reports whether Firestore lock document fields represent a held lock at now.
+func LockDataActive(data map[string]interface{}, now time.Time) bool {
+	_, ok := activeLockUntil(data, now)
+	return ok
 }
 
 // CountActiveLocks returns the number of active pipeline locks.
