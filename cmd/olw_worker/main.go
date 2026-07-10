@@ -17,6 +17,7 @@ import (
 
 	"github.com/rayer/llm-wiki-bff/internal/rawstatus"
 	"github.com/rayer/llm-wiki-bff/internal/storage"
+	"github.com/rayer/llm-wiki-bff/internal/suggestedqueries"
 	"github.com/rayer/llm-wiki-bff/internal/wikiindex"
 	"github.com/rayer/llm-wiki-bff/internal/wikiindex/fsstore"
 	"github.com/spf13/cobra"
@@ -309,7 +310,72 @@ func runPostprocess(ctx context.Context, vault string) error {
 	if err := writeRawStatus(ctx, vault); err != nil {
 		return fmt.Errorf("postprocess raw status: %w", err)
 	}
+	if err := writeSuggestedQueries(ctx, vault); err != nil {
+		return fmt.Errorf("postprocess suggested queries: %w", err)
+	}
 	return nil
+}
+
+func writeSuggestedQueries(ctx context.Context, vault string) error {
+	store := fsstore.New(vault)
+	data, err := store.ReadFile(ctx, wikiindex.ConceptsJSONLPath)
+	if err != nil {
+		if errors.Is(err, wikiindex.ErrNotFound) || errors.Is(err, os.ErrNotExist) {
+			data = nil
+		} else {
+			return fmt.Errorf("read concepts jsonl: %w", err)
+		}
+	}
+
+	mtimes, err := listConceptMtTimes(vault)
+	if err != nil {
+		return fmt.Errorf("list concept mtimes: %w", err)
+	}
+
+	now := time.Now()
+	var artifact suggestedqueries.Artifact
+	if len(data) > 0 {
+		artifact, err = suggestedqueries.BuildFromConceptsJSONL(data, mtimes, now)
+		if err != nil {
+			return fmt.Errorf("build suggested queries: %w", err)
+		}
+	} else {
+		artifact = suggestedqueries.Build(nil, mtimes, now)
+	}
+
+	payload, err := json.MarshalIndent(artifact, "", "  ")
+	if err != nil {
+		return err
+	}
+	if _, err := store.WriteBytesAtomic(ctx, payload, "cache/suggested_queries.json.tmp", suggestedqueries.Path); err != nil {
+		return fmt.Errorf("write suggested queries: %w", err)
+	}
+	return nil
+}
+
+func listConceptMtTimes(vault string) (map[string]time.Time, error) {
+	wikiDir := filepath.Join(vault, "wiki")
+	entries, err := os.ReadDir(wikiDir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return map[string]time.Time{}, nil
+		}
+		return nil, err
+	}
+
+	mtimes := make(map[string]time.Time, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".md" {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return nil, err
+		}
+		slug := strings.TrimSuffix(entry.Name(), ".md")
+		mtimes[slug] = info.ModTime().UTC()
+	}
+	return mtimes, nil
 }
 
 func writeRawStatus(ctx context.Context, vault string) error {
