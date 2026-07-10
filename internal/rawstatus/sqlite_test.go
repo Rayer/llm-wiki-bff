@@ -32,8 +32,12 @@ insert into raw_notes(path, content_hash, status, ingested_at, error) values
 	if !artifact.Files["seed.md"].Ingested {
 		t.Fatalf("seed status = %#v, want ingested", artifact.Files["seed.md"])
 	}
-	if artifact.Files["changed.md"].Ingested || artifact.Files["failed.md"].Ingested {
-		t.Fatalf("changed/failed statuses = %#v", artifact.Files)
+	// Hash drift alone no longer blocks "ingested" UI; failed still does via error.
+	if !artifact.Files["changed.md"].Ingested {
+		t.Fatalf("changed status = %#v, want ingested from OLW status despite hash drift", artifact.Files["changed.md"])
+	}
+	if artifact.Files["failed.md"].Ingested {
+		t.Fatalf("failed status = %#v, want uningested due to error", artifact.Files["failed.md"])
 	}
 }
 

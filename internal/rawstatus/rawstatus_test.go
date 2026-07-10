@@ -26,17 +26,31 @@ func TestApplyMarksIngestedWhenHashStatusAndErrorMatch(t *testing.T) {
 	}
 }
 
-func TestApplyReturnsFalseForMissingChangedErrorAndUnsupportedStatus(t *testing.T) {
+func TestApplyTrustsOLWStatusEvenWhenListHashMissingOrDiffers(t *testing.T) {
+	files := []store.RawFile{
+		{Name: "nohash.md", Path: "raw/nohash.md", SHA256: ""},
+		{Name: "drift.md", Path: "raw/drift.md", SHA256: "list-hash"},
+	}
+	artifact := Artifact{Files: map[string]FileStatus{
+		"nohash.md": {Path: "raw/nohash.md", SHA256: "olw-hash", OLWStatus: "ingested"},
+		"drift.md":  {Path: "raw/drift.md", SHA256: "olw-hash", OLWStatus: "compiled"},
+	}}
+
+	got := Apply(files, artifact)
+	if len(got) != 2 || !got[0].Ingested || !got[1].Ingested {
+		t.Fatalf("Apply() = %#v, want both ingested from OLW status", got)
+	}
+}
+
+func TestApplyReturnsFalseForMissingErrorAndUnsupportedStatus(t *testing.T) {
 	files := []store.RawFile{
 		{Name: "missing.md", Path: "raw/missing.md", SHA256: "same"},
-		{Name: "changed.md", Path: "raw/changed.md", SHA256: "new"},
 		{Name: "failed.md", Path: "raw/failed.md", SHA256: "same"},
 		{Name: "new.md", Path: "raw/new.md", SHA256: "same"},
 	}
 	artifact := Artifact{Files: map[string]FileStatus{
-		"changed.md": {Path: "raw/changed.md", SHA256: "old", OLWStatus: "ingested", Ingested: true},
-		"failed.md":  {Path: "raw/failed.md", SHA256: "same", OLWStatus: "ingested", Ingested: true, Error: "boom"},
-		"new.md":     {Path: "raw/new.md", SHA256: "same", OLWStatus: "new", Ingested: true},
+		"failed.md": {Path: "raw/failed.md", SHA256: "same", OLWStatus: "ingested", Ingested: true, Error: "boom"},
+		"new.md":    {Path: "raw/new.md", SHA256: "same", OLWStatus: "new", Ingested: true},
 	}}
 
 	got := Apply(files, artifact)
