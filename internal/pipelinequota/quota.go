@@ -127,6 +127,28 @@ func Evaluate(in Input) Snapshot {
 	return snap
 }
 
+// IsTerminalExecutionStatus reports whether a Cloud Run execution has finished.
+func IsTerminalExecutionStatus(status string) bool {
+	switch status {
+	case "SUCCEEDED", "FAILED", "CANCELLED":
+		return true
+	default:
+		return false
+	}
+}
+
+// ComputeAlreadyRunning derives already_running from lock state and latest execution status.
+// A terminal latest execution overrides a stale lock so SUCCEEDED does not look blocked (LWC-144).
+func ComputeAlreadyRunning(lockActive bool, executionStatus string) bool {
+	if executionStatus == "RUNNING" {
+		return true
+	}
+	if IsTerminalExecutionStatus(executionStatus) {
+		return false
+	}
+	return lockActive
+}
+
 func block(s Snapshot, r Reason, msg string) Snapshot {
 	s.Allowed = false
 	s.Reason = r

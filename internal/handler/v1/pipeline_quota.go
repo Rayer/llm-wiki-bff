@@ -92,13 +92,11 @@ func (h *Handler) countNewRawForProject(ctx context.Context, userID, projectID s
 }
 
 // isPipelineRunning reports whether the project has an active lock or a Cloud Run execution in RUNNING.
+// Latest terminal execution overrides a stale Firestore lock (LWC-144).
 func (h *Handler) isPipelineRunning(ctx context.Context, userID, projectID string) (bool, error) {
 	locked, err := h.projectLockActive(ctx, userID, projectID)
 	if err != nil {
 		return false, err
-	}
-	if locked {
-		return true, nil
 	}
 
 	last, err := h.pipelineExecutionStatus(ctx, "")
@@ -106,10 +104,15 @@ func (h *Handler) isPipelineRunning(ctx context.Context, userID, projectID strin
 		// Cloud Run status may be unavailable (local/dev, metadata missing).
 		// Rely on the lock signal only in that case; log so transient API
 		// failures are visible when diagnosing a false-allow.
-		log.Printf("pipeline status for running check %s/%s: %v (treating as not running)", userID, projectID, err)
-		return false, nil
+		log.Printf("pipeline status for running check %s/%s: %v (using lock only)", userID, projectID, err)
+		return locked, nil
 	}
-	return last != nil && last.Status == "RUNNING", nil
+
+	executionStatus := ""
+	if last != nil {
+		executionStatus = last.Status
+	}
+	return pipelinequota.ComputeAlreadyRunning(locked, executionStatus), nil
 }
 
 // projectLockActive checks locks/{userID}__{projectID} for an active lock.
@@ -127,8 +130,7 @@ func (h *Handler) projectLockActive(ctx context.Context, userID, projectID strin
 		}
 		return false, err
 	}
-	statusVal, _ := doc.Data()["status"].(string)
-	return statusVal == "active", nil
+	return firestore.LockDataActive(doc.Data(), time.Now()), nil
 }
 
 // evaluateQuota builds a quota snapshot for the project.

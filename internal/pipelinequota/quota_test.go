@@ -121,6 +121,33 @@ func TestEvaluateDemoPriority(t *testing.T) {
 	}
 }
 
+func TestComputeAlreadyRunningTerminalOverridesStaleLock(t *testing.T) {
+	if ComputeAlreadyRunning(true, "SUCCEEDED") {
+		t.Fatal("stale lock must not block after SUCCEEDED")
+	}
+	if ComputeAlreadyRunning(true, "FAILED") {
+		t.Fatal("stale lock must not block after FAILED")
+	}
+}
+
+func TestComputeAlreadyRunningLiveExecutionWins(t *testing.T) {
+	if !ComputeAlreadyRunning(false, "RUNNING") {
+		t.Fatal("RUNNING execution must report already_running")
+	}
+	if !ComputeAlreadyRunning(true, "RUNNING") {
+		t.Fatal("RUNNING execution must win even without lock")
+	}
+}
+
+func TestComputeAlreadyRunningFallsBackToLock(t *testing.T) {
+	if !ComputeAlreadyRunning(true, "") {
+		t.Fatal("active lock without execution status must block")
+	}
+	if ComputeAlreadyRunning(false, "") {
+		t.Fatal("no lock and no execution must not block")
+	}
+}
+
 func TestCountNewRawFiles(t *testing.T) {
 	last := time.Date(2026, 7, 10, 10, 0, 0, 0, time.UTC)
 	files := []time.Time{
