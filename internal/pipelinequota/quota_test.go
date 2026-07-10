@@ -52,6 +52,28 @@ func TestEvaluateCooldown(t *testing.T) {
 	if got.Allowed || got.Reason != ReasonCooldown {
 		t.Fatalf("got %+v", got)
 	}
+	if got.CooldownUntil == nil {
+		t.Fatal("expected CooldownUntil while cooldown is active")
+	}
+}
+
+func TestEvaluateExpiredCooldownOmitsCooldownUntil(t *testing.T) {
+	now := time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC)
+	got := Evaluate(Input{
+		Now:         now,
+		Enforced:    true,
+		Limits:      Limits{DailyLimit: 2, Cooldown: time.Hour, MinNewRaw: 1},
+		RunsToday:   1,
+		DayKey:      "2026-07-10",
+		LastRunAt:   now.Add(-2 * time.Hour),
+		NewRawFiles: 1,
+	})
+	if !got.Allowed {
+		t.Fatalf("expected allow after cooldown, got %+v", got)
+	}
+	if got.CooldownUntil != nil {
+		t.Fatalf("CooldownUntil = %v, want nil after expiry", got.CooldownUntil)
+	}
 }
 
 func TestEvaluateNoNewRaw(t *testing.T) {

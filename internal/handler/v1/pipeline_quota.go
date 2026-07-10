@@ -3,6 +3,7 @@ package v1
 import (
 	"context"
 	"fmt"
+	"log"
 	"net/http"
 	"time"
 
@@ -103,7 +104,9 @@ func (h *Handler) isPipelineRunning(ctx context.Context, userID, projectID strin
 	last, err := h.pipelineExecutionStatus(ctx, "")
 	if err != nil {
 		// Cloud Run status may be unavailable (local/dev, metadata missing).
-		// Rely on the lock signal only in that case.
+		// Rely on the lock signal only in that case; log so transient API
+		// failures are visible when diagnosing a false-allow.
+		log.Printf("pipeline status for running check %s/%s: %v (treating as not running)", userID, projectID, err)
 		return false, nil
 	}
 	return last != nil && last.Status == "RUNNING", nil

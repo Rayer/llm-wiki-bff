@@ -112,12 +112,13 @@ func Evaluate(in Input) Snapshot {
 	}
 	if !in.LastRunAt.IsZero() {
 		until := in.LastRunAt.UTC().Add(lim.Cooldown)
+		// Only expose cooldown_until while the cooldown is still active.
+		// A past timestamp is contract noise for clients (FE already treats ms≤0 as clear).
 		if now.Before(until) {
 			snap.CooldownUntil = &until
 			mins := int(until.Sub(now).Minutes()) + 1
 			return block(snap, ReasonCooldown, fmt.Sprintf("Cooldown active; try again in %d minutes", mins))
 		}
-		snap.CooldownUntil = &until
 	}
 	if in.NewRawFiles < lim.MinNewRaw {
 		return block(snap, ReasonNoNewRaw, "Upload at least one new or modified raw file before running")
