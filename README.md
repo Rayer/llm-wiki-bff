@@ -132,3 +132,16 @@ make build-sync
 go run . --local ./local-data
 LOCAL_DATA_DIR=./local-data DEV_JWT=true JWT_SECRET=dev-secret go run . --local ./local-data
 ```
+
+## Pipeline rate limits (LWC-138)
+
+User `POST /api/v1/pipeline/run` enforces per-project quotas before Cloud Run:
+
+| Env | Default | Meaning |
+|-----|---------|---------|
+| `PIPELINE_DAILY_LIMIT` | 2 | Max accepted runs per project per UTC day |
+| `PIPELINE_COOLDOWN_SECONDS` | 3600 | Min seconds between accepted runs |
+| `PIPELINE_MIN_NEW_RAW` | 1 | Require this many new/modified raw files since last run |
+| `PIPELINE_DEMO_USER_IDS` | (empty) | Comma-separated user IDs blocked from pipeline |
+
+When Firestore is unavailable, quota is not enforced (`quota.enforced=false`). Admin pipeline trigger skips daily/cooldown/new-raw but still blocks if already running.
