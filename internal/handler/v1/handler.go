@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -36,6 +37,15 @@ type Handler struct {
 	// Per-project list cache (invalidated on rebuild-index)
 	listCacheMu sync.RWMutex
 	listCache   map[string]cachedLists // key: "uid_pid"
+
+	// Pipeline quota (LWC-138). Zero values mean defaults via pipelineLimits().
+	pipelineDailyLimit int
+	pipelineCooldown   time.Duration
+	pipelineMinNewRaw  int
+	demoUserIDs        map[string]struct{}
+
+	// Optional injectable quota backend for tests; nil → use firestore when available.
+	quotaStore pipelineQuotaStore
 }
 
 type cachedLists struct {
@@ -62,6 +72,37 @@ func New(wikiStore store.RootStore, fs *firestore.Client, idx *search.Index, cac
 // use Firestore locks, such as local filesystem development mode.
 func (h *Handler) SetRebuildIndexFunc(fn func(context.Context, string, string) (wikiindex.IDMap, error)) {
 	h.rebuildIndex = fn
+}
+
+// SetPipelineQuotaConfig configures per-project pipeline rate limits and demo user IDs.
+// Non-positive dailyLimit / cooldownSeconds / minNewRaw fall back to defaults (2 / 3600s / 1).
+func (h *Handler) SetPipelineQuotaConfig(dailyLimit, cooldownSeconds, minNewRaw int, demoUserIDs []string) {
+	if dailyLimit <= 0 {
+		dailyLimit = 2
+	}
+	if cooldownSeconds <= 0 {
+		cooldownSeconds = 3600
+	}
+	if minNewRaw <= 0 {
+		minNewRaw = 1
+	}
+	h.pipelineDailyLimit = dailyLimit
+	h.pipelineCooldown = time.Duration(cooldownSeconds) * time.Second
+	h.pipelineMinNewRaw = minNewRaw
+
+	demo := make(map[string]struct{}, len(demoUserIDs))
+	for _, id := range demoUserIDs {
+		id = strings.TrimSpace(id)
+		if id != "" {
+			demo[id] = struct{}{}
+		}
+	}
+	h.demoUserIDs = demo
+}
+
+// SetPipelineQuotaStore injects a quota backend (primarily for tests).
+func (h *Handler) SetPipelineQuotaStore(store pipelineQuotaStore) {
+	h.quotaStore = store
 }
 
 // GetStore returns the request-scoped wiki store.
