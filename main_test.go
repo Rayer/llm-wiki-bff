@@ -11,6 +11,7 @@ import (
 	"github.com/rayer/llm-wiki-bff/internal/config"
 	handlerv1 "github.com/rayer/llm-wiki-bff/internal/handler/v1"
 	"github.com/rayer/llm-wiki-bff/internal/middleware"
+	"github.com/rayer/llm-wiki-bff/internal/syssettings"
 )
 
 func TestSecurityHeadersMiddleware(t *testing.T) {
@@ -125,12 +126,36 @@ func TestAdminProjectsRouteDoesNotRequireProjectHeader(t *testing.T) {
 	}
 }
 
+func TestAdminSettingsRouteRequiresAdminRole(t *testing.T) {
+	router := newAdminRouteTestRouter(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/settings", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("missing auth status = %d, want %d", rec.Code, http.StatusUnauthorized)
+	}
+
+	userToken, err := auth.GenerateAccessToken("user-123", "", "test-secret")
+	if err != nil {
+		t.Fatalf("generate user token: %v", err)
+	}
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/admin/settings", nil)
+	req.Header.Set("Authorization", "Bearer "+userToken)
+	rec = httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("non-admin status = %d, want %d", rec.Code, http.StatusForbidden)
+	}
+}
+
 func newAdminRouteTestRouter(t *testing.T) *gin.Engine {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
 
 	router := gin.New()
 	handler := handlerv1.New(nil, nil, nil, nil, nil, nil)
-	registerAdminRoutes(router, config.Config{JWTSecret: "test-secret"}, handler)
+	settingsStore := &syssettings.FakeStore{Enabled: true}
+	registerAdminRoutes(router, config.Config{JWTSecret: "test-secret"}, handler, settingsStore)
 	return router
 }

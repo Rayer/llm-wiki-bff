@@ -97,6 +97,35 @@ func TestLoadPipelineQuotaZeroEnvUsesDefaults(t *testing.T) {
 	}
 }
 
+func TestLoadRegistrationEnabledFromEnv(t *testing.T) {
+	t.Setenv("REGISTRATION_ENABLED", "false")
+
+	dir := writeConfig(t, "dev_jwt = true\n")
+	cfg, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.RegistrationEnabled == nil {
+		t.Fatal("RegistrationEnabled = nil, want pointer to false")
+	}
+	if *cfg.RegistrationEnabled {
+		t.Fatalf("RegistrationEnabled = true, want false")
+	}
+}
+
+func TestLoadRegistrationEnabledUnset(t *testing.T) {
+	t.Setenv("REGISTRATION_ENABLED", "")
+
+	dir := writeConfig(t, "dev_jwt = true\n")
+	cfg, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.RegistrationEnabled != nil {
+		t.Fatalf("RegistrationEnabled = %#v, want nil when env unset", cfg.RegistrationEnabled)
+	}
+}
+
 func writeConfig(t *testing.T, contents string) string {
 	t.Helper()
 	dir := t.TempDir()

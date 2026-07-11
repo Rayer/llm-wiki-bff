@@ -33,6 +33,10 @@ type Config struct {
 	PipelineCooldownSeconds int
 	PipelineMinNewRaw       int
 	PipelineDemoUserIDs     []string
+
+	// Registration gate (LWC-149). Env: REGISTRATION_ENABLED (true/false/1/0).
+	// Nil means unset; resolution falls back to default true when Firestore doc is absent.
+	RegistrationEnabled *bool
 }
 
 // UserConfig holds a hardcoded user for authentication.
@@ -58,6 +62,7 @@ func Load(path string) (Config, error) {
 	v.BindEnv("pipeline_cooldown_seconds", "PIPELINE_COOLDOWN_SECONDS")
 	v.BindEnv("pipeline_min_new_raw", "PIPELINE_MIN_NEW_RAW")
 	v.BindEnv("pipeline_demo_user_ids", "PIPELINE_DEMO_USER_IDS")
+	v.BindEnv("registration_enabled", "REGISTRATION_ENABLED")
 
 	if err := v.ReadInConfig(); err != nil {
 		var notFound viper.ConfigFileNotFoundError
@@ -79,6 +84,13 @@ func Load(path string) (Config, error) {
 		minNewRaw = DefaultPipelineMinNewRaw
 	}
 
+	var registrationEnabled *bool
+	if raw := strings.TrimSpace(v.GetString("registration_enabled")); raw != "" {
+		if enabled, ok := parseBoolEnv(raw); ok {
+			registrationEnabled = &enabled
+		}
+	}
+
 	cfg := Config{
 		GCPProject:              v.GetString("gcp_project"),
 		Bucket:                  v.GetString("bucket"),
@@ -93,8 +105,21 @@ func Load(path string) (Config, error) {
 		PipelineCooldownSeconds: cooldownSeconds,
 		PipelineMinNewRaw:       minNewRaw,
 		PipelineDemoUserIDs:     splitCommaList(v.GetString("pipeline_demo_user_ids")),
+		RegistrationEnabled:     registrationEnabled,
 	}
 	return cfg, nil
+}
+
+func parseBoolEnv(raw string) (bool, bool) {
+	raw = strings.TrimSpace(strings.ToLower(raw))
+	switch raw {
+	case "true", "1":
+		return true, true
+	case "false", "0":
+		return false, true
+	default:
+		return false, false
+	}
 }
 
 func splitCommaList(raw string) []string {

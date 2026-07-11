@@ -25,8 +25,26 @@ type RegisterResponse struct {
 	ProjectID string `json:"default_project_id"`
 }
 
-func RegisterHandler(fs *firestore.Client, jwtSecret string) gin.HandlerFunc {
+// RegistrationGate reports whether self-serve registration is currently allowed.
+type RegistrationGate interface {
+	IsRegistrationEnabled(ctx context.Context) (bool, error)
+}
+
+func RegisterHandler(fs *firestore.Client, jwtSecret string, gate RegistrationGate) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		if gate != nil {
+			enabled, err := gate.IsRegistrationEnabled(c.Request.Context())
+			if err != nil {
+				log.Printf("[register] registration gate check failed: %v", err)
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+				return
+			}
+			if !enabled {
+				c.JSON(http.StatusForbidden, gin.H{"error": "registration is disabled"})
+				return
+			}
+		}
+
 		var req RegisterRequest
 		if err := c.ShouldBindJSON(&req); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "email and password required"})
