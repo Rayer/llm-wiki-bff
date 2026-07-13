@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/rayer/llm-wiki-bff/internal/gcs"
@@ -15,7 +16,7 @@ type fakeReader struct {
 	pages        map[string]string
 	errs         map[string]error
 	jsonl        string // pre-built JSONL for ReadFile
-	getPageCalls int
+	getPageCalls atomic.Int64
 }
 
 func (f *fakeReader) ReadFile(_ context.Context, _ string) ([]byte, error) {
@@ -30,7 +31,7 @@ func (f *fakeReader) ListConcepts(_ context.Context, _ bool) ([]gcs.WikiPage, er
 }
 
 func (f *fakeReader) GetPage(_ context.Context, slug, category string) (*gcs.WikiPage, []byte, error) {
-	f.getPageCalls++
+	f.getPageCalls.Add(1)
 	if category != "concepts" {
 		return nil, nil, errors.New("unexpected category")
 	}
@@ -149,8 +150,8 @@ func TestBuildReadsJSONLWithoutGetPage(t *testing.T) {
 	if len(got) != 1 || got[0].Slug != "alpha" || got[0].Body != "alpha body" {
 		t.Fatalf("entries = %#v", got)
 	}
-	if reader.getPageCalls != 0 {
-		t.Fatalf("GetPage called %d times, want 0", reader.getPageCalls)
+	if calls := reader.getPageCalls.Load(); calls != 0 {
+		t.Fatalf("GetPage called %d times, want 0", calls)
 	}
 }
 
@@ -171,8 +172,8 @@ func TestSearchUsesJSONLOnColdStart(t *testing.T) {
 	if len(results) != 1 || results[0].Slug != "keyword-slug" {
 		t.Fatalf("results = %#v", results)
 	}
-	if reader.getPageCalls != 0 {
-		t.Fatalf("GetPage called %d times, want 0", reader.getPageCalls)
+	if calls := reader.getPageCalls.Load(); calls != 0 {
+		t.Fatalf("GetPage called %d times, want 0", calls)
 	}
 }
 
