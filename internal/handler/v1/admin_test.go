@@ -1,15 +1,233 @@
 package v1
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
+	"cloud.google.com/go/storage"
 	"github.com/gin-gonic/gin"
+	store "github.com/rayer/llm-wiki-bff/internal/storage"
 	"github.com/stretchr/testify/assert"
 )
+
+type adminStatsProjectStore struct {
+	prefix          string
+	concepts        []store.WikiPage
+	sources         []store.WikiPage
+	cacheConcepts   []store.WikiPage
+	cacheSources    []store.WikiPage
+	conceptErr      error
+	sourceErr       error
+	cacheConceptErr error
+	cacheSourceErr  error
+}
+
+func (s *adminStatsProjectStore) Prefix() string { return s.prefix }
+
+func (s *adminStatsProjectStore) ReadFile(context.Context, string) ([]byte, error) {
+	return nil, storage.ErrObjectNotExist
+}
+
+func (s *adminStatsProjectStore) WriteBytes(context.Context, []byte, string) (string, error) {
+	return "", errors.New("not implemented")
+}
+
+func (s *adminStatsProjectStore) WriteBytesAtomic(context.Context, []byte, string, string) (string, error) {
+	return "", errors.New("not implemented")
+}
+
+func (s *adminStatsProjectStore) ListProjects(context.Context, string) ([]store.Project, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (s *adminStatsProjectStore) ListConcepts(context.Context, bool) ([]store.WikiPage, error) {
+	return s.concepts, s.conceptErr
+}
+
+func (s *adminStatsProjectStore) ListSources(context.Context) ([]store.WikiPage, error) {
+	return s.sources, s.sourceErr
+}
+
+func (s *adminStatsProjectStore) ListConceptsFromCache(context.Context) ([]store.WikiPage, error) {
+	return s.cacheConcepts, s.cacheConceptErr
+}
+
+func (s *adminStatsProjectStore) ListSourcesFromCache(context.Context) ([]store.WikiPage, error) {
+	return s.cacheSources, s.cacheSourceErr
+}
+
+func (s *adminStatsProjectStore) GetPage(context.Context, string, string) (*store.WikiPage, []byte, error) {
+	return nil, nil, errors.New("not implemented")
+}
+
+func (s *adminStatsProjectStore) ListMarkdownFiles(context.Context, string) ([]store.MarkdownFile, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (s *adminStatsProjectStore) ListRawFiles(context.Context) ([]store.RawFile, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (s *adminStatsProjectStore) BucketStats(context.Context) (int64, int64, error) {
+	return 0, 0, errors.New("not implemented")
+}
+
+func (s *adminStatsProjectStore) GetMetaSHA256(context.Context, string) (string, error) {
+	return "", errors.New("not implemented")
+}
+
+type adminStatsRootStore struct {
+	*adminStatsProjectStore
+	scoped map[string]*adminStatsProjectStore
+}
+
+func (s *adminStatsRootStore) Scope(userID, projectID string) store.Store {
+	return s.scoped[userID+"/"+projectID]
+}
+
+func TestLoadAdminProjectStatisticsUsesScopedCacheAndFallback(t *testing.T) {
+	root := &adminStatsRootStore{
+		adminStatsProjectStore: &adminStatsProjectStore{prefix: "root"},
+		scoped: map[string]*adminStatsProjectStore{
+			"user-a/project-a": {
+				prefix:        "users/user-a/projects/project-a",
+				cacheConcepts: []store.WikiPage{{Slug: "a-one"}, {Slug: "a-two"}},
+				cacheSources:  []store.WikiPage{{Slug: "a-source"}},
+			},
+			"user-a/project-b": {
+				prefix:        "users/user-a/projects/project-b",
+				cacheConcepts: []store.WikiPage{{Slug: "b-one"}},
+				cacheSources:  []store.WikiPage{{Slug: "b-one"}, {Slug: "b-two"}},
+			},
+			"user-b/empty": {
+				prefix:        "users/user-b/projects/empty",
+				cacheConcepts: []store.WikiPage{},
+				cacheSources:  []store.WikiPage{},
+			},
+			"user-b/legacy": {
+				prefix:          "users/user-b/projects/legacy",
+				concepts:        []store.WikiPage{{Slug: "legacy-one"}, {Slug: "legacy-two"}, {Slug: "legacy-three"}},
+				sources:         []store.WikiPage{{Slug: "legacy-source"}},
+				cacheConceptErr: storage.ErrObjectNotExist,
+				cacheSourceErr:  storage.ErrObjectNotExist,
+			},
+		},
+	}
+
+	got, err := loadAdminProjectStatistics(context.Background(), root, []adminProjectRecord{
+		{userID: "user-a", projectID: "project-a"},
+		{userID: "user-a", projectID: "project-b"},
+		{userID: "user-b", projectID: "empty"},
+		{userID: "user-b", projectID: "legacy"},
+	})
+	if err != nil {
+		t.Fatalf("loadAdminProjectStatistics() error = %v", err)
+	}
+
+	assert.Equal(t, adminProjectStatistics{conceptCount: 2, sourceCount: 1}, got["user-a/project-a"])
+	assert.Equal(t, adminProjectStatistics{conceptCount: 1, sourceCount: 2}, got["user-a/project-b"])
+	assert.Equal(t, adminProjectStatistics{conceptCount: 0, sourceCount: 0}, got["user-b/empty"])
+	assert.Equal(t, adminProjectStatistics{conceptCount: 3, sourceCount: 1}, got["user-b/legacy"])
+}
+
+func TestAdminProjectCountsByUserUsesActualOwnership(t *testing.T) {
+	got := adminProjectCountsByUser([]adminProjectRecord{
+		{userID: "user-a", projectID: "project-a"},
+		{userID: "user-a", projectID: "project-b"},
+		{userID: "user-b", projectID: "project-c"},
+	})
+
+	assert.Equal(t, 2, got["user-a"])
+	assert.Equal(t, 1, got["user-b"])
+	assert.Equal(t, 0, got["user-c"])
+}
+
+func TestAdminProjectRecordFromFirestoreDocUsesStoredProjectID(t *testing.T) {
+	project, ok := adminProjectRecordFromFirestoreDoc("user-a_doc-suffix", map[string]interface{}{
+		"project_id": "authoritative-project",
+		"name":       "Authoritative Project",
+	})
+	if !ok {
+		t.Fatal("adminProjectRecordFromFirestoreDoc returned ok=false")
+	}
+	assert.Equal(t, "user-a", project.userID)
+	assert.Equal(t, "authoritative-project", project.projectID)
+	assert.Equal(t, "Authoritative Project", project.name)
+}
+
+func TestAdminProjectRecordFromFirestoreDocRejectsMalformedProject(t *testing.T) {
+	if _, ok := adminProjectRecordFromFirestoreDoc("malformed", map[string]interface{}{
+		"name": "Malformed",
+	}); ok {
+		t.Fatal("malformed project document must not be counted")
+	}
+}
+
+func TestAdminProjectRecordFromFirestoreDocRejectsUnscopedProjectID(t *testing.T) {
+	if _, ok := adminProjectRecordFromFirestoreDoc("malformed", map[string]interface{}{
+		"project_id": "authoritative-project",
+		"name":       "Malformed",
+	}); ok {
+		t.Fatal("project document without an owner prefix must not be counted")
+	}
+}
+
+func TestAdminProjectRecordFromFirestoreDocRejectsUnsafeStorageSegments(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		docID string
+		data  map[string]interface{}
+	}{
+		{
+			name:  "unsafe owner",
+			docID: "user/../other_project",
+			data:  map[string]interface{}{"project_id": "project"},
+		},
+		{
+			name:  "unsafe project",
+			docID: "user-long_project",
+			data:  map[string]interface{}{"project_id": "../other"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, ok := adminProjectRecordFromFirestoreDoc(tc.docID, tc.data); ok {
+				t.Fatal("unsafe storage segment must not be counted")
+			}
+		})
+	}
+}
+
+func TestAdminStatisticsJSONFieldContract(t *testing.T) {
+	projectJSON, err := json.Marshal(adminProjectEntry{
+		ID:           "user-a_project-a",
+		ConceptCount: 2,
+		SourceCount:  1,
+	})
+	if err != nil {
+		t.Fatalf("marshal project entry: %v", err)
+	}
+	userJSON, err := json.Marshal(adminUserEntry{ID: "user-a", ProjectCount: 2})
+	if err != nil {
+		t.Fatalf("marshal user entry: %v", err)
+	}
+
+	var project map[string]interface{}
+	var user map[string]interface{}
+	if err := json.Unmarshal(projectJSON, &project); err != nil {
+		t.Fatalf("decode project JSON: %v", err)
+	}
+	if err := json.Unmarshal(userJSON, &user); err != nil {
+		t.Fatalf("decode user JSON: %v", err)
+	}
+	assert.Equal(t, float64(2), project["concept_count"])
+	assert.Equal(t, float64(1), project["source_count"])
+	assert.Equal(t, float64(2), user["project_count"])
+}
 
 // =========================================================================
 // AdminRenameProject tests

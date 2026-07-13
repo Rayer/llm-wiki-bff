@@ -17,14 +17,15 @@ import (
 	"cloud.google.com/go/firestore"
 	"cloud.google.com/go/storage"
 	"github.com/gin-gonic/gin"
+	"github.com/rayer/llm-wiki-bff/internal/auth"
 	conceptcache "github.com/rayer/llm-wiki-bff/internal/cache"
 	"github.com/rayer/llm-wiki-bff/internal/gcs"
 	"github.com/rayer/llm-wiki-bff/internal/handler"
 	"github.com/rayer/llm-wiki-bff/internal/llm"
 	"github.com/rayer/llm-wiki-bff/internal/pipelinequota"
 	"github.com/rayer/llm-wiki-bff/internal/search"
-	"github.com/rayer/llm-wiki-bff/internal/suggestedqueries"
 	store "github.com/rayer/llm-wiki-bff/internal/storage"
+	"github.com/rayer/llm-wiki-bff/internal/suggestedqueries"
 	"github.com/rayer/llm-wiki-bff/internal/wikiindex"
 	"google.golang.org/api/iterator"
 	"google.golang.org/grpc/codes"
@@ -1394,6 +1395,124 @@ func (h *Handler) verifyAdminProjectExists(ctx context.Context, docID string) er
 	return err
 }
 
+type adminProjectEntry struct {
+	ID           string `json:"id"`
+	Name         string `json:"name"`
+	UserID       string `json:"user_id"`
+	UserName     string `json:"user_name"`
+	UserEmail    string `json:"user_email"`
+	ProjectID    string `json:"project_id"`
+	ConceptCount int    `json:"concept_count"`
+	SourceCount  int    `json:"source_count"`
+}
+
+type adminUserEntry struct {
+	ID           string `json:"id"`
+	Name         string `json:"name"`
+	Email        string `json:"email"`
+	Role         string `json:"role"`
+	ProjectCount int    `json:"project_count"`
+}
+
+type adminProjectRecord struct {
+	id        string
+	name      string
+	userID    string
+	projectID string
+}
+
+type adminProjectStatistics struct {
+	conceptCount int
+	sourceCount  int
+}
+
+func adminProjectRecordFromFirestoreDoc(docID string, data map[string]interface{}) (adminProjectRecord, bool) {
+	userID, docProjectID := splitProjectDocID(docID)
+	if !auth.ValidPathSegment(userID) || !auth.ValidPathSegment(docProjectID) || !strings.Contains(docID, "_") {
+		return adminProjectRecord{}, false
+	}
+	project, userID, ok := projectResponseFromFirestoreDoc(docID, data)
+	if !ok {
+		return adminProjectRecord{}, false
+	}
+	if !auth.ValidPathSegment(userID) || !auth.ValidPathSegment(project.ID) {
+		return adminProjectRecord{}, false
+	}
+	return adminProjectRecord{
+		id:        docID,
+		name:      project.Name,
+		userID:    userID,
+		projectID: project.ID,
+	}, true
+}
+
+func adminProjectRecordKey(userID, projectID string) string {
+	return userID + "/" + projectID
+}
+
+func loadAdminProjectStatistics(ctx context.Context, root store.RootStore, projects []adminProjectRecord) (map[string]adminProjectStatistics, error) {
+	if root == nil {
+		return nil, fmt.Errorf("wiki storage is not configured")
+	}
+
+	statistics := make(map[string]adminProjectStatistics, len(projects))
+	for _, project := range projects {
+		scoped := root.Scope(project.userID, project.projectID)
+		if scoped == nil {
+			return nil, fmt.Errorf("wiki storage is not configured for project %s", adminProjectRecordKey(project.userID, project.projectID))
+		}
+
+		concepts, err := listConceptsCacheFirst(ctx, scoped, false)
+		if err != nil {
+			return nil, fmt.Errorf("list concepts for project %s: %w", adminProjectRecordKey(project.userID, project.projectID), err)
+		}
+		sources, err := listSourcesCacheFirst(ctx, scoped)
+		if err != nil {
+			return nil, fmt.Errorf("list sources for project %s: %w", adminProjectRecordKey(project.userID, project.projectID), err)
+		}
+
+		statistics[adminProjectRecordKey(project.userID, project.projectID)] = adminProjectStatistics{
+			conceptCount: len(concepts),
+			sourceCount:  len(sources),
+		}
+	}
+	return statistics, nil
+}
+
+func adminProjectCountsByUser(projects []adminProjectRecord) map[string]int {
+	counts := make(map[string]int)
+	for _, project := range projects {
+		counts[project.userID]++
+	}
+	return counts
+}
+
+func (h *Handler) listAdminProjectRecords(ctx context.Context) ([]adminProjectRecord, error) {
+	if h.firestore == nil || h.firestore.Raw() == nil {
+		return nil, errFirestoreNotConfigured
+	}
+
+	iter := h.firestore.Raw().Collection("projects").Documents(ctx)
+	defer iter.Stop()
+
+	projects := make([]adminProjectRecord, 0)
+	for {
+		doc, err := iter.Next()
+		if err != nil {
+			if status.Code(err) == codes.NotFound || errors.Is(err, iterator.Done) {
+				break
+			}
+			return nil, err
+		}
+		project, ok := adminProjectRecordFromFirestoreDoc(doc.Ref.ID, doc.Data())
+		if !ok {
+			continue
+		}
+		projects = append(projects, project)
+	}
+	return projects, nil
+}
+
 // AdminProjects handles GET /admin/projects.
 //
 //	@Summary		List all projects (admin)
@@ -1418,50 +1537,25 @@ func (h *Handler) AdminProjects(c *gin.Context) {
 	ctx := c.Request.Context()
 	filterUserID := strings.TrimSpace(c.Query("user_id"))
 
-	iter := fs.Collection("projects").Documents(ctx)
-	defer iter.Stop()
-
-	type projectEntry struct {
-		ID        string `json:"id"`
-		Name      string `json:"name"`
-		UserID    string `json:"user_id"`
-		UserName  string `json:"user_name"`
-		UserEmail string `json:"user_email"`
-		ProjectID string `json:"project_id"`
-	}
-
-	type rawProject struct {
-		id   string
-		name string
-		uid  string
-		pid  string
-	}
-
-	rawProjects := make([]rawProject, 0)
+	rawProjects := make([]adminProjectRecord, 0)
 	userIDs := make(map[string]bool)
-
-	for {
-		doc, err := iter.Next()
-		if err != nil {
-			if status.Code(err) == codes.NotFound || errors.Is(err, iterator.Done) {
-				break
-			}
-			c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "list projects: " + err.Error()})
-			return
-		}
-		uid, pid := splitProjectDocID(doc.Ref.ID)
-
-		if filterUserID != "" && uid != filterUserID {
+	projectRecords, err := h.listAdminProjectRecords(ctx)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "list projects: " + err.Error()})
+		return
+	}
+	for _, project := range projectRecords {
+		if filterUserID != "" && project.userID != filterUserID {
 			continue
 		}
+		rawProjects = append(rawProjects, project)
+		userIDs[project.userID] = true
+	}
 
-		data := doc.Data()
-		if isIdempotencyCacheDoc(doc.Ref.ID, data) {
-			continue
-		}
-		name, _ := data["name"].(string)
-		rawProjects = append(rawProjects, rawProject{doc.Ref.ID, name, uid, pid})
-		userIDs[uid] = true
+	statistics, err := loadAdminProjectStatistics(ctx, h.store, rawProjects)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "count project statistics: " + err.Error()})
+		return
 	}
 
 	// Batch-fetch user names and emails
@@ -1482,16 +1576,19 @@ func (h *Handler) AdminProjects(c *gin.Context) {
 		userMap[uid] = struct{ name, email string }{name, email}
 	}
 
-	projects := make([]projectEntry, 0, len(rawProjects))
+	projects := make([]adminProjectEntry, 0, len(rawProjects))
 	for _, rp := range rawProjects {
-		u := userMap[rp.uid]
-		projects = append(projects, projectEntry{
-			ID:        rp.id,
-			Name:      rp.name,
-			UserID:    rp.uid,
-			UserName:  u.name,
-			UserEmail: u.email,
-			ProjectID: rp.pid,
+		u := userMap[rp.userID]
+		stats := statistics[adminProjectRecordKey(rp.userID, rp.projectID)]
+		projects = append(projects, adminProjectEntry{
+			ID:           rp.id,
+			Name:         rp.name,
+			UserID:       rp.userID,
+			UserName:     u.name,
+			UserEmail:    u.email,
+			ProjectID:    rp.projectID,
+			ConceptCount: stats.conceptCount,
+			SourceCount:  stats.sourceCount,
 		})
 	}
 
@@ -1822,6 +1919,12 @@ func (h *Handler) AdminListUsers(c *gin.Context) {
 	fs := h.firestore.Raw()
 	ctx := c.Request.Context()
 	filterRole := strings.TrimSpace(c.Query("role"))
+	projectRecords, err := h.listAdminProjectRecords(ctx)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "count user projects: " + err.Error()})
+		return
+	}
+	projectCounts := adminProjectCountsByUser(projectRecords)
 
 	var iter *firestore.DocumentIterator
 	if filterRole != "" {
@@ -1831,14 +1934,7 @@ func (h *Handler) AdminListUsers(c *gin.Context) {
 	}
 	defer iter.Stop()
 
-	type userEntry struct {
-		ID    string `json:"id"`
-		Name  string `json:"name"`
-		Email string `json:"email"`
-		Role  string `json:"role"`
-	}
-
-	users := make([]userEntry, 0)
+	users := make([]adminUserEntry, 0)
 	for {
 		doc, err := iter.Next()
 		if err != nil {
@@ -1860,11 +1956,12 @@ func (h *Handler) AdminListUsers(c *gin.Context) {
 				name = email
 			}
 		}
-		users = append(users, userEntry{
-			ID:    doc.Ref.ID,
-			Name:  name,
-			Email: email,
-			Role:  role,
+		users = append(users, adminUserEntry{
+			ID:           doc.Ref.ID,
+			Name:         name,
+			Email:        email,
+			Role:         role,
+			ProjectCount: projectCounts[doc.Ref.ID],
 		})
 	}
 
