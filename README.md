@@ -85,7 +85,7 @@ More detail: [docs/LOCAL_DEV.md](docs/LOCAL_DEV.md).
 
 ## Deploy
 
-The final environment mapping and release process are documented in [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md). The Makefile uses a full commit SHA image tag and production-shaped defaults; override its variables for development.
+The final environment mapping and release process are documented in [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md). The Makefile uses a full commit SHA image tag and development-only deploy defaults; production promotion is available only through the release-gated GitHub workflow.
 
 Build image:
 
