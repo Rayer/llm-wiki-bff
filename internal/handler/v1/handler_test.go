@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -125,6 +126,75 @@ func TestProjectResponseFromFirestoreDocUsesProjectIDField(t *testing.T) {
 	}
 	if resp.Name != "Human Project Name" {
 		t.Fatalf("name = %q, want Human Project Name", resp.Name)
+	}
+}
+
+func TestPipelineURLsUseConfiguredJobTarget(t *testing.T) {
+	h := New(nil, nil, search.NewIndex(), conceptcache.New(), nil, nil)
+	h.SetPipelineJobURL(" https://run.googleapis.com/v2/projects/dev/locations/asia-east1/jobs/olw-pipeline-dev:run ")
+
+	if got, want := h.pipelineJobURL(), "https://run.googleapis.com/v2/projects/dev/locations/asia-east1/jobs/olw-pipeline-dev:run"; got != want {
+		t.Fatalf("pipelineJobURL() = %q, want %q", got, want)
+	}
+	if got, want := h.cloudRunExecutionsURL(), "https://run.googleapis.com/v2/projects/dev/locations/asia-east1/jobs/olw-pipeline-dev/executions?pageSize=1"; got != want {
+		t.Fatalf("cloudRunExecutionsURL() = %q, want %q", got, want)
+	}
+	if got, want := h.cloudRunExecutionURL("exec-1"), "https://run.googleapis.com/v2/projects/dev/locations/asia-east1/jobs/olw-pipeline-dev/executions/exec-1"; got != want {
+		t.Fatalf("cloudRunExecutionURL() = %q, want %q", got, want)
+	}
+}
+
+func TestPipelineURLsKeepLegacyDefaultTarget(t *testing.T) {
+	h := New(nil, nil, search.NewIndex(), conceptcache.New(), nil, nil)
+
+	if got, want := h.pipelineJobURL(), defaultCloudRunJobURL; got != want {
+		t.Fatalf("pipelineJobURL() = %q, want %q", got, want)
+	}
+}
+
+func TestPipelineRequestsUseConfiguredJobTarget(t *testing.T) {
+	var paths []string
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		paths = append(paths, r.URL.Path)
+		switch {
+		case r.URL.Path == "/token":
+			return testHTTPResponse(http.StatusOK, `{"access_token":"test-token"}`), nil
+		case strings.HasSuffix(r.URL.Path, "/jobs/olw-pipeline-dev:run"):
+			return testHTTPResponse(http.StatusOK, `{"metadata":{"execution":"projects/dev/locations/asia-east1/jobs/olw-pipeline-dev/executions/exec-1"}}`), nil
+		case strings.HasSuffix(r.URL.Path, "/jobs/olw-pipeline-dev/executions"):
+			return testHTTPResponse(http.StatusOK, `{"executions":[]}`), nil
+		case strings.HasSuffix(r.URL.Path, "/jobs/olw-pipeline-dev/executions/exec-1"):
+			return testHTTPResponse(http.StatusOK, `{"name":"projects/dev/locations/asia-east1/jobs/olw-pipeline-dev/executions/exec-1","succeededCount":1}`), nil
+		default:
+			return testHTTPResponse(http.StatusNotFound, `not found`), nil
+		}
+	})}
+
+	h := New(nil, nil, search.NewIndex(), conceptcache.New(), nil, nil)
+	h.httpClient = client
+	h.metadataTokenURL = "http://metadata.test/token"
+	h.SetPipelineJobURL("https://run.test/v2/projects/dev/locations/asia-east1/jobs/olw-pipeline-dev:run")
+
+	if _, err := h.invokePipelineJob(context.Background(), "user", "project"); err != nil {
+		t.Fatalf("invokePipelineJob() error = %v", err)
+	}
+	if _, err := h.pipelineExecutionStatus(context.Background(), ""); err != nil {
+		t.Fatalf("pipelineExecutionStatus(list) error = %v", err)
+	}
+	if _, err := h.pipelineExecutionStatus(context.Background(), "exec-1"); err != nil {
+		t.Fatalf("pipelineExecutionStatus(detail) error = %v", err)
+	}
+
+	want := []string{
+		"/token",
+		"/v2/projects/dev/locations/asia-east1/jobs/olw-pipeline-dev:run",
+		"/token",
+		"/v2/projects/dev/locations/asia-east1/jobs/olw-pipeline-dev/executions",
+		"/token",
+		"/v2/projects/dev/locations/asia-east1/jobs/olw-pipeline-dev/executions/exec-1",
+	}
+	if !reflect.DeepEqual(paths, want) {
+		t.Fatalf("request paths = %#v, want %#v", paths, want)
 	}
 }
 

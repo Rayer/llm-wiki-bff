@@ -85,7 +85,7 @@ More detail: [docs/LOCAL_DEV.md](docs/LOCAL_DEV.md).
 
 ## Deploy
 
-The Makefile deploy path builds a Docker image, pushes it, and deploys the BFF service to Cloud Run.
+The final environment mapping and release process are documented in [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md). The Makefile uses a full commit SHA image tag and production-shaped defaults; override its variables for development.
 
 Build image:
 
@@ -111,19 +111,9 @@ Build, push, and deploy:
 make all
 ```
 
-Current deploy target:
-
-```sh
-gcloud run deploy llm-wiki-bff \
-  --image gcr.io/llm-wiki-cloud/llm-wiki-bff \
-  --region asia-east1 \
-  --platform managed \
-  --allow-unauthenticated \
-  --set-env-vars GCP_PROJECT=llm-wiki-cloud,BUCKET=llm-wiki-data,USER_ID=test-user,PROJECT_ID=demo \
-  --port 8080
-```
-
 Production mode expects GCP credentials and uses GCS/Firestore. Local mode is selected only when `--local` or `LOCAL_DATA_DIR` is set.
+
+The BFF supports `FIRESTORE_DATABASE_ID`, `PIPELINE_JOB_URL`, and `ALLOWED_ORIGINS` environment overrides. Empty database and pipeline values preserve the legacy defaults.
 
 ## Useful Commands
 

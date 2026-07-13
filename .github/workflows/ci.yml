@@ -1,9 +1,9 @@
-name: CI/CD
+name: CI
 on:
   push:
-    branches: [main]
+    branches: [main, develop/1.0]
   pull_request:
-    branches: [main]
+    branches: [main, develop/1.0]
   workflow_dispatch:
 
 jobs:
@@ -16,30 +16,3 @@ jobs:
           go-version: "1.26"
       - run: go vet ./...
       - run: go test ./... -v -count=1 -race
-
-  deploy:
-    needs: test
-    runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main'
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Build and deploy to k3s
-        uses: appleboy/ssh-action@v1
-        with:
-          host: ${{ secrets.SSH_HOST }}
-          username: ${{ secrets.SSH_USER }}
-          key: ${{ secrets.SSH_KEY }}
-          script: |
-            bash -c '
-            set -e
-            cd /tmp
-            rm -rf llm-wiki-bff
-            git clone --depth 1 https://github.com/Rayer/llm-wiki-bff.git
-            cd llm-wiki-bff
-            docker build -t llm-wiki-bff:latest .
-            docker save llm-wiki-bff:latest | sudo k3s ctr images import -
-            kubectl rollout restart deployment/llm-wiki-bff
-            kubectl rollout status deployment/llm-wiki-bff --timeout=60s
-            docker image prune -f
-            '

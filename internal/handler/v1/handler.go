@@ -74,6 +74,12 @@ func (h *Handler) SetRebuildIndexFunc(fn func(context.Context, string, string) (
 	h.rebuildIndex = fn
 }
 
+// SetPipelineJobURL configures the Cloud Run Job endpoint used by pipeline
+// trigger and status paths. An empty value preserves the legacy target.
+func (h *Handler) SetPipelineJobURL(jobURL string) {
+	h.cloudRunJobURL = strings.TrimSpace(jobURL)
+}
+
 // SetPipelineQuotaConfig configures per-project pipeline rate limits and demo user IDs.
 // Non-positive dailyLimit / cooldownSeconds / minNewRaw fall back to defaults (2 / 3600s / 1).
 func (h *Handler) SetPipelineQuotaConfig(dailyLimit, cooldownSeconds, minNewRaw int, demoUserIDs []string) {

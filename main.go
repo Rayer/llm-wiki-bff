@@ -93,7 +93,7 @@ func main() {
 	if localMode {
 		log.Printf("Local mode: Firestore client disabled")
 	} else {
-		fsClient, err = firestore.NewClient(cfg.GCPProject, "", "")
+		fsClient, err = firestore.NewClientWithDatabase(cfg.GCPProject, cfg.FirestoreDatabaseID, "", "")
 		if err != nil {
 			log.Printf("WARNING: Firestore client not available: %v", err)
 		} else {
@@ -140,6 +140,7 @@ func main() {
 
 	// Handlers
 	hV1 := handlerv1.New(wikiStore, fsClient, idx, conceptCache, llmClient, expander)
+	hV1.SetPipelineJobURL(cfg.PipelineJobURL)
 	hV1.SetPipelineQuotaConfig(
 		cfg.PipelineDailyLimit,
 		cfg.PipelineCooldownSeconds,
@@ -160,10 +161,7 @@ func main() {
 	r.Use(middleware.LatencyMiddleware())
 
 	// CORS — must be BEFORE routes
-	allowOrigins := []string{"https://wiki.rayer.idv.tw", "https://llm-wiki-frontend.vercel.app", "https://llm-wiki-bff-dev.rayer.idv.tw"}
-	if localMode {
-		allowOrigins = append(allowOrigins, "http://localhost:3000", "http://127.0.0.1:3000")
-	}
+	allowOrigins := cfg.AllowedOriginsFor(localMode)
 	r.Use(cors.New(cors.Config{
 		AllowOrigins:     allowOrigins,
 		AllowMethods:     []string{"GET", "POST", "PATCH", "DELETE", "OPTIONS"},

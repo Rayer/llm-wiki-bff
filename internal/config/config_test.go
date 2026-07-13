@@ -126,6 +126,55 @@ func TestLoadRegistrationEnabledUnset(t *testing.T) {
 	}
 }
 
+func TestLoadEnvironmentSelectionDefaults(t *testing.T) {
+	t.Setenv("FIRESTORE_DATABASE_ID", "")
+	t.Setenv("PIPELINE_JOB_URL", "")
+	t.Setenv("ALLOWED_ORIGINS", "")
+
+	cfg, err := Load(writeConfig(t, "dev_jwt = true\n"))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.FirestoreDatabaseID != "" {
+		t.Fatalf("FirestoreDatabaseID = %q, want empty default", cfg.FirestoreDatabaseID)
+	}
+	if cfg.PipelineJobURL != DefaultPipelineJobURL {
+		t.Fatalf("PipelineJobURL = %q, want %q", cfg.PipelineJobURL, DefaultPipelineJobURL)
+	}
+	wantOrigins := []string{
+		"https://wiki.rayer.idv.tw",
+		"https://llm-wiki-frontend.vercel.app",
+		"https://llm-wiki-bff-dev.rayer.idv.tw",
+	}
+	if !reflect.DeepEqual(cfg.AllowedOrigins, wantOrigins) {
+		t.Fatalf("AllowedOrigins = %#v, want %#v", cfg.AllowedOrigins, wantOrigins)
+	}
+}
+
+func TestLoadEnvironmentSelectionFromEnv(t *testing.T) {
+	t.Setenv("FIRESTORE_DATABASE_ID", " llm-wiki-cloud-dev ")
+	t.Setenv("PIPELINE_JOB_URL", " https://run.googleapis.com/v2/projects/p/locations/r/jobs/olw-pipeline-dev:run ")
+	t.Setenv("ALLOWED_ORIGINS", " https://dev.example, https://dev.example, *, http://localhost:3000 ")
+
+	cfg, err := Load(writeConfig(t, "dev_jwt = true\n"))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.FirestoreDatabaseID != "llm-wiki-cloud-dev" {
+		t.Fatalf("FirestoreDatabaseID = %q", cfg.FirestoreDatabaseID)
+	}
+	if cfg.PipelineJobURL != "https://run.googleapis.com/v2/projects/p/locations/r/jobs/olw-pipeline-dev:run" {
+		t.Fatalf("PipelineJobURL = %q", cfg.PipelineJobURL)
+	}
+	wantOrigins := []string{"https://dev.example", "http://localhost:3000"}
+	if !reflect.DeepEqual(cfg.AllowedOrigins, wantOrigins) {
+		t.Fatalf("AllowedOrigins = %#v, want %#v", cfg.AllowedOrigins, wantOrigins)
+	}
+	if got := cfg.AllowedOriginsFor(true); !reflect.DeepEqual(got, append(wantOrigins, "http://127.0.0.1:3000")) {
+		t.Fatalf("AllowedOriginsFor(local) = %#v", got)
+	}
+}
+
 func writeConfig(t *testing.T, contents string) string {
 	t.Helper()
 	dir := t.TempDir()
