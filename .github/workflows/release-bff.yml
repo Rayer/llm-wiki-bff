@@ -132,14 +132,15 @@ jobs:
             --quiet
           echo "✅ Promoted $IMMUTABLE_IMAGE to ${{ env.SERVICE_NAME }}"
 
-      - name: Update prod channel tag (fail-closed)
+      - name: Tag promoted production image (fail-closed)
         env:
           IMMUTABLE_IMAGE: ${{ steps.image.outputs.image }}
+          COMMIT_SHA: ${{ steps.commit.outputs.commit_sha }}
         run: |
           set -euo pipefail
           gcloud artifacts docker tags add \
             "$IMMUTABLE_IMAGE" \
-            "${{ env.AR_REPO }}/llm-wiki-bff:prod" \
+            "${{ env.AR_REPO }}/llm-wiki-bff:prod-${COMMIT_SHA}" \
             --quiet
 
       - name: Show deployment info
