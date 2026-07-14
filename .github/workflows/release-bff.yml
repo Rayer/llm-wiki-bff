@@ -125,7 +125,7 @@ jobs:
             --region ${{ env.REGION }} \
             --service-account "${{ env.RUNTIME_SERVICE_ACCOUNT }}" \
             --network default --subnet default \
-            --vpc-egress all-traffic \
+            --vpc-egress private-ranges-only \
             --allow-unauthenticated \
             --update-secrets "JWT_SECRET=${{ env.JWT_SECRET_NAME }}:latest,DEEPSEEK_API_KEY=deepseek-apikey:latest" \
             --update-env-vars "^@^GCP_PROJECT=${{ env.PROJECT_ID }}@BUCKET=${{ env.BUCKET }}@FIRESTORE_DATABASE_ID=${{ env.FIRESTORE_DATABASE_ID }}@PIPELINE_JOB_URL=https://run.googleapis.com/v2/projects/${{ env.PROJECT_ID }}/locations/${{ env.REGION }}/jobs/${{ env.PIPELINE_JOB_NAME }}:run@ALLOWED_ORIGINS=${{ env.ALLOWED_ORIGINS }}@DEV_JWT=false" \
