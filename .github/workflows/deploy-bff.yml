@@ -16,7 +16,7 @@ jobs:
   test-and-deploy:
     name: Test & Deploy
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
 
     permissions:
       contents: read
@@ -59,11 +59,57 @@ jobs:
           JWT_SECRET_NAME: jwt-secret-dev
           ALLOWED_ORIGINS: https://llm-wiki-frontend-dev.vercel.app,http://localhost:3000,http://127.0.0.1:3000
         run: |
+          set -euo pipefail
           COMMIT_SHA=$(git rev-parse HEAD)
           IMAGE="${{ env.AR_REPO }}/llm-wiki-bff:$COMMIT_SHA"
-          echo "Building $IMAGE…"
-          gcloud builds submit --tag "$IMAGE" --timeout=600s --suppress-logs --quiet
-          echo "Deploying $IMAGE…"
+          echo "Building ${IMAGE}…"
+          BUILD_ID=$(gcloud builds submit \
+            --tag "$IMAGE" \
+            --timeout=600s \
+            --async \
+            --suppress-logs \
+            --format='value(id)' \
+            --quiet)
+          if [[ ! "$BUILD_ID" =~ ^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$ ]]; then
+            echo "Cloud Build submission returned an invalid build ID: $BUILD_ID"
+            exit 1
+          fi
+          echo "Submitted Cloud Build $BUILD_ID; waiting for completion…"
+
+          STATUS=""
+          POLL_DEADLINE=$((SECONDS + 720))
+          while (( SECONDS < POLL_DEADLINE )); do
+            if ! STATUS=$(gcloud builds describe "$BUILD_ID" \
+              --project="${{ env.PROJECT_ID }}" \
+              --format='value(status)' \
+              --quiet); then
+              echo "Unable to read Cloud Build $BUILD_ID status; failing closed."
+              exit 1
+            fi
+            case "$STATUS" in
+              SUCCESS)
+                echo "Cloud Build $BUILD_ID completed successfully."
+                break
+                ;;
+              QUEUED|WORKING)
+                sleep 15
+                ;;
+              FAILURE|INTERNAL_ERROR|TIMEOUT|CANCELLED|EXPIRED|STATUS_UNKNOWN|UNKNOWN|"")
+                echo "Cloud Build $BUILD_ID ended with status '${STATUS:-empty}'; refusing to deploy."
+                exit 1
+                ;;
+              *)
+                echo "Cloud Build $BUILD_ID returned unknown status '$STATUS'; refusing to deploy."
+                exit 1
+                ;;
+            esac
+          done
+          if [[ "$STATUS" != SUCCESS ]]; then
+            echo "Timed out waiting for Cloud Build $BUILD_ID after 720 seconds; refusing to deploy."
+            exit 1
+          fi
+
+          echo "Deploying ${IMAGE}…"
           gcloud run deploy ${{ env.SERVICE_NAME }} \
             --image "$IMAGE" \
             --region ${{ env.REGION }} \
