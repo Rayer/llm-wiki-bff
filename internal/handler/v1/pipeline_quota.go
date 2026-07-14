@@ -91,28 +91,74 @@ func (h *Handler) countNewRawForProject(ctx context.Context, userID, projectID s
 	return pipelinequota.CountNewRaw(updated, lastRunAt), nil
 }
 
-// isPipelineRunning reports whether the project has an active lock or a Cloud Run execution in RUNNING.
-// Latest terminal execution overrides a stale Firestore lock (LWC-144).
+// isPipelineRunning reports whether the project has an active lock or any owned
+// Cloud Run execution in RUNNING. All-terminal owned history overrides a stale
+// Firestore lock (LWC-144).
 func (h *Handler) isPipelineRunning(ctx context.Context, userID, projectID string) (bool, error) {
 	locked, err := h.projectLockActive(ctx, userID, projectID)
 	if err != nil {
 		return false, err
 	}
 
-	last, err := h.pipelineExecutionStatus(ctx, "")
+	hasOwned, allTerminal, anyRunning, err := h.pipelineOwnedExecutionActivityForOwner(ctx, userID, projectID)
 	if err != nil {
 		// Cloud Run status may be unavailable (local/dev, metadata missing).
 		// Rely on the lock signal only in that case; log so transient API
 		// failures are visible when diagnosing a false-allow.
-		log.Printf("pipeline status for running check %s/%s: %v (using lock only)", userID, projectID, err)
+		log.Printf("pipeline activity scan for running check %s/%s: %v (using lock only)", userID, projectID, err)
 		return locked, nil
 	}
 
-	executionStatus := ""
-	if last != nil {
-		executionStatus = last.Status
+	return pipelineRunningForOwnedActivity(locked, hasOwned, allTerminal, anyRunning), nil
+}
+
+// pipelineOwnedExecutionActivityForOwner scans every page of executions for a
+// project. It intentionally does not stop at the newest owned execution: an
+// older running execution must still block a new pipeline run.
+func (h *Handler) pipelineOwnedExecutionActivityForOwner(ctx context.Context, userID, projectID string) (hasOwned, allTerminal, anyRunning bool, err error) {
+	token, err := h.getMetadataAccessToken(ctx)
+	if err != nil {
+		return false, false, false, err
 	}
-	return pipelinequota.ComputeAlreadyRunning(locked, executionStatus), nil
+
+	pageToken := ""
+	for {
+		executions, err := h.listCloudRunExecutions(ctx, token, pageToken)
+		if err != nil {
+			return false, false, false, err
+		}
+		for _, execution := range executions.Executions {
+			if !cloudRunExecutionOwnedBy(execution, userID, projectID) {
+				continue
+			}
+			if !hasOwned {
+				hasOwned = true
+				allTerminal = true
+			}
+
+			status := cloudRunExecutionStatus(execution)
+			if status == "RUNNING" {
+				return true, false, true, nil
+			}
+			if !pipelinequota.IsTerminalExecutionStatus(status) {
+				allTerminal = false
+			}
+		}
+		if executions.NextPageToken == "" {
+			return hasOwned, allTerminal, false, nil
+		}
+		pageToken = executions.NextPageToken
+	}
+}
+
+func pipelineRunningForOwnedActivity(lockActive, hasOwned, allTerminal, anyRunning bool) bool {
+	if anyRunning {
+		return true
+	}
+	if hasOwned && allTerminal {
+		return false
+	}
+	return lockActive
 }
 
 // projectLockActive checks locks/{userID}__{projectID} for an active lock.

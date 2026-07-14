@@ -40,8 +40,9 @@ const (
 )
 
 var (
-	errIndexNotFound          = errors.New("index not found")
-	errFirestoreNotConfigured = errors.New("Firestore client is not configured")
+	errIndexNotFound             = errors.New("index not found")
+	errFirestoreNotConfigured    = errors.New("Firestore client is not configured")
+	errPipelineExecutionNotFound = errors.New("pipeline execution not found")
 )
 
 // Health handles GET /api/v1/health.
@@ -840,20 +841,35 @@ type pipelineStatusResponse struct {
 }
 
 type cloudRunExecutionsResponse struct {
-	Executions []cloudRunExecution `json:"executions"`
+	Executions    []cloudRunExecution `json:"executions"`
+	NextPageToken string              `json:"nextPageToken"`
 }
 
 type cloudRunExecution struct {
-	Name             string              `json:"name"`
-	StartTime        string              `json:"startTime"`
-	CompletionTime   string              `json:"completionTime"`
-	EndTime          string              `json:"endTime"`
-	CompletionStatus string              `json:"completionStatus"`
-	Conditions       []cloudRunCondition `json:"conditions"`
-	RunningCount     int                 `json:"runningCount"`
-	SucceededCount   int                 `json:"succeededCount"`
-	FailedCount      int                 `json:"failedCount"`
-	CancelledCount   int                 `json:"cancelledCount"`
+	Name             string                    `json:"name"`
+	StartTime        string                    `json:"startTime"`
+	CompletionTime   string                    `json:"completionTime"`
+	EndTime          string                    `json:"endTime"`
+	CompletionStatus string                    `json:"completionStatus"`
+	Conditions       []cloudRunCondition       `json:"conditions"`
+	RunningCount     int                       `json:"runningCount"`
+	SucceededCount   int                       `json:"succeededCount"`
+	FailedCount      int                       `json:"failedCount"`
+	CancelledCount   int                       `json:"cancelledCount"`
+	Template         cloudRunExecutionTemplate `json:"template"`
+}
+
+type cloudRunExecutionTemplate struct {
+	Containers []cloudRunContainer `json:"containers"`
+}
+
+type cloudRunContainer struct {
+	Env []cloudRunEnv `json:"env"`
+}
+
+type cloudRunEnv struct {
+	Name  string `json:"name"`
+	Value string `json:"value"`
 }
 
 type cloudRunCondition struct {
@@ -891,12 +907,24 @@ func (h *Handler) PipelineStatus(c *gin.Context) {
 
 	ctx := c.Request.Context()
 	executionID := strings.TrimSpace(c.Query("execution_id"))
+	if executionID != "" {
+		var err error
+		executionID, err = validatePipelineExecutionID(executionID)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, handler.ErrorResponse{Error: err.Error()})
+			return
+		}
+	}
 	response := pipelineStatusResponse{
 		ProjectID:        projectID,
 		SuggestedQueries: h.loadSuggestedQueries(ctx, c),
 	}
-	lastExecution, err := h.pipelineExecutionStatus(ctx, executionID)
+	lastExecution, err := h.pipelineExecutionStatusForOwner(ctx, executionID, userID, projectID)
 	if err != nil {
+		if errors.Is(err, errPipelineExecutionNotFound) {
+			c.JSON(http.StatusNotFound, handler.ErrorResponse{Error: errPipelineExecutionNotFound.Error()})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "pipeline status failed: " + err.Error()})
 		return
 	}
@@ -1034,10 +1062,17 @@ func (h *Handler) pipelineHTTPClient() *http.Client {
 }
 
 func (h *Handler) cloudRunExecutionsURL() string {
+	return h.cloudRunExecutionsURLWithPageToken("")
+}
+
+func (h *Handler) cloudRunExecutionsURLWithPageToken(pageToken string) string {
 	runURL := h.pipelineJobURL()
 	baseURL := strings.TrimSuffix(runURL, ":run")
 	values := url.Values{}
-	values.Set("pageSize", "1")
+	values.Set("pageSize", "20")
+	if pageToken != "" {
+		values.Set("pageToken", pageToken)
+	}
 	return baseURL + "/executions?" + values.Encode()
 }
 
@@ -1094,50 +1129,140 @@ func shortCloudRunExecutionName(name string, allowBare bool) string {
 }
 
 func (h *Handler) pipelineExecutionStatus(ctx context.Context, executionID string) (*handler.PipelineExecutionResponse, error) {
+	return h.pipelineExecutionStatusWithOwner(ctx, executionID, nil)
+}
+
+func (h *Handler) pipelineExecutionStatusForOwner(ctx context.Context, executionID, userID, projectID string) (*handler.PipelineExecutionResponse, error) {
+	return h.pipelineExecutionStatusWithOwner(ctx, executionID, &pipelineExecutionOwner{
+		userID:    userID,
+		projectID: projectID,
+	})
+}
+
+type pipelineExecutionOwner struct {
+	userID    string
+	projectID string
+}
+
+func (h *Handler) pipelineExecutionStatusWithOwner(ctx context.Context, executionID string, owner *pipelineExecutionOwner) (*handler.PipelineExecutionResponse, error) {
 	token, err := h.getMetadataAccessToken(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	statusURL := h.cloudRunExecutionsURL()
 	if executionID != "" {
-		statusURL = h.cloudRunExecutionURL(executionID)
+		execution, err := h.fetchCloudRunExecution(ctx, token, executionID)
+		if err != nil {
+			return nil, err
+		}
+		if owner != nil && !cloudRunExecutionOwnedBy(execution, owner.userID, owner.projectID) {
+			return nil, errPipelineExecutionNotFound
+		}
+		return newPipelineExecutionResponse(execution), nil
 	}
+
+	pageToken := ""
+	for {
+		executions, err := h.listCloudRunExecutions(ctx, token, pageToken)
+		if err != nil {
+			return nil, err
+		}
+		if owner == nil {
+			if len(executions.Executions) == 0 {
+				return nil, nil
+			}
+			return newPipelineExecutionResponse(executions.Executions[0]), nil
+		}
+		for _, execution := range executions.Executions {
+			if cloudRunExecutionOwnedBy(execution, owner.userID, owner.projectID) {
+				return newPipelineExecutionResponse(execution), nil
+			}
+		}
+		if executions.NextPageToken == "" {
+			return nil, nil
+		}
+		pageToken = executions.NextPageToken
+	}
+}
+
+func (h *Handler) fetchCloudRunExecution(ctx context.Context, token, executionID string) (cloudRunExecution, error) {
+	statusURL := h.cloudRunExecutionURL(executionID)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, statusURL, nil)
 	if err != nil {
-		return nil, err
+		return cloudRunExecution{}, err
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 
 	resp, err := h.pipelineHTTPClient().Do(req)
 	if err != nil {
-		return nil, err
+		return cloudRunExecution{}, err
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, err
+		return cloudRunExecution{}, err
+	}
+	if resp.StatusCode == http.StatusNotFound {
+		return cloudRunExecution{}, errPipelineExecutionNotFound
 	}
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return nil, fmt.Errorf("%s", string(body))
+		return cloudRunExecution{}, fmt.Errorf("%s", string(body))
 	}
 
-	if executionID != "" {
-		var execution cloudRunExecution
-		if err := json.Unmarshal(body, &execution); err != nil {
-			return nil, err
-		}
-		return newPipelineExecutionResponse(execution), nil
+	var execution cloudRunExecution
+	if err := json.Unmarshal(body, &execution); err != nil {
+		return cloudRunExecution{}, err
+	}
+	return execution, nil
+}
+
+func (h *Handler) listCloudRunExecutions(ctx context.Context, token, pageToken string) (cloudRunExecutionsResponse, error) {
+	statusURL := h.cloudRunExecutionsURLWithPageToken(pageToken)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, statusURL, nil)
+	if err != nil {
+		return cloudRunExecutionsResponse{}, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := h.pipelineHTTPClient().Do(req)
+	if err != nil {
+		return cloudRunExecutionsResponse{}, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return cloudRunExecutionsResponse{}, err
+	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return cloudRunExecutionsResponse{}, fmt.Errorf("%s", string(body))
 	}
 
 	var executions cloudRunExecutionsResponse
 	if err := json.Unmarshal(body, &executions); err != nil {
-		return nil, err
+		return cloudRunExecutionsResponse{}, err
 	}
-	if len(executions.Executions) == 0 {
-		return nil, nil
+	return executions, nil
+}
+
+func cloudRunExecutionOwnedBy(execution cloudRunExecution, userID, projectID string) bool {
+	userID = strings.TrimSpace(userID)
+	projectID = strings.TrimSpace(projectID)
+	if userID == "" || projectID == "" {
+		return false
 	}
-	return newPipelineExecutionResponse(executions.Executions[0]), nil
+
+	for _, container := range execution.Template.Containers {
+		env := make(map[string]string)
+		for _, variable := range container.Env {
+			env[variable.Name] = variable.Value
+		}
+		if env["USER_ID"] == userID &&
+			env["PROJECT_ID"] == projectID &&
+			env["TASK_TYPE"] == "pipeline" {
+			return true
+		}
+	}
+	return false
 }
 
 func newPipelineExecutionResponse(execution cloudRunExecution) *handler.PipelineExecutionResponse {
@@ -1196,6 +1321,14 @@ func (h *Handler) PipelineLog(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, handler.ErrorResponse{Error: err.Error()})
 		return
 	}
+	if _, err := h.pipelineExecutionStatusForOwner(c.Request.Context(), executionID, userID, projectID); err != nil {
+		if errors.Is(err, errPipelineExecutionNotFound) {
+			c.JSON(http.StatusNotFound, handler.ErrorResponse{Error: errPipelineExecutionNotFound.Error()})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "pipeline execution lookup failed: " + err.Error()})
+		return
+	}
 
 	wikiStore, err := h.GetStore(c)
 	if err != nil {
@@ -1215,6 +1348,15 @@ func (h *Handler) PipelineLog(c *gin.Context) {
 }
 
 func pipelineLogPath(executionID string) (string, error) {
+	var err error
+	executionID, err = validatePipelineExecutionID(executionID)
+	if err != nil {
+		return "", err
+	}
+	return "cache/pipeline-" + executionID + ".log", nil
+}
+
+func validatePipelineExecutionID(executionID string) (string, error) {
 	executionID = strings.TrimSpace(executionID)
 	if executionID == "" {
 		return "", errors.New("execution_id is required")
@@ -1222,7 +1364,7 @@ func pipelineLogPath(executionID string) (string, error) {
 	if strings.ContainsAny(executionID, `/\`+"\x00") || executionID == "." || executionID == ".." || strings.Contains(executionID, "..") {
 		return "", fmt.Errorf("unsafe execution_id: %s", executionID)
 	}
-	return "cache/pipeline-" + executionID + ".log", nil
+	return executionID, nil
 }
 
 func cloudRunExecutionStatus(execution cloudRunExecution) string {
