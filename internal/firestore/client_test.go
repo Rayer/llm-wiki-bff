@@ -1,11 +1,53 @@
 package firestore
 
 import (
+	"context"
 	"testing"
 	"time"
 
+	cloudfirestore "cloud.google.com/go/firestore"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
+
+func TestNewClientWithDatabaseSelectsNamedDatabase(t *testing.T) {
+	original := newFirestoreClient
+	t.Cleanup(func() { newFirestoreClient = original })
+
+	var gotDatabaseID string
+	newFirestoreClient = func(_ context.Context, _ string, databaseID string) (*cloudfirestore.Client, error) {
+		gotDatabaseID = databaseID
+		return &cloudfirestore.Client{}, nil
+	}
+
+	client, err := NewClientWithDatabase("project", "named-db", "user", "project-id")
+	if err != nil {
+		t.Fatalf("NewClientWithDatabase() error = %v", err)
+	}
+	if gotDatabaseID != "named-db" {
+		t.Fatalf("database ID passed to Firestore constructor = %q, want %q", gotDatabaseID, "named-db")
+	}
+	if client.databaseID != "named-db" {
+		t.Fatalf("wrapper databaseID = %q, want %q", client.databaseID, "named-db")
+	}
+}
+
+func TestNewClientKeepsDefaultDatabaseSelection(t *testing.T) {
+	original := newFirestoreClient
+	t.Cleanup(func() { newFirestoreClient = original })
+
+	var gotDatabaseID string
+	newFirestoreClient = func(_ context.Context, _ string, databaseID string) (*cloudfirestore.Client, error) {
+		gotDatabaseID = databaseID
+		return &cloudfirestore.Client{}, nil
+	}
+
+	if _, err := NewClient("project", "user", "project-id"); err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	if gotDatabaseID != "" {
+		t.Fatalf("database ID passed to Firestore constructor = %q, want empty default", gotDatabaseID)
+	}
+}
 
 func TestActiveLockUntilReturnsExpiryForActiveUnexpiredLock(t *testing.T) {
 	now := time.Date(2026, 7, 6, 12, 0, 0, 0, time.UTC)

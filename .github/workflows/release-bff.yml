@@ -1,0 +1,139 @@
+name: Promote BFF to Cloud Run (production)
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: Full commit SHA for an image already built by the dev workflow
+        required: true
+        type: string
+
+env:
+  PROJECT_ID: llm-wiki-cloud
+  SERVICE_NAME: llm-wiki-bff
+  REGION: asia-east1
+  AR_REPO: asia-east1-docker.pkg.dev/llm-wiki-cloud/cloud-run-images
+  BUCKET: llm-wiki-data
+  FIRESTORE_DATABASE_ID: llm-wiki-cloud-prod
+  PIPELINE_JOB_NAME: olw-pipeline
+  RUNTIME_SERVICE_ACCOUNT: lwc-bff-prod@llm-wiki-cloud.iam.gserviceaccount.com
+  JWT_SECRET_NAME: jwt-secret-prod
+  ALLOWED_ORIGINS: https://wiki.rayer.idv.tw,https://llm-wiki-frontend.vercel.app
+
+jobs:
+  promote:
+    name: Promote immutable image
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: production
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+
+    steps:
+      - name: Checkout develop/1.0
+        uses: actions/checkout@v4
+        with:
+          ref: develop/1.0
+          fetch-depth: 0
+
+      - name: Validate promotion commit
+        id: commit
+        env:
+          COMMIT_SHA: ${{ inputs.commit_sha }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$COMMIT_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "commit_sha must be a 40-character lowercase commit SHA"
+            exit 1
+          fi
+          git fetch origin develop/1.0 --force --no-tags
+          if ! git cat-file -e "$COMMIT_SHA^{commit}"; then
+            echo "commit_sha does not identify a commit"
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$COMMIT_SHA" origin/develop/1.0; then
+            echo "commit_sha is not an ancestor of develop/1.0"
+            exit 1
+          fi
+          echo "commit_sha=$COMMIT_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Verify successful dev deployment run
+        id: dev_run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMIT_SHA: ${{ steps.commit.outputs.commit_sha }}
+        run: |
+          set -euo pipefail
+          RUN_ID=$(gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/deploy-bff.yml/runs?event=push&status=completed&head_sha=${COMMIT_SHA}&per_page=100" \
+            | jq -r --arg sha "$COMMIT_SHA" 'first(.workflow_runs[] | select(.event == "push" and .head_branch == "develop/1.0" and .head_sha == $sha and .conclusion == "success") | .id) // empty')
+          if [[ -z "$RUN_ID" ]]; then
+            echo "no successful push run of deploy-bff.yml found for $COMMIT_SHA"
+            exit 1
+          fi
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "Using successful dev deployment run $RUN_ID for $COMMIT_SHA"
+
+      - name: Download dev image digest artifact
+        id: image
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMIT_SHA: ${{ steps.commit.outputs.commit_sha }}
+          DEV_RUN_ID: ${{ steps.dev_run.outputs.run_id }}
+        run: |
+          set -euo pipefail
+          ARTIFACT_DIR="$RUNNER_TEMP/bff-image-digest"
+          rm -rf "$ARTIFACT_DIR"
+          mkdir -p "$ARTIFACT_DIR"
+          gh run download "$DEV_RUN_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            --name "bff-image-digest-$COMMIT_SHA" \
+            --dir "$ARTIFACT_DIR"
+          DIGEST_FILE="$ARTIFACT_DIR/bff-image-digest-$COMMIT_SHA.txt"
+          if [[ ! -f "$DIGEST_FILE" ]] || [[ $(find "$ARTIFACT_DIR" -type f | wc -l) -ne 1 ]]; then
+            echo "digest artifact contents are missing or unexpected"
+            exit 1
+          fi
+          DIGEST=$(tr -d '[:space:]' < "$DIGEST_FILE")
+          if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "digest artifact is missing or invalid"
+            exit 1
+          fi
+          echo "image=${{ env.AR_REPO }}/llm-wiki-bff@$DIGEST" >> "$GITHUB_OUTPUT"
+          echo "Promoting digest $DIGEST for $COMMIT_SHA"
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v3
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+
+      - name: Deploy existing image to Cloud Run
+        env:
+          IMMUTABLE_IMAGE: ${{ steps.image.outputs.image }}
+        run: |
+          gcloud run deploy ${{ env.SERVICE_NAME }} \
+            --image "$IMMUTABLE_IMAGE" \
+            --region ${{ env.REGION }} \
+            --service-account "${{ env.RUNTIME_SERVICE_ACCOUNT }}" \
+            --network default --subnet default \
+            --vpc-egress all-traffic \
+            --allow-unauthenticated \
+            --update-secrets "JWT_SECRET=${{ env.JWT_SECRET_NAME }}:latest,DEEPSEEK_API_KEY=deepseek-apikey:latest" \
+            --update-env-vars "^@^GCP_PROJECT=${{ env.PROJECT_ID }}@BUCKET=${{ env.BUCKET }}@FIRESTORE_DATABASE_ID=${{ env.FIRESTORE_DATABASE_ID }}@PIPELINE_JOB_URL=https://run.googleapis.com/v2/projects/${{ env.PROJECT_ID }}/locations/${{ env.REGION }}/jobs/${{ env.PIPELINE_JOB_NAME }}:run@ALLOWED_ORIGINS=${{ env.ALLOWED_ORIGINS }}@DEV_JWT=false" \
+            --quiet
+          echo "✅ Promoted $IMMUTABLE_IMAGE to ${{ env.SERVICE_NAME }}"
+
+      - name: Show deployment info
+        run: |
+          gcloud run services describe ${{ env.SERVICE_NAME }} \
+            --region ${{ env.REGION }} \
+            --format="value(status.url)"

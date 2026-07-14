@@ -126,6 +126,80 @@ func TestLoadRegistrationEnabledUnset(t *testing.T) {
 	}
 }
 
+func TestLoadEnvironmentSelectionDefaults(t *testing.T) {
+	t.Setenv("FIRESTORE_DATABASE_ID", "")
+	t.Setenv("PIPELINE_JOB_URL", "")
+	t.Setenv("ALLOWED_ORIGINS", "")
+
+	cfg, err := Load(writeConfig(t, "dev_jwt = true\n"))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.FirestoreDatabaseID != "" {
+		t.Fatalf("FirestoreDatabaseID = %q, want empty default", cfg.FirestoreDatabaseID)
+	}
+	if cfg.PipelineJobURL != DefaultPipelineJobURL {
+		t.Fatalf("PipelineJobURL = %q, want %q", cfg.PipelineJobURL, DefaultPipelineJobURL)
+	}
+	wantOrigins := []string{
+		"https://wiki.rayer.idv.tw",
+		"https://llm-wiki-frontend.vercel.app",
+		"https://llm-wiki-bff-dev.rayer.idv.tw",
+	}
+	if !reflect.DeepEqual(cfg.AllowedOrigins, wantOrigins) {
+		t.Fatalf("AllowedOrigins = %#v, want %#v", cfg.AllowedOrigins, wantOrigins)
+	}
+}
+
+func TestLoadEnvironmentSelectionFromEnv(t *testing.T) {
+	t.Setenv("FIRESTORE_DATABASE_ID", " llm-wiki-cloud-dev ")
+	t.Setenv("PIPELINE_JOB_URL", " https://run.googleapis.com/v2/projects/p/locations/r/jobs/olw-pipeline-dev:run ")
+	t.Setenv("ALLOWED_ORIGINS", " https://dev.example, https://dev.example, *, http://localhost:3000 ")
+
+	cfg, err := Load(writeConfig(t, "dev_jwt = true\n"))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.FirestoreDatabaseID != "llm-wiki-cloud-dev" {
+		t.Fatalf("FirestoreDatabaseID = %q", cfg.FirestoreDatabaseID)
+	}
+	if cfg.PipelineJobURL != "https://run.googleapis.com/v2/projects/p/locations/r/jobs/olw-pipeline-dev:run" {
+		t.Fatalf("PipelineJobURL = %q", cfg.PipelineJobURL)
+	}
+	wantOrigins := []string{"https://dev.example", "http://localhost:3000"}
+	if !reflect.DeepEqual(cfg.AllowedOrigins, wantOrigins) {
+		t.Fatalf("AllowedOrigins = %#v, want %#v", cfg.AllowedOrigins, wantOrigins)
+	}
+	if got := cfg.AllowedOriginsFor(true); !reflect.DeepEqual(got, append(wantOrigins, "http://127.0.0.1:3000")) {
+		t.Fatalf("AllowedOriginsFor(local) = %#v", got)
+	}
+}
+
+func TestLoadRejectsInvalidPipelineJobURL(t *testing.T) {
+	tests := []struct {
+		name string
+		url  string
+	}{
+		{name: "http", url: "http://run.googleapis.com/v2/projects/p/locations/r/jobs/j:run"},
+		{name: "malicious host", url: "https://attacker.example/v2/projects/p/locations/r/jobs/j:run"},
+		{name: "userinfo", url: "https://attacker.example@run.googleapis.com/v2/projects/p/locations/r/jobs/j:run"},
+		{name: "query", url: "https://run.googleapis.com/v2/projects/p/locations/r/jobs/j:run?token=leak"},
+		{name: "fragment", url: "https://run.googleapis.com/v2/projects/p/locations/r/jobs/j:run#fragment"},
+		{name: "malformed suffix", url: "https://run.googleapis.com/v2/projects/p/locations/r/jobs/j:invoke"},
+		{name: "empty location segment", url: "https://run.googleapis.com/v2/projects/p/locations//jobs/j:run"},
+		{name: "unsafe project segment", url: "https://run.googleapis.com/v2/projects/p%2Fattacker/locations/r/jobs/j:run"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("PIPELINE_JOB_URL", tt.url)
+			if _, err := Load(writeConfig(t, "dev_jwt = true\n")); err == nil {
+				t.Fatalf("Load() accepted invalid pipeline job URL %q", tt.url)
+			}
+		})
+	}
+}
+
 func writeConfig(t *testing.T, contents string) string {
 	t.Helper()
 	dir := t.TempDir()

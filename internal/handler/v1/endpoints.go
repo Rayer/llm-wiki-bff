@@ -19,6 +19,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/rayer/llm-wiki-bff/internal/auth"
 	conceptcache "github.com/rayer/llm-wiki-bff/internal/cache"
+	"github.com/rayer/llm-wiki-bff/internal/config"
 	"github.com/rayer/llm-wiki-bff/internal/gcs"
 	"github.com/rayer/llm-wiki-bff/internal/handler"
 	"github.com/rayer/llm-wiki-bff/internal/llm"
@@ -34,7 +35,7 @@ import (
 
 const (
 	defaultMetadataTokenURL = "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token"
-	defaultCloudRunJobURL   = "https://run.googleapis.com/v2/projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline:run"
+	defaultCloudRunJobURL   = config.DefaultPipelineJobURL
 	defaultWorkerCommands   = `[["run","--auto-approve"],["approve","--all"]]`
 )
 
@@ -793,10 +794,7 @@ func (h *Handler) invokePipelineJob(ctx context.Context, userID, projectID strin
 		return "", err
 	}
 
-	runURL := h.cloudRunJobURL
-	if runURL == "" {
-		runURL = defaultCloudRunJobURL
-	}
+	runURL := h.pipelineJobURL()
 	runReq, err := http.NewRequestWithContext(ctx, http.MethodPost, runURL, bytes.NewReader(body))
 	if err != nil {
 		return "", err
@@ -1036,10 +1034,7 @@ func (h *Handler) pipelineHTTPClient() *http.Client {
 }
 
 func (h *Handler) cloudRunExecutionsURL() string {
-	runURL := h.cloudRunJobURL
-	if runURL == "" {
-		runURL = defaultCloudRunJobURL
-	}
+	runURL := h.pipelineJobURL()
 	baseURL := strings.TrimSuffix(runURL, ":run")
 	values := url.Values{}
 	values.Set("pageSize", "1")
@@ -1047,12 +1042,16 @@ func (h *Handler) cloudRunExecutionsURL() string {
 }
 
 func (h *Handler) cloudRunExecutionURL(executionID string) string {
-	runURL := h.cloudRunJobURL
-	if runURL == "" {
-		runURL = defaultCloudRunJobURL
-	}
+	runURL := h.pipelineJobURL()
 	baseURL := strings.TrimSuffix(runURL, ":run")
 	return baseURL + "/executions/" + url.PathEscape(executionID)
+}
+
+func (h *Handler) pipelineJobURL() string {
+	if h.cloudRunJobURL != "" {
+		return h.cloudRunJobURL
+	}
+	return defaultCloudRunJobURL
 }
 
 func cloudRunExecutionIDFromRunResponse(body []byte) (string, error) {
