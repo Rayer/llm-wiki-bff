@@ -28,7 +28,7 @@ No credential values belong in workflow files, Makefiles, documentation, or comm
 For a local/manual development deploy, use the Makefile with its immutable commit tag and development-only defaults:
 
 ```sh
-make docker-build docker-push deploy
+make docker-build docker-push deploy-dev
 ```
 
-The Makefile deploy target explicitly sets the dev runtime service account, dev Secret Manager references, and `DEV_JWT=false`. It must not be overridden for production. `make deploy-prod` fails closed; production must use the `Promote BFF to Cloud Run (production)` GitHub workflow with a verified full commit SHA.
+The Makefile `deploy-dev` target hardcodes the dev service, data resources, runtime service account, Secret Manager references, and `DEV_JWT=false`; command-line environment overrides cannot redirect it to production. `deploy` is only an alias for `deploy-dev`. `make deploy-prod` fails closed; production must use the `Promote BFF to Cloud Run (production)` GitHub workflow with a verified full commit SHA.
