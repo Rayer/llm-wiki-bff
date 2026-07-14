@@ -19,9 +19,9 @@ type RegisterRequest struct {
 }
 
 type RegisterResponse struct {
-	Token    string `json:"token"`
-	UserID   string `json:"user_id"`
-	Email    string `json:"email"`
+	Token     string `json:"token"`
+	UserID    string `json:"user_id"`
+	Email     string `json:"email"`
 	ProjectID string `json:"default_project_id"`
 }
 
@@ -30,6 +30,23 @@ type RegistrationGate interface {
 	IsRegistrationEnabled(ctx context.Context) (bool, error)
 }
 
+// RegisterHandler creates a user and its default project when registration is enabled.
+//
+//	@Summary		Register an account
+//	@Description	Returns a JWT in the response body and does not set a refresh cookie.
+//	@Tags			auth
+//	@Accept			json
+//	@Produce		json
+//	@Param			request	body		RegisterRequest	true	"Registration details"
+//	@Success		201		{object}	RegisterResponse
+//	@Failure		400		{object}	ErrorResponse
+//	@Failure		403		{object}	ErrorResponse
+//	@Failure		409		{object}	ErrorResponse
+//	@Failure		500		{object}	ErrorResponse
+//	@Failure		503		{object}	ErrorResponse
+//	@Failure		429		{object}	RateLimitErrorResponse
+//	@Header			429		{integer}	Retry-After	"Seconds until the rate limit window resets"
+//	@Router			/api/v1/auth/register [post]
 func RegisterHandler(fs *firestore.Client, jwtSecret string, gate RegistrationGate) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if gate != nil {
