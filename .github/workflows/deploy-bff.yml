@@ -16,7 +16,7 @@ jobs:
   test-and-deploy:
     name: Test & Deploy
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 80
 
     permissions:
       contents: read
@@ -77,7 +77,9 @@ jobs:
           echo "Submitted Cloud Build $BUILD_ID; waiting for completion…"
 
           STATUS=""
-          POLL_DEADLINE=$((SECONDS + 720))
+          # Cloud Build's default queue TTL is 3600s; add the 600s build
+          # timeout and a 120s polling buffer so valid queued builds can finish.
+          POLL_DEADLINE=$((SECONDS + 4320))
           while (( SECONDS < POLL_DEADLINE )); do
             if ! STATUS=$(gcloud builds describe "$BUILD_ID" \
               --project="${{ env.PROJECT_ID }}" \
@@ -91,7 +93,7 @@ jobs:
                 echo "Cloud Build $BUILD_ID completed successfully."
                 break
                 ;;
-              QUEUED|WORKING)
+              PENDING|QUEUED|WORKING)
                 sleep 15
                 ;;
               FAILURE|INTERNAL_ERROR|TIMEOUT|CANCELLED|EXPIRED|STATUS_UNKNOWN|UNKNOWN|"")
@@ -105,7 +107,7 @@ jobs:
             esac
           done
           if [[ "$STATUS" != SUCCESS ]]; then
-            echo "Timed out waiting for Cloud Build $BUILD_ID after 720 seconds; refusing to deploy."
+            echo "Timed out waiting for Cloud Build $BUILD_ID after 4320 seconds; refusing to deploy."
             exit 1
           fi
 
