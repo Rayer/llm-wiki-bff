@@ -153,14 +153,15 @@ jobs:
           path: ${{ steps.image_digest.outputs.digest_file }}
           if-no-files-found: error
 
-      - name: Update dev channel tag (fail-closed)
+      - name: Tag deployed dev image (fail-closed)
         env:
           IMMUTABLE_IMAGE: ${{ env.AR_REPO }}/llm-wiki-bff@${{ steps.image_digest.outputs.digest }}
         run: |
           set -euo pipefail
+          DEV_IMAGE_TAG="${{ env.AR_REPO }}/llm-wiki-bff:dev-${GITHUB_SHA}"
           gcloud artifacts docker tags add \
             "$IMMUTABLE_IMAGE" \
-            "${{ env.AR_REPO }}/llm-wiki-bff:dev" \
+            "$DEV_IMAGE_TAG" \
             --quiet
 
       - name: Show deployment info
