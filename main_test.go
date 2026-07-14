@@ -1,8 +1,14 @@
 package main
 
 import (
+	"encoding/json"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"strconv"
 	"testing"
 	"time"
 
@@ -13,6 +19,118 @@ import (
 	"github.com/rayer/llm-wiki-bff/internal/middleware"
 	"github.com/rayer/llm-wiki-bff/internal/syssettings"
 )
+
+func TestSwaggerDocumentsPublicAuthRoutes(t *testing.T) {
+	document := readSwaggerDocument(t)
+	for path := range registeredAuthPOSTRoutes(t) {
+		operations, ok := document.Paths[path]
+		if !ok {
+			t.Errorf("Swagger document is missing registered auth route %s", path)
+			continue
+		}
+		if _, ok := operations["post"]; !ok {
+			t.Errorf("Swagger document is missing POST operation for registered auth route %s", path)
+		}
+	}
+}
+
+func TestSwaggerDocumentsAuthRateLimitResponses(t *testing.T) {
+	document := readSwaggerDocument(t)
+	for _, path := range []string{"/api/v1/auth/login", "/api/v1/auth/register"} {
+		var operation struct {
+			Responses map[string]struct {
+				Schema struct {
+					Ref string `json:"$ref"`
+				} `json:"schema"`
+				Headers map[string]json.RawMessage `json:"headers"`
+			} `json:"responses"`
+		}
+		if err := json.Unmarshal(document.Paths[path]["post"], &operation); err != nil {
+			t.Fatalf("decode POST operation for %s: %v", path, err)
+		}
+		response, ok := operation.Responses["429"]
+		if !ok {
+			t.Errorf("Swagger document is missing 429 rate-limit response for %s", path)
+			continue
+		}
+		if response.Schema.Ref != "#/definitions/auth.RateLimitErrorResponse" {
+			t.Errorf("429 schema for %s = %q, want rate-limit error response", path, response.Schema.Ref)
+		}
+		if _, ok := response.Headers["Retry-After"]; !ok {
+			t.Errorf("Swagger document is missing Retry-After header for %s 429 response", path)
+		}
+	}
+}
+
+func TestSwaggerDocumentsRegisterResponseDescription(t *testing.T) {
+	document := readSwaggerDocument(t)
+	var operation struct {
+		Description string `json:"description"`
+	}
+	if err := json.Unmarshal(document.Paths["/api/v1/auth/register"]["post"], &operation); err != nil {
+		t.Fatalf("decode register POST operation: %v", err)
+	}
+	if operation.Description != "Returns a JWT in the response body and does not set a refresh cookie." {
+		t.Errorf("register description = %q, want JWT response body and no refresh cookie only", operation.Description)
+	}
+}
+
+func readSwaggerDocument(t *testing.T) struct {
+	Paths map[string]map[string]json.RawMessage `json:"paths"`
+} {
+	t.Helper()
+	data, err := os.ReadFile("docs/swagger.json")
+	if err != nil {
+		t.Fatalf("read generated Swagger document: %v", err)
+	}
+	var document struct {
+		Paths map[string]map[string]json.RawMessage `json:"paths"`
+	}
+	if err := json.Unmarshal(data, &document); err != nil {
+		t.Fatalf("decode generated Swagger document: %v", err)
+	}
+	return document
+}
+
+func registeredAuthPOSTRoutes(t *testing.T) map[string]struct{} {
+	t.Helper()
+	file, err := parser.ParseFile(token.NewFileSet(), "main.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse route registration: %v", err)
+	}
+
+	routes := make(map[string]struct{})
+	ast.Inspect(file, func(node ast.Node) bool {
+		call, ok := node.(*ast.CallExpr)
+		if !ok || len(call.Args) == 0 {
+			return true
+		}
+		selector, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok || selector.Sel.Name != http.MethodPost {
+			return true
+		}
+		receiver, ok := selector.X.(*ast.Ident)
+		if !ok || receiver.Name != "authRoutes" {
+			return true
+		}
+		path, ok := call.Args[0].(*ast.BasicLit)
+		if !ok || path.Kind != token.STRING {
+			t.Errorf("auth route registration does not use a string path")
+			return true
+		}
+		route, err := strconv.Unquote(path.Value)
+		if err != nil {
+			t.Errorf("unquote auth route %q: %v", path.Value, err)
+			return true
+		}
+		routes["/api/v1/auth"+route] = struct{}{}
+		return true
+	})
+	if len(routes) == 0 {
+		t.Fatal("no auth POST routes found in main.go")
+	}
+	return routes
+}
 
 func TestObservabilityServiceNameUsesCloudRunService(t *testing.T) {
 	tests := []struct {

@@ -15,6 +15,19 @@ type RefreshResponse struct {
 
 type userLookupFunc func(ctx context.Context, fs *firestore.Client, userID string) (*UserRecord, error)
 
+// RefreshHandler rotates the refresh token and issues a new access token.
+//
+//	@Summary		Refresh an access token
+//	@Description	Requires the refresh_token cookie. The cookie is single-use and is rotated on success; the response returns a new 15-minute access token and seven-day refresh_token cookie. In local mode, the cookie omits Domain and Secure.
+//	@Tags			auth
+//	@Produce		json
+//	@Param			Cookie	header		string	true	"refresh_token=<token>"
+//	@Success		200		{object}	RefreshResponse
+//	@Header			200		{string}	Set-Cookie	"Firestore mode: refresh_token; Path=/; Domain=rayer.idv.tw; Max-Age=604800; HttpOnly; Secure; SameSite=Lax"
+//	@Failure		401		{object}	ErrorResponse
+//	@Failure		500		{object}	ErrorResponse
+//	@Failure		503		{object}	ErrorResponse
+//	@Router			/api/v1/auth/refresh [post]
 func RefreshHandler(fsClient *firestore.Client, jwtSecret string) gin.HandlerFunc {
 	return refreshHandler(fsClient, jwtSecret, GetUser)
 }
