@@ -11,12 +11,6 @@ env:
   SERVICE_NAME: llm-wiki-bff-dev
   REGION: asia-east1
   AR_REPO: asia-east1-docker.pkg.dev/llm-wiki-cloud/cloud-run-images
-  BUCKET: llm-wiki-data-dev
-  FIRESTORE_DATABASE_ID: llm-wiki-cloud-dev
-  PIPELINE_JOB_NAME: olw-pipeline-dev
-  RUNTIME_SERVICE_ACCOUNT: lwc-bff-dev@llm-wiki-cloud.iam.gserviceaccount.com
-  JWT_SECRET_NAME: jwt-secret-dev
-  ALLOWED_ORIGINS: https://llm-wiki-frontend-dev.vercel.app,http://localhost:3000,http://127.0.0.1:3000
 
 jobs:
   test-and-deploy:
@@ -57,6 +51,13 @@ jobs:
           project_id: ${{ env.PROJECT_ID }}
 
       - name: Build and deploy to Cloud Run
+        env:
+          BUCKET: llm-wiki-data-dev
+          FIRESTORE_DATABASE_ID: llm-wiki-cloud-dev
+          PIPELINE_JOB_NAME: olw-pipeline-dev
+          RUNTIME_SERVICE_ACCOUNT: lwc-bff-dev@llm-wiki-cloud.iam.gserviceaccount.com
+          JWT_SECRET_NAME: jwt-secret-dev
+          ALLOWED_ORIGINS: https://llm-wiki-frontend-dev.vercel.app,http://localhost:3000,http://127.0.0.1:3000
         run: |
           COMMIT_SHA=$(git rev-parse HEAD)
           IMAGE="${{ env.AR_REPO }}/llm-wiki-bff:$COMMIT_SHA"

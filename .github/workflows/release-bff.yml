@@ -13,12 +13,6 @@ env:
   SERVICE_NAME: llm-wiki-bff
   REGION: asia-east1
   AR_REPO: asia-east1-docker.pkg.dev/llm-wiki-cloud/cloud-run-images
-  BUCKET: llm-wiki-data
-  FIRESTORE_DATABASE_ID: llm-wiki-cloud-prod
-  PIPELINE_JOB_NAME: olw-pipeline
-  RUNTIME_SERVICE_ACCOUNT: lwc-bff-prod@llm-wiki-cloud.iam.gserviceaccount.com
-  JWT_SECRET_NAME: jwt-secret-prod
-  ALLOWED_ORIGINS: https://wiki.rayer.idv.tw,https://llm-wiki-frontend.vercel.app
 
 jobs:
   promote:
@@ -119,6 +113,12 @@ jobs:
       - name: Deploy existing image to Cloud Run
         env:
           IMMUTABLE_IMAGE: ${{ steps.image.outputs.image }}
+          BUCKET: llm-wiki-data
+          FIRESTORE_DATABASE_ID: llm-wiki-cloud-prod
+          PIPELINE_JOB_NAME: olw-pipeline
+          RUNTIME_SERVICE_ACCOUNT: lwc-bff-prod@llm-wiki-cloud.iam.gserviceaccount.com
+          JWT_SECRET_NAME: jwt-secret-prod
+          ALLOWED_ORIGINS: https://wiki.rayer.idv.tw,https://llm-wiki-frontend.vercel.app
         run: |
           gcloud run deploy ${{ env.SERVICE_NAME }} \
             --image "$IMMUTABLE_IMAGE" \
