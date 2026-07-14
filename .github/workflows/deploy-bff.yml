@@ -142,6 +142,7 @@ jobs:
           DIGEST_FILE="bff-image-digest-$COMMIT_SHA.txt"
           printf '%s\n' "$DIGEST" > "$DIGEST_FILE"
           echo "commit_sha=$COMMIT_SHA" >> "$GITHUB_OUTPUT"
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
           echo "digest_file=$DIGEST_FILE" >> "$GITHUB_OUTPUT"
           echo "Resolved $IMAGE to $DIGEST"
 
@@ -151,6 +152,16 @@ jobs:
           name: bff-image-digest-${{ steps.image_digest.outputs.commit_sha }}
           path: ${{ steps.image_digest.outputs.digest_file }}
           if-no-files-found: error
+
+      - name: Update dev channel tag (fail-closed)
+        env:
+          IMMUTABLE_IMAGE: ${{ env.AR_REPO }}/llm-wiki-bff@${{ steps.image_digest.outputs.digest }}
+        run: |
+          set -euo pipefail
+          gcloud artifacts docker tags add \
+            "$IMMUTABLE_IMAGE" \
+            "${{ env.AR_REPO }}/llm-wiki-bff:dev" \
+            --quiet
 
       - name: Show deployment info
         run: |
