@@ -127,7 +127,7 @@ func main() {
 	}
 
 	// OpenTelemetry metrics (graceful fallback)
-	provider, err := observability.InitMetrics(context.Background(), "llm-wiki-bff-dev", observability.GetProjectID())
+	provider, err := observability.InitMetrics(context.Background(), observabilityServiceName(os.Getenv("K_SERVICE")), observability.GetProjectID())
 	if err != nil {
 		log.Printf("[observability] WARNING: metrics init failed (continuing): %v", err)
 	} else {
@@ -257,6 +257,15 @@ func main() {
 	log.Printf("BFF listening on :%s", cfg.Port)
 	log.Printf("Swagger UI: http://localhost:%s/swagger/index.html", cfg.Port)
 	log.Fatal(r.Run(":" + cfg.Port))
+}
+
+const legacyObservabilityServiceName = "llm-wiki-bff-dev"
+
+func observabilityServiceName(kService string) string {
+	if serviceName := strings.TrimSpace(kService); serviceName != "" {
+		return serviceName
+	}
+	return legacyObservabilityServiceName
 }
 
 func registerAdminRoutes(r *gin.Engine, cfg config.Config, hV1 *handlerv1.Handler, settingsStore syssettings.RegistrationGate) {

@@ -175,6 +175,31 @@ func TestLoadEnvironmentSelectionFromEnv(t *testing.T) {
 	}
 }
 
+func TestLoadRejectsInvalidPipelineJobURL(t *testing.T) {
+	tests := []struct {
+		name string
+		url  string
+	}{
+		{name: "http", url: "http://run.googleapis.com/v2/projects/p/locations/r/jobs/j:run"},
+		{name: "malicious host", url: "https://attacker.example/v2/projects/p/locations/r/jobs/j:run"},
+		{name: "userinfo", url: "https://attacker.example@run.googleapis.com/v2/projects/p/locations/r/jobs/j:run"},
+		{name: "query", url: "https://run.googleapis.com/v2/projects/p/locations/r/jobs/j:run?token=leak"},
+		{name: "fragment", url: "https://run.googleapis.com/v2/projects/p/locations/r/jobs/j:run#fragment"},
+		{name: "malformed suffix", url: "https://run.googleapis.com/v2/projects/p/locations/r/jobs/j:invoke"},
+		{name: "empty location segment", url: "https://run.googleapis.com/v2/projects/p/locations//jobs/j:run"},
+		{name: "unsafe project segment", url: "https://run.googleapis.com/v2/projects/p%2Fattacker/locations/r/jobs/j:run"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("PIPELINE_JOB_URL", tt.url)
+			if _, err := Load(writeConfig(t, "dev_jwt = true\n")); err == nil {
+				t.Fatalf("Load() accepted invalid pipeline job URL %q", tt.url)
+			}
+		})
+	}
+}
+
 func writeConfig(t *testing.T, contents string) string {
 	t.Helper()
 	dir := t.TempDir()

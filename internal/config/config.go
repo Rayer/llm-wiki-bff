@@ -2,6 +2,8 @@ package config
 
 import (
 	"errors"
+	"fmt"
+	"net/url"
 	"strings"
 
 	"github.com/spf13/viper"
@@ -101,6 +103,9 @@ func Load(path string) (Config, error) {
 	if pipelineJobURL == "" {
 		pipelineJobURL = DefaultPipelineJobURL
 	}
+	if err := validatePipelineJobURL(pipelineJobURL); err != nil {
+		return Config{}, fmt.Errorf("invalid pipeline_job_url: %w", err)
+	}
 
 	var registrationEnabled *bool
 	if raw := strings.TrimSpace(v.GetString("registration_enabled")); raw != "" {
@@ -129,6 +134,55 @@ func Load(path string) (Config, error) {
 		RegistrationEnabled:     registrationEnabled,
 	}
 	return cfg, nil
+}
+
+func validatePipelineJobURL(rawURL string) error {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("parse URL: %w", err)
+	}
+	if u.Scheme != "https" {
+		return fmt.Errorf("scheme must be https")
+	}
+	if u.Host != "run.googleapis.com" {
+		return fmt.Errorf("host must be run.googleapis.com")
+	}
+	if u.User != nil {
+		return fmt.Errorf("userinfo is not allowed")
+	}
+	if u.RawQuery != "" || u.ForceQuery {
+		return fmt.Errorf("query is not allowed")
+	}
+	if u.Fragment != "" {
+		return fmt.Errorf("fragment is not allowed")
+	}
+	if u.RawPath != "" {
+		return fmt.Errorf("escaped paths are not allowed")
+	}
+
+	parts := strings.Split(u.Path, "/")
+	if len(parts) != 8 || parts[1] != "v2" || parts[2] != "projects" || parts[4] != "locations" || parts[6] != "jobs" {
+		return fmt.Errorf("path must be /v2/projects/{project}/locations/{location}/jobs/{job}:run")
+	}
+	if !isSafePipelinePathSegment(parts[3]) || !isSafePipelinePathSegment(parts[5]) {
+		return fmt.Errorf("project and location path segments must be non-empty and safe")
+	}
+	if !strings.HasSuffix(parts[7], ":run") || !isSafePipelinePathSegment(strings.TrimSuffix(parts[7], ":run")) {
+		return fmt.Errorf("job path segment must end with :run and be safe")
+	}
+	return nil
+}
+
+func isSafePipelinePathSegment(segment string) bool {
+	if segment == "" || segment == "." || segment == ".." {
+		return false
+	}
+	for _, r := range segment {
+		if (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && (r < '0' || r > '9') && r != '-' && r != '_' && r != '.' {
+			return false
+		}
+	}
+	return true
 }
 
 // AllowedOriginsFor returns configured origins and adds local development

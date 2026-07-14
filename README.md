@@ -113,7 +113,7 @@ make all
 
 Production mode expects GCP credentials and uses GCS/Firestore. Local mode is selected only when `--local` or `LOCAL_DATA_DIR` is set.
 
-The BFF supports `FIRESTORE_DATABASE_ID`, `PIPELINE_JOB_URL`, and `ALLOWED_ORIGINS` environment overrides. Empty database and pipeline values preserve the legacy defaults.
+The BFF supports `FIRESTORE_DATABASE_ID`, `PIPELINE_JOB_URL`, and `ALLOWED_ORIGINS` environment overrides. Empty database and pipeline values preserve the legacy defaults; configured pipeline URLs must be HTTPS Cloud Run Jobs `:run` URLs on `run.googleapis.com` with the expected resource path.
 
 ## Useful Commands
 

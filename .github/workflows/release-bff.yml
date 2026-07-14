@@ -28,9 +28,82 @@ jobs:
     environment: production
     permissions:
       contents: read
+      actions: read
       id-token: write
 
     steps:
+      - name: Checkout develop/1.0
+        uses: actions/checkout@v4
+        with:
+          ref: develop/1.0
+          fetch-depth: 0
+
+      - name: Validate promotion commit
+        id: commit
+        env:
+          COMMIT_SHA: ${{ inputs.commit_sha }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$COMMIT_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "commit_sha must be a 40-character lowercase commit SHA"
+            exit 1
+          fi
+          git fetch origin develop/1.0 --force --no-tags
+          if ! git cat-file -e "$COMMIT_SHA^{commit}"; then
+            echo "commit_sha does not identify a commit"
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$COMMIT_SHA" origin/develop/1.0; then
+            echo "commit_sha is not an ancestor of develop/1.0"
+            exit 1
+          fi
+          echo "commit_sha=$COMMIT_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Verify successful dev deployment run
+        id: dev_run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMIT_SHA: ${{ steps.commit.outputs.commit_sha }}
+        run: |
+          set -euo pipefail
+          RUN_ID=$(gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/deploy-bff.yml/runs?event=push&status=completed&head_sha=${COMMIT_SHA}&per_page=100" \
+            | jq -r --arg sha "$COMMIT_SHA" 'first(.workflow_runs[] | select(.event == "push" and .head_branch == "develop/1.0" and .head_sha == $sha and .conclusion == "success") | .id) // empty')
+          if [[ -z "$RUN_ID" ]]; then
+            echo "no successful push run of deploy-bff.yml found for $COMMIT_SHA"
+            exit 1
+          fi
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "Using successful dev deployment run $RUN_ID for $COMMIT_SHA"
+
+      - name: Download dev image digest artifact
+        id: image
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMIT_SHA: ${{ steps.commit.outputs.commit_sha }}
+          DEV_RUN_ID: ${{ steps.dev_run.outputs.run_id }}
+        run: |
+          set -euo pipefail
+          ARTIFACT_DIR="$RUNNER_TEMP/bff-image-digest"
+          rm -rf "$ARTIFACT_DIR"
+          mkdir -p "$ARTIFACT_DIR"
+          gh run download "$DEV_RUN_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            --name "bff-image-digest-$COMMIT_SHA" \
+            --dir "$ARTIFACT_DIR"
+          DIGEST_FILE="$ARTIFACT_DIR/bff-image-digest-$COMMIT_SHA.txt"
+          if [[ ! -f "$DIGEST_FILE" ]] || [[ $(find "$ARTIFACT_DIR" -type f | wc -l) -ne 1 ]]; then
+            echo "digest artifact contents are missing or unexpected"
+            exit 1
+          fi
+          DIGEST=$(tr -d '[:space:]' < "$DIGEST_FILE")
+          if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "digest artifact is missing or invalid"
+            exit 1
+          fi
+          echo "image=${{ env.AR_REPO }}/llm-wiki-bff@$DIGEST" >> "$GITHUB_OUTPUT"
+          echo "Promoting digest $DIGEST for $COMMIT_SHA"
+
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v3
         with:
@@ -42,23 +115,6 @@ jobs:
         uses: google-github-actions/setup-gcloud@v2
         with:
           project_id: ${{ env.PROJECT_ID }}
-
-      - name: Resolve immutable commit-tagged image
-        id: image
-        env:
-          COMMIT_SHA: ${{ inputs.commit_sha }}
-        run: |
-          if [[ ! "$COMMIT_SHA" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "commit_sha must be a 40-character lowercase commit SHA"
-            exit 1
-          fi
-          IMAGE="${{ env.AR_REPO }}/llm-wiki-bff:$COMMIT_SHA"
-          DIGEST=$(gcloud artifacts docker images describe "$IMAGE" --format="value(image_summary.digest)" --quiet)
-          if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-            echo "image digest is missing or invalid"
-            exit 1
-          fi
-          echo "image=${{ env.AR_REPO }}/llm-wiki-bff@$DIGEST" >> "$GITHUB_OUTPUT"
 
       - name: Deploy existing image to Cloud Run
         env:

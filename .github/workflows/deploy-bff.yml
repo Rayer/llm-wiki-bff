@@ -75,6 +75,34 @@ jobs:
             --quiet
           echo "✅ Deployed ${{ env.SERVICE_NAME }} ($COMMIT_SHA)"
 
+      - name: Resolve deployed image digest
+        id: image_digest
+        run: |
+          set -euo pipefail
+          COMMIT_SHA=$(git rev-parse HEAD)
+          if [[ ! "$COMMIT_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "built commit SHA must be a 40-character lowercase commit SHA"
+            exit 1
+          fi
+          IMAGE="${{ env.AR_REPO }}/llm-wiki-bff:$COMMIT_SHA"
+          DIGEST=$(gcloud artifacts docker images describe "$IMAGE" --format="value(image_summary.digest)" --quiet)
+          if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "deployed image digest is missing or invalid"
+            exit 1
+          fi
+          DIGEST_FILE="bff-image-digest-$COMMIT_SHA.txt"
+          printf '%s\n' "$DIGEST" > "$DIGEST_FILE"
+          echo "commit_sha=$COMMIT_SHA" >> "$GITHUB_OUTPUT"
+          echo "digest_file=$DIGEST_FILE" >> "$GITHUB_OUTPUT"
+          echo "Resolved $IMAGE to $DIGEST"
+
+      - name: Upload image digest artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bff-image-digest-${{ steps.image_digest.outputs.commit_sha }}
+          path: ${{ steps.image_digest.outputs.digest_file }}
+          if-no-files-found: error
+
       - name: Show deployment info
         run: |
           gcloud run services describe ${{ env.SERVICE_NAME }} \

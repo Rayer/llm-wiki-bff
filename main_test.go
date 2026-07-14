@@ -14,6 +14,26 @@ import (
 	"github.com/rayer/llm-wiki-bff/internal/syssettings"
 )
 
+func TestObservabilityServiceNameUsesCloudRunService(t *testing.T) {
+	tests := []struct {
+		name     string
+		kService string
+		want     string
+	}{
+		{name: "production", kService: "llm-wiki-bff", want: "llm-wiki-bff"},
+		{name: "development", kService: "llm-wiki-bff-dev", want: "llm-wiki-bff-dev"},
+		{name: "local fallback", want: "llm-wiki-bff-dev"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := observabilityServiceName(tt.kService); got != tt.want {
+				t.Fatalf("observabilityServiceName(%q) = %q, want %q", tt.kService, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestSecurityHeadersMiddleware(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
