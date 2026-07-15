@@ -25,6 +25,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Go
         uses: actions/setup-go@v5
@@ -50,6 +52,36 @@ jobs:
         with:
           project_id: ${{ env.PROJECT_ID }}
 
+      - name: Resolve build identity
+        id: identity
+        run: |
+          set -euo pipefail
+          APP_VERSION=$(go run ./cmd/versioncheck VERSION)
+          GIT_SHA=$(git rev-parse HEAD)
+          if [[ ! "$GIT_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "GIT_SHA must be a 40-character lowercase commit SHA"
+            exit 1
+          fi
+          GIT_BRANCH="${GITHUB_REF_NAME}"
+          if [[ ! "$GIT_BRANCH" =~ ^[0-9A-Za-z][0-9A-Za-z._/-]*$ ]]; then
+            echo "GIT_BRANCH is invalid: $GIT_BRANCH"
+            exit 1
+          fi
+          mapfile -t exact_tags < <(git tag --points-at HEAD --format='%(refname:strip=2)')
+          if (( ${#exact_tags[@]} > 1 )); then
+            echo "multiple exact git tags point at HEAD"
+            exit 1
+          fi
+          GIT_TAG="${exact_tags[0]:-}"
+          if [[ -n "$GIT_TAG" && ! "$GIT_TAG" =~ ^[0-9A-Za-z][0-9A-Za-z._/-]*$ ]]; then
+            echo "GIT_TAG is invalid: $GIT_TAG"
+            exit 1
+          fi
+          echo "app_version=$APP_VERSION" >> "$GITHUB_OUTPUT"
+          echo "git_sha=$GIT_SHA" >> "$GITHUB_OUTPUT"
+          echo "git_branch=$GIT_BRANCH" >> "$GITHUB_OUTPUT"
+          echo "git_tag=$GIT_TAG" >> "$GITHUB_OUTPUT"
+
       - name: Build and deploy to Cloud Run
         env:
           BUCKET: llm-wiki-data-dev
@@ -58,13 +90,17 @@ jobs:
           RUNTIME_SERVICE_ACCOUNT: lwc-bff-dev@llm-wiki-cloud.iam.gserviceaccount.com
           JWT_SECRET_NAME: jwt-secret-dev
           ALLOWED_ORIGINS: https://llm-wiki-frontend-dev.vercel.app,http://localhost:3000,http://127.0.0.1:3000
+          APP_VERSION: ${{ steps.identity.outputs.app_version }}
+          GIT_SHA: ${{ steps.identity.outputs.git_sha }}
+          GIT_BRANCH: ${{ steps.identity.outputs.git_branch }}
+          GIT_TAG: ${{ steps.identity.outputs.git_tag }}
         run: |
           set -euo pipefail
-          COMMIT_SHA=$(git rev-parse HEAD)
-          IMAGE="${{ env.AR_REPO }}/llm-wiki-bff:$COMMIT_SHA"
+          IMAGE="${{ env.AR_REPO }}/llm-wiki-bff:$GIT_SHA"
           echo "Building ${IMAGE}…"
           BUILD_ID=$(gcloud builds submit \
-            --tag "$IMAGE" \
+            --config cloudbuild-bff.yaml \
+            --substitutions="_IMAGE=$IMAGE,_APP_VERSION=$APP_VERSION,_GIT_SHA=$GIT_SHA,_GIT_BRANCH=$GIT_BRANCH,_GIT_TAG=$GIT_TAG" \
             --timeout=600s \
             --async \
             --suppress-logs \
@@ -122,13 +158,13 @@ jobs:
             --update-secrets "JWT_SECRET=${{ env.JWT_SECRET_NAME }}:latest,DEEPSEEK_API_KEY=deepseek-apikey:latest" \
             --update-env-vars "^@^GCP_PROJECT=${{ env.PROJECT_ID }}@BUCKET=${{ env.BUCKET }}@FIRESTORE_DATABASE_ID=${{ env.FIRESTORE_DATABASE_ID }}@PIPELINE_JOB_URL=https://run.googleapis.com/v2/projects/${{ env.PROJECT_ID }}/locations/${{ env.REGION }}/jobs/${{ env.PIPELINE_JOB_NAME }}:run@ALLOWED_ORIGINS=${{ env.ALLOWED_ORIGINS }}@DEV_JWT=false" \
             --quiet
-          echo "✅ Deployed ${{ env.SERVICE_NAME }} ($COMMIT_SHA)"
+          echo "✅ Deployed ${{ env.SERVICE_NAME }} ($GIT_SHA)"
 
       - name: Resolve deployed image digest
         id: image_digest
         run: |
           set -euo pipefail
-          COMMIT_SHA=$(git rev-parse HEAD)
+          COMMIT_SHA="${{ steps.identity.outputs.git_sha }}"
           if [[ ! "$COMMIT_SHA" =~ ^[0-9a-f]{40}$ ]]; then
             echo "built commit SHA must be a 40-character lowercase commit SHA"
             exit 1
@@ -158,7 +194,7 @@ jobs:
           IMMUTABLE_IMAGE: ${{ env.AR_REPO }}/llm-wiki-bff@${{ steps.image_digest.outputs.digest }}
         run: |
           set -euo pipefail
-          DEV_IMAGE_TAG="${{ env.AR_REPO }}/llm-wiki-bff:dev-${GITHUB_SHA}"
+          DEV_IMAGE_TAG="${{ env.AR_REPO }}/llm-wiki-bff:dev-${{ steps.identity.outputs.git_sha }}"
           gcloud artifacts docker tags add \
             "$IMMUTABLE_IMAGE" \
             "$DEV_IMAGE_TAG" \

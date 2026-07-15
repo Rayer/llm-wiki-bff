@@ -1,0 +1,25 @@
+substitutions:
+  _IMAGE: ""
+  _APP_VERSION: ""
+  _GIT_SHA: ""
+  _GIT_BRANCH: ""
+  _GIT_TAG: ""
+
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - --build-arg
+      - APP_VERSION=${_APP_VERSION}
+      - --build-arg
+      - GIT_SHA=${_GIT_SHA}
+      - --build-arg
+      - GIT_BRANCH=${_GIT_BRANCH}
+      - --build-arg
+      - GIT_TAG=${_GIT_TAG}
+      - --tag
+      - ${_IMAGE}
+      - .
+
+images:
+  - ${_IMAGE}

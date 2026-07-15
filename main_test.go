@@ -75,6 +75,72 @@ func TestSwaggerDocumentsRegisterResponseDescription(t *testing.T) {
 	}
 }
 
+func TestSwaggerDocumentsPublicVersionRoute(t *testing.T) {
+	document := readSwaggerDocument(t)
+	operation, ok := document.Paths["/api/v1/public/version"]
+	if !ok {
+		t.Fatal("Swagger document is missing /api/v1/public/version")
+	}
+	get, ok := operation["get"]
+	if !ok {
+		t.Fatal("Swagger document is missing GET /api/v1/public/version")
+	}
+	var response struct {
+		Responses map[string]struct {
+			Schema struct {
+				Ref string `json:"$ref"`
+			} `json:"schema"`
+			Headers map[string]json.RawMessage `json:"headers"`
+		} `json:"responses"`
+	}
+	if err := json.Unmarshal(get, &response); err != nil {
+		t.Fatalf("decode version operation: %v", err)
+	}
+	status, ok := response.Responses["200"]
+	if !ok {
+		t.Fatal("Swagger document is missing 200 response for public version")
+	}
+	if status.Schema.Ref != "#/definitions/buildinfo.Info" {
+		t.Fatalf("public version response = %q, want buildinfo.Info", status.Schema.Ref)
+	}
+	if _, ok := status.Headers["Cache-Control"]; !ok {
+		t.Fatal("Swagger document is missing Cache-Control response header for public version")
+	}
+	var definition struct {
+		Definitions map[string]struct {
+			Properties map[string]json.RawMessage `json:"properties"`
+		} `json:"definitions"`
+	}
+	data, err := os.ReadFile("docs/swagger.json")
+	if err != nil {
+		t.Fatalf("read generated Swagger document: %v", err)
+	}
+	if err := json.Unmarshal(data, &definition); err != nil {
+		t.Fatalf("decode generated Swagger definitions: %v", err)
+	}
+	properties := definition.Definitions["buildinfo.Info"].Properties
+	if _, ok := properties["branch"]; !ok {
+		t.Fatal("public version Swagger schema is missing branch")
+	}
+	if _, ok := properties["ref"]; ok {
+		t.Fatal("public version Swagger schema must not expose generic ref")
+	}
+}
+
+func TestPublicVersionRouteDoesNotRequireAuthOrProject(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	v1 := router.Group("/api/v1")
+	v1.Use(auth.JWTAuth(config.Config{JWTSecret: "test-secret"}), auth.ProjectMiddleware())
+	registerPublicRoutes(router, &syssettings.FakeStore{Enabled: true})
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/v1/public/version", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("public version status = %d, want %d without authentication or project header", recorder.Code, http.StatusOK)
+	}
+}
+
 func readSwaggerDocument(t *testing.T) struct {
 	Paths map[string]map[string]json.RawMessage `json:"paths"`
 } {
