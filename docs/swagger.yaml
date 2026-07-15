@@ -71,6 +71,23 @@ definitions:
       role:
         type: string
     type: object
+  buildinfo.Info:
+    properties:
+      branch:
+        type: string
+      commit:
+        type: string
+      image_tag:
+        type: string
+      product_version:
+        type: string
+      revision:
+        type: string
+      service:
+        type: string
+      tag:
+        type: string
+    type: object
   gcs.WikiPage:
     properties:
       concepts:
@@ -1229,6 +1246,25 @@ paths:
           schema:
             $ref: '#/definitions/syssettings.Settings'
       summary: Public runtime config
+      tags:
+      - public
+  /api/v1/public/version:
+    get:
+      description: Returns allowlisted product build metadata and Cloud Run identity.
+        This response never includes image digests, environment variables, credentials,
+        project IDs, or user IDs.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          headers:
+            Cache-Control:
+              description: no-store
+              type: string
+          schema:
+            $ref: '#/definitions/buildinfo.Info'
+      summary: Build and deployment identity
       tags:
       - public
   /api/v1/query:

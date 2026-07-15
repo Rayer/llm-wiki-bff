@@ -1316,6 +1316,32 @@ const docTemplate = `{
                 }
             }
         },
+        "/api/v1/public/version": {
+            "get": {
+                "description": "Returns allowlisted product build metadata and Cloud Run identity. This response never includes image digests, environment variables, credentials, project IDs, or user IDs.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "public"
+                ],
+                "summary": "Build and deployment identity",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/buildinfo.Info"
+                        },
+                        "headers": {
+                            "Cache-Control": {
+                                "type": "string",
+                                "description": "no-store"
+                            }
+                        }
+                    }
+                }
+            }
+        },
         "/api/v1/query": {
             "post": {
                 "security": [
@@ -1629,6 +1655,32 @@ const docTemplate = `{
                     "type": "string"
                 },
                 "role": {
+                    "type": "string"
+                }
+            }
+        },
+        "buildinfo.Info": {
+            "type": "object",
+            "properties": {
+                "branch": {
+                    "type": "string"
+                },
+                "commit": {
+                    "type": "string"
+                },
+                "image_tag": {
+                    "type": "string"
+                },
+                "product_version": {
+                    "type": "string"
+                },
+                "revision": {
+                    "type": "string"
+                },
+                "service": {
+                    "type": "string"
+                },
+                "tag": {
                     "type": "string"
                 }
             }

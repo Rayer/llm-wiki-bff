@@ -17,6 +17,7 @@ import (
 	ginSwagger "github.com/swaggo/gin-swagger"
 
 	"github.com/rayer/llm-wiki-bff/internal/auth"
+	"github.com/rayer/llm-wiki-bff/internal/buildinfo"
 	conceptcache "github.com/rayer/llm-wiki-bff/internal/cache"
 	"github.com/rayer/llm-wiki-bff/internal/config"
 	"github.com/rayer/llm-wiki-bff/internal/firestore"
@@ -176,8 +177,7 @@ func main() {
 		settingsStore = syssettings.NewStore(nil, cfg.RegistrationEnabled)
 	}
 
-	// Public config (no auth middleware)
-	r.GET("/api/v1/public/config", syssettings.PublicConfigHandler(settingsStore))
+	registerPublicRoutes(r, settingsStore)
 
 	// Public auth routes (no auth middleware)
 	authRoutes := r.Group("/api/v1/auth")
@@ -257,6 +257,12 @@ func main() {
 	log.Printf("BFF listening on :%s", cfg.Port)
 	log.Printf("Swagger UI: http://localhost:%s/swagger/index.html", cfg.Port)
 	log.Fatal(r.Run(":" + cfg.Port))
+}
+
+func registerPublicRoutes(r *gin.Engine, settingsStore syssettings.RegistrationGate) {
+	// Public routes are registered on the root router, outside JWT and project middleware.
+	r.GET("/api/v1/public/config", syssettings.PublicConfigHandler(settingsStore))
+	r.GET("/api/v1/public/version", buildinfo.Handler())
 }
 
 const legacyObservabilityServiceName = "llm-wiki-bff-dev"
