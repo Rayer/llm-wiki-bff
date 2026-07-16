@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -130,94 +132,13 @@ func TestPrepareOLWEnvironmentIsolatesConfigAndMapsDeepSeekKey(t *testing.T) {
 	}
 }
 
-func TestPrepareWorkspaceSymlinksRawAndCopiesWritableState(t *testing.T) {
-	vault := newTestVault(t)
-	parent := t.TempDir()
-
-	workspace, err := prepareWorkspace(vault, parent)
-	if err != nil {
-		t.Fatalf("prepareWorkspace() error = %v", err)
-	}
-	defer workspace.cleanup()
-
-	rawInfo, err := os.Lstat(filepath.Join(workspace.path, "raw"))
-	if err != nil {
-		t.Fatalf("lstat workspace raw: %v", err)
-	}
-	if rawInfo.Mode()&os.ModeSymlink == 0 {
-		t.Fatalf("workspace raw mode = %v, want symlink", rawInfo.Mode())
-	}
-	rawTarget, err := os.Readlink(filepath.Join(workspace.path, "raw"))
-	if err != nil {
-		t.Fatalf("readlink workspace raw: %v", err)
-	}
-	if rawTarget != filepath.Join(vault, "raw") {
-		t.Fatalf("raw symlink = %q, want %q", rawTarget, filepath.Join(vault, "raw"))
-	}
-
-	assertFileContent(t, filepath.Join(workspace.path, "wiki", "page.md"), "original wiki")
-	assertFileContent(t, filepath.Join(workspace.path, "wiki", "sources", "source.md"), "original source")
-	assertFileContent(t, filepath.Join(workspace.path, "cache", "id_map.json"), "{}")
-	assertFileContent(t, filepath.Join(workspace.path, ".olw", "state.db"), "state")
-	assertFileContent(t, filepath.Join(workspace.path, "wiki.toml"), "config")
-}
-
-func TestWorkspaceSyncBackCopiesDurableOutputsAndExcludesPipelineLock(t *testing.T) {
-	vault := newTestVault(t)
-	parent := t.TempDir()
-
-	workspace, err := prepareWorkspace(vault, parent)
-	if err != nil {
-		t.Fatalf("prepareWorkspace() error = %v", err)
-	}
-	defer workspace.cleanup()
-
-	writeFile(t, filepath.Join(workspace.path, "wiki", "page.md"), "updated wiki")
-	writeFile(t, filepath.Join(workspace.path, "wiki", "new.md"), "new wiki")
-	writeFile(t, filepath.Join(workspace.path, "cache", "concepts.jsonl"), "{}\n")
-	writeFile(t, filepath.Join(workspace.path, ".olw", "state.db"), "updated state")
-	writeFile(t, filepath.Join(workspace.path, ".olw", "pipeline.lock"), "do not sync")
-	if err := os.Remove(filepath.Join(workspace.path, "wiki", "sources", "source.md")); err != nil {
-		t.Fatalf("remove workspace source: %v", err)
-	}
-
-	if err := workspace.syncBack(); err != nil {
-		t.Fatalf("syncBack() error = %v", err)
-	}
-
-	assertFileContent(t, filepath.Join(vault, "wiki", "page.md"), "updated wiki")
-	assertFileContent(t, filepath.Join(vault, "wiki", "new.md"), "new wiki")
-	assertMissing(t, filepath.Join(vault, "wiki", "sources", "source.md"))
-	assertFileContent(t, filepath.Join(vault, "cache", "concepts.jsonl"), "{}\n")
-	assertFileContent(t, filepath.Join(vault, ".olw", "state.db"), "updated state")
-	assertMissing(t, filepath.Join(vault, ".olw", "pipeline.lock"))
-}
-
-func TestPrepareWorkspaceAllowsMissingOptionalDirectories(t *testing.T) {
-	vault := t.TempDir()
-	parent := t.TempDir()
-	writeFile(t, filepath.Join(vault, "wiki.toml"), "config")
-
-	workspace, err := prepareWorkspace(vault, parent)
-	if err != nil {
-		t.Fatalf("prepareWorkspace() error = %v", err)
-	}
-	defer workspace.cleanup()
-
-	assertFileContent(t, filepath.Join(workspace.path, "wiki.toml"), "config")
-	assertMissing(t, filepath.Join(workspace.path, "raw"))
-	assertMissing(t, filepath.Join(workspace.path, "wiki"))
-	assertMissing(t, filepath.Join(workspace.path, "cache"))
-	assertMissing(t, filepath.Join(workspace.path, ".olw"))
-}
-
 func TestRunWorkerBatchPassesIsolatedOLWEnvironment(t *testing.T) {
 	old := execOLW
 	defer func() { execOLW = old }()
 
 	vault := t.TempDir()
 	var gotEnv []string
-	execOLW = func(_ context.Context, _ string, _ []string, env []string) error {
+	execOLW = func(_ context.Context, _ string, _ []string, env []string, _, _ io.Writer) error {
 		gotEnv = append([]string(nil), env...)
 		return nil
 	}
@@ -242,7 +163,7 @@ func TestRunWorkerBatchCanInitializeVaultBeforeCommands(t *testing.T) {
 
 	vault := t.TempDir()
 	var ran [][]string
-	execOLW = func(_ context.Context, _ string, command []string, _ []string) error {
+	execOLW = func(_ context.Context, _ string, command []string, _ []string, _, _ io.Writer) error {
 		ran = append(ran, append([]string(nil), command...))
 		return nil
 	}
@@ -269,7 +190,7 @@ func TestRunWorkerBatchDoesNotInitializeVaultByDefault(t *testing.T) {
 
 	vault := t.TempDir()
 	var ran [][]string
-	execOLW = func(_ context.Context, _ string, command []string, _ []string) error {
+	execOLW = func(_ context.Context, _ string, command []string, _ []string, _, _ io.Writer) error {
 		ran = append(ran, append([]string(nil), command...))
 		return nil
 	}
@@ -283,81 +204,13 @@ func TestRunWorkerBatchDoesNotInitializeVaultByDefault(t *testing.T) {
 	}
 }
 
-func TestRunWorkerBatchUsesWorkspaceAndSyncsBackOnSuccess(t *testing.T) {
-	old := execOLW
-	defer func() { execOLW = old }()
-
-	vault := newTestVault(t)
-	parent := t.TempDir()
-	var execVault string
-	execOLW = func(_ context.Context, vault string, _ []string, _ []string) error {
-		execVault = vault
-		writeFile(t, filepath.Join(vault, "wiki", "generated.md"), "generated")
-		writeFile(t, filepath.Join(vault, "cache", "concepts.jsonl"), "{}\n")
-		writeFile(t, filepath.Join(vault, ".olw", "state.db"), "updated state")
-		return nil
-	}
-
-	cfg := workerConfig{
-		VaultPath:       vault,
-		APIKey:          "secret",
-		Postprocess:     false,
-		StopOnError:     true,
-		UseWorkspace:    true,
-		WorkspaceParent: parent,
-	}
-	if err := runWorkerBatch(context.Background(), cfg, `[["run","--auto-approve"]]`); err != nil {
-		t.Fatalf("runWorkerBatch() error = %v", err)
-	}
-	if execVault == "" {
-		t.Fatal("execOLW was not called")
-	}
-	if execVault == vault {
-		t.Fatalf("exec vault = original vault %q, want workspace", execVault)
-	}
-	if !strings.HasPrefix(execVault, parent) {
-		t.Fatalf("exec vault = %q, want under %q", execVault, parent)
-	}
-	assertFileContent(t, filepath.Join(vault, "wiki", "generated.md"), "generated")
-	assertFileContent(t, filepath.Join(vault, "cache", "concepts.jsonl"), "{}\n")
-	assertFileContent(t, filepath.Join(vault, ".olw", "state.db"), "updated state")
-}
-
-func TestRunWorkerBatchDoesNotSyncWorkspaceBackOnOLWFailure(t *testing.T) {
-	old := execOLW
-	defer func() { execOLW = old }()
-
-	failErr := errors.New("olw failed")
-	vault := newTestVault(t)
-	execOLW = func(_ context.Context, vault string, _ []string, _ []string) error {
-		writeFile(t, filepath.Join(vault, "wiki", "generated.md"), "generated")
-		writeFile(t, filepath.Join(vault, "cache", "concepts.jsonl"), "{}\n")
-		return failErr
-	}
-
-	cfg := workerConfig{
-		VaultPath:       vault,
-		APIKey:          "secret",
-		Postprocess:     false,
-		StopOnError:     true,
-		UseWorkspace:    true,
-		WorkspaceParent: t.TempDir(),
-	}
-	err := runWorkerBatch(context.Background(), cfg, `[["run","--auto-approve"]]`)
-	if !errors.Is(err, failErr) {
-		t.Fatalf("runWorkerBatch() error = %v, want %v", err, failErr)
-	}
-	assertMissing(t, filepath.Join(vault, "wiki", "generated.md"))
-	assertMissing(t, filepath.Join(vault, "cache", "concepts.jsonl"))
-}
-
 func TestRunOLWBatchStopsOnFirstFailure(t *testing.T) {
 	old := execOLW
 	defer func() { execOLW = old }()
 
 	failErr := errors.New("failed")
 	var ran [][]string
-	execOLW = func(_ context.Context, _ string, command []string, _ []string) error {
+	execOLW = func(_ context.Context, _ string, command []string, _ []string, _, _ io.Writer) error {
 		ran = append(ran, append([]string(nil), command...))
 		if command[0] == "fail" {
 			return failErr
@@ -365,7 +218,7 @@ func TestRunOLWBatchStopsOnFirstFailure(t *testing.T) {
 		return nil
 	}
 
-	err := runOLWBatch(context.Background(), t.TempDir(), [][]string{{"fail"}, {"second"}}, true, nil)
+	err := runOLWBatch(context.Background(), t.TempDir(), [][]string{{"fail"}, {"second"}}, true, nil, nil, nil)
 	if !errors.Is(err, failErr) {
 		t.Fatalf("runOLWBatch() error = %v, want %v", err, failErr)
 	}
@@ -379,7 +232,7 @@ func TestRunOLWBatchContinuesWhenStopOnErrorFalse(t *testing.T) {
 	defer func() { execOLW = old }()
 
 	var ran [][]string
-	execOLW = func(_ context.Context, _ string, command []string, _ []string) error {
+	execOLW = func(_ context.Context, _ string, command []string, _ []string, _, _ io.Writer) error {
 		ran = append(ran, append([]string(nil), command...))
 		if command[0] == "fail" {
 			return errors.New("failed")
@@ -387,12 +240,100 @@ func TestRunOLWBatchContinuesWhenStopOnErrorFalse(t *testing.T) {
 		return nil
 	}
 
-	err := runOLWBatch(context.Background(), t.TempDir(), [][]string{{"fail"}, {"second"}}, false, nil)
+	err := runOLWBatch(context.Background(), t.TempDir(), [][]string{{"fail"}, {"second"}}, false, nil, nil, nil)
 	if err == nil {
 		t.Fatal("runOLWBatch() error = nil, want error")
 	}
 	if len(ran) != 2 {
 		t.Fatalf("ran %d commands, want 2: %#v", len(ran), ran)
+	}
+}
+
+func TestRunWorkerBatchWritesPipelineLogForExecution(t *testing.T) {
+	old := execOLW
+	defer func() { execOLW = old }()
+
+	vault := t.TempDir()
+	execOLW = func(_ context.Context, _ string, _ []string, _ []string, stdout, stderr io.Writer) error {
+		if _, err := stdout.Write([]byte("stdout line\n")); err != nil {
+			t.Fatalf("write stdout: %v", err)
+		}
+		if _, err := stderr.Write([]byte("stderr line\n")); err != nil {
+			t.Fatalf("write stderr: %v", err)
+		}
+		return nil
+	}
+
+	cfg := workerConfig{VaultPath: vault, APIKey: "secret", ExecutionID: "olw-pipeline-abc123", Postprocess: false, StopOnError: true}
+	if err := runWorkerBatch(context.Background(), cfg, `[["run","--auto-approve"]]`); err != nil {
+		t.Fatalf("runWorkerBatch() error = %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(vault, "cache", "pipeline-olw-pipeline-abc123.log"))
+	if err != nil {
+		t.Fatalf("read pipeline log: %v", err)
+	}
+	text := string(data)
+	if !strings.Contains(text, "stdout line\n") || !strings.Contains(text, "stderr line\n") {
+		t.Fatalf("log = %q, want stdout and stderr", text)
+	}
+}
+
+func TestPipelineLogPathRejectsUnsafeExecutionID(t *testing.T) {
+	if _, err := pipelineLogPath(t.TempDir(), "../escape"); err == nil {
+		t.Fatal("pipelineLogPath() error = nil, want error")
+	}
+}
+
+func TestRunPostprocessWritesSuggestedQueriesFromConcepts(t *testing.T) {
+	vault := t.TempDir()
+	mustWriteFile(t, filepath.Join(vault, "wiki", "alpha.md"), []byte("---\nid: alpha-id\ntitle: Alpha\nupdated: 2026-07-01T00:00:00Z\n---\nAlpha"))
+	mustWriteFile(t, filepath.Join(vault, "wiki", "beta.md"), []byte("---\nid: beta-id\ntitle: Beta\nupdated: 2026-07-10T00:00:00Z\n---\nBeta"))
+
+	if err := runPostprocess(context.Background(), vault); err != nil {
+		t.Fatalf("runPostprocess() error = %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(vault, "cache", "suggested_queries.json"))
+	if err != nil {
+		t.Fatalf("read suggested_queries.json: %v", err)
+	}
+	var artifact struct {
+		Queries   []string `json:"queries"`
+		UpdatedAt string   `json:"updated_at"`
+	}
+	if err := json.Unmarshal(data, &artifact); err != nil {
+		t.Fatalf("decode suggested_queries.json: %v", err)
+	}
+	if len(artifact.Queries) != 2 {
+		t.Fatalf("queries = %#v, want 2 entries", artifact.Queries)
+	}
+	if artifact.Queries[0] != "Beta" {
+		t.Fatalf("queries[0] = %q, want Beta", artifact.Queries[0])
+	}
+	if artifact.UpdatedAt == "" {
+		t.Fatal("updated_at is empty")
+	}
+}
+
+func TestRunPostprocessWritesEmptyRawStatusWhenStateDBMissing(t *testing.T) {
+	vault := t.TempDir()
+	mustWriteFile(t, filepath.Join(vault, "raw", "seed.md"), []byte("seed"))
+	mustWriteFile(t, filepath.Join(vault, "wiki", "alpha.md"), []byte("---\nid: concept-id\ntitle: Alpha\n---\nAlpha"))
+
+	if err := runPostprocess(context.Background(), vault); err != nil {
+		t.Fatalf("runPostprocess() error = %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(vault, "cache", "raw_status.json"))
+	if err != nil {
+		t.Fatalf("read raw_status.json: %v", err)
+	}
+	if !strings.Contains(string(data), `"files": {}`) {
+		t.Fatalf("raw_status.json = %s, want empty files object", data)
+	}
+	if !strings.Contains(string(data), `"file_count": 1`) {
+		t.Fatalf("raw_status.json = %s, want file_count 1 for seed.md", data)
 	}
 }
 
@@ -407,46 +348,12 @@ func envMap(env []string) map[string]string {
 	return out
 }
 
-func newTestVault(t *testing.T) string {
+func mustWriteFile(t *testing.T, path string, data []byte) {
 	t.Helper()
-
-	vault := t.TempDir()
-	writeFile(t, filepath.Join(vault, "raw", "seed.md"), "raw")
-	writeFile(t, filepath.Join(vault, "wiki", "page.md"), "original wiki")
-	writeFile(t, filepath.Join(vault, "wiki", "sources", "source.md"), "original source")
-	writeFile(t, filepath.Join(vault, "cache", "id_map.json"), "{}")
-	writeFile(t, filepath.Join(vault, ".olw", "state.db"), "state")
-	writeFile(t, filepath.Join(vault, "wiki.toml"), "config")
-	return vault
-}
-
-func writeFile(t *testing.T, path string, content string) {
-	t.Helper()
-
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		t.Fatalf("mkdir %s: %v", filepath.Dir(path), err)
+		t.Fatal(err)
 	}
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-		t.Fatalf("write %s: %v", path, err)
-	}
-}
-
-func assertFileContent(t *testing.T, path string, want string) {
-	t.Helper()
-
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read %s: %v", path, err)
-	}
-	if string(data) != want {
-		t.Fatalf("%s = %q, want %q", path, data, want)
-	}
-}
-
-func assertMissing(t *testing.T, path string) {
-	t.Helper()
-
-	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("lstat %s error = %v, want not exist", path, err)
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
 	}
 }

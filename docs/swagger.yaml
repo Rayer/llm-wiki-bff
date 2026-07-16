@@ -1,5 +1,93 @@
 basePath: /
 definitions:
+  auth.ErrorResponse:
+    properties:
+      error:
+        type: string
+    type: object
+  auth.LoginRequest:
+    properties:
+      email:
+        type: string
+      password:
+        type: string
+    required:
+    - email
+    - password
+    type: object
+  auth.LoginResponse:
+    properties:
+      access_token:
+        type: string
+      user:
+        $ref: '#/definitions/auth.User'
+    type: object
+  auth.LogoutResponse:
+    properties:
+      ok:
+        type: boolean
+    type: object
+  auth.RateLimitErrorResponse:
+    properties:
+      error:
+        type: string
+      retry_after:
+        type: integer
+    type: object
+  auth.RefreshResponse:
+    properties:
+      access_token:
+        type: string
+      user:
+        $ref: '#/definitions/auth.User'
+    type: object
+  auth.RegisterRequest:
+    properties:
+      email:
+        type: string
+      password:
+        type: string
+    required:
+    - email
+    - password
+    type: object
+  auth.RegisterResponse:
+    properties:
+      default_project_id:
+        type: string
+      email:
+        type: string
+      token:
+        type: string
+      user_id:
+        type: string
+    type: object
+  auth.User:
+    properties:
+      email:
+        type: string
+      id:
+        type: string
+      role:
+        type: string
+    type: object
+  buildinfo.Info:
+    properties:
+      branch:
+        type: string
+      commit:
+        type: string
+      image_tag:
+        type: string
+      product_version:
+        type: string
+      revision:
+        type: string
+      service:
+        type: string
+      tag:
+        type: string
+    type: object
   gcs.WikiPage:
     properties:
       concepts:
@@ -19,7 +107,6 @@ definitions:
       source_url:
         type: string
       status:
-        description: '"published" or "draft"'
         type: string
       title:
         type: string
@@ -31,6 +118,8 @@ definitions:
       frontmatter:
         additionalProperties: true
         type: object
+      id:
+        type: string
       raw:
         type: string
       slug:
@@ -80,6 +169,21 @@ definitions:
         items:
           type: string
         type: array
+    type: object
+  handler.PipelineExecutionResponse:
+    properties:
+      duration:
+        type: string
+      end_time:
+        type: string
+      log_url:
+        type: string
+      name:
+        type: string
+      start_time:
+        type: string
+      status:
+        type: string
     type: object
   handler.ProjectResponse:
     properties:
@@ -164,12 +268,16 @@ definitions:
         type: integer
       index_sources:
         type: integer
+      last_execution:
+        $ref: '#/definitions/handler.PipelineExecutionResponse'
       lock_expiry:
         type: string
       lock_worker:
         type: string
       locked:
         type: boolean
+      raw_count:
+        type: integer
       running_pipelines:
         type: integer
       sources_count:
@@ -198,6 +306,47 @@ definitions:
           type: string
         type: array
     type: object
+  pipelinequota.Reason:
+    enum:
+    - ""
+    - demo
+    - daily_limit
+    - cooldown
+    - already_running
+    - no_new_raw
+    type: string
+    x-enum-varnames:
+    - ReasonNone
+    - ReasonDemo
+    - ReasonDailyLimit
+    - ReasonCooldown
+    - ReasonAlreadyRunning
+    - ReasonNoNewRaw
+  pipelinequota.Snapshot:
+    properties:
+      allowed:
+        type: boolean
+      already_running:
+        type: boolean
+      cooldown_until:
+        type: string
+      daily_limit:
+        type: integer
+      enforced:
+        type: boolean
+      message:
+        type: string
+      min_new_raw:
+        type: integer
+      new_raw_files:
+        type: integer
+      next_reset:
+        type: string
+      reason:
+        $ref: '#/definitions/pipelinequota.Reason'
+      runs_today:
+        type: integer
+    type: object
   search.Citation:
     properties:
       path:
@@ -222,6 +371,29 @@ definitions:
       type:
         description: '"source" or "concept"'
         type: string
+    type: object
+  syssettings.Settings:
+    properties:
+      registration_enabled:
+        type: boolean
+    type: object
+  syssettings.patchSettingsRequest:
+    properties:
+      registration_enabled:
+        type: boolean
+    type: object
+  v1.pipelineStatusResponse:
+    properties:
+      last_execution:
+        $ref: '#/definitions/handler.PipelineExecutionResponse'
+      project_id:
+        type: string
+      quota:
+        $ref: '#/definitions/pipelinequota.Snapshot'
+      suggested_queries:
+        items:
+          type: string
+        type: array
     type: object
 info:
   contact:
@@ -458,6 +630,72 @@ paths:
       summary: Rebuild index for a project (admin)
       tags:
       - admin
+  /api/v1/admin/settings:
+    get:
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/syssettings.Settings'
+        "401":
+          description: Unauthorized
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Get system settings (admin)
+      tags:
+      - admin
+    patch:
+      consumes:
+      - application/json
+      parameters:
+      - description: Settings payload
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/syssettings.patchSettingsRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/syssettings.Settings'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "401":
+          description: Unauthorized
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Update system settings (admin)
+      tags:
+      - admin
   /api/v1/admin/users:
     get:
       consumes:
@@ -587,6 +825,167 @@ paths:
       summary: Update a user (admin)
       tags:
       - admin
+  /api/v1/auth/login:
+    post:
+      consumes:
+      - application/json
+      description: Authenticates email and password, returns a 15-minute access token,
+        and sets a seven-day refresh_token cookie. In local mode, the cookie omits
+        Domain and Secure.
+      parameters:
+      - description: Credentials
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/auth.LoginRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          headers:
+            Set-Cookie:
+              description: 'Firestore mode: refresh_token; Path=/; Domain=rayer.idv.tw;
+                Max-Age=604800; HttpOnly; Secure; SameSite=Lax'
+              type: string
+          schema:
+            $ref: '#/definitions/auth.LoginResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/auth.ErrorResponse'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/auth.ErrorResponse'
+        "429":
+          description: Too Many Requests
+          headers:
+            Retry-After:
+              description: Seconds until the rate limit window resets
+              type: integer
+          schema:
+            $ref: '#/definitions/auth.RateLimitErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/auth.ErrorResponse'
+        "503":
+          description: Service Unavailable
+          schema:
+            $ref: '#/definitions/auth.ErrorResponse'
+      summary: Log in
+      tags:
+      - auth
+  /api/v1/auth/logout:
+    post:
+      description: Clears the refresh_token cookie. No access token or request body
+        is required.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          headers:
+            Set-Cookie:
+              description: refresh_token; Path=/; Domain=rayer.idv.tw; Max-Age=0;
+                HttpOnly; Secure; SameSite=Lax
+              type: string
+          schema:
+            $ref: '#/definitions/auth.LogoutResponse'
+      summary: Log out
+      tags:
+      - auth
+  /api/v1/auth/refresh:
+    post:
+      description: Requires the refresh_token cookie. The cookie is single-use and
+        is rotated on success; the response returns a new 15-minute access token and
+        seven-day refresh_token cookie. In local mode, the cookie omits Domain and
+        Secure.
+      parameters:
+      - description: refresh_token=<token>
+        in: header
+        name: Cookie
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          headers:
+            Set-Cookie:
+              description: 'Firestore mode: refresh_token; Path=/; Domain=rayer.idv.tw;
+                Max-Age=604800; HttpOnly; Secure; SameSite=Lax'
+              type: string
+          schema:
+            $ref: '#/definitions/auth.RefreshResponse'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/auth.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/auth.ErrorResponse'
+        "503":
+          description: Service Unavailable
+          schema:
+            $ref: '#/definitions/auth.ErrorResponse'
+      summary: Refresh an access token
+      tags:
+      - auth
+  /api/v1/auth/register:
+    post:
+      consumes:
+      - application/json
+      description: Returns a JWT in the response body and does not set a refresh cookie.
+      parameters:
+      - description: Registration details
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/auth.RegisterRequest'
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            $ref: '#/definitions/auth.RegisterResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/auth.ErrorResponse'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/auth.ErrorResponse'
+        "409":
+          description: Conflict
+          schema:
+            $ref: '#/definitions/auth.ErrorResponse'
+        "429":
+          description: Too Many Requests
+          headers:
+            Retry-After:
+              description: Seconds until the rate limit window resets
+              type: integer
+          schema:
+            $ref: '#/definitions/auth.RateLimitErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/auth.ErrorResponse'
+        "503":
+          description: Service Unavailable
+          schema:
+            $ref: '#/definitions/auth.ErrorResponse'
+      summary: Register an account
+      tags:
+      - auth
   /api/v1/concepts:
     get:
       description: Returns published wiki concepts by default. Set include_drafts=true
@@ -737,6 +1136,80 @@ paths:
       summary: Prometheus metrics
       tags:
       - metrics
+  /api/v1/pipeline/log:
+    get:
+      description: Returns the stdout and stderr log captured by the pipeline worker
+        for the current project execution.
+      parameters:
+      - description: Cloud Run execution ID
+        in: query
+        name: execution_id
+        required: true
+        type: string
+      produces:
+      - text/plain
+      responses:
+        "200":
+          description: OK
+          schema:
+            type: string
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+      security:
+      - DevUserAuth: []
+      - ProjectHeader: []
+      summary: Read pipeline log
+      tags:
+      - pipeline
+  /api/v1/pipeline/status:
+    get:
+      description: Returns the latest Cloud Run pipeline execution for the current
+        project. Pass execution_id to fetch a specific execution. When an execution
+        is available, last_execution.log_url points to the authenticated log endpoint.
+      parameters:
+      - description: Cloud Run execution ID
+        in: query
+        name: execution_id
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/v1.pipelineStatusResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+      security:
+      - DevUserAuth: []
+      - ProjectHeader: []
+      summary: Pipeline execution status
+      tags:
+      - pipeline
   /api/v1/projects:
     get:
       description: Returns all projects for the authenticated user.
@@ -762,6 +1235,38 @@ paths:
       summary: List user projects
       tags:
       - projects
+  /api/v1/public/config:
+    get:
+      description: Returns public feature flags such as registration_enabled.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/syssettings.Settings'
+      summary: Public runtime config
+      tags:
+      - public
+  /api/v1/public/version:
+    get:
+      description: Returns allowlisted product build metadata and Cloud Run identity.
+        This response never includes image digests, environment variables, credentials,
+        project IDs, or user IDs.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          headers:
+            Cache-Control:
+              description: no-store
+              type: string
+          schema:
+            $ref: '#/definitions/buildinfo.Info'
+      summary: Build and deployment identity
+      tags:
+      - public
   /api/v1/query:
     post:
       consumes:

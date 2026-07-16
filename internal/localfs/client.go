@@ -45,7 +45,7 @@ func (c *Client) Scope(userID, projectID string) store.Store {
 }
 
 func (c *Client) Prefix() string {
-	return fmt.Sprintf("users/%s/projects/%s", c.userID, c.projectID)
+	return store.ProjectPrefix(c.userID, c.projectID)
 }
 
 func (c *Client) ReadFile(ctx context.Context, relPath string) ([]byte, error) {
@@ -248,6 +248,53 @@ func (c *Client) ListMarkdownFiles(ctx context.Context, dir string) ([]store.Mar
 	}
 	sort.Slice(files, func(i, j int) bool {
 		return files[i].Slug < files[j].Slug
+	})
+	return files, nil
+}
+
+func (c *Client) ListRawFiles(ctx context.Context) ([]store.RawFile, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	fullDir, err := c.fullPath("raw")
+	if err != nil {
+		return nil, err
+	}
+	entries, err := os.ReadDir(fullDir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return []store.RawFile{}, nil
+		}
+		return nil, fmt.Errorf("list raw files: %w", err)
+	}
+
+	files := make([]store.RawFile, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return nil, fmt.Errorf("stat raw/%s: %w", entry.Name(), err)
+		}
+		if !info.Mode().IsRegular() {
+			continue
+		}
+		rel := filepath.ToSlash(filepath.Join("raw", entry.Name()))
+		sha256, err := c.GetMetaSHA256(ctx, rel)
+		if err != nil {
+			return nil, err
+		}
+		files = append(files, store.RawFile{
+			Name:    entry.Name(),
+			Path:    rel,
+			Size:    info.Size(),
+			Updated: info.ModTime().UTC(),
+			SHA256:  sha256,
+		})
+	}
+	sort.Slice(files, func(i, j int) bool {
+		return files[i].Name < files[j].Name
 	})
 	return files, nil
 }

@@ -4,17 +4,25 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"cloud.google.com/go/storage"
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus"
 	conceptcache "github.com/rayer/llm-wiki-bff/internal/cache"
+	"github.com/rayer/llm-wiki-bff/internal/firestore"
 	"github.com/rayer/llm-wiki-bff/internal/gcs"
+	"github.com/rayer/llm-wiki-bff/internal/localfs"
+	"github.com/rayer/llm-wiki-bff/internal/pipelinequota"
 	"github.com/rayer/llm-wiki-bff/internal/search"
 )
 
@@ -119,6 +127,125 @@ func TestProjectResponseFromFirestoreDocUsesProjectIDField(t *testing.T) {
 	}
 	if resp.Name != "Human Project Name" {
 		t.Fatalf("name = %q, want Human Project Name", resp.Name)
+	}
+}
+
+func TestPipelineURLsUseConfiguredJobTarget(t *testing.T) {
+	h := New(nil, nil, search.NewIndex(), conceptcache.New(), nil, nil)
+	h.SetPipelineJobURL(" https://run.googleapis.com/v2/projects/dev/locations/asia-east1/jobs/olw-pipeline-dev:run ")
+
+	if got, want := h.pipelineJobURL(), "https://run.googleapis.com/v2/projects/dev/locations/asia-east1/jobs/olw-pipeline-dev:run"; got != want {
+		t.Fatalf("pipelineJobURL() = %q, want %q", got, want)
+	}
+	if got, want := h.cloudRunExecutionsURL(), "https://run.googleapis.com/v2/projects/dev/locations/asia-east1/jobs/olw-pipeline-dev/executions?pageSize=20"; got != want {
+		t.Fatalf("cloudRunExecutionsURL() = %q, want %q", got, want)
+	}
+	if got, want := h.cloudRunExecutionURL("exec-1"), "https://run.googleapis.com/v2/projects/dev/locations/asia-east1/jobs/olw-pipeline-dev/executions/exec-1"; got != want {
+		t.Fatalf("cloudRunExecutionURL() = %q, want %q", got, want)
+	}
+}
+
+func TestPipelineURLsKeepLegacyDefaultTarget(t *testing.T) {
+	h := New(nil, nil, search.NewIndex(), conceptcache.New(), nil, nil)
+
+	if got, want := h.pipelineJobURL(), defaultCloudRunJobURL; got != want {
+		t.Fatalf("pipelineJobURL() = %q, want %q", got, want)
+	}
+}
+
+func TestPipelineRequestsUseConfiguredJobTarget(t *testing.T) {
+	var paths []string
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		paths = append(paths, r.URL.Path)
+		switch {
+		case r.URL.Path == "/token":
+			return testHTTPResponse(http.StatusOK, `{"access_token":"test-token"}`), nil
+		case strings.HasSuffix(r.URL.Path, "/jobs/olw-pipeline-dev:run"):
+			return testHTTPResponse(http.StatusOK, `{"metadata":{"execution":"projects/dev/locations/asia-east1/jobs/olw-pipeline-dev/executions/exec-1"}}`), nil
+		case strings.HasSuffix(r.URL.Path, "/jobs/olw-pipeline-dev/executions"):
+			return testHTTPResponse(http.StatusOK, `{"executions":[]}`), nil
+		case strings.HasSuffix(r.URL.Path, "/jobs/olw-pipeline-dev/executions/exec-1"):
+			return testHTTPResponse(http.StatusOK, `{"name":"projects/dev/locations/asia-east1/jobs/olw-pipeline-dev/executions/exec-1","succeededCount":1}`), nil
+		default:
+			return testHTTPResponse(http.StatusNotFound, `not found`), nil
+		}
+	})}
+
+	h := New(nil, nil, search.NewIndex(), conceptcache.New(), nil, nil)
+	h.httpClient = client
+	h.metadataTokenURL = "http://metadata.test/token"
+	h.SetPipelineJobURL("https://run.test/v2/projects/dev/locations/asia-east1/jobs/olw-pipeline-dev:run")
+
+	if _, err := h.invokePipelineJob(context.Background(), "user", "project"); err != nil {
+		t.Fatalf("invokePipelineJob() error = %v", err)
+	}
+	if _, err := h.pipelineExecutionStatus(context.Background(), ""); err != nil {
+		t.Fatalf("pipelineExecutionStatus(list) error = %v", err)
+	}
+	if _, err := h.pipelineExecutionStatus(context.Background(), "exec-1"); err != nil {
+		t.Fatalf("pipelineExecutionStatus(detail) error = %v", err)
+	}
+
+	want := []string{
+		"/token",
+		"/v2/projects/dev/locations/asia-east1/jobs/olw-pipeline-dev:run",
+		"/token",
+		"/v2/projects/dev/locations/asia-east1/jobs/olw-pipeline-dev/executions",
+		"/token",
+		"/v2/projects/dev/locations/asia-east1/jobs/olw-pipeline-dev/executions/exec-1",
+	}
+	if !reflect.DeepEqual(paths, want) {
+		t.Fatalf("request paths = %#v, want %#v", paths, want)
+	}
+}
+
+func TestProjectResponseFromFirestoreDocSkipsIdempotencyCacheDoc(t *testing.T) {
+	// init-project stores a cache doc at {userID}_{idempotencyKey} that points at
+	// the real project via project_id. Listing must not emit that project twice.
+	_, _, ok := projectResponseFromFirestoreDoc("user-1_idem-key-1", map[string]interface{}{
+		"project_id":      "project-123",
+		"name":            "Human Project Name",
+		"status":          "ready",
+		"status_url":      "/api/v1/projects/project-123/status",
+		"idempotency_key": "idem-key-1",
+	})
+	if ok {
+		t.Fatal("idempotency cache doc must not be treated as a listable project")
+	}
+}
+
+func TestProjectResponseFromFirestoreDocKeepsRealProjectWithIdempotencyKey(t *testing.T) {
+	resp, uid, ok := projectResponseFromFirestoreDoc("user-1_project-123", map[string]interface{}{
+		"project_id":      "project-123",
+		"name":            "Human Project Name",
+		"status":          "ready",
+		"idempotency_key": "idem-key-1",
+	})
+	if !ok {
+		t.Fatal("real project doc must still be listable when it records an idempotency_key")
+	}
+	if uid != "user-1" || resp.ID != "project-123" {
+		t.Fatalf("got uid=%q id=%q", uid, resp.ID)
+	}
+}
+
+func TestIsIdempotencyCacheDoc(t *testing.T) {
+	if !isIdempotencyCacheDoc("user-1_idem-key-1", map[string]interface{}{
+		"project_id":      "project-123",
+		"idempotency_key": "idem-key-1",
+	}) {
+		t.Fatal("expected cache doc detection")
+	}
+	if isIdempotencyCacheDoc("user-1_project-123", map[string]interface{}{
+		"project_id":      "project-123",
+		"idempotency_key": "idem-key-1",
+	}) {
+		t.Fatal("real project must not be treated as cache doc")
+	}
+	if isIdempotencyCacheDoc("user-1_project-123", map[string]interface{}{
+		"project_id": "project-123",
+	}) {
+		t.Fatal("doc without idempotency_key is not a cache doc")
 	}
 }
 
@@ -425,8 +552,8 @@ func TestPipelineRunExecutesCloudRunJob(t *testing.T) {
 	}
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
-	c.Request = httptest.NewRequest(http.MethodPost, "/api/v1/pipeline/run", strings.NewReader(`{"project":"demo","command":"sync"}`))
-	c.Request.Header.Set("Content-Type", "application/json")
+	// Project comes from ProjectMiddleware context (X-Project-ID), not request body.
+	c.Request = httptest.NewRequest(http.MethodPost, "/api/v1/pipeline/run", nil)
 	c.Set("userID", "request-user")
 	c.Set("projectID", "demo")
 
@@ -435,12 +562,22 @@ func TestPipelineRunExecutesCloudRunJob(t *testing.T) {
 	if recorder.Code != http.StatusAccepted {
 		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusAccepted, recorder.Body.String())
 	}
-	var body map[string]string
+	var body map[string]any
 	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	if body["status"] != "accepted" || body["command"] != "run" || body["project"] != "demo" || body["execution_id"] != "olw-pipeline-abc123" {
+	if body["status"] != "accepted" || body["command"] != "run" || body["project_id"] != "demo" || body["execution_id"] != "olw-pipeline-abc123" {
 		t.Fatalf("body = %#v", body)
+	}
+	if _, hasLegacyProject := body["project"]; hasLegacyProject {
+		t.Fatalf("body still has legacy project field: %#v", body)
+	}
+	quota, ok := body["quota"].(map[string]any)
+	if !ok {
+		t.Fatalf("quota missing or wrong type: %#v", body["quota"])
+	}
+	if enforced, _ := quota["enforced"].(bool); enforced {
+		t.Fatalf("expected enforced=false without quota store, got %#v", quota)
 	}
 	want := map[string]any{
 		"overrides": map[string]any{
@@ -451,7 +588,6 @@ func TestPipelineRunExecutesCloudRunJob(t *testing.T) {
 						map[string]any{"name": "USER_ID", "value": "request-user"},
 						map[string]any{"name": "PROJECT_ID", "value": "demo"},
 						map[string]any{"name": "TASK_TYPE", "value": "pipeline"},
-						map[string]any{"name": "WORKSPACE", "value": "true"},
 					},
 				},
 			},
@@ -475,17 +611,22 @@ func TestPipelineRunDefaultsCommandAndUser(t *testing.T) {
 		} `json:"overrides"`
 	}
 	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		if r.URL.Path == "/token" {
+		switch r.URL.Path {
+		case "/token":
 			return testHTTPResponse(http.StatusOK, `{"access_token":"test-token"}`), nil
-		}
-		if err := json.NewDecoder(r.Body).Decode(&runRequest); err != nil {
-			t.Errorf("decode run request: %v", err)
-		}
-		return testHTTPResponse(http.StatusOK, `{
-			"metadata": {
-				"execution": "projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline/executions/olw-pipeline-default"
+		case "/run":
+			if err := json.NewDecoder(r.Body).Decode(&runRequest); err != nil {
+				t.Errorf("decode run request: %v", err)
 			}
-		}`), nil
+			return testHTTPResponse(http.StatusOK, `{
+				"metadata": {
+					"execution": "projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline/executions/olw-pipeline-default"
+				}
+			}`), nil
+		default:
+			// evaluateQuota → isPipelineRunning probes executions list.
+			return testHTTPResponse(http.StatusOK, `{"executions":[]}`), nil
+		}
 	})}
 
 	h := &Handler{
@@ -496,8 +637,7 @@ func TestPipelineRunDefaultsCommandAndUser(t *testing.T) {
 	}
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
-	c.Request = httptest.NewRequest(http.MethodPost, "/api/v1/pipeline/run", strings.NewReader(`{"project":"demo"}`))
-	c.Request.Header.Set("Content-Type", "application/json")
+	c.Request = httptest.NewRequest(http.MethodPost, "/api/v1/pipeline/run", nil)
 	c.Set("projectID", "demo")
 	c.Set("userID", "request-user")
 
@@ -506,18 +646,21 @@ func TestPipelineRunDefaultsCommandAndUser(t *testing.T) {
 	if recorder.Code != http.StatusAccepted {
 		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusAccepted, recorder.Body.String())
 	}
-	var body map[string]string
+	var body map[string]any
 	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
 	if body["execution_id"] != "olw-pipeline-default" {
 		t.Fatalf("execution_id = %q, want olw-pipeline-default", body["execution_id"])
 	}
+	if body["project_id"] != "demo" {
+		t.Fatalf("project_id = %q, want demo", body["project_id"])
+	}
 	override := runRequest.Overrides.ContainerOverrides[0]
 	if len(override.Args) != 2 || override.Args[0] != "run" || override.Args[1] != defaultWorkerCommands {
 		t.Fatalf("args = %#v, want [run %s]", override.Args, defaultWorkerCommands)
 	}
-	if override.Env[0].Value != "request-user" || override.Env[1].Value != "demo" || override.Env[2].Value != "pipeline" || override.Env[3].Value != "true" {
+	if override.Env[0].Value != "request-user" || override.Env[1].Value != "demo" || override.Env[2].Value != "pipeline" {
 		t.Fatalf("env = %#v", override.Env)
 	}
 }
@@ -605,7 +748,7 @@ func TestAdminPipelineTriggerInvokesWorkerWithoutImmediateRebuild(t *testing.T) 
 	if len(override.Args) != 2 || override.Args[0] != "run" || override.Args[1] != defaultWorkerCommands {
 		t.Fatalf("args = %#v, want [run %s]", override.Args, defaultWorkerCommands)
 	}
-	if override.Env[0].Value != "request-user" || override.Env[1].Value != "demo" || override.Env[2].Value != "pipeline" || override.Env[3].Value != "true" {
+	if override.Env[0].Value != "request-user" || override.Env[1].Value != "demo" || override.Env[2].Value != "pipeline" {
 		t.Fatalf("env = %#v", override.Env)
 	}
 }
@@ -629,10 +772,14 @@ func TestPipelineRunRequiresProject(t *testing.T) {
 
 func TestPipelineRunReturnsCloudRunResponseOnFailure(t *testing.T) {
 	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		if r.URL.Path == "/token" {
+		switch r.URL.Path {
+		case "/token":
 			return testHTTPResponse(http.StatusOK, `{"access_token":"test-token"}`), nil
+		case "/run":
+			return testHTTPResponse(http.StatusForbidden, "permission denied\n"), nil
+		default:
+			return testHTTPResponse(http.StatusOK, `{"executions":[]}`), nil
 		}
-		return testHTTPResponse(http.StatusForbidden, "permission denied\n"), nil
 	})}
 
 	h := &Handler{
@@ -643,8 +790,7 @@ func TestPipelineRunReturnsCloudRunResponseOnFailure(t *testing.T) {
 	}
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
-	c.Request = httptest.NewRequest(http.MethodPost, "/api/v1/pipeline/run", strings.NewReader(`{"project":"demo"}`))
-	c.Request.Header.Set("Content-Type", "application/json")
+	c.Request = httptest.NewRequest(http.MethodPost, "/api/v1/pipeline/run", nil)
 	c.Set("projectID", "demo")
 	c.Set("userID", "request-user")
 
@@ -654,6 +800,496 @@ func TestPipelineRunReturnsCloudRunResponseOnFailure(t *testing.T) {
 		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusInternalServerError, recorder.Body.String())
 	}
 	if body := recorder.Body.String(); !strings.Contains(body, "pipeline failed: permission denied") {
+		t.Fatalf("body = %s", body)
+	}
+}
+
+// stubQuotaStore is an in-memory pipelineQuotaStore for handler tests.
+type stubQuotaStore struct {
+	runsToday    int
+	dayKey       string
+	lastRunAt    time.Time
+	reserveCalls int
+	refundCalls  int
+	lastRefund   firestore.QuotaPrev
+}
+
+func (s *stubQuotaStore) LoadQuotaState(context.Context, string, string) (int, string, time.Time, error) {
+	return s.runsToday, s.dayKey, s.lastRunAt, nil
+}
+
+func (s *stubQuotaStore) ReserveQuota(
+	_ context.Context,
+	_, _ string,
+	limits pipelinequota.Limits,
+	now time.Time,
+	isDemo, alreadyRunning bool,
+	newRawFiles int,
+) (prev firestore.QuotaPrev, snap pipelinequota.Snapshot, reserved bool, err error) {
+	s.reserveCalls++
+	now = now.UTC()
+	prev = firestore.QuotaPrev{
+		RunsToday: s.runsToday,
+		DayKey:    s.dayKey,
+		LastRunAt: s.lastRunAt,
+	}
+	pre := pipelinequota.Evaluate(pipelinequota.Input{
+		Now:            now,
+		Limits:         limits,
+		IsDemo:         isDemo,
+		AlreadyRunning: alreadyRunning,
+		RunsToday:      s.runsToday,
+		DayKey:         s.dayKey,
+		LastRunAt:      s.lastRunAt,
+		NewRawFiles:    newRawFiles,
+		Enforced:       true,
+	})
+	if !pre.Allowed {
+		return prev, pre, false, nil
+	}
+	today := pipelinequota.DayKeyUTC(now)
+	s.runsToday = pre.RunsToday + 1
+	s.dayKey = today
+	s.lastRunAt = now
+	snap = pipelinequota.Evaluate(pipelinequota.Input{
+		Now:            now,
+		Limits:         limits,
+		IsDemo:         isDemo,
+		AlreadyRunning: alreadyRunning,
+		RunsToday:      s.runsToday,
+		DayKey:         s.dayKey,
+		LastRunAt:      s.lastRunAt,
+		NewRawFiles:    newRawFiles,
+		Enforced:       true,
+	})
+	return prev, snap, true, nil
+}
+
+func (s *stubQuotaStore) RefundQuotaPrev(_ context.Context, _, _ string, prev firestore.QuotaPrev) error {
+	s.refundCalls++
+	s.lastRefund = prev
+	s.runsToday = prev.RunsToday
+	s.dayKey = prev.DayKey
+	s.lastRunAt = prev.LastRunAt
+	return nil
+}
+
+func pipelineRunHTTPClient(t *testing.T, runHits *int) *http.Client {
+	t.Helper()
+	return &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/token":
+			return testHTTPResponse(http.StatusOK, `{"access_token":"test-token"}`), nil
+		case "/run":
+			if runHits != nil {
+				*runHits++
+			}
+			return testHTTPResponse(http.StatusOK, `{
+				"metadata": {
+					"execution": "projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline/executions/olw-pipeline-ok"
+				}
+			}`), nil
+		default:
+			// Executions list used by isPipelineRunning — empty so not RUNNING.
+			return testHTTPResponse(http.StatusOK, `{"executions":[]}`), nil
+		}
+	})}
+}
+
+func TestPipelineRunBlocksDemoUser(t *testing.T) {
+	var runHits int
+	stub := &stubQuotaStore{}
+	h := &Handler{
+		index:            search.NewIndex(),
+		httpClient:       pipelineRunHTTPClient(t, &runHits),
+		metadataTokenURL: "http://metadata.test/token",
+		cloudRunJobURL:   "https://run.test/run",
+	}
+	h.SetPipelineQuotaConfig(2, 3600, 1, []string{"demo-user"})
+	h.SetPipelineQuotaStore(stub)
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/api/v1/pipeline/run", nil)
+	c.Set("userID", "demo-user")
+	c.Set("projectID", "proj-1")
+
+	h.PipelineRun(c)
+
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusForbidden, recorder.Body.String())
+	}
+	if runHits != 0 {
+		t.Fatalf("Cloud Run /run hit %d times, want 0", runHits)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body["error"] != "pipeline blocked: demo" {
+		t.Fatalf("error = %#v", body["error"])
+	}
+	quota, _ := body["quota"].(map[string]any)
+	if quota["reason"] != "demo" || quota["allowed"] != false {
+		t.Fatalf("quota = %#v", quota)
+	}
+}
+
+func TestPipelineRunBlocksDailyLimit(t *testing.T) {
+	var runHits int
+	now := time.Now().UTC()
+	stub := &stubQuotaStore{
+		runsToday: 2,
+		dayKey:    pipelinequota.DayKeyUTC(now),
+		lastRunAt: now.Add(-2 * time.Hour),
+	}
+	// Provide a raw file so no_new_raw is not the blocking reason.
+	root := t.TempDir()
+	rawDir := filepath.Join(root, "users", "request-user", "projects", "proj-1", "raw")
+	if err := os.MkdirAll(rawDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(rawDir, "a.md"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	h := &Handler{
+		store:            localfs.New(root),
+		index:            search.NewIndex(),
+		httpClient:       pipelineRunHTTPClient(t, &runHits),
+		metadataTokenURL: "http://metadata.test/token",
+		cloudRunJobURL:   "https://run.test/run",
+	}
+	h.SetPipelineQuotaConfig(2, 3600, 1, nil)
+	h.SetPipelineQuotaStore(stub)
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/api/v1/pipeline/run", nil)
+	c.Set("userID", "request-user")
+	c.Set("projectID", "proj-1")
+
+	h.PipelineRun(c)
+
+	if recorder.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusTooManyRequests, recorder.Body.String())
+	}
+	if runHits != 0 {
+		t.Fatalf("Cloud Run /run hit %d times, want 0", runHits)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body["error"] != "pipeline blocked: daily_limit" {
+		t.Fatalf("error = %#v", body["error"])
+	}
+	quota, _ := body["quota"].(map[string]any)
+	if quota["reason"] != "daily_limit" {
+		t.Fatalf("quota = %#v", quota)
+	}
+	if stub.reserveCalls != 1 {
+		t.Fatalf("reserveCalls = %d, want 1", stub.reserveCalls)
+	}
+	if stub.refundCalls != 0 {
+		t.Fatalf("refundCalls = %d, want 0", stub.refundCalls)
+	}
+}
+
+func TestPipelineRunRefundsOnInvokeFailure(t *testing.T) {
+	now := time.Now().UTC()
+	stub := &stubQuotaStore{
+		runsToday: 0,
+		dayKey:    pipelinequota.DayKeyUTC(now),
+	}
+	root := t.TempDir()
+	rawDir := filepath.Join(root, "users", "request-user", "projects", "proj-1", "raw")
+	if err := os.MkdirAll(rawDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(rawDir, "a.md"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/token":
+			return testHTTPResponse(http.StatusOK, `{"access_token":"test-token"}`), nil
+		case "/run":
+			return testHTTPResponse(http.StatusForbidden, "permission denied\n"), nil
+		default:
+			return testHTTPResponse(http.StatusOK, `{"executions":[]}`), nil
+		}
+	})}
+
+	h := &Handler{
+		store:            localfs.New(root),
+		index:            search.NewIndex(),
+		httpClient:       client,
+		metadataTokenURL: "http://metadata.test/token",
+		cloudRunJobURL:   "https://run.test/run",
+	}
+	h.SetPipelineQuotaConfig(2, 3600, 1, nil)
+	h.SetPipelineQuotaStore(stub)
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/api/v1/pipeline/run", nil)
+	c.Set("userID", "request-user")
+	c.Set("projectID", "proj-1")
+
+	h.PipelineRun(c)
+
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusInternalServerError, recorder.Body.String())
+	}
+	if stub.reserveCalls != 1 {
+		t.Fatalf("reserveCalls = %d, want 1", stub.reserveCalls)
+	}
+	if stub.refundCalls != 1 {
+		t.Fatalf("refundCalls = %d, want 1", stub.refundCalls)
+	}
+	if stub.runsToday != 0 {
+		t.Fatalf("runsToday after refund = %d, want 0", stub.runsToday)
+	}
+}
+
+func TestPipelineStatusIncludesSuggestedQueries(t *testing.T) {
+	root := t.TempDir()
+	projectRoot := filepath.Join(root, "users", "request-user", "projects", "demo-project")
+	if err := os.MkdirAll(filepath.Join(projectRoot, "cache"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	queriesJSON := `{"queries":["Beta","Alpha"],"updated_at":"2026-07-10T00:00:00Z"}`
+	if err := os.WriteFile(filepath.Join(projectRoot, "cache", "suggested_queries.json"), []byte(queriesJSON), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == "/token" {
+			return testHTTPResponse(http.StatusOK, `{"access_token":"test-token"}`), nil
+		}
+		return testHTTPResponse(http.StatusOK, `{}`), nil
+	})}
+	h := New(localfs.New(root), nil, search.NewIndex(), conceptcache.New(), nil, nil)
+	h.httpClient = client
+	h.metadataTokenURL = "http://metadata.test/token"
+	h.cloudRunJobURL = "https://run.googleapis.com/v2/projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline:run"
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/api/v1/pipeline/status", nil)
+	c.Set("userID", "request-user")
+	c.Set("projectID", "demo-project")
+
+	h.PipelineStatus(c)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var body struct {
+		SuggestedQueries []string `json:"suggested_queries"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(body.SuggestedQueries) != 2 || body.SuggestedQueries[0] != "Beta" {
+		t.Fatalf("suggested_queries = %#v, want [Beta Alpha]", body.SuggestedQueries)
+	}
+}
+
+func TestPipelineStatusReturnsEmptySuggestedQueriesWhenArtifactMissing(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "users", "request-user", "projects", "demo-project"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == "/token" {
+			return testHTTPResponse(http.StatusOK, `{"access_token":"test-token"}`), nil
+		}
+		return testHTTPResponse(http.StatusOK, `{}`), nil
+	})}
+	h := New(localfs.New(root), nil, search.NewIndex(), conceptcache.New(), nil, nil)
+	h.httpClient = client
+	h.metadataTokenURL = "http://metadata.test/token"
+	h.cloudRunJobURL = "https://run.googleapis.com/v2/projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline:run"
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/api/v1/pipeline/status", nil)
+	c.Set("userID", "request-user")
+	c.Set("projectID", "demo-project")
+
+	h.PipelineStatus(c)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var body struct {
+		SuggestedQueries []string `json:"suggested_queries"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body.SuggestedQueries == nil {
+		t.Fatal("suggested_queries = nil, want empty slice")
+	}
+	if len(body.SuggestedQueries) != 0 {
+		t.Fatalf("suggested_queries = %#v, want []", body.SuggestedQueries)
+	}
+}
+
+func TestPipelineStatusIncludesQuota(t *testing.T) {
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == "/token" {
+			return testHTTPResponse(http.StatusOK, `{"access_token":"test-token"}`), nil
+		}
+		return testHTTPResponse(http.StatusOK, `{}`), nil
+	})}
+
+	h := &Handler{
+		index:            search.NewIndex(),
+		httpClient:       client,
+		metadataTokenURL: "http://metadata.test/token",
+		cloudRunJobURL:   "https://run.googleapis.com/v2/projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline:run",
+	}
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/api/v1/pipeline/status", nil)
+	c.Set("userID", "request-user")
+	c.Set("projectID", "new-project")
+
+	h.PipelineStatus(c)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var body struct {
+		ProjectID string                  `json:"project_id"`
+		Quota     *pipelinequota.Snapshot `json:"quota"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body.Quota == nil {
+		t.Fatal("quota is nil")
+	}
+	if body.Quota.Enforced {
+		t.Fatalf("expected enforced=false without store, got %+v", body.Quota)
+	}
+	if !body.Quota.Allowed {
+		t.Fatalf("expected allowed when unenforced, got %+v", body.Quota)
+	}
+}
+
+func TestPipelineStatusAlreadyRunningFalseAfterSucceeded(t *testing.T) {
+	stub := &stubQuotaStore{
+		runsToday: 0,
+		dayKey:    "2026-07-10",
+	}
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/token":
+			return testHTTPResponse(http.StatusOK, `{"access_token":"test-token"}`), nil
+		case "/v2/projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline/executions":
+			return testHTTPResponse(http.StatusOK, `{"executions":[`+pipelineOwnershipExecution("projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline/executions/exec-done", "request-user", "demo-project", "pipeline")+`]}`), nil
+		default:
+			return testHTTPResponse(http.StatusNotFound, `not found`), nil
+		}
+	})}
+
+	h := &Handler{
+		index:            search.NewIndex(),
+		httpClient:       client,
+		metadataTokenURL: "http://metadata.test/token",
+		cloudRunJobURL:   "https://run.googleapis.com/v2/projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline:run",
+	}
+	h.SetPipelineQuotaConfig(2, 3600, 1, nil)
+	h.SetPipelineQuotaStore(stub)
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/api/v1/pipeline/status", nil)
+	c.Set("userID", "request-user")
+	c.Set("projectID", "demo-project")
+
+	h.PipelineStatus(c)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var body struct {
+		LastExecution *struct {
+			Status string `json:"status"`
+		} `json:"last_execution"`
+		Quota *pipelinequota.Snapshot `json:"quota"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body.LastExecution == nil || body.LastExecution.Status != "SUCCEEDED" {
+		t.Fatalf("last_execution = %#v", body.LastExecution)
+	}
+	if body.Quota == nil {
+		t.Fatal("quota is nil")
+	}
+	if body.Quota.AlreadyRunning {
+		t.Fatalf("quota.already_running must be false after SUCCEEDED, got %+v", body.Quota)
+	}
+}
+
+func TestAdminPipelineTriggerBlocksAlreadyRunning(t *testing.T) {
+	var runHits int
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/token":
+			return testHTTPResponse(http.StatusOK, `{"access_token":"test-token"}`), nil
+		case "/run":
+			runHits++
+			return testHTTPResponse(http.StatusOK, `{
+				"metadata": {
+					"execution": "projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline/executions/olw-pipeline-admin"
+				}
+			}`), nil
+		default:
+			// isPipelineRunning lists executions and sees RUNNING.
+			return testHTTPResponse(http.StatusOK, `{"executions":[{
+				"name":"projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline/executions/exec-running",
+				"runningCount":1,
+				"conditions":[{"type":"Completed","state":"CONDITION_RECONCILING"}],
+				"template":{"containers":[{"env":[
+					{"name":"USER_ID","value":"request-user"},
+					{"name":"PROJECT_ID","value":"demo"},
+					{"name":"TASK_TYPE","value":"pipeline"}
+				]}]}
+			}]}`), nil
+		}
+	})}
+
+	h := &Handler{
+		index:            search.NewIndex(),
+		httpClient:       client,
+		metadataTokenURL: "http://metadata.test/token",
+		cloudRunJobURL:   "https://run.googleapis.com/v2/projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline:run",
+		projectExists: func(context.Context, string) error {
+			return nil
+		},
+	}
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/api/v1/admin/projects/request-user_demo/pipeline", nil)
+	c.Params = gin.Params{{Key: "id", Value: "request-user_demo"}}
+
+	h.AdminPipelineTrigger(c)
+
+	if recorder.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusConflict, recorder.Body.String())
+	}
+	if runHits != 0 {
+		t.Fatalf("Cloud Run /run hit %d times, want 0", runHits)
+	}
+	if body := recorder.Body.String(); !strings.Contains(body, "already running") {
 		t.Fatalf("body = %s", body)
 	}
 }
@@ -672,14 +1308,7 @@ func TestPipelineStatusReturnsLatestExecution(t *testing.T) {
 			if got := r.Header.Get("Authorization"); got != "Bearer test-token" {
 				t.Errorf("Authorization = %q, want Bearer test-token", got)
 			}
-			return testHTTPResponse(http.StatusOK, `{
-				"executions": [{
-					"name": "projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline/executions/exec-1",
-					"startTime": "2026-06-29T01:02:03Z",
-					"completionTime": "2026-06-29T01:02:13Z",
-					"conditions": [{"type": "Completed", "state": "CONDITION_SUCCEEDED"}]
-				}]
-			}`), nil
+			return testHTTPResponse(http.StatusOK, `{"executions":[`+pipelineOwnershipExecution("projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline/executions/exec-1", "request-user", "demo-project", "pipeline")+`]}`), nil
 		default:
 			return testHTTPResponse(http.StatusNotFound, `not found`), nil
 		}
@@ -705,8 +1334,8 @@ func TestPipelineStatusReturnsLatestExecution(t *testing.T) {
 	if executionRequest == nil {
 		t.Fatalf("Cloud Run executions request was not made")
 	}
-	if got := executionRequest.URL.Query().Get("pageSize"); got != "1" {
-		t.Fatalf("pageSize = %q, want 1", got)
+	if got := executionRequest.URL.Query().Get("pageSize"); got != "20" {
+		t.Fatalf("pageSize = %q, want 20", got)
 	}
 	var body struct {
 		ProjectID     string `json:"project_id"`
@@ -716,6 +1345,7 @@ func TestPipelineStatusReturnsLatestExecution(t *testing.T) {
 			StartTime string `json:"start_time"`
 			EndTime   string `json:"end_time"`
 			Duration  string `json:"duration"`
+			LogURL    string `json:"log_url"`
 		} `json:"last_execution"`
 	}
 	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
@@ -728,11 +1358,450 @@ func TestPipelineStatusReturnsLatestExecution(t *testing.T) {
 		t.Fatalf("last_execution = nil, want execution")
 	}
 	if body.LastExecution.Name != "projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline/executions/exec-1" ||
-		body.LastExecution.Status != "SUCCESS" ||
+		body.LastExecution.Status != "SUCCEEDED" ||
 		body.LastExecution.StartTime != "2026-06-29T01:02:03Z" ||
 		body.LastExecution.EndTime != "2026-06-29T01:02:13Z" ||
 		body.LastExecution.Duration != "10s" {
 		t.Fatalf("last_execution = %#v", body.LastExecution)
+	}
+}
+
+func pipelineOwnershipExecution(name, userID, projectID, taskType string) string {
+	return fmt.Sprintf(`{
+		"name": %q,
+		"startTime": "2026-06-29T01:02:03Z",
+		"completionTime": "2026-06-29T01:02:13Z",
+		"completionStatus": "EXECUTION_SUCCEEDED",
+		"template": {"containers": [{"env": [
+			{"name": "USER_ID", "value": %q},
+			{"name": "PROJECT_ID", "value": %q},
+			{"name": "TASK_TYPE", "value": %q}
+		]}]}
+	}`, name, userID, projectID, taskType)
+}
+
+func pipelineRunningOwnershipExecution(name, userID, projectID string) string {
+	return fmt.Sprintf(`{
+		"name": %q,
+		"runningCount": 1,
+		"conditions": [{"type": "Completed", "state": "CONDITION_RECONCILING"}],
+		"template": {"containers": [{"env": [
+			{"name": "USER_ID", "value": %q},
+			{"name": "PROJECT_ID", "value": %q},
+			{"name": "TASK_TYPE", "value": "pipeline"}
+		]}]}
+	}`, name, userID, projectID)
+}
+
+func newPipelineOwnershipHandler(client *http.Client) *Handler {
+	return &Handler{
+		index:            search.NewIndex(),
+		httpClient:       client,
+		metadataTokenURL: "http://metadata.test/token",
+		cloudRunJobURL:   "https://run.googleapis.com/v2/projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline:run",
+	}
+}
+
+func TestPipelineOwnedExecutionActivityFindsOlderRunningExecutionOnSamePage(t *testing.T) {
+	terminal := pipelineOwnershipExecution("projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline/executions/newer-terminal", "request-user", "demo-project", "pipeline")
+	running := pipelineRunningOwnershipExecution("projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline/executions/older-running", "request-user", "demo-project")
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == "/token" {
+			return testHTTPResponse(http.StatusOK, `{"access_token":"test-token"}`), nil
+		}
+		return testHTTPResponse(http.StatusOK, `{"executions":[`+terminal+`,`+running+`]}`), nil
+	})}
+
+	h := newPipelineOwnershipHandler(client)
+	hasOwned, allTerminal, anyRunning, err := h.pipelineOwnedExecutionActivityForOwner(t.Context(), "request-user", "demo-project")
+	if err != nil {
+		t.Fatalf("pipelineOwnedExecutionActivityForOwner() error = %v", err)
+	}
+	if !hasOwned || allTerminal || !anyRunning {
+		t.Fatalf("activity = hasOwned:%t allTerminal:%t anyRunning:%t", hasOwned, allTerminal, anyRunning)
+	}
+	if !pipelineRunningForOwnedActivity(false, hasOwned, allTerminal, anyRunning) {
+		t.Fatal("older RUNNING execution must report already running")
+	}
+}
+
+func TestPipelineOwnedExecutionActivityFindsOlderRunningExecutionAcrossPages(t *testing.T) {
+	terminal := pipelineOwnershipExecution("projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline/executions/newer-terminal-page", "request-user", "demo-project", "pipeline")
+	running := pipelineRunningOwnershipExecution("projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline/executions/older-running-page", "request-user", "demo-project")
+	var pageTokens []string
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == "/token" {
+			return testHTTPResponse(http.StatusOK, `{"access_token":"test-token"}`), nil
+		}
+		pageToken := r.URL.Query().Get("pageToken")
+		pageTokens = append(pageTokens, pageToken)
+		if pageToken == "page-2" {
+			return testHTTPResponse(http.StatusOK, `{"executions":[`+running+`]}`), nil
+		}
+		return testHTTPResponse(http.StatusOK, `{"executions":[`+terminal+`],"nextPageToken":"page-2"}`), nil
+	})}
+
+	h := newPipelineOwnershipHandler(client)
+	hasOwned, allTerminal, anyRunning, err := h.pipelineOwnedExecutionActivityForOwner(t.Context(), "request-user", "demo-project")
+	if err != nil {
+		t.Fatalf("pipelineOwnedExecutionActivityForOwner() error = %v", err)
+	}
+	if !hasOwned || allTerminal || !anyRunning {
+		t.Fatalf("activity = hasOwned:%t allTerminal:%t anyRunning:%t", hasOwned, allTerminal, anyRunning)
+	}
+	if len(pageTokens) != 2 || pageTokens[1] != "page-2" {
+		t.Fatalf("page tokens = %#v, want second page", pageTokens)
+	}
+}
+
+func TestPipelineOwnedExecutionActivityAllTerminalOverridesLock(t *testing.T) {
+	terminal := pipelineOwnershipExecution("projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline/executions/terminal", "request-user", "demo-project", "pipeline")
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == "/token" {
+			return testHTTPResponse(http.StatusOK, `{"access_token":"test-token"}`), nil
+		}
+		return testHTTPResponse(http.StatusOK, `{"executions":[`+terminal+`]}`), nil
+	})}
+
+	h := newPipelineOwnershipHandler(client)
+	hasOwned, allTerminal, anyRunning, err := h.pipelineOwnedExecutionActivityForOwner(t.Context(), "request-user", "demo-project")
+	if err != nil {
+		t.Fatalf("pipelineOwnedExecutionActivityForOwner() error = %v", err)
+	}
+	if !hasOwned || !allTerminal || anyRunning {
+		t.Fatalf("activity = hasOwned:%t allTerminal:%t anyRunning:%t", hasOwned, allTerminal, anyRunning)
+	}
+	if pipelineRunningForOwnedActivity(true, hasOwned, allTerminal, anyRunning) {
+		t.Fatal("terminal owned history must override a stale lock")
+	}
+}
+
+func TestPipelineOwnedExecutionActivityWithoutOwnerFallsBackToLock(t *testing.T) {
+	foreign := pipelineOwnershipExecution("projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline/executions/foreign", "other-user", "demo-project", "pipeline")
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == "/token" {
+			return testHTTPResponse(http.StatusOK, `{"access_token":"test-token"}`), nil
+		}
+		return testHTTPResponse(http.StatusOK, `{"executions":[`+foreign+`]}`), nil
+	})}
+
+	h := newPipelineOwnershipHandler(client)
+	hasOwned, allTerminal, anyRunning, err := h.pipelineOwnedExecutionActivityForOwner(t.Context(), "request-user", "demo-project")
+	if err != nil {
+		t.Fatalf("pipelineOwnedExecutionActivityForOwner() error = %v", err)
+	}
+	if hasOwned || allTerminal || anyRunning {
+		t.Fatalf("activity = hasOwned:%t allTerminal:%t anyRunning:%t", hasOwned, allTerminal, anyRunning)
+	}
+	if !pipelineRunningForOwnedActivity(true, hasOwned, allTerminal, anyRunning) {
+		t.Fatal("missing owned history must fall back to active lock")
+	}
+}
+
+func TestPipelineStatusFiltersInterleavedTenants(t *testing.T) {
+	foreign := pipelineOwnershipExecution("projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline/executions/foreign", "other-user", "demo-project", "pipeline")
+	own := pipelineOwnershipExecution("projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline/executions/own", "request-user", "demo-project", "pipeline")
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == "/token" {
+			return testHTTPResponse(http.StatusOK, `{"access_token":"test-token"}`), nil
+		}
+		return testHTTPResponse(http.StatusOK, `{"executions":[`+foreign+`,`+own+`]}`), nil
+	})}
+
+	h := newPipelineOwnershipHandler(client)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/api/v1/pipeline/status", nil)
+	c.Set("userID", "request-user")
+	c.Set("projectID", "demo-project")
+
+	h.PipelineStatus(c)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), "/executions/own") {
+		t.Fatalf("body = %s, want matching tenant execution", recorder.Body.String())
+	}
+	if strings.Contains(recorder.Body.String(), "/executions/foreign") {
+		t.Fatalf("body = %s, leaked foreign execution", recorder.Body.String())
+	}
+}
+
+func TestPipelineStatusPaginatesUntilOwnedExecution(t *testing.T) {
+	foreign := pipelineOwnershipExecution("projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline/executions/foreign-page", "other-user", "demo-project", "pipeline")
+	own := pipelineOwnershipExecution("projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline/executions/own-page", "request-user", "demo-project", "pipeline")
+	var pageTokens []string
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == "/token" {
+			return testHTTPResponse(http.StatusOK, `{"access_token":"test-token"}`), nil
+		}
+		pageToken := r.URL.Query().Get("pageToken")
+		pageTokens = append(pageTokens, pageToken)
+		if pageToken == "page-2" {
+			return testHTTPResponse(http.StatusOK, `{"executions":[`+own+`]}`), nil
+		}
+		return testHTTPResponse(http.StatusOK, `{"executions":[`+foreign+`],"nextPageToken":"page-2"}`), nil
+	})}
+
+	h := newPipelineOwnershipHandler(client)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/api/v1/pipeline/status", nil)
+	c.Set("userID", "request-user")
+	c.Set("projectID", "demo-project")
+
+	h.PipelineStatus(c)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), "/executions/own-page") {
+		t.Fatalf("body = %s, want paginated matching execution", recorder.Body.String())
+	}
+	if len(pageTokens) < 2 || pageTokens[1] != "page-2" {
+		t.Fatalf("page tokens = %#v, want a follow-up request with page-2", pageTokens)
+	}
+}
+
+func TestPipelineStatusReturnsNullWhenNoOwnedExecutionMatches(t *testing.T) {
+	defaultEnv := pipelineOwnershipExecution("projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline/executions/default", "", "", "pipeline")
+	foreign := pipelineOwnershipExecution("projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline/executions/foreign-only", "other-user", "other-project", "pipeline")
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == "/token" {
+			return testHTTPResponse(http.StatusOK, `{"access_token":"test-token"}`), nil
+		}
+		return testHTTPResponse(http.StatusOK, `{"executions":[`+defaultEnv+`,`+foreign+`]}`), nil
+	})}
+
+	h := newPipelineOwnershipHandler(client)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/api/v1/pipeline/status", nil)
+	c.Set("userID", "request-user")
+	c.Set("projectID", "demo-project")
+
+	h.PipelineStatus(c)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), `"last_execution":null`) {
+		t.Fatalf("body = %s, want null last_execution", recorder.Body.String())
+	}
+}
+
+func TestPipelineStatusRejectsSplitContainerOwnership(t *testing.T) {
+	splitOwnership := `{
+		"name":"projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline/executions/split-env",
+		"template":{"containers":[
+			{"env":[{"name":"USER_ID","value":"request-user"}]},
+			{"env":[
+				{"name":"PROJECT_ID","value":"demo-project"},
+				{"name":"TASK_TYPE","value":"pipeline"}
+			]}
+		]}
+	}`
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == "/token" {
+			return testHTTPResponse(http.StatusOK, `{"access_token":"test-token"}`), nil
+		}
+		return testHTTPResponse(http.StatusOK, `{"executions":[`+splitOwnership+`]}`), nil
+	})}
+
+	h := newPipelineOwnershipHandler(client)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/api/v1/pipeline/status", nil)
+	c.Set("userID", "request-user")
+	c.Set("projectID", "demo-project")
+
+	h.PipelineStatus(c)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), `"last_execution":null`) {
+		t.Fatalf("body = %s, split-container env must not authorize", recorder.Body.String())
+	}
+}
+
+func TestPipelineStatusRejectsUnsafeExplicitExecutionIDsBeforeOutboundRequests(t *testing.T) {
+	for _, executionID := range []string{".", "..", "../escape", `bad\\path`, "bad%00id"} {
+		t.Run(executionID, func(t *testing.T) {
+			var outboundRequests int
+			client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+				outboundRequests++
+				return testHTTPResponse(http.StatusNotFound, `not found`), nil
+			})}
+
+			h := newPipelineOwnershipHandler(client)
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodGet, "/api/v1/pipeline/status?execution_id="+executionID, nil)
+			c.Set("userID", "request-user")
+			c.Set("projectID", "demo-project")
+
+			h.PipelineStatus(c)
+
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusBadRequest, recorder.Body.String())
+			}
+			if outboundRequests != 0 {
+				t.Fatalf("outbound requests = %d, want 0", outboundRequests)
+			}
+		})
+	}
+}
+
+func TestPipelineStatusRejectsForeignExplicitExecution(t *testing.T) {
+	foreign := pipelineOwnershipExecution("projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline/executions/foreign-explicit", "other-user", "demo-project", "pipeline")
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == "/token" {
+			return testHTTPResponse(http.StatusOK, `{"access_token":"test-token"}`), nil
+		}
+		if strings.HasSuffix(r.URL.Path, "/executions/foreign-explicit") {
+			return testHTTPResponse(http.StatusOK, foreign), nil
+		}
+		return testHTTPResponse(http.StatusOK, `{"executions":[]}`), nil
+	})}
+
+	h := newPipelineOwnershipHandler(client)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/api/v1/pipeline/status?execution_id=foreign-explicit", nil)
+	c.Set("userID", "request-user")
+	c.Set("projectID", "demo-project")
+
+	h.PipelineStatus(c)
+
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusNotFound, recorder.Body.String())
+	}
+	if strings.Contains(recorder.Body.String(), "foreign-explicit") {
+		t.Fatalf("body = %s, leaked execution identity", recorder.Body.String())
+	}
+}
+
+func TestPipelineStatusReturns404ForUnknownExplicitExecution(t *testing.T) {
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == "/token" {
+			return testHTTPResponse(http.StatusOK, `{"access_token":"test-token"}`), nil
+		}
+		return testHTTPResponse(http.StatusNotFound, `not found`), nil
+	})}
+
+	h := newPipelineOwnershipHandler(client)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/api/v1/pipeline/status?execution_id=unknown-execution", nil)
+	c.Set("userID", "request-user")
+	c.Set("projectID", "demo-project")
+
+	h.PipelineStatus(c)
+
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusNotFound, recorder.Body.String())
+	}
+	if strings.Contains(recorder.Body.String(), "unknown-execution") {
+		t.Fatalf("body = %s, leaked execution identity", recorder.Body.String())
+	}
+}
+
+func TestPipelineStatusReturnsOwnedExplicitExecution(t *testing.T) {
+	owned := pipelineOwnershipExecution("projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline/executions/owned-explicit", "request-user", "demo-project", "pipeline")
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == "/token" {
+			return testHTTPResponse(http.StatusOK, `{"access_token":"test-token"}`), nil
+		}
+		if strings.HasSuffix(r.URL.Path, "/executions/owned-explicit") {
+			return testHTTPResponse(http.StatusOK, owned), nil
+		}
+		return testHTTPResponse(http.StatusOK, `{"executions":[]}`), nil
+	})}
+
+	h := newPipelineOwnershipHandler(client)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/api/v1/pipeline/status?execution_id=owned-explicit", nil)
+	c.Set("userID", "request-user")
+	c.Set("projectID", "demo-project")
+
+	h.PipelineStatus(c)
+
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), "/executions/owned-explicit") {
+		t.Fatalf("status = %d; body = %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestPipelineLogRejectsForeignExecution(t *testing.T) {
+	root := t.TempDir()
+	logPath := filepath.Join(root, "users", "request-user", "projects", "demo-project", "cache", "pipeline-foreign-log.log")
+	if err := os.MkdirAll(filepath.Dir(logPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(logPath, []byte("must not leak\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	foreign := pipelineOwnershipExecution("projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline/executions/foreign-log", "other-user", "demo-project", "pipeline")
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == "/token" {
+			return testHTTPResponse(http.StatusOK, `{"access_token":"test-token"}`), nil
+		}
+		return testHTTPResponse(http.StatusOK, foreign), nil
+	})}
+
+	h := New(localfs.New(root), nil, search.NewIndex(), conceptcache.New(), nil, nil)
+	h.httpClient = client
+	h.metadataTokenURL = "http://metadata.test/token"
+	h.cloudRunJobURL = "https://run.googleapis.com/v2/projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline:run"
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/api/v1/pipeline/log?execution_id=foreign-log", nil)
+	c.Set("userID", "request-user")
+	c.Set("projectID", "demo-project")
+
+	h.PipelineLog(c)
+
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusNotFound, recorder.Body.String())
+	}
+	if strings.Contains(recorder.Body.String(), "must not leak") {
+		t.Fatalf("body = %s, read foreign log", recorder.Body.String())
+	}
+}
+
+func TestPipelineLogReturnsOwnedExecutionLog(t *testing.T) {
+	root := t.TempDir()
+	logPath := filepath.Join(root, "users", "request-user", "projects", "demo-project", "cache", "pipeline-owned-log.log")
+	if err := os.MkdirAll(filepath.Dir(logPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(logPath, []byte("owned output\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	owned := pipelineOwnershipExecution("projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline/executions/owned-log", "request-user", "demo-project", "pipeline")
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == "/token" {
+			return testHTTPResponse(http.StatusOK, `{"access_token":"test-token"}`), nil
+		}
+		return testHTTPResponse(http.StatusOK, owned), nil
+	})}
+
+	h := New(localfs.New(root), nil, search.NewIndex(), conceptcache.New(), nil, nil)
+	h.httpClient = client
+	h.metadataTokenURL = "http://metadata.test/token"
+	h.cloudRunJobURL = "https://run.googleapis.com/v2/projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline:run"
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/api/v1/pipeline/log?execution_id=owned-log", nil)
+	c.Set("userID", "request-user")
+	c.Set("projectID", "demo-project")
+
+	h.PipelineLog(c)
+
+	if recorder.Code != http.StatusOK || recorder.Body.String() != "owned output\n" {
+		t.Fatalf("status = %d; body = %q", recorder.Code, recorder.Body.String())
 	}
 }
 
@@ -751,7 +1820,12 @@ func TestPipelineStatusReturnsSpecificExecution(t *testing.T) {
 				"name": "projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline/executions/olw-pipeline-abc123",
 				"startTime": "2026-06-29T02:00:00Z",
 				"completionTime": "2026-06-29T02:00:07Z",
-				"completionStatus": "EXECUTION_SUCCEEDED"
+				"completionStatus": "EXECUTION_SUCCEEDED",
+				"template": {"containers": [{"env": [
+					{"name": "USER_ID", "value": "request-user"},
+					{"name": "PROJECT_ID", "value": "demo-project"},
+					{"name": "TASK_TYPE", "value": "pipeline"}
+				]}]}
 			}`), nil
 		default:
 			return testHTTPResponse(http.StatusNotFound, `not found`), nil
@@ -789,6 +1863,7 @@ func TestPipelineStatusReturnsSpecificExecution(t *testing.T) {
 			StartTime string `json:"start_time"`
 			EndTime   string `json:"end_time"`
 			Duration  string `json:"duration"`
+			LogURL    string `json:"log_url"`
 		} `json:"last_execution"`
 	}
 	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
@@ -801,11 +1876,69 @@ func TestPipelineStatusReturnsSpecificExecution(t *testing.T) {
 		t.Fatalf("last_execution = nil, want execution")
 	}
 	if body.LastExecution.Name != "projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline/executions/olw-pipeline-abc123" ||
-		body.LastExecution.Status != "SUCCESS" ||
+		body.LastExecution.Status != "SUCCEEDED" ||
 		body.LastExecution.StartTime != "2026-06-29T02:00:00Z" ||
 		body.LastExecution.EndTime != "2026-06-29T02:00:07Z" ||
 		body.LastExecution.Duration != "7s" {
 		t.Fatalf("last_execution = %#v", body.LastExecution)
+	}
+	if body.LastExecution.LogURL != "/api/v1/pipeline/log?execution_id=olw-pipeline-abc123" {
+		t.Fatalf("log_url = %q, want pipeline log URL", body.LastExecution.LogURL)
+	}
+}
+
+func TestPipelineLogReturnsProjectScopedLog(t *testing.T) {
+	root := t.TempDir()
+	logPath := filepath.Join(root, "users", "request-user", "projects", "demo-project", "cache", "pipeline-olw-pipeline-abc123.log")
+	if err := os.MkdirAll(filepath.Dir(logPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(logPath, []byte("pipeline output\nstderr output\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	owned := pipelineOwnershipExecution("projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline/executions/olw-pipeline-abc123", "request-user", "demo-project", "pipeline")
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == "/token" {
+			return testHTTPResponse(http.StatusOK, `{"access_token":"test-token"}`), nil
+		}
+		return testHTTPResponse(http.StatusOK, owned), nil
+	})}
+	h := New(localfs.New(root), nil, search.NewIndex(), conceptcache.New(), nil, nil)
+	h.httpClient = client
+	h.metadataTokenURL = "http://metadata.test/token"
+	h.cloudRunJobURL = "https://run.googleapis.com/v2/projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline:run"
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/api/v1/pipeline/log?execution_id=olw-pipeline-abc123", nil)
+	c.Set("userID", "request-user")
+	c.Set("projectID", "demo-project")
+
+	h.PipelineLog(c)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	if contentType := recorder.Header().Get("Content-Type"); !strings.HasPrefix(contentType, "text/plain") {
+		t.Fatalf("Content-Type = %q, want text/plain", contentType)
+	}
+	if body := recorder.Body.String(); body != "pipeline output\nstderr output\n" {
+		t.Fatalf("body = %q", body)
+	}
+}
+
+func TestPipelineLogRejectsUnsafeExecutionID(t *testing.T) {
+	h := New(localfs.New(t.TempDir()), nil, search.NewIndex(), conceptcache.New(), nil, nil)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/api/v1/pipeline/log?execution_id=../escape", nil)
+	c.Set("userID", "request-user")
+	c.Set("projectID", "demo-project")
+
+	h.PipelineLog(c)
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusBadRequest, recorder.Body.String())
 	}
 }
 
@@ -839,28 +1972,150 @@ func TestPipelineStatusReturnsNullWhenNoExecutions(t *testing.T) {
 	}
 }
 
-func TestBuildInitProjectRunBody(t *testing.T) {
-	body, err := buildInitProjectRunBody("user-1", "a1b2c3d4e5f6", "Demo Project")
-	if err != nil {
-		t.Fatalf("buildInitProjectRunBody: %v", err)
+func TestStatusIncludesLatestPipelineExecutionWhenAvailable(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "users", "request-user", "projects", "demo-project"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/token":
+			return testHTTPResponse(http.StatusOK, `{"access_token":"test-token"}`), nil
+		case "/v2/projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline/executions":
+			return testHTTPResponse(http.StatusOK, `{
+				"executions": [{
+					"name": "projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline/executions/exec-1",
+					"startTime": "2026-06-29T01:02:03Z",
+					"completionTime": "2026-06-29T01:02:13Z",
+					"completionStatus": "EXECUTION_SUCCEEDED"
+				}]
+			}`), nil
+		default:
+			return testHTTPResponse(http.StatusNotFound, `not found`), nil
+		}
+	})}
+	h := New(localfs.New(root), nil, search.NewIndex(), conceptcache.New(), nil, nil)
+	h.httpClient = client
+	h.metadataTokenURL = "http://metadata.test/token"
+	h.cloudRunJobURL = "https://run.googleapis.com/v2/projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline:run"
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/api/v1/status", nil)
+	c.Set("userID", "request-user")
+	c.Set("projectID", "demo-project")
+
+	h.Status(c)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var body struct {
+		LastExecution *struct {
+			Status string `json:"status"`
+			LogURL string `json:"log_url"`
+		} `json:"last_execution"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if body.LastExecution == nil {
+		t.Fatal("last_execution = nil, want latest execution")
+	}
+	if body.LastExecution.Status != "SUCCEEDED" || body.LastExecution.LogURL != "/api/v1/pipeline/log?execution_id=exec-1" {
+		t.Fatalf("last_execution = %#v", body.LastExecution)
+	}
+}
+
+func TestStatusRawCountUsesLiveRawListing(t *testing.T) {
+	root := t.TempDir()
+	projectRoot := filepath.Join(root, "users", "request-user", "projects", "demo-project")
+	if err := os.MkdirAll(filepath.Join(projectRoot, "raw"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(projectRoot, "cache"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Stale artifact must not win over live raw/ files (LWC-129).
+	statusJSON := `{"version":1,"generated_at":"2026-07-09T10:00:00Z","file_count":2,"files":{}}`
+	if err := os.WriteFile(filepath.Join(projectRoot, "cache", "raw_status.json"), []byte(statusJSON), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"a.md", "b.md", "c.md"} {
+		if err := os.WriteFile(filepath.Join(projectRoot, "raw", name), []byte("# "+name+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
 	}
 
-	want := map[string]any{
-		"overrides": map[string]any{
-			"containerOverrides": []any{
-				map[string]any{
-					"env": []any{
-						map[string]any{"name": "TASK_TYPE", "value": "init"},
-						map[string]any{"name": "USER_ID", "value": "user-1"},
-						map[string]any{"name": "PROJECT_ID", "value": "a1b2c3d4e5f6"},
-						map[string]any{"name": "PROJECT_NAME", "value": "Demo Project"},
-					},
-				},
-			},
-		},
+	h := New(localfs.New(root), nil, search.NewIndex(), conceptcache.New(), nil, nil)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/api/v1/status", nil)
+	c.Set("userID", "request-user")
+	c.Set("projectID", "demo-project")
+
+	h.Status(c)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusOK, recorder.Body.String())
 	}
-	if string(body) != mustJSON(t, want) {
-		t.Fatalf("body = %s, want %s", body, mustJSON(t, want))
+	var body struct {
+		RawCount int `json:"raw_count"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if body.RawCount != 3 {
+		t.Fatalf("raw_count = %d, want 3 (live list, not artifact file_count=2)", body.RawCount)
+	}
+}
+
+func TestStatusIgnoresPipelineExecutionLookupFailure(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "users", "request-user", "projects", "demo-project"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == "/token" {
+			return testHTTPResponse(http.StatusInternalServerError, `metadata unavailable`), nil
+		}
+		return testHTTPResponse(http.StatusNotFound, `not found`), nil
+	})}
+	h := New(localfs.New(root), nil, search.NewIndex(), conceptcache.New(), nil, nil)
+	h.httpClient = client
+	h.metadataTokenURL = "http://metadata.test/token"
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/api/v1/status", nil)
+	c.Set("userID", "request-user")
+	c.Set("projectID", "demo-project")
+
+	h.Status(c)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	if body := recorder.Body.String(); strings.Contains(body, "last_execution") {
+		t.Fatalf("body should omit last_execution on lookup failure: %s", body)
+	}
+}
+
+func TestInitProjectReadyDefaults(t *testing.T) {
+	resp := newInitProjectResponse("a1b2c3d4e5f6", "Demo Project")
+	if resp.Status != "ready" {
+		t.Fatalf("response status = %q, want ready", resp.Status)
+	}
+	if resp.StatusURL != "/api/v1/projects/a1b2c3d4e5f6/status" {
+		t.Fatalf("status URL = %q", resp.StatusURL)
+	}
+
+	data := initProjectData("a1b2c3d4e5f6", "Demo Project", "idem-1", time.Unix(1, 0))
+	if data["status"] != "ready" {
+		t.Fatalf("project data status = %q, want ready", data["status"])
+	}
+	if data["idempotency_key"] != "idem-1" {
+		t.Fatalf("idempotency key = %q", data["idempotency_key"])
 	}
 }
 
@@ -1017,11 +2272,12 @@ func TestHandlersMatchGinHandlerSignature(t *testing.T) {
 		h.PrometheusMetrics,
 		h.PipelineRun,
 		h.PipelineStatus,
+		h.PipelineLog,
 		h.RebuildIndex,
 		h.InitProject,
 		h.ProjectStatus,
 	}
-	if len(handlers) != 14 {
-		t.Fatalf("handler count = %d, want 14", len(handlers))
+	if len(handlers) != 15 {
+		t.Fatalf("handler count = %d, want 15", len(handlers))
 	}
 }

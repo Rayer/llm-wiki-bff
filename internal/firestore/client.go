@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"cloud.google.com/go/firestore"
@@ -13,9 +14,10 @@ import (
 
 // Client wraps Firestore operations for pipeline status.
 type Client struct {
-	fs     *firestore.Client
-	lockID string
-	locks  *firestore.CollectionRef
+	fs         *firestore.Client
+	databaseID string
+	lockID     string
+	locks      *firestore.CollectionRef
 }
 
 // Status represents the current pipeline state.
@@ -27,18 +29,36 @@ type Status struct {
 
 // NewClient creates a Firestore client.
 func NewClient(project, userID, projectID string) (*Client, error) {
+	return NewClientWithDatabase(project, "", userID, projectID)
+}
+
+// NewClientWithDatabase creates a Firestore client for databaseID. An empty
+// databaseID preserves the default database behavior of NewClient.
+func NewClientWithDatabase(project, databaseID, userID, projectID string) (*Client, error) {
 	ctx := context.Background()
-	fs, err := firestore.NewClient(ctx, project)
+	databaseID = strings.TrimSpace(databaseID)
+	fs, err := newFirestoreClient(ctx, project, databaseID)
 	if err != nil {
 		return nil, fmt.Errorf("firestore client: %w", err)
+	}
+	if databaseID == "" {
+		databaseID = firestore.DefaultDatabaseID
 	}
 
 	lockID := fmt.Sprintf("%s__%s", userID, projectID)
 	return &Client{
-		fs:     fs,
-		lockID: lockID,
-		locks:  fs.Collection("locks"),
+		fs:         fs,
+		databaseID: databaseID,
+		lockID:     lockID,
+		locks:      fs.Collection("locks"),
 	}, nil
+}
+
+var newFirestoreClient = func(ctx context.Context, project, databaseID string) (*firestore.Client, error) {
+	if databaseID == "" {
+		return firestore.NewClient(ctx, project)
+	}
+	return firestore.NewClientWithDatabase(ctx, project, databaseID)
 }
 
 // GetStatus returns the current pipeline lock status.
@@ -49,20 +69,22 @@ func (c *Client) GetStatus(ctx context.Context) (*Status, error) {
 	}
 
 	data := doc.Data()
-	status, _ := data["status"].(string)
-	if status != "active" {
+	expiresAt, ok := activeLockUntil(data, time.Now())
+	if !ok {
 		return &Status{Locked: false}, nil
 	}
 
-	s := &Status{Locked: true}
+	s := &Status{Locked: true, LockExpiry: expiresAt}
 	if w, ok := data["worker"].(string); ok {
 		s.Worker = w
 	}
-	if t, ok := firestoreTimestamp(data["expires_at"]); ok {
-		s.LockExpiry = t
-	}
-
 	return s, nil
+}
+
+// LockDataActive reports whether Firestore lock document fields represent a held lock at now.
+func LockDataActive(data map[string]interface{}, now time.Time) bool {
+	_, ok := activeLockUntil(data, now)
+	return ok
 }
 
 // CountActiveLocks returns the number of active pipeline locks.

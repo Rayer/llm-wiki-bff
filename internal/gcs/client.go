@@ -85,7 +85,7 @@ func (c *Client) NewScopedClient(userID, projectID string) *Client {
 }
 
 func (c *Client) prefix() string {
-	return fmt.Sprintf("users/%s/projects/%s", c.userID, c.projectID)
+	return store.ProjectPrefix(c.userID, c.projectID)
 }
 
 // ListSources returns all compiled wiki sources.
@@ -256,6 +256,49 @@ func (c *Client) ListMarkdownFiles(ctx context.Context, dir string) ([]MarkdownF
 		})
 	}
 	return files, nil
+}
+
+func (c *Client) ListRawFiles(ctx context.Context) ([]store.RawFile, error) {
+	prefix := c.prefix() + "/raw/"
+	it := c.bucket.Objects(ctx, &storage.Query{Prefix: prefix})
+
+	files := make([]store.RawFile, 0)
+	for {
+		attrs, err := it.Next()
+		if err != nil {
+			if errors.Is(err, iterator.Done) {
+				break
+			}
+			return nil, err
+		}
+		name, ok := c.rawFileNameFromObject(attrs.Name)
+		if !ok {
+			continue
+		}
+		files = append(files, store.RawFile{
+			Name:    name,
+			Path:    "raw/" + name,
+			Size:    attrs.Size,
+			Updated: attrs.Updated.UTC(),
+			SHA256:  attrs.Metadata["sha256"],
+		})
+	}
+	sort.Slice(files, func(i, j int) bool {
+		return files[i].Name < files[j].Name
+	})
+	return files, nil
+}
+
+func (c *Client) rawFileNameFromObject(objectName string) (string, bool) {
+	prefix := c.prefix() + "/raw/"
+	if !strings.HasPrefix(objectName, prefix) {
+		return "", false
+	}
+	name := strings.TrimPrefix(objectName, prefix)
+	if name == "" || strings.Contains(name, "/") {
+		return "", false
+	}
+	return name, true
 }
 
 // listDir lists .md files under the given directory prefix.
@@ -541,7 +584,7 @@ func (c *Client) ListProjects(ctx context.Context, userID string) ([]Project, er
 		return nil, fmt.Errorf("GCS client is not configured")
 	}
 
-	basePrefix := fmt.Sprintf("users/%s/projects/", userID)
+	basePrefix := store.UserProjectsPrefix(userID)
 	it := c.bucket.Objects(ctx, &storage.Query{
 		Prefix:    basePrefix,
 		Delimiter: "/",
@@ -590,7 +633,7 @@ func (c *Client) ListProjects(ctx context.Context, userID string) ([]Project, er
 }
 
 func (c *Client) projectCreatedAt(ctx context.Context, userID, projectID string) string {
-	path := fmt.Sprintf("users/%s/projects/%s/index.md", userID, projectID)
+	path := store.ProjectObjectPath(userID, projectID, "index.md")
 	attrs, err := c.bucket.Object(path).Attrs(ctx)
 	if err != nil || attrs.Created.IsZero() {
 		return ""

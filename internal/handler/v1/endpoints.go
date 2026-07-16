@@ -17,11 +17,16 @@ import (
 	"cloud.google.com/go/firestore"
 	"cloud.google.com/go/storage"
 	"github.com/gin-gonic/gin"
+	"github.com/rayer/llm-wiki-bff/internal/auth"
 	conceptcache "github.com/rayer/llm-wiki-bff/internal/cache"
+	"github.com/rayer/llm-wiki-bff/internal/config"
 	"github.com/rayer/llm-wiki-bff/internal/gcs"
 	"github.com/rayer/llm-wiki-bff/internal/handler"
 	"github.com/rayer/llm-wiki-bff/internal/llm"
+	"github.com/rayer/llm-wiki-bff/internal/pipelinequota"
 	"github.com/rayer/llm-wiki-bff/internal/search"
+	store "github.com/rayer/llm-wiki-bff/internal/storage"
+	"github.com/rayer/llm-wiki-bff/internal/suggestedqueries"
 	"github.com/rayer/llm-wiki-bff/internal/wikiindex"
 	"google.golang.org/api/iterator"
 	"google.golang.org/grpc/codes"
@@ -30,13 +35,14 @@ import (
 
 const (
 	defaultMetadataTokenURL = "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token"
-	defaultCloudRunJobURL   = "https://run.googleapis.com/v2/projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline:run"
+	defaultCloudRunJobURL   = config.DefaultPipelineJobURL
 	defaultWorkerCommands   = `[["run","--auto-approve"],["approve","--all"]]`
 )
 
 var (
-	errIndexNotFound          = errors.New("index not found")
-	errFirestoreNotConfigured = errors.New("Firestore client is not configured")
+	errIndexNotFound             = errors.New("index not found")
+	errFirestoreNotConfigured    = errors.New("Firestore client is not configured")
+	errPipelineExecutionNotFound = errors.New("pipeline execution not found")
 )
 
 // Health handles GET /api/v1/health.
@@ -194,6 +200,11 @@ func projectResponseFromFirestoreDoc(docID string, data map[string]interface{}) 
 	if userID == "" {
 		return handler.ProjectResponse{}, "", false
 	}
+	// Idempotency cache docs live in the same collection and share project_id with
+	// the real project; skip them so list endpoints do not emit duplicate IDs.
+	if isIdempotencyCacheDoc(docID, data) {
+		return handler.ProjectResponse{}, "", false
+	}
 	projectID, _ := data["project_id"].(string)
 	projectID = strings.TrimSpace(projectID)
 	if projectID == "" {
@@ -214,6 +225,19 @@ func projectResponseFromFirestoreDoc(docID string, data map[string]interface{}) 
 		Name:      name,
 		CreatedAt: firestoreCreatedAt(data["created_at"]),
 	}, userID, true
+}
+
+// isIdempotencyCacheDoc reports whether a Firestore projects collection document is
+// the init-project idempotency cache entry rather than the real project.
+// Cache docs are stored at {userID}_{idempotencyKey} and still carry project_id.
+func isIdempotencyCacheDoc(docID string, data map[string]interface{}) bool {
+	key, _ := data["idempotency_key"].(string)
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return false
+	}
+	_, docSuffix := splitProjectDocID(docID)
+	return strings.TrimSpace(docSuffix) == key
 }
 
 func firestoreCreatedAt(value interface{}) string {
@@ -702,12 +726,55 @@ func (h *Handler) PipelineRun(c *gin.Context) {
 		return
 	}
 
-	token, err := h.getMetadataAccessToken(c.Request.Context())
+	ctx := c.Request.Context()
+	snap, reserved, prev, err := h.evaluateQuota(ctx, userID, projectID, true)
 	if err != nil {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{
+			Error: "pipeline failed: " + err.Error(),
+		})
+		return
+	}
+	// Post-reserve snapshots re-evaluate the *next* run and often have Allowed=false
+	// (cooldown). Use reserved for the accept path; only block when nothing was reserved
+	// and the pre-reserve evaluation denied the run. Unenforced (no store) is Allowed + !reserved.
+	if !reserved && !snap.Allowed {
+		c.JSON(httpStatusForReason(snap.Reason), gin.H{
+			"error": fmt.Sprintf("pipeline blocked: %s", snap.Reason),
+			"quota": snap,
+		})
+		return
+	}
+
+	executionID, err := h.invokePipelineJob(ctx, userID, projectID)
+	if err != nil {
+		if reserved {
+			if qs := h.effectiveQuotaStore(); qs != nil {
+				if refundErr := qs.RefundQuotaPrev(ctx, userID, projectID, prev); refundErr != nil {
+					log.Printf("pipeline quota refund failed for %s/%s: %v", userID, projectID, refundErr)
+				}
+			}
+		}
 		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{
 			Error: fmt.Sprintf("pipeline failed: %s", err),
 		})
 		return
+	}
+
+	c.JSON(http.StatusAccepted, gin.H{
+		"status":       "accepted",
+		"command":      "run",
+		"project_id":   projectID,
+		"execution_id": executionID,
+		"quota":        snap,
+	})
+}
+
+// invokePipelineJob starts the shared Cloud Run pipeline job for userID/projectID.
+// Used by both user PipelineRun and AdminPipelineTrigger.
+func (h *Handler) invokePipelineJob(ctx context.Context, userID, projectID string) (executionID string, err error) {
+	token, err := h.getMetadataAccessToken(ctx)
+	if err != nil {
+		return "", err
 	}
 
 	body, err := json.Marshal(gin.H{
@@ -719,58 +786,40 @@ func (h *Handler) PipelineRun(c *gin.Context) {
 						{"name": "USER_ID", "value": userID},
 						{"name": "PROJECT_ID", "value": projectID},
 						{"name": "TASK_TYPE", "value": "pipeline"},
-						{"name": "WORKSPACE", "value": "true"},
 					},
 				},
 			},
 		},
 	})
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "pipeline failed: " + err.Error()})
-		return
+		return "", err
 	}
 
-	runURL := h.cloudRunJobURL
-	if runURL == "" {
-		runURL = defaultCloudRunJobURL
-	}
-	runReq, err := http.NewRequestWithContext(c.Request.Context(), http.MethodPost, runURL, bytes.NewReader(body))
+	runURL := h.pipelineJobURL()
+	runReq, err := http.NewRequestWithContext(ctx, http.MethodPost, runURL, bytes.NewReader(body))
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "pipeline failed: " + err.Error()})
-		return
+		return "", err
 	}
 	runReq.Header.Set("Authorization", "Bearer "+token)
 	runReq.Header.Set("Content-Type", "application/json")
 
 	resp, err := h.pipelineHTTPClient().Do(runReq)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "pipeline failed: " + err.Error()})
-		return
+		return "", err
 	}
 	defer resp.Body.Close()
 	responseBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "pipeline failed: " + err.Error()})
-		return
+		return "", err
 	}
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{
-			Error: fmt.Sprintf("pipeline failed: %s", string(responseBody)),
-		})
-		return
+		return "", fmt.Errorf("%s", string(responseBody))
 	}
-	executionID, err := cloudRunExecutionIDFromRunResponse(responseBody)
+	executionID, err = cloudRunExecutionIDFromRunResponse(responseBody)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "pipeline failed: " + err.Error()})
-		return
+		return "", err
 	}
-
-	c.JSON(http.StatusAccepted, gin.H{
-		"status":       "accepted",
-		"command":      "run",
-		"project":      projectID,
-		"execution_id": executionID,
-	})
+	return executionID, nil
 }
 
 type cloudRunJobRunResponse struct {
@@ -785,33 +834,42 @@ type cloudRunJobRunResponse struct {
 }
 
 type pipelineStatusResponse struct {
-	LastExecution *pipelineExecutionResponse `json:"last_execution"`
-	ProjectID     string                     `json:"project_id"`
-}
-
-type pipelineExecutionResponse struct {
-	Name      string `json:"name"`
-	Status    string `json:"status"`
-	StartTime string `json:"start_time"`
-	EndTime   string `json:"end_time"`
-	Duration  string `json:"duration"`
+	LastExecution    *handler.PipelineExecutionResponse `json:"last_execution"`
+	ProjectID        string                             `json:"project_id"`
+	Quota            *pipelinequota.Snapshot            `json:"quota,omitempty"`
+	SuggestedQueries []string                           `json:"suggested_queries"`
 }
 
 type cloudRunExecutionsResponse struct {
-	Executions []cloudRunExecution `json:"executions"`
+	Executions    []cloudRunExecution `json:"executions"`
+	NextPageToken string              `json:"nextPageToken"`
 }
 
 type cloudRunExecution struct {
-	Name             string              `json:"name"`
-	StartTime        string              `json:"startTime"`
-	CompletionTime   string              `json:"completionTime"`
-	EndTime          string              `json:"endTime"`
-	CompletionStatus string              `json:"completionStatus"`
-	Conditions       []cloudRunCondition `json:"conditions"`
-	RunningCount     int                 `json:"runningCount"`
-	SucceededCount   int                 `json:"succeededCount"`
-	FailedCount      int                 `json:"failedCount"`
-	CancelledCount   int                 `json:"cancelledCount"`
+	Name             string                    `json:"name"`
+	StartTime        string                    `json:"startTime"`
+	CompletionTime   string                    `json:"completionTime"`
+	EndTime          string                    `json:"endTime"`
+	CompletionStatus string                    `json:"completionStatus"`
+	Conditions       []cloudRunCondition       `json:"conditions"`
+	RunningCount     int                       `json:"runningCount"`
+	SucceededCount   int                       `json:"succeededCount"`
+	FailedCount      int                       `json:"failedCount"`
+	CancelledCount   int                       `json:"cancelledCount"`
+	Template         cloudRunExecutionTemplate `json:"template"`
+}
+
+type cloudRunExecutionTemplate struct {
+	Containers []cloudRunContainer `json:"containers"`
+}
+
+type cloudRunContainer struct {
+	Env []cloudRunEnv `json:"env"`
+}
+
+type cloudRunEnv struct {
+	Name  string `json:"name"`
+	Value string `json:"value"`
 }
 
 type cloudRunCondition struct {
@@ -822,6 +880,19 @@ type cloudRunCondition struct {
 }
 
 // PipelineStatus handles GET /api/v1/pipeline/status.
+//
+//	@Summary		Pipeline execution status
+//	@Description	Returns the latest Cloud Run pipeline execution for the current project. Pass execution_id to fetch a specific execution. When an execution is available, last_execution.log_url points to the authenticated log endpoint.
+//	@Tags			pipeline
+//	@Produce		json
+//	@Param			execution_id	query		string	false	"Cloud Run execution ID"
+//	@Success		200				{object}	pipelineStatusResponse
+//	@Failure		400				{object}	handler.ErrorResponse
+//	@Failure		401				{object}	handler.ErrorResponse
+//	@Failure		500				{object}	handler.ErrorResponse
+//	@Security		DevUserAuth
+//	@Security		ProjectHeader
+//	@Router			/api/v1/pipeline/status [get]
 func (h *Handler) PipelineStatus(c *gin.Context) {
 	userID := strings.TrimSpace(c.GetString("userID"))
 	if userID == "" {
@@ -834,58 +905,38 @@ func (h *Handler) PipelineStatus(c *gin.Context) {
 		return
 	}
 
-	token, err := h.getMetadataAccessToken(c.Request.Context())
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "pipeline status failed: " + err.Error()})
-		return
-	}
-
+	ctx := c.Request.Context()
 	executionID := strings.TrimSpace(c.Query("execution_id"))
-	statusURL := h.cloudRunExecutionsURL()
 	if executionID != "" {
-		statusURL = h.cloudRunExecutionURL(executionID)
-	}
-	req, err := http.NewRequestWithContext(c.Request.Context(), http.MethodGet, statusURL, nil)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "pipeline status failed: " + err.Error()})
-		return
-	}
-	req.Header.Set("Authorization", "Bearer "+token)
-
-	resp, err := h.pipelineHTTPClient().Do(req)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "pipeline status failed: " + err.Error()})
-		return
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "pipeline status failed: " + err.Error()})
-		return
-	}
-	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "pipeline status failed: " + string(body)})
-		return
-	}
-
-	response := pipelineStatusResponse{ProjectID: projectID}
-	if executionID != "" {
-		var execution cloudRunExecution
-		if err := json.Unmarshal(body, &execution); err != nil {
-			c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "pipeline status failed: " + err.Error()})
+		var err error
+		executionID, err = validatePipelineExecutionID(executionID)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, handler.ErrorResponse{Error: err.Error()})
 			return
 		}
-		response.LastExecution = newPipelineExecutionResponse(execution)
-	} else {
-		var executions cloudRunExecutionsResponse
-		if err := json.Unmarshal(body, &executions); err != nil {
-			c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "pipeline status failed: " + err.Error()})
+	}
+	response := pipelineStatusResponse{
+		ProjectID:        projectID,
+		SuggestedQueries: h.loadSuggestedQueries(ctx, c),
+	}
+	lastExecution, err := h.pipelineExecutionStatusForOwner(ctx, executionID, userID, projectID)
+	if err != nil {
+		if errors.Is(err, errPipelineExecutionNotFound) {
+			c.JSON(http.StatusNotFound, handler.ErrorResponse{Error: errPipelineExecutionNotFound.Error()})
 			return
 		}
-		if len(executions.Executions) > 0 {
-			response.LastExecution = newPipelineExecutionResponse(executions.Executions[0])
-		}
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "pipeline status failed: " + err.Error()})
+		return
 	}
+	response.LastExecution = lastExecution
+
+	// Evaluate-only quota snapshot for frontend Run-button gating (never mutates).
+	snap, _, _, err := h.evaluateQuota(ctx, userID, projectID, false)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "pipeline status failed: " + err.Error()})
+		return
+	}
+	response.Quota = &snap
 	c.JSON(http.StatusOK, response)
 }
 
@@ -916,6 +967,7 @@ func (h *Handler) RebuildIndex(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: err.Error()})
 			return
 		}
+		h.invalidateCachesAfterRebuild(userID, projectID)
 		c.JSON(http.StatusOK, gin.H{
 			"status": "ok",
 			"entries": gin.H{
@@ -956,6 +1008,7 @@ func (h *Handler) RebuildIndex(c *gin.Context) {
 		return
 	}
 
+	h.invalidateCachesAfterRebuild(userID, projectID)
 	c.JSON(http.StatusOK, gin.H{
 		"status": "ok",
 		"entries": gin.H{
@@ -1009,23 +1062,31 @@ func (h *Handler) pipelineHTTPClient() *http.Client {
 }
 
 func (h *Handler) cloudRunExecutionsURL() string {
-	runURL := h.cloudRunJobURL
-	if runURL == "" {
-		runURL = defaultCloudRunJobURL
-	}
+	return h.cloudRunExecutionsURLWithPageToken("")
+}
+
+func (h *Handler) cloudRunExecutionsURLWithPageToken(pageToken string) string {
+	runURL := h.pipelineJobURL()
 	baseURL := strings.TrimSuffix(runURL, ":run")
 	values := url.Values{}
-	values.Set("pageSize", "1")
+	values.Set("pageSize", "20")
+	if pageToken != "" {
+		values.Set("pageToken", pageToken)
+	}
 	return baseURL + "/executions?" + values.Encode()
 }
 
 func (h *Handler) cloudRunExecutionURL(executionID string) string {
-	runURL := h.cloudRunJobURL
-	if runURL == "" {
-		runURL = defaultCloudRunJobURL
-	}
+	runURL := h.pipelineJobURL()
 	baseURL := strings.TrimSuffix(runURL, ":run")
 	return baseURL + "/executions/" + url.PathEscape(executionID)
+}
+
+func (h *Handler) pipelineJobURL() string {
+	if h.cloudRunJobURL != "" {
+		return h.cloudRunJobURL
+	}
+	return defaultCloudRunJobURL
 }
 
 func cloudRunExecutionIDFromRunResponse(body []byte) (string, error) {
@@ -1067,18 +1128,243 @@ func shortCloudRunExecutionName(name string, allowBare bool) string {
 	return ""
 }
 
-func newPipelineExecutionResponse(execution cloudRunExecution) *pipelineExecutionResponse {
+func (h *Handler) pipelineExecutionStatus(ctx context.Context, executionID string) (*handler.PipelineExecutionResponse, error) {
+	return h.pipelineExecutionStatusWithOwner(ctx, executionID, nil)
+}
+
+func (h *Handler) pipelineExecutionStatusForOwner(ctx context.Context, executionID, userID, projectID string) (*handler.PipelineExecutionResponse, error) {
+	return h.pipelineExecutionStatusWithOwner(ctx, executionID, &pipelineExecutionOwner{
+		userID:    userID,
+		projectID: projectID,
+	})
+}
+
+type pipelineExecutionOwner struct {
+	userID    string
+	projectID string
+}
+
+func (h *Handler) pipelineExecutionStatusWithOwner(ctx context.Context, executionID string, owner *pipelineExecutionOwner) (*handler.PipelineExecutionResponse, error) {
+	token, err := h.getMetadataAccessToken(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	if executionID != "" {
+		execution, err := h.fetchCloudRunExecution(ctx, token, executionID)
+		if err != nil {
+			return nil, err
+		}
+		if owner != nil && !cloudRunExecutionOwnedBy(execution, owner.userID, owner.projectID) {
+			return nil, errPipelineExecutionNotFound
+		}
+		return newPipelineExecutionResponse(execution), nil
+	}
+
+	pageToken := ""
+	for {
+		executions, err := h.listCloudRunExecutions(ctx, token, pageToken)
+		if err != nil {
+			return nil, err
+		}
+		if owner == nil {
+			if len(executions.Executions) == 0 {
+				return nil, nil
+			}
+			return newPipelineExecutionResponse(executions.Executions[0]), nil
+		}
+		for _, execution := range executions.Executions {
+			if cloudRunExecutionOwnedBy(execution, owner.userID, owner.projectID) {
+				return newPipelineExecutionResponse(execution), nil
+			}
+		}
+		if executions.NextPageToken == "" {
+			return nil, nil
+		}
+		pageToken = executions.NextPageToken
+	}
+}
+
+func (h *Handler) fetchCloudRunExecution(ctx context.Context, token, executionID string) (cloudRunExecution, error) {
+	statusURL := h.cloudRunExecutionURL(executionID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, statusURL, nil)
+	if err != nil {
+		return cloudRunExecution{}, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := h.pipelineHTTPClient().Do(req)
+	if err != nil {
+		return cloudRunExecution{}, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return cloudRunExecution{}, err
+	}
+	if resp.StatusCode == http.StatusNotFound {
+		return cloudRunExecution{}, errPipelineExecutionNotFound
+	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return cloudRunExecution{}, fmt.Errorf("%s", string(body))
+	}
+
+	var execution cloudRunExecution
+	if err := json.Unmarshal(body, &execution); err != nil {
+		return cloudRunExecution{}, err
+	}
+	return execution, nil
+}
+
+func (h *Handler) listCloudRunExecutions(ctx context.Context, token, pageToken string) (cloudRunExecutionsResponse, error) {
+	statusURL := h.cloudRunExecutionsURLWithPageToken(pageToken)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, statusURL, nil)
+	if err != nil {
+		return cloudRunExecutionsResponse{}, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := h.pipelineHTTPClient().Do(req)
+	if err != nil {
+		return cloudRunExecutionsResponse{}, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return cloudRunExecutionsResponse{}, err
+	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return cloudRunExecutionsResponse{}, fmt.Errorf("%s", string(body))
+	}
+
+	var executions cloudRunExecutionsResponse
+	if err := json.Unmarshal(body, &executions); err != nil {
+		return cloudRunExecutionsResponse{}, err
+	}
+	return executions, nil
+}
+
+func cloudRunExecutionOwnedBy(execution cloudRunExecution, userID, projectID string) bool {
+	userID = strings.TrimSpace(userID)
+	projectID = strings.TrimSpace(projectID)
+	if userID == "" || projectID == "" {
+		return false
+	}
+
+	for _, container := range execution.Template.Containers {
+		env := make(map[string]string)
+		for _, variable := range container.Env {
+			env[variable.Name] = variable.Value
+		}
+		if env["USER_ID"] == userID &&
+			env["PROJECT_ID"] == projectID &&
+			env["TASK_TYPE"] == "pipeline" {
+			return true
+		}
+	}
+	return false
+}
+
+func newPipelineExecutionResponse(execution cloudRunExecution) *handler.PipelineExecutionResponse {
 	endTime := execution.CompletionTime
 	if endTime == "" {
 		endTime = execution.EndTime
 	}
-	return &pipelineExecutionResponse{
+	return &handler.PipelineExecutionResponse{
 		Name:      execution.Name,
 		Status:    cloudRunExecutionStatus(execution),
 		StartTime: execution.StartTime,
 		EndTime:   endTime,
 		Duration:  executionDuration(execution.StartTime, endTime),
+		LogURL:    pipelineLogURLForExecution(execution),
 	}
+}
+
+func pipelineLogURLForExecution(execution cloudRunExecution) string {
+	executionID := shortCloudRunExecutionName(execution.Name, true)
+	if executionID == "" {
+		return ""
+	}
+	return "/api/v1/pipeline/log?execution_id=" + url.QueryEscape(executionID)
+}
+
+// PipelineLog handles GET /api/v1/pipeline/log.
+//
+//	@Summary		Read pipeline log
+//	@Description	Returns the stdout and stderr log captured by the pipeline worker for the current project execution.
+//	@Tags			pipeline
+//	@Produce		plain
+//	@Param			execution_id	query		string	true	"Cloud Run execution ID"
+//	@Success		200				{string}	string
+//	@Failure		400				{object}	handler.ErrorResponse
+//	@Failure		401				{object}	handler.ErrorResponse
+//	@Failure		404				{object}	handler.ErrorResponse
+//	@Failure		500				{object}	handler.ErrorResponse
+//	@Security		DevUserAuth
+//	@Security		ProjectHeader
+//	@Router			/api/v1/pipeline/log [get]
+func (h *Handler) PipelineLog(c *gin.Context) {
+	userID := strings.TrimSpace(c.GetString("userID"))
+	if userID == "" {
+		c.JSON(http.StatusUnauthorized, handler.ErrorResponse{Error: "user not authenticated"})
+		return
+	}
+	projectID := strings.TrimSpace(c.GetString("projectID"))
+	if projectID == "" {
+		c.JSON(http.StatusBadRequest, handler.ErrorResponse{Error: "project is required"})
+		return
+	}
+
+	executionID := strings.TrimSpace(c.Query("execution_id"))
+	logPath, err := pipelineLogPath(executionID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, handler.ErrorResponse{Error: err.Error()})
+		return
+	}
+	if _, err := h.pipelineExecutionStatusForOwner(c.Request.Context(), executionID, userID, projectID); err != nil {
+		if errors.Is(err, errPipelineExecutionNotFound) {
+			c.JSON(http.StatusNotFound, handler.ErrorResponse{Error: errPipelineExecutionNotFound.Error()})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "pipeline execution lookup failed: " + err.Error()})
+		return
+	}
+
+	wikiStore, err := h.GetStore(c)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: err.Error()})
+		return
+	}
+	data, err := wikiStore.ReadFile(c.Request.Context(), logPath)
+	if err != nil {
+		if errors.Is(err, storage.ErrObjectNotExist) {
+			c.JSON(http.StatusNotFound, handler.ErrorResponse{Error: "pipeline log not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "read pipeline log: " + err.Error()})
+		return
+	}
+	c.Data(http.StatusOK, "text/plain; charset=utf-8", data)
+}
+
+func pipelineLogPath(executionID string) (string, error) {
+	var err error
+	executionID, err = validatePipelineExecutionID(executionID)
+	if err != nil {
+		return "", err
+	}
+	return "cache/pipeline-" + executionID + ".log", nil
+}
+
+func validatePipelineExecutionID(executionID string) (string, error) {
+	executionID = strings.TrimSpace(executionID)
+	if executionID == "" {
+		return "", errors.New("execution_id is required")
+	}
+	if strings.ContainsAny(executionID, `/\`+"\x00") || executionID == "." || executionID == ".." || strings.Contains(executionID, "..") {
+		return "", fmt.Errorf("unsafe execution_id: %s", executionID)
+	}
+	return executionID, nil
 }
 
 func cloudRunExecutionStatus(execution cloudRunExecution) string {
@@ -1109,7 +1395,7 @@ func cloudRunExecutionStatus(execution cloudRunExecution) string {
 		return "RUNNING"
 	}
 	if execution.SucceededCount > 0 {
-		return "SUCCESS"
+		return "SUCCEEDED"
 	}
 	return "UNKNOWN"
 }
@@ -1120,7 +1406,7 @@ func normalizeCloudRunStatus(value string) string {
 	status = strings.TrimPrefix(status, "EXECUTION_")
 	switch status {
 	case "SUCCEEDED", "TRUE":
-		return "SUCCESS"
+		return "SUCCEEDED"
 	case "FAILED", "FALSE":
 		return "FAILED"
 	case "CANCELLED":
@@ -1175,8 +1461,13 @@ func (h *Handler) Status(c *gin.Context) {
 	resp := handler.StatusResponse{
 		SourcesCount:  len(sources),
 		ConceptsCount: len(concepts),
+		RawCount:      rawFileCount(ctx, gcsClient),
 		IndexSources:  h.index.SourceCount(),
 		IndexConcepts: h.index.ConceptCount(),
+	}
+
+	if lastExecution, err := h.pipelineExecutionStatus(ctx, ""); err == nil {
+		resp.LastExecution = lastExecution
 	}
 
 	if h.firestore != nil {
@@ -1193,6 +1484,33 @@ func (h *Handler) Status(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, resp)
+}
+
+func (h *Handler) loadSuggestedQueries(ctx context.Context, c *gin.Context) []string {
+	wikiStore, err := h.GetStore(c)
+	if err != nil {
+		return []string{}
+	}
+	data, err := wikiStore.ReadFile(ctx, suggestedqueries.Path)
+	if err != nil {
+		return []string{}
+	}
+	artifact, err := suggestedqueries.Decode(data)
+	if err != nil {
+		return []string{}
+	}
+	return suggestedqueries.Queries(artifact)
+}
+
+// rawFileCount returns the live number of files under project raw/ (ListRawFiles).
+// Intentionally ignores cache/raw_status.json so nav/status counts update after upload
+// without waiting for pipeline postprocess (LWC-129). List errors yield 0.
+func rawFileCount(ctx context.Context, wikiStore store.Store) int {
+	files, err := wikiStore.ListRawFiles(ctx)
+	if err != nil {
+		return 0
+	}
+	return len(files)
 }
 
 // splitProjectDocID parses a Firestore doc ID in the format "{userID}_{projectID}".
@@ -1216,6 +1534,124 @@ func (h *Handler) verifyAdminProjectExists(ctx context.Context, docID string) er
 	}
 	_, err := h.firestore.Raw().Collection("projects").Doc(docID).Get(ctx)
 	return err
+}
+
+type adminProjectEntry struct {
+	ID           string `json:"id"`
+	Name         string `json:"name"`
+	UserID       string `json:"user_id"`
+	UserName     string `json:"user_name"`
+	UserEmail    string `json:"user_email"`
+	ProjectID    string `json:"project_id"`
+	ConceptCount int    `json:"concept_count"`
+	SourceCount  int    `json:"source_count"`
+}
+
+type adminUserEntry struct {
+	ID           string `json:"id"`
+	Name         string `json:"name"`
+	Email        string `json:"email"`
+	Role         string `json:"role"`
+	ProjectCount int    `json:"project_count"`
+}
+
+type adminProjectRecord struct {
+	id        string
+	name      string
+	userID    string
+	projectID string
+}
+
+type adminProjectStatistics struct {
+	conceptCount int
+	sourceCount  int
+}
+
+func adminProjectRecordFromFirestoreDoc(docID string, data map[string]interface{}) (adminProjectRecord, bool) {
+	userID, docProjectID := splitProjectDocID(docID)
+	if !auth.ValidPathSegment(userID) || !auth.ValidPathSegment(docProjectID) || !strings.Contains(docID, "_") {
+		return adminProjectRecord{}, false
+	}
+	project, userID, ok := projectResponseFromFirestoreDoc(docID, data)
+	if !ok {
+		return adminProjectRecord{}, false
+	}
+	if !auth.ValidPathSegment(userID) || !auth.ValidPathSegment(project.ID) {
+		return adminProjectRecord{}, false
+	}
+	return adminProjectRecord{
+		id:        docID,
+		name:      project.Name,
+		userID:    userID,
+		projectID: project.ID,
+	}, true
+}
+
+func adminProjectRecordKey(userID, projectID string) string {
+	return userID + "/" + projectID
+}
+
+func loadAdminProjectStatistics(ctx context.Context, root store.RootStore, projects []adminProjectRecord) (map[string]adminProjectStatistics, error) {
+	if root == nil {
+		return nil, fmt.Errorf("wiki storage is not configured")
+	}
+
+	statistics := make(map[string]adminProjectStatistics, len(projects))
+	for _, project := range projects {
+		scoped := root.Scope(project.userID, project.projectID)
+		if scoped == nil {
+			return nil, fmt.Errorf("wiki storage is not configured for project %s", adminProjectRecordKey(project.userID, project.projectID))
+		}
+
+		concepts, err := listConceptsCacheFirst(ctx, scoped, false)
+		if err != nil {
+			return nil, fmt.Errorf("list concepts for project %s: %w", adminProjectRecordKey(project.userID, project.projectID), err)
+		}
+		sources, err := listSourcesCacheFirst(ctx, scoped)
+		if err != nil {
+			return nil, fmt.Errorf("list sources for project %s: %w", adminProjectRecordKey(project.userID, project.projectID), err)
+		}
+
+		statistics[adminProjectRecordKey(project.userID, project.projectID)] = adminProjectStatistics{
+			conceptCount: len(concepts),
+			sourceCount:  len(sources),
+		}
+	}
+	return statistics, nil
+}
+
+func adminProjectCountsByUser(projects []adminProjectRecord) map[string]int {
+	counts := make(map[string]int)
+	for _, project := range projects {
+		counts[project.userID]++
+	}
+	return counts
+}
+
+func (h *Handler) listAdminProjectRecords(ctx context.Context) ([]adminProjectRecord, error) {
+	if h.firestore == nil || h.firestore.Raw() == nil {
+		return nil, errFirestoreNotConfigured
+	}
+
+	iter := h.firestore.Raw().Collection("projects").Documents(ctx)
+	defer iter.Stop()
+
+	projects := make([]adminProjectRecord, 0)
+	for {
+		doc, err := iter.Next()
+		if err != nil {
+			if status.Code(err) == codes.NotFound || errors.Is(err, iterator.Done) {
+				break
+			}
+			return nil, err
+		}
+		project, ok := adminProjectRecordFromFirestoreDoc(doc.Ref.ID, doc.Data())
+		if !ok {
+			continue
+		}
+		projects = append(projects, project)
+	}
+	return projects, nil
 }
 
 // AdminProjects handles GET /admin/projects.
@@ -1242,47 +1678,25 @@ func (h *Handler) AdminProjects(c *gin.Context) {
 	ctx := c.Request.Context()
 	filterUserID := strings.TrimSpace(c.Query("user_id"))
 
-	iter := fs.Collection("projects").Documents(ctx)
-	defer iter.Stop()
-
-	type projectEntry struct {
-		ID        string `json:"id"`
-		Name      string `json:"name"`
-		UserID    string `json:"user_id"`
-		UserName  string `json:"user_name"`
-		UserEmail string `json:"user_email"`
-		ProjectID string `json:"project_id"`
-	}
-
-	type rawProject struct {
-		id   string
-		name string
-		uid  string
-		pid  string
-	}
-
-	rawProjects := make([]rawProject, 0)
+	rawProjects := make([]adminProjectRecord, 0)
 	userIDs := make(map[string]bool)
-
-	for {
-		doc, err := iter.Next()
-		if err != nil {
-			if status.Code(err) == codes.NotFound || errors.Is(err, iterator.Done) {
-				break
-			}
-			c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "list projects: " + err.Error()})
-			return
-		}
-		uid, pid := splitProjectDocID(doc.Ref.ID)
-
-		if filterUserID != "" && uid != filterUserID {
+	projectRecords, err := h.listAdminProjectRecords(ctx)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "list projects: " + err.Error()})
+		return
+	}
+	for _, project := range projectRecords {
+		if filterUserID != "" && project.userID != filterUserID {
 			continue
 		}
+		rawProjects = append(rawProjects, project)
+		userIDs[project.userID] = true
+	}
 
-		data := doc.Data()
-		name, _ := data["name"].(string)
-		rawProjects = append(rawProjects, rawProject{doc.Ref.ID, name, uid, pid})
-		userIDs[uid] = true
+	statistics, err := loadAdminProjectStatistics(ctx, h.store, rawProjects)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "count project statistics: " + err.Error()})
+		return
 	}
 
 	// Batch-fetch user names and emails
@@ -1303,16 +1717,19 @@ func (h *Handler) AdminProjects(c *gin.Context) {
 		userMap[uid] = struct{ name, email string }{name, email}
 	}
 
-	projects := make([]projectEntry, 0, len(rawProjects))
+	projects := make([]adminProjectEntry, 0, len(rawProjects))
 	for _, rp := range rawProjects {
-		u := userMap[rp.uid]
-		projects = append(projects, projectEntry{
-			ID:        rp.id,
-			Name:      rp.name,
-			UserID:    rp.uid,
-			UserName:  u.name,
-			UserEmail: u.email,
-			ProjectID: rp.pid,
+		u := userMap[rp.userID]
+		stats := statistics[adminProjectRecordKey(rp.userID, rp.projectID)]
+		projects = append(projects, adminProjectEntry{
+			ID:           rp.id,
+			Name:         rp.name,
+			UserID:       rp.userID,
+			UserName:     u.name,
+			UserEmail:    u.email,
+			ProjectID:    rp.projectID,
+			ConceptCount: stats.conceptCount,
+			SourceCount:  stats.sourceCount,
 		})
 	}
 
@@ -1365,7 +1782,7 @@ func (h *Handler) AdminDeleteProject(c *gin.Context) {
 
 	// Delete GCS data
 	if h.store != nil {
-		prefix := fmt.Sprintf("users/%s/projects/%s/", uid, pid)
+		prefix := store.ProjectPrefixWithSlash(uid, pid)
 		if err := deleteGCSPrefix(ctx, h.store, prefix); err != nil {
 			log.Printf("[admin] GCS cleanup warning for %s: %v", docID, err)
 		}
@@ -1505,6 +1922,7 @@ func (h *Handler) AdminRebuildIndex(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: err.Error()})
 			return
 		}
+		h.invalidateCachesAfterRebuild(uid, pid)
 		c.JSON(http.StatusOK, gin.H{
 			"status": "ok",
 			"entries": gin.H{
@@ -1512,7 +1930,6 @@ func (h *Handler) AdminRebuildIndex(c *gin.Context) {
 				"source":  len(next.Source),
 			},
 		})
-		h.listCacheInvalidate(uid + "_" + pid)
 		return
 	}
 
@@ -1548,6 +1965,7 @@ func (h *Handler) AdminRebuildIndex(c *gin.Context) {
 		return
 	}
 
+	h.invalidateCachesAfterRebuild(uid, pid)
 	c.JSON(http.StatusOK, gin.H{
 		"status": "ok",
 		"entries": gin.H{
@@ -1595,62 +2013,18 @@ func (h *Handler) AdminPipelineTrigger(c *gin.Context) {
 		return
 	}
 
-	// Get metadata access token for Cloud Run Jobs API
-	mdToken, err := h.getMetadataAccessToken(ctx)
+	// Admin bypasses daily/cooldown/new-raw/demo quota but still blocks concurrent runs.
+	alreadyRunning, err := h.isPipelineRunning(ctx, uid, pid)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "auth: " + err.Error()})
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "pipeline status: " + err.Error()})
+		return
+	}
+	if alreadyRunning {
+		c.JSON(http.StatusConflict, handler.ErrorResponse{Error: "pipeline is already running"})
 		return
 	}
 
-	// Invoke Cloud Run worker job with user/project overrides
-	body, err := json.Marshal(gin.H{
-		"overrides": gin.H{
-			"containerOverrides": []gin.H{
-				{
-					"args": []string{"run", defaultWorkerCommands},
-					"env": []gin.H{
-						{"name": "USER_ID", "value": uid},
-						{"name": "PROJECT_ID", "value": pid},
-						{"name": "TASK_TYPE", "value": "pipeline"},
-						{"name": "WORKSPACE", "value": "true"},
-					},
-				},
-			},
-		},
-	})
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "marshal: " + err.Error()})
-		return
-	}
-
-	runURL := h.cloudRunJobURL
-	if runURL == "" {
-		runURL = defaultCloudRunJobURL
-	}
-	runReq, err := http.NewRequestWithContext(ctx, http.MethodPost, runURL, bytes.NewReader(body))
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "request: " + err.Error()})
-		return
-	}
-	runReq.Header.Set("Authorization", "Bearer "+mdToken)
-	runReq.Header.Set("Content-Type", "application/json")
-
-	resp, err := h.pipelineHTTPClient().Do(runReq)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "invoke: " + err.Error()})
-		return
-	}
-	defer resp.Body.Close()
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "read: " + err.Error()})
-		return
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "invoke failed: " + string(respBody)})
-		return
-	}
-	executionID, err := cloudRunExecutionIDFromRunResponse(respBody)
+	executionID, err := h.invokePipelineJob(ctx, uid, pid)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "invoke failed: " + err.Error()})
 		return
@@ -1686,6 +2060,12 @@ func (h *Handler) AdminListUsers(c *gin.Context) {
 	fs := h.firestore.Raw()
 	ctx := c.Request.Context()
 	filterRole := strings.TrimSpace(c.Query("role"))
+	projectRecords, err := h.listAdminProjectRecords(ctx)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "count user projects: " + err.Error()})
+		return
+	}
+	projectCounts := adminProjectCountsByUser(projectRecords)
 
 	var iter *firestore.DocumentIterator
 	if filterRole != "" {
@@ -1695,14 +2075,7 @@ func (h *Handler) AdminListUsers(c *gin.Context) {
 	}
 	defer iter.Stop()
 
-	type userEntry struct {
-		ID    string `json:"id"`
-		Name  string `json:"name"`
-		Email string `json:"email"`
-		Role  string `json:"role"`
-	}
-
-	users := make([]userEntry, 0)
+	users := make([]adminUserEntry, 0)
 	for {
 		doc, err := iter.Next()
 		if err != nil {
@@ -1724,11 +2097,12 @@ func (h *Handler) AdminListUsers(c *gin.Context) {
 				name = email
 			}
 		}
-		users = append(users, userEntry{
-			ID:    doc.Ref.ID,
-			Name:  name,
-			Email: email,
-			Role:  role,
+		users = append(users, adminUserEntry{
+			ID:           doc.Ref.ID,
+			Name:         name,
+			Email:        email,
+			Role:         role,
+			ProjectCount: projectCounts[doc.Ref.ID],
 		})
 	}
 
@@ -1856,7 +2230,7 @@ func (h *Handler) AdminDeleteUser(c *gin.Context) {
 
 		// Delete GCS data
 		if h.store != nil && pid != "" {
-			prefix := fmt.Sprintf("users/%s/projects/%s/", userID, pid)
+			prefix := store.ProjectPrefixWithSlash(userID, pid)
 			if err := deleteGCSPrefix(ctx, h.store, prefix); err != nil {
 				log.Printf("[admin] GCS cleanup warning for %s/%s: %v", userID, pid, err)
 			}

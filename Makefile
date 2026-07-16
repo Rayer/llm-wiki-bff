@@ -1,6 +1,9 @@
-IMAGE := gcr.io/llm-wiki-cloud/llm-wiki-bff
+REGION ?= asia-east1
+IMAGE_REPO ?= asia-east1-docker.pkg.dev/llm-wiki-cloud/cloud-run-images/llm-wiki-bff
+IMAGE_TAG ?= $(shell git rev-parse HEAD)
+IMAGE := $(IMAGE_REPO):$(IMAGE_TAG)
 
-.PHONY: docker-build docker-push deploy all build-sync seed dev bff-local clean-local
+.PHONY: docker-build docker-push deploy deploy-dev deploy-prod all build-sync seed dev bff-local clean-local
 
 docker-build:
 	docker build -t $(IMAGE) .
@@ -8,10 +11,16 @@ docker-build:
 docker-push:
 	docker push $(IMAGE)
 
-deploy:
-	gcloud run deploy llm-wiki-bff --image $(IMAGE) --region asia-east1 --platform managed --allow-unauthenticated --set-env-vars GCP_PROJECT=llm-wiki-cloud,BUCKET=llm-wiki-data,USER_ID=test-user,PROJECT_ID=demo --port 8080
+deploy: deploy-dev
 
-all: docker-build docker-push deploy
+deploy-dev:
+	gcloud run deploy llm-wiki-bff-dev --project llm-wiki-cloud --image $(IMAGE) --region asia-east1 --platform managed --allow-unauthenticated --service-account lwc-bff-dev@llm-wiki-cloud.iam.gserviceaccount.com --update-secrets "JWT_SECRET=jwt-secret-dev:latest,DEEPSEEK_API_KEY=deepseek-apikey:latest" --update-env-vars "^@^GCP_PROJECT=llm-wiki-cloud@BUCKET=llm-wiki-data-dev@FIRESTORE_DATABASE_ID=llm-wiki-cloud-dev@PIPELINE_JOB_URL=https://run.googleapis.com/v2/projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline-dev:run@ALLOWED_ORIGINS=https://llm-wiki-frontend-dev.vercel.app,http://localhost:3000,http://127.0.0.1:3000@DEV_JWT=false" --port 8080
+
+deploy-prod:
+	@echo "Production deploys are release-gated. Run the Promote BFF to Cloud Run (production) GitHub workflow with a verified full commit SHA."
+	@exit 1
+
+all: docker-build docker-push deploy-dev
 
 build-sync:
 	go build -o lwc-sync ./cmd/sync/

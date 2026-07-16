@@ -25,9 +25,37 @@ type LoginResponse struct {
 type User struct {
 	ID    string `json:"id"`
 	Email string `json:"email"`
+	Role  string `json:"role,omitempty"`
+}
+
+// ErrorResponse is the JSON response returned when an auth request fails.
+type ErrorResponse struct {
+	Error string `json:"error"`
+}
+
+// RateLimitErrorResponse is returned when an auth request exceeds its rate limit.
+type RateLimitErrorResponse struct {
+	Error      string `json:"error"`
+	RetryAfter int    `json:"retry_after"`
 }
 
 // LoginHandler returns a Gin handler that validates credentials against Firestore and issues a JWT.
+//
+//	@Summary		Log in
+//	@Description	Authenticates email and password, returns a 15-minute access token, and sets a seven-day refresh_token cookie. In local mode, the cookie omits Domain and Secure.
+//	@Tags			auth
+//	@Accept			json
+//	@Produce		json
+//	@Param			request	body		LoginRequest	true	"Credentials"
+//	@Success		200		{object}	LoginResponse
+//	@Header			200		{string}	Set-Cookie	"Firestore mode: refresh_token; Path=/; Domain=rayer.idv.tw; Max-Age=604800; HttpOnly; Secure; SameSite=Lax"
+//	@Failure		400		{object}	ErrorResponse
+//	@Failure		401		{object}	ErrorResponse
+//	@Failure		500		{object}	ErrorResponse
+//	@Failure		503		{object}	ErrorResponse
+//	@Failure		429		{object}	RateLimitErrorResponse
+//	@Header			429		{integer}	Retry-After	"Seconds until the rate limit window resets"
+//	@Router			/api/v1/auth/login [post]
 func LoginHandler(fsClient *firestore.Client, jwtSecret string) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var req LoginRequest
@@ -45,12 +73,12 @@ func LoginHandler(fsClient *firestore.Client, jwtSecret string) gin.HandlerFunc 
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid credentials"})
 			return
 		}
-		accessToken, err := GenerateAccessToken(userID, jwtSecret)
+		accessToken, err := GenerateAccessToken(userID, user.Role, jwtSecret)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate token"})
 			return
 		}
-		refreshToken, err := GenerateRefreshToken(userID, jwtSecret)
+		refreshToken, err := GenerateRefreshToken(userID, user.Role, jwtSecret)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate token"})
 			return
@@ -58,7 +86,7 @@ func LoginHandler(fsClient *firestore.Client, jwtSecret string) gin.HandlerFunc 
 		setRefreshTokenCookie(c, refreshToken, int(refreshTokenTTL.Seconds()))
 		c.JSON(http.StatusOK, LoginResponse{
 			AccessToken: accessToken,
-			User:        User{ID: userID, Email: user.Email},
+			User:        User{ID: userID, Email: user.Email, Role: user.Role},
 		})
 	}
 }

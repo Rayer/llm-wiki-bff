@@ -85,7 +85,7 @@ More detail: [docs/LOCAL_DEV.md](docs/LOCAL_DEV.md).
 
 ## Deploy
 
-The Makefile deploy path builds a Docker image, pushes it, and deploys the BFF service to Cloud Run.
+The final environment mapping and release process are documented in [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md). The Makefile uses a full commit SHA image tag and development-only deploy defaults; production promotion is available only through the release-gated GitHub workflow.
 
 Build image:
 
@@ -111,19 +111,9 @@ Build, push, and deploy:
 make all
 ```
 
-Current deploy target:
-
-```sh
-gcloud run deploy llm-wiki-bff \
-  --image gcr.io/llm-wiki-cloud/llm-wiki-bff \
-  --region asia-east1 \
-  --platform managed \
-  --allow-unauthenticated \
-  --set-env-vars GCP_PROJECT=llm-wiki-cloud,BUCKET=llm-wiki-data,USER_ID=test-user,PROJECT_ID=demo \
-  --port 8080
-```
-
 Production mode expects GCP credentials and uses GCS/Firestore. Local mode is selected only when `--local` or `LOCAL_DATA_DIR` is set.
+
+The BFF supports `FIRESTORE_DATABASE_ID`, `PIPELINE_JOB_URL`, and `ALLOWED_ORIGINS` environment overrides. Empty database and pipeline values preserve the legacy defaults; configured pipeline URLs must be HTTPS Cloud Run Jobs `:run` URLs on `run.googleapis.com` with the expected resource path.
 
 ## Useful Commands
 
@@ -132,3 +122,16 @@ make build-sync
 go run . --local ./local-data
 LOCAL_DATA_DIR=./local-data DEV_JWT=true JWT_SECRET=dev-secret go run . --local ./local-data
 ```
+
+## Pipeline rate limits (LWC-138)
+
+User `POST /api/v1/pipeline/run` enforces per-project quotas before Cloud Run:
+
+| Env | Default | Meaning |
+|-----|---------|---------|
+| `PIPELINE_DAILY_LIMIT` | 2 | Max accepted runs per project per UTC day |
+| `PIPELINE_COOLDOWN_SECONDS` | 3600 | Min seconds between accepted runs |
+| `PIPELINE_MIN_NEW_RAW` | 1 | Require this many new/modified raw files since last run |
+| `PIPELINE_DEMO_USER_IDS` | (empty) | Comma-separated user IDs blocked from pipeline |
+
+When Firestore is unavailable, quota is not enforced (`quota.enforced=false`). Admin pipeline trigger skips daily/cooldown/new-raw but still blocks if already running.

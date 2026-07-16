@@ -229,6 +229,8 @@ func (h *Handler) Status(c *gin.Context) {
 	resp := StatusResponse{
 		SourcesCount:  len(sources),
 		ConceptsCount: len(concepts),
+		// Legacy /api/status has no project-scoped raw_status; leave raw_count at 0.
+		RawCount:      0,
 		IndexSources:  h.index.SourceCount(),
 		IndexConcepts: h.index.ConceptCount(),
 	}

@@ -1,10 +1,15 @@
 package v1
 
 import (
+	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
+
+	"cloud.google.com/go/storage"
+	store "github.com/rayer/llm-wiki-bff/internal/storage"
 )
 
 func TestValidateRawUploadFilenameAcceptsSafeMarkdownFilename(t *testing.T) {
@@ -67,7 +72,7 @@ func TestReadRawUploadBodyRejectsEmptyAndOversizeFiles(t *testing.T) {
 }
 
 func TestRawUploadResponseUsesProjectScopedPath(t *testing.T) {
-	resp := newRawUploadResponse("user-1", "project-1", "note.md", 12, "abc123")
+	resp := newRawUploadResponse("user-1", "project-1", "note.md", 12, "abc123", rawUploadStatusCreated)
 
 	if resp.Filename != "note.md" {
 		t.Fatalf("filename = %q, want note.md", resp.Filename)
@@ -77,5 +82,98 @@ func TestRawUploadResponseUsesProjectScopedPath(t *testing.T) {
 	}
 	if resp.Bytes != 12 || resp.SHA256 != "abc123" {
 		t.Fatalf("bytes=%d sha256=%q, want bytes=12 sha256=abc123", resp.Bytes, resp.SHA256)
+	}
+	if resp.Status != rawUploadStatusCreated {
+		t.Fatalf("status = %q, want %q", resp.Status, rawUploadStatusCreated)
+	}
+}
+
+type fakeRawDigestStore struct {
+	meta    map[string]string
+	files   map[string][]byte
+	metaErr error
+	readErr error
+}
+
+func (f *fakeRawDigestStore) Prefix() string { return "users/u/projects/p" }
+func (f *fakeRawDigestStore) ReadFile(_ context.Context, relPath string) ([]byte, error) {
+	if f.readErr != nil {
+		return nil, f.readErr
+	}
+	data, ok := f.files[relPath]
+	if !ok {
+		return nil, storage.ErrObjectNotExist
+	}
+	return data, nil
+}
+func (f *fakeRawDigestStore) WriteBytes(context.Context, []byte, string) (string, error) {
+	return "", errors.New("not implemented")
+}
+func (f *fakeRawDigestStore) WriteBytesAtomic(context.Context, []byte, string, string) (string, error) {
+	return "", errors.New("not implemented")
+}
+func (f *fakeRawDigestStore) ListProjects(context.Context, string) ([]store.Project, error) {
+	return nil, errors.New("not implemented")
+}
+func (f *fakeRawDigestStore) ListConcepts(context.Context, bool) ([]store.WikiPage, error) {
+	return nil, errors.New("not implemented")
+}
+func (f *fakeRawDigestStore) ListSources(context.Context) ([]store.WikiPage, error) {
+	return nil, errors.New("not implemented")
+}
+func (f *fakeRawDigestStore) ListConceptsFromCache(context.Context) ([]store.WikiPage, error) {
+	return nil, errors.New("not implemented")
+}
+func (f *fakeRawDigestStore) ListSourcesFromCache(context.Context) ([]store.WikiPage, error) {
+	return nil, errors.New("not implemented")
+}
+func (f *fakeRawDigestStore) GetPage(context.Context, string, string) (*store.WikiPage, []byte, error) {
+	return nil, nil, errors.New("not implemented")
+}
+func (f *fakeRawDigestStore) ListMarkdownFiles(context.Context, string) ([]store.MarkdownFile, error) {
+	return nil, errors.New("not implemented")
+}
+func (f *fakeRawDigestStore) ListRawFiles(context.Context) ([]store.RawFile, error) {
+	return nil, errors.New("not implemented")
+}
+func (f *fakeRawDigestStore) BucketStats(context.Context) (int64, int64, error) {
+	return 0, 0, errors.New("not implemented")
+}
+func (f *fakeRawDigestStore) GetMetaSHA256(_ context.Context, relPath string) (string, error) {
+	if f.metaErr != nil {
+		return "", f.metaErr
+	}
+	if f.meta == nil {
+		return "", nil
+	}
+	return f.meta[relPath], nil
+}
+
+func TestResolveExistingRawDigestUsesMetadata(t *testing.T) {
+	s := &fakeRawDigestStore{meta: map[string]string{"raw/note.md": "abc"}}
+	digest, exists, err := resolveExistingRawDigest(context.Background(), s, "raw/note.md")
+	if err != nil || !exists || digest != "abc" {
+		t.Fatalf("got digest=%q exists=%v err=%v", digest, exists, err)
+	}
+}
+
+func TestResolveExistingRawDigestFallsBackToRead(t *testing.T) {
+	content := []byte("# hello\n")
+	want := fmt.Sprintf("%x", sha256.Sum256(content))
+	s := &fakeRawDigestStore{
+		meta:  map[string]string{},
+		files: map[string][]byte{"raw/note.md": content},
+	}
+	digest, exists, err := resolveExistingRawDigest(context.Background(), s, "raw/note.md")
+	if err != nil || !exists || digest != want {
+		t.Fatalf("got digest=%q exists=%v err=%v want %q", digest, exists, err, want)
+	}
+}
+
+func TestResolveExistingRawDigestMissingFile(t *testing.T) {
+	s := &fakeRawDigestStore{meta: map[string]string{}, files: map[string][]byte{}}
+	digest, exists, err := resolveExistingRawDigest(context.Background(), s, "raw/note.md")
+	if err != nil || exists || digest != "" {
+		t.Fatalf("got digest=%q exists=%v err=%v", digest, exists, err)
 	}
 }
