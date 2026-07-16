@@ -5,12 +5,38 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"testing"
 
 	"cloud.google.com/go/storage"
 	store "github.com/rayer/llm-wiki-bff/internal/storage"
 )
+
+func TestRawUploadDecision(t *testing.T) {
+	tests := []struct {
+		name                   string
+		exists, overwrite      bool
+		existingDigest, digest string
+		wantStatus             int
+		wantUploadStatus       string
+		wantWrite              bool
+	}{
+		{name: "create", digest: "new", wantStatus: http.StatusCreated, wantUploadStatus: rawUploadStatusCreated, wantWrite: true},
+		{name: "already exists", exists: true, existingDigest: "same", digest: "same", wantStatus: http.StatusOK, wantUploadStatus: rawUploadStatusAlreadyExists},
+		{name: "conflict without overwrite", exists: true, existingDigest: "old", digest: "new", wantStatus: http.StatusConflict},
+		{name: "replace with overwrite", exists: true, overwrite: true, existingDigest: "old", digest: "new", wantStatus: http.StatusOK, wantUploadStatus: rawUploadStatusReplaced, wantWrite: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			status, uploadStatus, write := rawUploadDecision(tt.exists, tt.existingDigest, tt.digest, tt.overwrite)
+			if status != tt.wantStatus || uploadStatus != tt.wantUploadStatus || write != tt.wantWrite {
+				t.Fatalf("got status=%d uploadStatus=%q write=%v; want status=%d uploadStatus=%q write=%v", status, uploadStatus, write, tt.wantStatus, tt.wantUploadStatus, tt.wantWrite)
+			}
+		})
+	}
+}
 
 func TestValidateRawUploadFilenameAcceptsSafeMarkdownFilename(t *testing.T) {
 	tests := []string{
