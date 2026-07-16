@@ -26,10 +26,10 @@ jobs:
       id-token: write
 
     steps:
-      - name: Checkout develop/1.0
+      - name: Checkout main
         uses: actions/checkout@v4
         with:
-          ref: develop/1.0
+          ref: main
           fetch-depth: 0
 
       - name: Validate promotion commit
@@ -42,13 +42,13 @@ jobs:
             echo "commit_sha must be a 40-character lowercase commit SHA"
             exit 1
           fi
-          git fetch origin develop/1.0 --force --no-tags
+          git fetch origin main --force --no-tags
           if ! git cat-file -e "$COMMIT_SHA^{commit}"; then
             echo "commit_sha does not identify a commit"
             exit 1
           fi
-          if ! git merge-base --is-ancestor "$COMMIT_SHA" origin/develop/1.0; then
-            echo "commit_sha is not an ancestor of develop/1.0"
+          if ! git merge-base --is-ancestor "$COMMIT_SHA" origin/main; then
+            echo "commit_sha is not an ancestor of main"
             exit 1
           fi
           echo "commit_sha=$COMMIT_SHA" >> "$GITHUB_OUTPUT"
@@ -62,7 +62,7 @@ jobs:
           set -euo pipefail
           RUN_ID=$(gh api \
             "repos/${GITHUB_REPOSITORY}/actions/workflows/deploy-bff.yml/runs?event=push&status=completed&head_sha=${COMMIT_SHA}&per_page=100" \
-            | jq -r --arg sha "$COMMIT_SHA" 'first(.workflow_runs[] | select(.event == "push" and .head_branch == "develop/1.0" and .head_sha == $sha and .conclusion == "success") | .id) // empty')
+            | jq -r --arg sha "$COMMIT_SHA" 'first(.workflow_runs[] | select(.event == "push" and .head_branch == "main" and .head_sha == $sha and .conclusion == "success") | .id) // empty')
           if [[ -z "$RUN_ID" ]]; then
             echo "no successful push run of deploy-bff.yml found for $COMMIT_SHA"
             exit 1

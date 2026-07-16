@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - develop/1.0
+      - main
   workflow_dispatch:
 
 env:
@@ -83,6 +84,7 @@ jobs:
           echo "git_tag=$GIT_TAG" >> "$GITHUB_OUTPUT"
 
       - name: Build and deploy to Cloud Run
+        id: build
         env:
           BUCKET: llm-wiki-data-dev
           FIRESTORE_DATABASE_ID: llm-wiki-cloud-dev
@@ -147,9 +149,35 @@ jobs:
             exit 1
           fi
 
-          echo "Deploying ${IMAGE}…"
+          if ! BUILD_RESULT=$(gcloud builds describe "$BUILD_ID" \
+            --project="${{ env.PROJECT_ID }}" \
+            --format=json \
+            --quiet); then
+            echo "Unable to read successful Cloud Build $BUILD_ID result; failing closed."
+            exit 1
+          fi
+          if ! RESULT_IMAGES=$(jq -cer --arg image "$IMAGE" \
+            '[.results.images[]? | select(.name == $image)]' <<<"$BUILD_RESULT"); then
+            echo "Cloud Build $BUILD_ID returned an unreadable image result; failing closed."
+            exit 1
+          fi
+          RESULT_IMAGE_COUNT=$(jq -er 'length' <<<"$RESULT_IMAGES")
+          if [[ "$RESULT_IMAGE_COUNT" != "1" ]]; then
+            echo "Cloud Build $BUILD_ID returned $RESULT_IMAGE_COUNT image results for $IMAGE; refusing to deploy."
+            exit 1
+          fi
+          DIGEST=$(jq -er '.[0].digest' <<<"$RESULT_IMAGES")
+          if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "Cloud Build $BUILD_ID returned an invalid image digest; refusing to deploy."
+            exit 1
+          fi
+          IMMUTABLE_IMAGE="${{ env.AR_REPO }}/llm-wiki-bff@$DIGEST"
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          echo "immutable_image=$IMMUTABLE_IMAGE" >> "$GITHUB_OUTPUT"
+
+          echo "Deploying ${IMMUTABLE_IMAGE}…"
           gcloud run deploy ${{ env.SERVICE_NAME }} \
-            --image "$IMAGE" \
+            --image "$IMMUTABLE_IMAGE" \
             --region ${{ env.REGION }} \
             --service-account "${{ env.RUNTIME_SERVICE_ACCOUNT }}" \
             --network default --subnet default \
@@ -160,8 +188,27 @@ jobs:
             --quiet
           echo "✅ Deployed ${{ env.SERVICE_NAME }} ($GIT_SHA)"
 
-      - name: Resolve deployed image digest
+          LATEST_READY_REVISION=$(gcloud run services describe ${{ env.SERVICE_NAME }} \
+            --region ${{ env.REGION }} \
+            --format='value(status.latestReadyRevisionName)' \
+            --quiet)
+          if [[ -z "$LATEST_READY_REVISION" ]]; then
+            echo "Cloud Run did not report a latest ready revision; refusing to publish provenance."
+            exit 1
+          fi
+          DEPLOYED_IMAGE_DIGEST=$(gcloud run revisions describe "$LATEST_READY_REVISION" \
+            --region ${{ env.REGION }} \
+            --format='value(status.imageDigest)' \
+            --quiet)
+          if [[ "$DEPLOYED_IMAGE_DIGEST" != "$IMMUTABLE_IMAGE" ]]; then
+            echo "Latest ready revision $LATEST_READY_REVISION image digest does not match the deployed build result; refusing to publish provenance."
+            exit 1
+          fi
+
+      - name: Persist build image digest
         id: image_digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           set -euo pipefail
           COMMIT_SHA="${{ steps.identity.outputs.git_sha }}"
@@ -169,10 +216,8 @@ jobs:
             echo "built commit SHA must be a 40-character lowercase commit SHA"
             exit 1
           fi
-          IMAGE="${{ env.AR_REPO }}/llm-wiki-bff:$COMMIT_SHA"
-          DIGEST=$(gcloud artifacts docker images describe "$IMAGE" --format="value(image_summary.digest)" --quiet)
           if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-            echo "deployed image digest is missing or invalid"
+            echo "Cloud Build image digest is missing or invalid"
             exit 1
           fi
           DIGEST_FILE="bff-image-digest-$COMMIT_SHA.txt"
@@ -180,7 +225,7 @@ jobs:
           echo "commit_sha=$COMMIT_SHA" >> "$GITHUB_OUTPUT"
           echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
           echo "digest_file=$DIGEST_FILE" >> "$GITHUB_OUTPUT"
-          echo "Resolved $IMAGE to $DIGEST"
+          echo "Persisted Cloud Build image digest $DIGEST"
 
       - name: Upload image digest artifact
         uses: actions/upload-artifact@v4
