@@ -32,6 +32,95 @@ func TestDevWorkflowValidatesAndPassesBuildIdentity(t *testing.T) {
 	assertWorkflowUsesCentralizedVersioncheck(t, contents)
 }
 
+func TestDeployWorkflowPushesDevelopAndMain(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
+	const pushBranchesStart = "  push:\n    branches:\n"
+	start := strings.Index(contents, pushBranchesStart)
+	if start == -1 {
+		t.Fatal("deploy workflow is missing a push branches trigger")
+	}
+	pushBranches := contents[start+len(pushBranchesStart):]
+	if end := strings.Index(pushBranches, "  workflow_dispatch:"); end != -1 {
+		pushBranches = pushBranches[:end]
+	}
+	var branches []string
+	for _, line := range strings.Split(pushBranches, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if !strings.HasPrefix(line, "- ") {
+			t.Fatalf("deploy workflow push branch line must use YAML list syntax; got %q", line)
+		}
+		branches = append(branches, strings.TrimSpace(strings.TrimPrefix(line, "- ")))
+	}
+	want := []string{"develop/1.0", "main"}
+	if len(branches) != len(want) {
+		t.Fatalf("deploy workflow push branches = %q, want %q", branches, want)
+	}
+	for i, branch := range want {
+		if branches[i] != branch {
+			t.Fatalf("deploy workflow push branch %d = %q, want %q", i, branches[i], branch)
+		}
+	}
+}
+
+func TestDeployWorkflowUsesImmutableCloudBuildResultDigest(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
+	for _, want := range []string{
+		"id: build",
+		`BUILD_RESULT=$(gcloud builds describe "$BUILD_ID"`,
+		"--format=json",
+		`[.results.images[]? | select(.name == $image)]`,
+		`if [[ "$RESULT_IMAGE_COUNT" != "1" ]]; then`,
+		`DIGEST=$(jq -er '.[0].digest' <<<"$RESULT_IMAGES")`,
+		`if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then`,
+		`IMMUTABLE_IMAGE="${{ env.AR_REPO }}/llm-wiki-bff@$DIGEST"`,
+		`--image "$IMMUTABLE_IMAGE"`,
+		`echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"`,
+		`DIGEST: ${{ steps.build.outputs.digest }}`,
+		"latestReadyRevisionName",
+		"gcloud run revisions describe",
+		"status.imageDigest",
+		`[[ "$DEPLOYED_IMAGE_DIGEST" != "$IMMUTABLE_IMAGE" ]]`,
+	} {
+		if !strings.Contains(contents, want) {
+			t.Errorf("deploy workflow is missing immutable build provenance contract %q", want)
+		}
+	}
+	if strings.Contains(contents, "gcloud artifacts docker images describe") {
+		t.Fatal("deploy workflow must not re-resolve the mutable image tag after Cloud Build")
+	}
+	if strings.Contains(contents, `--image "$IMAGE"`) {
+		t.Fatal("deploy workflow must not deploy the mutable Cloud Build output tag")
+	}
+	if strings.Index(contents, `BUILD_RESULT=$(gcloud builds describe "$BUILD_ID"`) > strings.Index(contents, `--image "$IMMUTABLE_IMAGE"`) {
+		t.Fatal("deploy workflow must read the exact Cloud Build result before deploying")
+	}
+	if strings.Index(contents, "latestReadyRevisionName") > strings.Index(contents, "Upload image digest artifact") {
+		t.Fatal("deploy workflow must verify the latest ready revision before uploading the digest artifact")
+	}
+}
+
+func TestReleaseWorkflowRequiresMainBuildProvenance(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/release-bff.yml")
+	for _, want := range []string{
+		"- name: Checkout main",
+		"ref: main",
+		"git fetch origin main --force --no-tags",
+		`git merge-base --is-ancestor "$COMMIT_SHA" origin/main`,
+		"commit_sha is not an ancestor of main",
+		`.head_branch == "main"`,
+	} {
+		if !strings.Contains(contents, want) {
+			t.Errorf("release workflow is missing main provenance contract %q", want)
+		}
+	}
+	if strings.Contains(contents, "develop/1.0") {
+		t.Fatal("release workflow must not accept develop/1.0 provenance")
+	}
+}
+
 func TestCIWorkflowValidatesProductVersion(t *testing.T) {
 	contents := readWorkflow(t, ".github/workflows/ci.yml")
 	for _, want := range []string{
