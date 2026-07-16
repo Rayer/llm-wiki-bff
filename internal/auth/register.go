@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"time"
 
 	"cloud.google.com/go/firestore"
 	"github.com/gin-gonic/gin"
@@ -17,6 +18,8 @@ type RegisterRequest struct {
 	Email    string `json:"email" binding:"required"`
 	Password string `json:"password" binding:"required"`
 }
+
+const registrationTokenTTL = 24 * time.Hour
 
 type RegisterResponse struct {
 	Token     string `json:"token"`
@@ -109,7 +112,7 @@ func RegisterHandler(fs *firestore.Client, jwtSecret string, gate RegistrationGa
 		}
 
 		// Issue JWT
-		token, err := GenerateToken(userID, jwtSecret, 24*3600)
+		token, err := GenerateToken(userID, jwtSecret, registrationTokenTTL)
 		if err != nil {
 			log.Printf("[register] JWT generation failed: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
