@@ -1,14 +1,22 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/rayer/llm-wiki-bff/internal/annotation"
+	"github.com/rayer/llm-wiki-bff/internal/sourcestatus"
 )
 
 func TestParseCommandBatch(t *testing.T) {
@@ -285,6 +293,27 @@ func TestPipelineLogPathRejectsUnsafeExecutionID(t *testing.T) {
 	}
 }
 
+func TestWorkspaceSuccessSanitizesSecretSplitAcrossWrites(t *testing.T) {
+	old := execOLW
+	defer func() { execOLW = old }()
+	vault := workspaceVault(t, "original")
+	execOLW = func(_ context.Context, _ string, _ []string, _ []string, stdout, _ io.Writer) error {
+		if _, err := io.WriteString(stdout, "token=chunked-"); err != nil {
+			return err
+		}
+		_, err := io.WriteString(stdout, "secret")
+		return err
+	}
+	cfg := workerConfig{VaultPath: vault, APIKey: "chunked-secret", ExecutionID: "success", Workspace: true, WorkspaceDir: t.TempDir(), Postprocess: true}
+	if err := runWorkerBatch(context.Background(), cfg, `[["run"]]`); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(vault, "cache", "pipeline-success.log"))
+	if err != nil || strings.Contains(string(data), "chunked-secret") || !strings.Contains(string(data), "[REDACTED]") {
+		t.Fatalf("success log=%q err=%v", data, err)
+	}
+}
+
 func TestRunPostprocessWritesSuggestedQueriesFromConcepts(t *testing.T) {
 	vault := t.TempDir()
 	mustWriteFile(t, filepath.Join(vault, "wiki", "alpha.md"), []byte("---\nid: alpha-id\ntitle: Alpha\nupdated: 2026-07-01T00:00:00Z\n---\nAlpha"))
@@ -356,4 +385,623 @@ func mustWriteFile(t *testing.T, path string, data []byte) {
 	if err := os.WriteFile(path, data, 0o644); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestWorkspaceMaterializesAnnotationWithoutChangingStoredRaw(t *testing.T) {
+	old := execOLW
+	defer func() { execOLW = old }()
+	vault := workspaceVault(t, "original")
+	writeWorkspaceAnnotation(t, vault, "s1", "raw/source.md", "A human note")
+	var gotVault, gotRaw string
+	execOLW = func(_ context.Context, work string, _ []string, _ []string, _, _ io.Writer) error {
+		data, err := os.ReadFile(filepath.Join(work, "raw", "source.md"))
+		if err != nil {
+			return err
+		}
+		gotVault, gotRaw = work, string(data)
+		return nil
+	}
+	cfg := workerConfig{VaultPath: vault, APIKey: "secret", Workspace: true, WorkspaceDir: t.TempDir(), Postprocess: true, StopOnError: true}
+	if err := runWorkerBatch(context.Background(), cfg, `[["run"]]`); err != nil {
+		t.Fatal(err)
+	}
+	if gotVault == vault || gotRaw != "original\n\n---\n\n## Human annotations (system)\n<!-- lwc-ann-v1 source_id=s1 ann_sha256="+annotation.Digest("A human note")+" -->\nA human note\n" {
+		t.Fatalf("OLW input vault=%q raw=%q", gotVault, gotRaw)
+	}
+	stored, err := os.ReadFile(filepath.Join(vault, "raw", "source.md"))
+	if err != nil || string(stored) != "original" {
+		t.Fatalf("stored raw=%q err=%v", stored, err)
+	}
+	artifact, err := readSourceStatus(vault)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt := artifact.Sources["s1"]
+	if !sourcestatus.ValidReceipt(receipt, "raw/source.md") || receipt.LastIngestedAnnSHA256 != annotation.Digest("A human note") {
+		t.Fatalf("receipt=%+v", receipt)
+	}
+}
+
+func TestWorkspaceEmptyAnnotationRemovesPriorInfluence(t *testing.T) {
+	old := execOLW
+	defer func() { execOLW = old }()
+	vault := workspaceVault(t, "original")
+	writeWorkspaceStatus(t, vault, sourcestatus.Receipt{RawPath: "raw/source.md", LastIngestedRawSHA256: sha256Text("original"), LastIngestedAnnSHA256: annotation.Digest("old"), LastIngestFingerprint: sourcestatus.Fingerprint(sha256Text("original"), annotation.Digest("old")), LastSuccessAt: time.Now().UTC().Format(time.RFC3339)})
+	var got string
+	execOLW = func(_ context.Context, work string, _ []string, _ []string, _, _ io.Writer) error {
+		data, err := os.ReadFile(filepath.Join(work, "raw", "source.md"))
+		got = string(data)
+		return err
+	}
+	if err := runWorkerBatch(context.Background(), workerConfig{VaultPath: vault, APIKey: "secret", Workspace: true, WorkspaceDir: t.TempDir(), Postprocess: true}, `[["run"]]`); err != nil {
+		t.Fatal(err)
+	}
+	if got != "original" {
+		t.Fatalf("empty annotation input=%q, want original raw only", got)
+	}
+	artifact, _ := readSourceStatus(vault)
+	if artifact.Sources["s1"].LastIngestedAnnSHA256 != annotation.Digest("") {
+		t.Fatalf("receipt=%+v", artifact.Sources["s1"])
+	}
+}
+
+func TestWorkspaceMarkerLikeAnnotationOnlyGetsOneSystemTrailer(t *testing.T) {
+	old := execOLW
+	defer func() { execOLW = old }()
+	vault := workspaceVault(t, "original")
+	writeWorkspaceAnnotation(t, vault, "s1", "raw/source.md", "## Human annotations (system)\n<!-- lwc-ann-v1 source_id=s1 ann_sha256=fake -->")
+	var got string
+	execOLW = func(_ context.Context, work string, _ []string, _ []string, _, _ io.Writer) error {
+		data, err := os.ReadFile(filepath.Join(work, "raw", "source.md"))
+		got = string(data)
+		return err
+	}
+	if err := runWorkerBatch(context.Background(), workerConfig{VaultPath: vault, APIKey: "secret", Workspace: true, WorkspaceDir: t.TempDir(), Postprocess: true}, `[["run"]]`); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(got, "## Human annotations (system)") != 2 || strings.Count(got, "<!-- lwc-ann-v1 source_id=s1 ann_sha256=") != 2 {
+		t.Fatalf("annotation text was not preserved literally or system trailer duplicated: %q", got)
+	}
+}
+
+func TestWorkspaceMaterializesAnnotatedSourceIdenticallyOnSequentialRuns(t *testing.T) {
+	old := execOLW
+	defer func() { execOLW = old }()
+	vault := workspaceVault(t, "original")
+	writeWorkspaceAnnotation(t, vault, "s1", "raw/source.md", "note\n")
+	var materialized []string
+	execOLW = func(_ context.Context, work string, _ []string, _ []string, _, _ io.Writer) error {
+		data, err := os.ReadFile(filepath.Join(work, "raw", "source.md"))
+		materialized = append(materialized, string(data))
+		return err
+	}
+	cfg := workerConfig{VaultPath: vault, APIKey: "secret", Workspace: true, WorkspaceDir: t.TempDir(), Postprocess: true}
+	for i := 0; i < 2; i++ {
+		if err := runWorkerBatch(context.Background(), cfg, `[["run","--auto-approve"],["approve","--all"]]`); err != nil {
+			t.Fatal(err)
+		}
+		// In production OLW regenerates id_map with its source mappings. The fake
+		// executor above does not, so retain this mapped-source fixture between
+		// the two independent workspace runs.
+		mustWriteFile(t, filepath.Join(vault, "cache", "id_map.json"), []byte(`{"source_meta":{"s1":{"source_file":"raw/source.md"}}}`))
+	}
+	if len(materialized) != 4 || materialized[0] != materialized[2] {
+		t.Fatalf("materialized runs differ: %#v", materialized)
+	}
+	if strings.Count(materialized[0], "<!-- lwc-ann-v1 source_id=s1 ") != 1 {
+		t.Fatalf("materialized input has wrong trailer count: %q", materialized[0])
+	}
+	stored, err := os.ReadFile(filepath.Join(vault, "raw", "source.md"))
+	if err != nil || string(stored) != "original" {
+		t.Fatalf("stored raw changed: %q err=%v", stored, err)
+	}
+}
+
+func TestWorkspaceRejectsDuplicateMappedRawPath(t *testing.T) {
+	vault := workspaceVault(t, "original")
+	mustWriteFile(t, filepath.Join(vault, "cache", "id_map.json"), []byte(`{"source_meta":{"s1":{"source_file":"raw/source.md"},"s2":{"source_file":"raw/source.md"}}}`))
+	err := runWorkerBatch(context.Background(), workerConfig{VaultPath: vault, APIKey: "secret", Workspace: true, WorkspaceDir: t.TempDir(), Postprocess: true}, `[["run"]]`)
+	if err == nil || !strings.Contains(err.Error(), "duplicate source mapping") {
+		t.Fatalf("error=%v", err)
+	}
+}
+
+func TestWorkspaceRequiresFirstCommandToBeRunBeforeLeaseOrExecution(t *testing.T) {
+	old := execOLW
+	defer func() { execOLW = old }()
+
+	for _, commands := range []string{
+		`[["clear"],["run","--auto-approve"]]`,
+		`[["approve","--all"]]`,
+		`[["clear"],["approve","--all"]]`,
+	} {
+		t.Run(commands, func(t *testing.T) {
+			vault := workspaceVault(t, "original")
+			executed := false
+			execOLW = func(context.Context, string, []string, []string, io.Writer, io.Writer) error {
+				executed = true
+				return nil
+			}
+
+			err := runWorkerBatch(context.Background(), workerConfig{VaultPath: vault, APIKey: "secret", ExecutionID: "invalid", Workspace: true, WorkspaceDir: t.TempDir(), Postprocess: true}, commands)
+			if err == nil || !strings.Contains(err.Error(), "requires the first olw command to be run") {
+				t.Fatalf("error=%v", err)
+			}
+			if executed {
+				t.Fatal("OLW executed for an invalid workspace batch")
+			}
+			for _, path := range []string{"cache/source_status.json", ".olw/lwc-worker-lease.json"} {
+				if _, err := os.Stat(filepath.Join(vault, path)); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("invalid batch wrote %s: %v", path, err)
+				}
+			}
+		})
+	}
+}
+
+func TestWorkspaceAcceptsProductionCommandContract(t *testing.T) {
+	old := execOLW
+	defer func() { execOLW = old }()
+	vault := workspaceVault(t, "original")
+	var got [][]string
+	execOLW = func(_ context.Context, _ string, command []string, _ []string, _, _ io.Writer) error {
+		got = append(got, append([]string(nil), command...))
+		return nil
+	}
+
+	if err := runWorkerBatch(context.Background(), workerConfig{VaultPath: vault, APIKey: "secret", Workspace: true, WorkspaceDir: t.TempDir(), Postprocess: true}, `[["run","--auto-approve"],["approve","--all"]]`); err != nil {
+		t.Fatal(err)
+	}
+	want := [][]string{{"run", "--auto-approve"}, {"approve", "--all"}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("commands=%q, want %q", got, want)
+	}
+}
+
+func TestWorkspaceLeaseRejectsOverlapBeforeSnapshotOrPublish(t *testing.T) {
+	old := execOLW
+	defer func() { execOLW = old }()
+	vault := workspaceVault(t, "original")
+	started := make(chan struct{})
+	release := make(chan struct{})
+	execOLW = func(_ context.Context, _ string, _ []string, _ []string, _, _ io.Writer) error {
+		close(started)
+		<-release
+		return nil
+	}
+	cfg := workerConfig{VaultPath: vault, APIKey: "secret", ExecutionID: "first", Workspace: true, WorkspaceDir: t.TempDir(), Postprocess: true}
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- runWorkerBatch(context.Background(), cfg, `[["run"]]`) }()
+	<-started
+	// Model an independently queued later run with a different source mapping.
+	// It must be denied before it can snapshot, publish, or write an s2 receipt.
+	mustWriteFile(t, filepath.Join(vault, "raw", "second.md"), []byte("second"))
+	mustWriteFile(t, filepath.Join(vault, "cache", "id_map.json"), []byte(`{"source_meta":{"s2":{"source_file":"raw/second.md"}}}`))
+	err := runWorkerBatch(context.Background(), workerConfig{VaultPath: vault, APIKey: "secret", ExecutionID: "second", Workspace: true, WorkspaceDir: t.TempDir(), Postprocess: true}, `[["run"]]`)
+	if err == nil || !strings.Contains(err.Error(), "vault lease is held") {
+		t.Fatalf("overlap error=%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(vault, "cache", "source_status.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("overlapping execution published receipt: %v", err)
+	}
+	close(release)
+	if err := <-firstDone; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readSourceStatus(vault); err != nil {
+		t.Fatalf("first receipt missing: %v", err)
+	}
+	status, err := readSourceStatus(vault)
+	if err != nil || status.Sources["s1"].LastIngestFingerprint == "" {
+		t.Fatalf("first receipt=%+v err=%v", status.Sources, err)
+	}
+	if _, exists := status.Sources["s2"]; exists {
+		t.Fatalf("overlapping later run wrote s2 receipt: %+v", status.Sources["s2"])
+	}
+}
+
+func TestStagePublishMirrorsWikiAndExcludesUnownedFiles(t *testing.T) {
+	vault := workspaceVault(t, "stored raw")
+	mustWriteFile(t, filepath.Join(vault, "wiki", "stale.md"), []byte("stale"))
+	mustWriteFile(t, filepath.Join(vault, "cache", "annotations", "s1.json"), []byte("keep annotation"))
+	mustWriteFile(t, filepath.Join(vault, "cache", "unknown.json"), []byte("keep unknown"))
+	mustWriteFile(t, filepath.Join(vault, ".olw", "other.db"), []byte("keep other"))
+	workspace := t.TempDir()
+	mustWriteFile(t, filepath.Join(workspace, "raw", "source.md"), []byte("workspace raw"))
+	mustWriteFile(t, filepath.Join(workspace, "wiki", "current.md"), []byte("current"))
+	mustWriteFile(t, filepath.Join(workspace, "cache", "id_map.json"), []byte("id map"))
+	mustWriteFile(t, filepath.Join(workspace, "cache", "annotations", "s1.json"), []byte("must not copy"))
+	mustWriteFile(t, filepath.Join(workspace, "cache", "unknown.json"), []byte("must not copy"))
+	mustWriteFile(t, filepath.Join(workspace, ".olw", "state.db"), []byte("state"))
+	mustWriteFile(t, filepath.Join(workspace, ".olw", "pipeline.lock"), []byte("must not copy"))
+	if err := syncWorkspaceOutputs(workspace, vault, ""); err != nil {
+		t.Fatal(err)
+	}
+	for _, absent := range []string{"wiki/stale.md", ".olw/pipeline.lock"} {
+		if _, err := os.Stat(filepath.Join(vault, absent)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("unexpected synced file %s: %v", absent, err)
+		}
+	}
+	for path, want := range map[string]string{"raw/source.md": "stored raw", "cache/annotations/s1.json": "keep annotation", "cache/unknown.json": "keep unknown", ".olw/other.db": "keep other", "wiki/current.md": "current", ".olw/state.db": "state"} {
+		data, err := os.ReadFile(filepath.Join(vault, path))
+		if err != nil || string(data) != want {
+			t.Fatalf("%s=%q err=%v, want %q", path, data, err, want)
+		}
+	}
+}
+
+func TestPublishRollbackPreservesPriorGenerationOnRenameError(t *testing.T) {
+	vault := t.TempDir()
+	mustWriteFile(t, filepath.Join(vault, "wiki", "page.md"), []byte("old"))
+	workspace := t.TempDir()
+	mustWriteFile(t, filepath.Join(workspace, "wiki", "page.md"), []byte("new"))
+	stage, err := stageWorkspaceOutputs(workspace, vault, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldRename := publishRename
+	defer func() { publishRename = oldRename }()
+	publishRename = func(root *os.Root, oldName, newName string) error {
+		if strings.HasSuffix(oldName, "/wiki") && newName == "wiki" {
+			return errors.New("injected rename failure")
+		}
+		return root.Rename(oldName, newName)
+	}
+	if err := publishStagedOutputs(vault, stage); err == nil {
+		t.Fatal("publish succeeded")
+	}
+	data, err := os.ReadFile(filepath.Join(vault, "wiki", "page.md"))
+	if err != nil || string(data) != "old" {
+		t.Fatalf("prior generation not restored: %q err=%v", data, err)
+	}
+}
+
+func TestRecoverCommittedPublishPreservesNewGeneration(t *testing.T) {
+	vault := t.TempDir()
+	mustWriteFile(t, filepath.Join(vault, "wiki", "page.md"), []byte("new"))
+	mustWriteFile(t, filepath.Join(vault, ".lwc-worker-backup-crash", "wiki", "page.md"), []byte("old"))
+	if err := os.Mkdir(filepath.Join(vault, ".lwc-worker-stage-crash"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	journal := publishJournalRecord{
+		Stage: ".lwc-worker-stage-crash", Backup: ".lwc-worker-backup-crash", Phase: publishPhaseCommitted,
+		Entries: []publishEntry{{Destination: "wiki", Stage: ".lwc-worker-stage-crash/wiki", Backup: ".lwc-worker-backup-crash/wiki", HadOld: true, Published: true}},
+	}
+	if err := writePublishJournal(vault, journal); err != nil {
+		t.Fatal(err)
+	}
+	if err := recoverInterruptedPublish(vault); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(vault, "wiki", "page.md"))
+	if err != nil || string(data) != "new" {
+		t.Fatalf("published generation changed after committed recovery: %q err=%v", data, err)
+	}
+	for _, name := range []string{publishJournal, journal.Stage, journal.Backup} {
+		if _, err := os.Stat(filepath.Join(vault, name)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("committed recovery left %s: %v", name, err)
+		}
+	}
+}
+
+func TestRecoverInterruptedPublishRejectsMalformedJournalWithoutChanges(t *testing.T) {
+	base := publishJournalRecord{
+		Stage:   ".lwc-worker-stage-crash",
+		Backup:  ".lwc-worker-backup-crash",
+		Entries: []publishEntry{{Destination: "wiki", Stage: ".lwc-worker-stage-crash/wiki", Backup: ".lwc-worker-backup-crash/wiki", HadOld: true, Published: true}},
+	}
+	cases := []struct {
+		name   string
+		mutate func(*publishJournalRecord)
+	}{
+		{"raw destination", func(j *publishJournalRecord) { j.Entries[0].Destination = "raw" }},
+		{"raw backup path", func(j *publishJournalRecord) { j.Entries[0].Backup = "raw" }},
+		{"traversal backup path", func(j *publishJournalRecord) { j.Entries[0].Backup = ".lwc-worker-backup-crash/../raw" }},
+		{"bad stage", func(j *publishJournalRecord) { j.Stage = "raw" }},
+		{"duplicate destination", func(j *publishJournalRecord) { j.Entries = append(j.Entries, j.Entries[0]) }},
+		{"invalid phase", func(j *publishJournalRecord) { j.Phase = "rollback" }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			vault := t.TempDir()
+			for path, data := range map[string]string{
+				"raw/source.md":                 "raw",
+				"cache/annotations/source.json": "annotation",
+				"wiki/page.md":                  "wiki",
+				"cache/id_map.json":             "cache",
+				".olw/state.db":                 "state",
+			} {
+				mustWriteFile(t, filepath.Join(vault, path), []byte(data))
+			}
+			journal := base
+			journal.Entries = append([]publishEntry(nil), base.Entries...)
+			tc.mutate(&journal)
+			data, err := json.Marshal(journal)
+			if err != nil {
+				t.Fatal(err)
+			}
+			mustWriteFile(t, filepath.Join(vault, publishJournal), data)
+			if err := recoverInterruptedPublish(vault); err == nil {
+				t.Fatal("recovery succeeded")
+			}
+			for path, want := range map[string]string{
+				"raw/source.md":                 "raw",
+				"cache/annotations/source.json": "annotation",
+				"wiki/page.md":                  "wiki",
+				"cache/id_map.json":             "cache",
+				".olw/state.db":                 "state",
+			} {
+				got, err := os.ReadFile(filepath.Join(vault, path))
+				if err != nil || string(got) != want {
+					t.Fatalf("%s=%q err=%v, want %q", path, got, err, want)
+				}
+			}
+		})
+	}
+}
+
+func TestCommittedCleanupFailurePreservesNewGeneration(t *testing.T) {
+	vault := t.TempDir()
+	workspace := t.TempDir()
+	mustWriteFile(t, filepath.Join(vault, "wiki", "page.md"), []byte("old"))
+	mustWriteFile(t, filepath.Join(workspace, "wiki", "page.md"), []byte("new"))
+	stage, err := stageWorkspaceOutputs(workspace, vault, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldRemoveAll := publishRemoveAll
+	defer func() { publishRemoveAll = oldRemoveAll }()
+	publishRemoveAll = func(root *os.Root, name string) error {
+		if strings.HasPrefix(name, ".lwc-worker-backup-") {
+			return errors.New("injected cleanup failure")
+		}
+		return root.RemoveAll(name)
+	}
+	err = publishStagedOutputs(vault, stage)
+	publishRemoveAll = oldRemoveAll
+	if err == nil || !strings.Contains(err.Error(), "injected cleanup failure") {
+		t.Fatalf("publish error=%v", err)
+	}
+	data, readErr := os.ReadFile(filepath.Join(vault, "wiki", "page.md"))
+	if readErr != nil || string(data) != "new" {
+		t.Fatalf("cleanup error rolled back new generation: %q err=%v", data, readErr)
+	}
+	if err := recoverInterruptedPublish(vault); err != nil {
+		t.Fatal(err)
+	}
+	data, readErr = os.ReadFile(filepath.Join(vault, "wiki", "page.md"))
+	if readErr != nil || string(data) != "new" {
+		t.Fatalf("committed recovery rolled back new generation: %q err=%v", data, readErr)
+	}
+}
+
+func TestPublishRejectsDestinationSymlink(t *testing.T) {
+	vault := t.TempDir()
+	external := t.TempDir()
+	if err := os.Symlink(external, filepath.Join(vault, "wiki")); err != nil {
+		t.Fatal(err)
+	}
+	workspace := t.TempDir()
+	mustWriteFile(t, filepath.Join(workspace, "wiki", "page.md"), []byte("new"))
+	if err := syncWorkspaceOutputs(workspace, vault, ""); err == nil || !strings.Contains(err.Error(), "destination symlink") {
+		t.Fatalf("error=%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(external, "page.md")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("wrote through destination symlink: %v", err)
+	}
+}
+
+func TestWorkspaceFailurePublishesCappedRedactedLog(t *testing.T) {
+	old := execOLW
+	defer func() { execOLW = old }()
+	vault := workspaceVault(t, "original")
+	execOLW = func(_ context.Context, _ string, _ []string, _ []string, stdout, _ io.Writer) error {
+		_, _ = io.WriteString(stdout, "key=very-secret")
+		return errors.New("OLW failed")
+	}
+	cfg := workerConfig{VaultPath: vault, APIKey: "very-secret", ExecutionID: "failed", Workspace: true, WorkspaceDir: t.TempDir(), Postprocess: true}
+	if err := runWorkerBatch(context.Background(), cfg, `[["run"]]`); err == nil {
+		t.Fatal("run succeeded")
+	}
+	data, err := os.ReadFile(filepath.Join(vault, "cache", "pipeline-failed.log"))
+	if err != nil || strings.Contains(string(data), "very-secret") || !strings.Contains(string(data), "[REDACTED]") {
+		t.Fatalf("failure log=%q err=%v", data, err)
+	}
+}
+
+func TestWorkspaceFailureLogPublishesWhenOtherWorkspaceOutputIsInvalid(t *testing.T) {
+	vault := t.TempDir()
+	workspace := t.TempDir()
+	mustWriteFile(t, filepath.Join(workspace, "cache", "pipeline-failed.log"), []byte("key=very-secret"))
+	if err := os.Symlink(t.TempDir(), filepath.Join(workspace, "wiki")); err != nil {
+		t.Fatal(err)
+	}
+	if err := publishWorkspaceFailureLog(workspace, vault, workerConfig{ExecutionID: "failed", APIKey: "very-secret"}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(vault, "cache", "pipeline-failed.log"))
+	if err != nil || string(data) != "key=[REDACTED]" {
+		t.Fatalf("failure log=%q err=%v", data, err)
+	}
+}
+
+func TestCappedRedactingWriterCapsAndRedacts(t *testing.T) {
+	var output bytes.Buffer
+	writer := &cappedRedactingWriter{writer: &output, secrets: []string{"secret"}, limit: 11}
+	if _, err := writer.Write([]byte("secret-123456789")); err != nil {
+		t.Fatal(err)
+	}
+	if got := output.String(); got != "[REDACTED]-" {
+		t.Fatalf("log=%q, want capped redaction", got)
+	}
+}
+
+func TestWorkspaceConcurrentAnnotationRemainsDirtyAndIsNotSyncedBack(t *testing.T) {
+	old := execOLW
+	defer func() { execOLW = old }()
+	vault := workspaceVault(t, "original")
+	writeWorkspaceAnnotation(t, vault, "s1", "raw/source.md", "start")
+	execOLW = func(_ context.Context, _ string, _ []string, _ []string, _, _ io.Writer) error {
+		writeWorkspaceAnnotation(t, vault, "s1", "raw/source.md", "concurrent")
+		return nil
+	}
+	if err := runWorkerBatch(context.Background(), workerConfig{VaultPath: vault, APIKey: "secret", Workspace: true, WorkspaceDir: t.TempDir(), Postprocess: true}, `[["run"]]`); err != nil {
+		t.Fatal(err)
+	}
+	artifact, _ := readSourceStatus(vault)
+	if got := artifact.Sources["s1"].LastIngestedAnnSHA256; got != annotation.Digest("start") {
+		t.Fatalf("receipt ann=%s, want start snapshot", got)
+	}
+	ann, err := readAnnotation(vault, "s1", "raw/source.md")
+	if err != nil || ann.Body != "concurrent" {
+		t.Fatalf("annotation=%+v err=%v", ann, err)
+	}
+}
+
+func TestWorkspaceConcurrentRawChangeKeepsStartReceipt(t *testing.T) {
+	old := execOLW
+	defer func() { execOLW = old }()
+	vault := workspaceVault(t, "original")
+	writeWorkspaceAnnotation(t, vault, "s1", "raw/source.md", "note")
+	var materialized string
+	execOLW = func(_ context.Context, work string, _ []string, _ []string, _, _ io.Writer) error {
+		data, err := os.ReadFile(filepath.Join(work, "raw", "source.md"))
+		materialized = string(data)
+		mustWriteFile(t, filepath.Join(vault, "raw", "source.md"), []byte("concurrent raw"))
+		return err
+	}
+	if err := runWorkerBatch(context.Background(), workerConfig{VaultPath: vault, APIKey: "secret", Workspace: true, WorkspaceDir: t.TempDir(), Postprocess: true}, `[["run"]]`); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(materialized, "original\n\n---") {
+		t.Fatalf("workspace input=%q, want start raw", materialized)
+	}
+	artifact, _ := readSourceStatus(vault)
+	if got := artifact.Sources["s1"].LastIngestedRawSHA256; got != sha256Text("original") {
+		t.Fatalf("receipt raw=%s, want start raw", got)
+	}
+	if raw, _ := os.ReadFile(filepath.Join(vault, "raw", "source.md")); string(raw) != "concurrent raw" {
+		t.Fatalf("concurrent raw was overwritten: %q", raw)
+	}
+}
+
+func TestWorkspaceFailurePreservesLastSuccessAndRecordsFailure(t *testing.T) {
+	old := execOLW
+	defer func() { execOLW = old }()
+	vault := workspaceVault(t, "original")
+	prior := sourcestatus.Receipt{RawPath: "raw/source.md", LastIngestedRawSHA256: "oldraw", LastIngestedAnnSHA256: "oldann", LastIngestFingerprint: sourcestatus.Fingerprint("oldraw", "oldann"), LastSuccessAt: time.Now().UTC().Format(time.RFC3339)}
+	writeWorkspaceStatus(t, vault, prior)
+	execOLW = func(context.Context, string, []string, []string, io.Writer, io.Writer) error {
+		return errors.New("OLW failed")
+	}
+	workspaceDir := t.TempDir()
+	err := runWorkerBatch(context.Background(), workerConfig{VaultPath: vault, APIKey: "secret", Workspace: true, WorkspaceDir: workspaceDir, Postprocess: true}, `[["run"]]`)
+	if err == nil {
+		t.Fatal("run error=nil")
+	}
+	artifact, _ := readSourceStatus(vault)
+	got := artifact.Sources["s1"]
+	if got.LastIngestFingerprint != prior.LastIngestFingerprint || got.FailedFingerprint == "" || got.Error == "" {
+		t.Fatalf("receipt=%+v", got)
+	}
+	if raw, _ := os.ReadFile(filepath.Join(vault, "raw", "source.md")); string(raw) != "original" {
+		t.Fatalf("stored raw=%q", raw)
+	}
+	if entries, err := os.ReadDir(workspaceDir); err != nil || len(entries) != 0 {
+		t.Fatalf("workspace entries=%v err=%v", entries, err)
+	}
+}
+
+func TestWorkspaceRejectsUnsafeMappingsAndCleansUp(t *testing.T) {
+	vault := workspaceVault(t, "original")
+	mustWriteFile(t, filepath.Join(vault, "cache", "id_map.json"), []byte(`{"source_meta":{"s1":{"source_file":"raw/../escape.md"}}}`))
+	workspaceDir := t.TempDir()
+	err := runWorkerBatch(context.Background(), workerConfig{VaultPath: vault, APIKey: "secret", Workspace: true, WorkspaceDir: workspaceDir, Postprocess: true}, `[["run"]]`)
+	if err == nil || !strings.Contains(err.Error(), "unsafe source mapping") {
+		t.Fatalf("error=%v", err)
+	}
+	entries, err := os.ReadDir(workspaceDir)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("workspace entries=%v err=%v", entries, err)
+	}
+}
+
+func TestWorkspaceRejectsRawSymlinkEscapeAndMalformedAnnotation(t *testing.T) {
+	vault := workspaceVault(t, "original")
+	external := filepath.Join(t.TempDir(), "outside.md")
+	mustWriteFile(t, external, []byte("outside"))
+	if err := os.Remove(filepath.Join(vault, "raw", "source.md")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(external, filepath.Join(vault, "raw", "source.md")); err != nil {
+		t.Fatal(err)
+	}
+	if err := runWorkerBatch(context.Background(), workerConfig{VaultPath: vault, APIKey: "secret", Workspace: true, WorkspaceDir: t.TempDir(), Postprocess: true}, `[["run"]]`); err == nil {
+		t.Fatal("symlink escape was accepted")
+	}
+
+	vault = workspaceVault(t, "original")
+	mustWriteFile(t, filepath.Join(vault, "cache", "annotations", "s1.json"), []byte(`{"invalid":true}`))
+	if err := runWorkerBatch(context.Background(), workerConfig{VaultPath: vault, APIKey: "secret", Workspace: true, WorkspaceDir: t.TempDir(), Postprocess: true}, `[["run"]]`); err == nil || !strings.Contains(err.Error(), "invalid annotation") {
+		t.Fatalf("malformed annotation error=%v", err)
+	}
+
+	vault = workspaceVault(t, "original")
+	mustWriteFile(t, filepath.Join(vault, "cache", "source_status.json"), []byte(`{"sources":`))
+	if err := runWorkerBatch(context.Background(), workerConfig{VaultPath: vault, APIKey: "secret", Workspace: true, WorkspaceDir: t.TempDir(), Postprocess: true}, `[["run"]]`); err == nil || !strings.Contains(err.Error(), "invalid source status") {
+		t.Fatalf("malformed source status error=%v", err)
+	}
+}
+
+func TestNoWorkspaceRunsAgainstOriginalVault(t *testing.T) {
+	old := execOLW
+	defer func() { execOLW = old }()
+	vault := workspaceVault(t, "original")
+	var got string
+	execOLW = func(_ context.Context, work string, _ []string, _ []string, _, _ io.Writer) error {
+		got = work
+		return nil
+	}
+	if err := runWorkerBatch(context.Background(), workerConfig{VaultPath: vault, APIKey: "secret", Workspace: false, Postprocess: false}, `[["run"]]`); err != nil {
+		t.Fatal(err)
+	}
+	want, err := filepath.EvalSymlinks(vault)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("OLW vault=%q, want %q", got, want)
+	}
+}
+
+func workspaceVault(t *testing.T, raw string) string {
+	t.Helper()
+	vault := t.TempDir()
+	mustWriteFile(t, filepath.Join(vault, "raw", "source.md"), []byte(raw))
+	mustWriteFile(t, filepath.Join(vault, "cache", "id_map.json"), []byte(`{"source_meta":{"s1":{"source_file":"raw/source.md"}}}`))
+	return vault
+}
+
+func writeWorkspaceAnnotation(t *testing.T, vault, sourceID, rawPath, body string) {
+	t.Helper()
+	object := annotation.Object{Version: 1, SourceID: sourceID, RawPath: rawPath, Body: body, SHA256: annotation.Digest(body), UpdatedAt: time.Now().UTC().Format(time.RFC3339), UpdatedBy: "tester"}
+	data, err := json.Marshal(object)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustWriteFile(t, filepath.Join(vault, filepath.FromSlash(annotation.Path(sourceID))), data)
+}
+
+func writeWorkspaceStatus(t *testing.T, vault string, receipt sourcestatus.Receipt) {
+	t.Helper()
+	data, err := json.Marshal(sourcestatus.Artifact{Version: 1, Sources: map[string]sourcestatus.Receipt{"s1": receipt}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustWriteFile(t, filepath.Join(vault, filepath.FromSlash(sourcestatus.Path)), data)
+}
+
+func sha256Text(text string) string {
+	sum := sha256.Sum256([]byte(text))
+	return fmt.Sprintf("%x", sum[:])
 }
