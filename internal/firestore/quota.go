@@ -50,7 +50,7 @@ func (c *Client) ReserveQuota(
 	limits pipelinequota.Limits,
 	now time.Time,
 	isDemo, alreadyRunning bool,
-	newRawFiles int,
+	newRawFiles, rawDirtyFiles, annotationDirtyFiles int,
 ) (prev QuotaPrev, snap pipelinequota.Snapshot, reserved bool, err error) {
 	now = now.UTC()
 	ref := c.fs.Collection(pipelineQuotaCollection).Doc(QuotaDocID(userID, projectID))
@@ -71,15 +71,17 @@ func (c *Client) ReserveQuota(
 		}
 
 		pre := pipelinequota.Evaluate(pipelinequota.Input{
-			Now:            now,
-			Limits:         limits,
-			IsDemo:         isDemo,
-			AlreadyRunning: alreadyRunning,
-			RunsToday:      runsToday,
-			DayKey:         dayKey,
-			LastRunAt:      lastRunAt,
-			NewRawFiles:    newRawFiles,
-			Enforced:       true,
+			Now:                  now,
+			Limits:               limits,
+			IsDemo:               isDemo,
+			AlreadyRunning:       alreadyRunning,
+			RunsToday:            runsToday,
+			DayKey:               dayKey,
+			LastRunAt:            lastRunAt,
+			NewRawFiles:          newRawFiles,
+			RawDirtyFiles:        rawDirtyFiles,
+			AnnotationDirtyFiles: annotationDirtyFiles,
+			Enforced:             true,
 		})
 		if !pre.Allowed {
 			snap = pre
@@ -102,15 +104,17 @@ func (c *Client) ReserveQuota(
 
 		// Post-reserve snapshot for callers (status of the *next* potential run).
 		snap = pipelinequota.Evaluate(pipelinequota.Input{
-			Now:            now,
-			Limits:         limits,
-			IsDemo:         isDemo,
-			AlreadyRunning: alreadyRunning,
-			RunsToday:      newRuns,
-			DayKey:         today,
-			LastRunAt:      now,
-			NewRawFiles:    newRawFiles,
-			Enforced:       true,
+			Now:                  now,
+			Limits:               limits,
+			IsDemo:               isDemo,
+			AlreadyRunning:       alreadyRunning,
+			RunsToday:            newRuns,
+			DayKey:               today,
+			LastRunAt:            now,
+			NewRawFiles:          newRawFiles,
+			RawDirtyFiles:        rawDirtyFiles,
+			AnnotationDirtyFiles: annotationDirtyFiles,
+			Enforced:             true,
 		})
 		reserved = true
 		return nil

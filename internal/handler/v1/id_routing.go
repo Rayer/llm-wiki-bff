@@ -229,14 +229,13 @@ func (h *Handler) handleIDRoutedPage(c *gin.Context, gcsClient store.Store, curr
 	frontmatter, body := parseFrontmatter(string(data))
 
 	if entry.Type == "source" {
-		c.JSON(http.StatusOK, handler.SourceDetailResponse{
-			Slug:        entry.Slug,
-			Title:       entry.Slug,
-			Type:        "source",
-			Frontmatter: frontmatter,
-			Body:        body,
-			Raw:         string(data),
-		})
+		page.ID = entry.ID
+		response, err := h.sourceDetailResponse(c, gcsClient, *page, data)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: err.Error()})
+			return true
+		}
+		c.JSON(http.StatusOK, response)
 		return true
 	}
 

@@ -1,8 +1,15 @@
 package gcs
 
 import (
+	"errors"
 	"strings"
 	"testing"
+
+	cloudstorage "cloud.google.com/go/storage"
+	store "github.com/rayer/llm-wiki-bff/internal/storage"
+	"google.golang.org/api/googleapi"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 func TestNewScopedClientUsesRequestedPrefixWithoutChangingDefault(t *testing.T) {
@@ -18,6 +25,26 @@ func TestNewScopedClientUsesRequestedPrefixWithoutChangingDefault(t *testing.T) 
 	}
 	if scopedClient.bucket != defaultClient.bucket {
 		t.Fatal("scoped client does not share the default client's bucket handle")
+	}
+}
+
+func TestConditionalWriteErrorMapsGenerationPreconditions(t *testing.T) {
+	for _, err := range []error{
+		status.Error(codes.FailedPrecondition, "stale"),
+		&googleapi.Error{Code: 412},
+	} {
+		if got := conditionalWriteError(err); !errors.Is(got, store.ErrGenerationMismatch) {
+			t.Fatalf("conditionalWriteError(%v) = %v", err, got)
+		}
+	}
+	if err := errors.New("boom"); conditionalWriteError(err) != err {
+		t.Fatal("non-precondition error was remapped")
+	}
+}
+
+func TestObjectNotFoundPreservesStorageSentinel(t *testing.T) {
+	if !objectNotFound(cloudstorage.ErrObjectNotExist) || !objectNotFound(status.Error(codes.NotFound, "missing")) {
+		t.Fatal("missing object errors were not recognized")
 	}
 }
 

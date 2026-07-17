@@ -49,8 +49,9 @@ type Handler struct {
 }
 
 type cachedLists struct {
-	concepts []store.WikiPage
-	sources  []store.WikiPage
+	concepts         []store.WikiPage
+	sources          []store.WikiPage
+	legacySourceMeta []store.WikiPage
 }
 
 // New creates a V1 Handler with the given dependencies.

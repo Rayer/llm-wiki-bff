@@ -824,7 +824,7 @@ func (s *stubQuotaStore) ReserveQuota(
 	limits pipelinequota.Limits,
 	now time.Time,
 	isDemo, alreadyRunning bool,
-	newRawFiles int,
+	newRawFiles, rawDirtyFiles, annotationDirtyFiles int,
 ) (prev firestore.QuotaPrev, snap pipelinequota.Snapshot, reserved bool, err error) {
 	s.reserveCalls++
 	now = now.UTC()
@@ -834,15 +834,17 @@ func (s *stubQuotaStore) ReserveQuota(
 		LastRunAt: s.lastRunAt,
 	}
 	pre := pipelinequota.Evaluate(pipelinequota.Input{
-		Now:            now,
-		Limits:         limits,
-		IsDemo:         isDemo,
-		AlreadyRunning: alreadyRunning,
-		RunsToday:      s.runsToday,
-		DayKey:         s.dayKey,
-		LastRunAt:      s.lastRunAt,
-		NewRawFiles:    newRawFiles,
-		Enforced:       true,
+		Now:                  now,
+		Limits:               limits,
+		IsDemo:               isDemo,
+		AlreadyRunning:       alreadyRunning,
+		RunsToday:            s.runsToday,
+		DayKey:               s.dayKey,
+		LastRunAt:            s.lastRunAt,
+		NewRawFiles:          newRawFiles,
+		RawDirtyFiles:        rawDirtyFiles,
+		AnnotationDirtyFiles: annotationDirtyFiles,
+		Enforced:             true,
 	})
 	if !pre.Allowed {
 		return prev, pre, false, nil
@@ -852,15 +854,17 @@ func (s *stubQuotaStore) ReserveQuota(
 	s.dayKey = today
 	s.lastRunAt = now
 	snap = pipelinequota.Evaluate(pipelinequota.Input{
-		Now:            now,
-		Limits:         limits,
-		IsDemo:         isDemo,
-		AlreadyRunning: alreadyRunning,
-		RunsToday:      s.runsToday,
-		DayKey:         s.dayKey,
-		LastRunAt:      s.lastRunAt,
-		NewRawFiles:    newRawFiles,
-		Enforced:       true,
+		Now:                  now,
+		Limits:               limits,
+		IsDemo:               isDemo,
+		AlreadyRunning:       alreadyRunning,
+		RunsToday:            s.runsToday,
+		DayKey:               s.dayKey,
+		LastRunAt:            s.lastRunAt,
+		NewRawFiles:          newRawFiles,
+		RawDirtyFiles:        rawDirtyFiles,
+		AnnotationDirtyFiles: annotationDirtyFiles,
+		Enforced:             true,
 	})
 	return prev, snap, true, nil
 }

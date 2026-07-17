@@ -1,6 +1,9 @@
 package storage
 
-import "path"
+import (
+	"path"
+	"strings"
+)
 
 // ProjectPrefix returns the canonical storage prefix for a user project.
 func ProjectPrefix(userID, projectID string) string {
@@ -20,4 +23,11 @@ func UserProjectsPrefix(userID string) string {
 // ProjectObjectPath returns an absolute object path under a project prefix.
 func ProjectObjectPath(userID, projectID, relPath string) string {
 	return path.Join(ProjectPrefix(userID, projectID), relPath)
+}
+
+// SafeRawPath accepts a direct object below raw/. It deliberately uses
+// path.Clean rather than rejecting harmless names such as raw/a..b.md.
+func SafeRawPath(raw string) bool {
+	return raw != "raw/" && !path.IsAbs(raw) && !strings.Contains(raw, "\\") &&
+		path.Clean(raw) == raw && strings.HasPrefix(raw, "raw/")
 }

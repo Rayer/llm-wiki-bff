@@ -16,7 +16,10 @@ import (
 	"cloud.google.com/go/storage"
 	fm "github.com/adrg/frontmatter"
 	store "github.com/rayer/llm-wiki-bff/internal/storage"
+	"google.golang.org/api/googleapi"
 	"google.golang.org/api/iterator"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // Client wraps GCS operations for a specific user/project.
@@ -31,8 +34,9 @@ type Project = store.Project
 type MarkdownFile = store.MarkdownFile
 
 type wikiPageFrontmatter struct {
-	ID    string `yaml:"id"`
-	Title string `yaml:"title"`
+	ID         string `yaml:"id"`
+	Title      string `yaml:"title"`
+	SourceFile string `yaml:"source_file"`
 }
 
 const (
@@ -47,7 +51,14 @@ type conceptCacheEntry struct {
 }
 
 type wikiIDMap struct {
-	Source map[string]string `json:"source"`
+	Source     map[string]string     `json:"source"`
+	SourceMeta map[string]sourceMeta `json:"source_meta"`
+}
+
+type sourceMeta struct {
+	Slug       string `json:"slug"`
+	Title      string `json:"title"`
+	SourceFile string `json:"source_file"`
 }
 
 // NewClient creates a new GCS client for the given bucket.
@@ -216,10 +227,98 @@ func (c *Client) ReadFile(ctx context.Context, relPath string) ([]byte, error) {
 	obj := c.bucket.Object(path)
 	r, err := obj.NewReader(ctx)
 	if err != nil {
+		if objectNotFound(err) {
+			return nil, storage.ErrObjectNotExist
+		}
 		return nil, fmt.Errorf("read %s: %w", path, err)
 	}
 	defer r.Close()
 	return io.ReadAll(r)
+}
+
+func (c *Client) ReadFileWithGeneration(ctx context.Context, relPath string) ([]byte, int64, error) {
+	path := fmt.Sprintf("%s/%s", c.prefix(), relPath)
+	obj := c.bucket.Object(path)
+	r, err := obj.NewReader(ctx)
+	if err != nil {
+		if objectNotFound(err) {
+			return nil, 0, storage.ErrObjectNotExist
+		}
+		return nil, 0, fmt.Errorf("read %s: %w", path, err)
+	}
+	defer r.Close()
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return nil, 0, err
+	}
+	return data, r.Attrs.Generation, nil
+}
+
+func objectNotFound(err error) bool {
+	return errors.Is(err, storage.ErrObjectNotExist) || status.Code(err) == codes.NotFound
+}
+
+func (c *Client) WriteFileIfGeneration(ctx context.Context, data []byte, relPath string, expected int64) (int64, error) {
+	obj := c.bucket.Object(fmt.Sprintf("%s/%s", c.prefix(), relPath))
+	obj = obj.If(storage.Conditions{GenerationMatch: expected})
+	w := obj.NewWriter(ctx)
+	var annotationMeta struct {
+		SHA256  string `json:"ann_sha256"`
+		RawPath string `json:"raw_path"`
+		Body    string `json:"body"`
+	}
+	_ = json.Unmarshal(data, &annotationMeta)
+	if annotationMeta.SHA256 != "" {
+		w.Metadata = map[string]string{"ann_sha256": annotationMeta.SHA256, "raw_path": annotationMeta.RawPath, "has_annotation": fmt.Sprintf("%t", annotationMeta.Body != "")}
+	}
+	if _, err := w.Write(data); err != nil {
+		closeErr := w.Close()
+		if mapped := conditionalWriteError(err); errors.Is(mapped, store.ErrGenerationMismatch) {
+			return 0, mapped
+		}
+		if mapped := conditionalWriteError(closeErr); errors.Is(mapped, store.ErrGenerationMismatch) {
+			return 0, mapped
+		}
+		return 0, err
+	}
+	if err := w.Close(); err != nil {
+		return 0, conditionalWriteError(err)
+	}
+	return w.Attrs().Generation, nil
+}
+
+// conditionalWriteError normalizes the two error surfaces used by GCS clients:
+// gRPC transports return FailedPrecondition while storage.NewClient returns a
+// googleapi HTTP 412 error for an ifGenerationMatch conflict.
+func conditionalWriteError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if status.Code(err) == codes.FailedPrecondition {
+		return store.ErrGenerationMismatch
+	}
+	var apiErr *googleapi.Error
+	if errors.As(err, &apiErr) && apiErr.Code == 412 {
+		return store.ErrGenerationMismatch
+	}
+	return err
+}
+
+func (c *Client) ListObjectMeta(ctx context.Context, relPrefix string) ([]store.ObjectMeta, error) {
+	prefix := fmt.Sprintf("%s/%s", c.prefix(), relPrefix)
+	it := c.bucket.Objects(ctx, &storage.Query{Prefix: prefix})
+	var out []store.ObjectMeta
+	for {
+		attrs, err := it.Next()
+		if errors.Is(err, iterator.Done) {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, store.ObjectMeta{Path: strings.TrimPrefix(attrs.Name, c.prefix()+"/"), Generation: attrs.Generation, Updated: attrs.Updated.UTC(), SHA256: attrs.Metadata["ann_sha256"], RawPath: attrs.Metadata["raw_path"], HasAnnotation: attrs.Metadata["has_annotation"] == "true"})
+	}
+	return out, nil
 }
 
 // ListMarkdownFiles reads direct .md files under dir, relative to the
@@ -352,6 +451,9 @@ func applyWikiPageFrontmatter(page WikiPage, data []byte) (WikiPage, error) {
 	if title := strings.TrimSpace(matter.Title); title != "" {
 		page.Title = title
 	}
+	if raw := strings.TrimSpace(matter.SourceFile); raw != "" {
+		page.RawPath = raw
+	}
 	return page, nil
 }
 
@@ -406,11 +508,17 @@ func WikiPagesFromSourceIDMap(data []byte) ([]WikiPage, error) {
 		if id == "" || slug == "" {
 			continue
 		}
+		meta := source.SourceMeta[id]
+		title := strings.TrimSpace(meta.Title)
+		if title == "" {
+			title = slug
+		}
 		pages = append(pages, WikiPage{
-			Slug:  slug,
-			Title: slug,
-			ID:    id,
-			Path:  fmt.Sprintf("wiki/sources/%s.md", slug),
+			Slug:    slug,
+			Title:   title,
+			ID:      id,
+			Path:    fmt.Sprintf("wiki/sources/%s.md", slug),
+			RawPath: strings.TrimSpace(meta.SourceFile),
 		})
 	}
 	sort.Slice(pages, func(i, j int) bool {

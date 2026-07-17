@@ -2,20 +2,31 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"time"
 )
 
+var ErrGenerationMismatch = errors.New("object generation mismatch")
+
 // WikiPage represents a wiki source or concept page.
 type WikiPage struct {
-	Slug      string   `json:"slug"`
-	Title     string   `json:"title"`
-	ID        string   `json:"id"`
-	Path      string   `json:"path"`
-	Status    string   `json:"status"`
-	Quality   string   `json:"quality,omitempty"`
-	Concepts  []string `json:"concepts,omitempty"`
-	SourceURL string   `json:"source_url,omitempty"`
-	RawSource string   `json:"raw_source,omitempty"`
+	Slug              string   `json:"slug"`
+	Title             string   `json:"title"`
+	ID                string   `json:"id"`
+	Path              string   `json:"path"`
+	Status            string   `json:"status"`
+	Quality           string   `json:"quality,omitempty"`
+	Concepts          []string `json:"concepts,omitempty"`
+	SourceURL         string   `json:"source_url,omitempty"`
+	RawSource         string   `json:"raw_source,omitempty"`
+	RawPath           string   `json:"raw_path,omitempty"`
+	AnnotationAllowed bool     `json:"annotation_allowed"`
+	HasAnnotation     bool     `json:"has_annotation"`
+	AnnotationDirty   bool     `json:"annotation_dirty"`
+	RawDirty          bool     `json:"raw_dirty"`
+	Dirty             bool     `json:"dirty"`
+	LifecycleStatus   string   `json:"lifecycle_status,omitempty"`
+	AnnUpdatedAt      string   `json:"ann_updated_at,omitempty"`
 }
 
 // Project represents a user project discovered in wiki storage.
@@ -38,6 +49,28 @@ type RawFile struct {
 	Size    int64
 	Updated time.Time
 	SHA256  string
+}
+
+// ObjectMeta is the inexpensive metadata needed for cache objects.
+type ObjectMeta struct {
+	Path          string
+	Generation    int64
+	Updated       time.Time
+	SHA256        string
+	RawPath       string
+	HasAnnotation bool
+}
+
+// ConditionalWriter is deliberately small so handlers do not depend on a
+// concrete storage implementation.
+type ConditionalWriter interface {
+	ReadFileWithGeneration(context.Context, string) ([]byte, int64, error)
+	WriteFileIfGeneration(context.Context, []byte, string, int64) (int64, error)
+}
+
+// ObjectLister exposes metadata-only prefix listing.
+type ObjectLister interface {
+	ListObjectMeta(context.Context, string) ([]ObjectMeta, error)
 }
 
 // Store is the project-scoped wiki storage contract used by BFF read/write paths.

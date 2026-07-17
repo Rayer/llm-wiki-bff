@@ -91,6 +91,28 @@ func TestEvaluateNoNewRaw(t *testing.T) {
 	}
 }
 
+func TestEvaluateAnnotationOnlyBypassesMinimumButNotOtherGates(t *testing.T) {
+	now := time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC)
+	base := Input{Now: now, Enforced: true, Limits: Limits{DailyLimit: 2, Cooldown: time.Hour, MinNewRaw: 2}, DayKey: DayKeyUTC(now), AnnotationDirtyFiles: 1}
+	if got := Evaluate(base); !got.Allowed || got.PendingWork != 1 || got.AnnotationDirtyFiles != 1 {
+		t.Fatalf("annotation-only work should allow: %+v", got)
+	}
+	for name, change := range map[string]func(*Input){
+		"demo":     func(in *Input) { in.IsDemo = true },
+		"running":  func(in *Input) { in.AlreadyRunning = true },
+		"daily":    func(in *Input) { in.RunsToday = 2 },
+		"cooldown": func(in *Input) { in.RunsToday = 1; in.LastRunAt = now.Add(-time.Minute) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			in := base
+			change(&in)
+			if got := Evaluate(in); got.Allowed {
+				t.Fatalf("%s must block annotation work: %+v", name, got)
+			}
+		})
+	}
+}
+
 func TestEvaluateAlreadyRunningPriority(t *testing.T) {
 	now := time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC)
 	got := Evaluate(Input{

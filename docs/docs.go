@@ -1440,19 +1440,155 @@ const docTemplate = `{
                         "ProjectHeader": []
                     }
                 ],
-                "description": "Returns all compiled wiki sources.",
+                "description": "Returns compiled wiki sources plus pending raw rows that have not been compiled.",
                 "produces": [
                     "application/json"
                 ],
                 "tags": [
                     "sources"
                 ],
-                "summary": "List wiki sources",
+                "summary": "List compiled sources and pending raw files",
                 "responses": {
                     "200": {
                         "description": "OK",
                         "schema": {
                             "$ref": "#/definitions/handler.SourcesListResponse"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error",
+                        "schema": {
+                            "$ref": "#/definitions/handler.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/sources/{id}/annotation": {
+            "get": {
+                "security": [
+                    {
+                        "DevUserAuth": []
+                    },
+                    {
+                        "ProjectHeader": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "sources"
+                ],
+                "summary": "Get a source annotation",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Source ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/handler.AnnotationResponse"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "$ref": "#/definitions/handler.ErrorResponse"
+                        }
+                    },
+                    "409": {
+                        "description": "Conflict",
+                        "schema": {
+                            "$ref": "#/definitions/handler.ErrorResponse"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error",
+                        "schema": {
+                            "$ref": "#/definitions/handler.ErrorResponse"
+                        }
+                    }
+                }
+            },
+            "put": {
+                "security": [
+                    {
+                        "DevUserAuth": []
+                    },
+                    {
+                        "ProjectHeader": []
+                    }
+                ],
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "sources"
+                ],
+                "summary": "Save or clear a source annotation",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Source ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "description": "Annotation",
+                        "name": "annotation",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handler.AnnotationRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/handler.AnnotationResponse"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/handler.ErrorResponse"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "$ref": "#/definitions/handler.ErrorResponse"
+                        }
+                    },
+                    "409": {
+                        "description": "Conflict",
+                        "schema": {
+                            "$ref": "#/definitions/handler.ErrorResponse"
+                        }
+                    },
+                    "412": {
+                        "description": "Precondition Failed",
+                        "schema": {
+                            "$ref": "#/definitions/handler.ErrorResponse"
+                        }
+                    },
+                    "413": {
+                        "description": "Request Entity Too Large",
+                        "schema": {
+                            "$ref": "#/definitions/handler.ErrorResponse"
                         }
                     },
                     "500": {
@@ -1688,19 +1824,43 @@ const docTemplate = `{
         "gcs.WikiPage": {
             "type": "object",
             "properties": {
+                "ann_updated_at": {
+                    "type": "string"
+                },
+                "annotation_allowed": {
+                    "type": "boolean"
+                },
+                "annotation_dirty": {
+                    "type": "boolean"
+                },
                 "concepts": {
                     "type": "array",
                     "items": {
                         "type": "string"
                     }
                 },
+                "dirty": {
+                    "type": "boolean"
+                },
+                "has_annotation": {
+                    "type": "boolean"
+                },
                 "id": {
+                    "type": "string"
+                },
+                "lifecycle_status": {
                     "type": "string"
                 },
                 "path": {
                     "type": "string"
                 },
                 "quality": {
+                    "type": "string"
+                },
+                "raw_dirty": {
+                    "type": "boolean"
+                },
+                "raw_path": {
                     "type": "string"
                 },
                 "raw_source": {
@@ -1716,6 +1876,61 @@ const docTemplate = `{
                     "type": "string"
                 },
                 "title": {
+                    "type": "string"
+                }
+            }
+        },
+        "handler.AnnotationRequest": {
+            "type": "object",
+            "required": [
+                "expected_generation"
+            ],
+            "properties": {
+                "body": {
+                    "type": "string"
+                },
+                "expected_generation": {
+                    "type": "string"
+                }
+            }
+        },
+        "handler.AnnotationResponse": {
+            "type": "object",
+            "properties": {
+                "ann_sha256": {
+                    "type": "string"
+                },
+                "annotation_dirty": {
+                    "type": "boolean"
+                },
+                "body": {
+                    "type": "string"
+                },
+                "dirty": {
+                    "type": "boolean"
+                },
+                "generation": {
+                    "type": "string"
+                },
+                "has_annotation": {
+                    "type": "boolean"
+                },
+                "lifecycle_status": {
+                    "type": "string"
+                },
+                "raw_dirty": {
+                    "type": "boolean"
+                },
+                "raw_path": {
+                    "type": "string"
+                },
+                "source_id": {
+                    "type": "string"
+                },
+                "updated_at": {
+                    "type": "string"
+                },
+                "updated_by": {
                     "type": "string"
                 }
             }
@@ -1914,14 +2129,41 @@ const docTemplate = `{
         "handler.SourceDetailResponse": {
             "type": "object",
             "properties": {
+                "ann_updated_at": {
+                    "type": "string"
+                },
+                "annotation_allowed": {
+                    "type": "boolean"
+                },
+                "annotation_dirty": {
+                    "type": "boolean"
+                },
                 "body": {
                     "type": "string"
+                },
+                "dirty": {
+                    "type": "boolean"
                 },
                 "frontmatter": {
                     "type": "object",
                     "additionalProperties": true
                 },
+                "has_annotation": {
+                    "type": "boolean"
+                },
+                "id": {
+                    "type": "string"
+                },
+                "lifecycle_status": {
+                    "type": "string"
+                },
                 "raw": {
+                    "type": "string"
+                },
+                "raw_dirty": {
+                    "type": "boolean"
+                },
+                "raw_path": {
                     "type": "string"
                 },
                 "slug": {
@@ -2047,6 +2289,9 @@ const docTemplate = `{
                 "already_running": {
                     "type": "boolean"
                 },
+                "annotation_dirty_files": {
+                    "type": "integer"
+                },
                 "cooldown_until": {
                     "type": "string"
                 },
@@ -2067,6 +2312,12 @@ const docTemplate = `{
                 },
                 "next_reset": {
                     "type": "string"
+                },
+                "pending_work": {
+                    "type": "integer"
+                },
+                "raw_dirty_files": {
+                    "type": "integer"
                 },
                 "reason": {
                     "$ref": "#/definitions/pipelinequota.Reason"

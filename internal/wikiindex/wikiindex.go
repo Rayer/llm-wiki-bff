@@ -35,16 +35,24 @@ type Store interface {
 }
 
 type IDMap struct {
-	Concept   map[string]string   `json:"concept"`
-	Source    map[string]string   `json:"source"`
-	Redirects map[string][]string `json:"redirects"`
+	Concept    map[string]string     `json:"concept"`
+	Source     map[string]string     `json:"source"`
+	SourceMeta map[string]SourceMeta `json:"source_meta,omitempty"`
+	Redirects  map[string][]string   `json:"redirects"`
+}
+
+type SourceMeta struct {
+	Slug       string `json:"slug"`
+	Title      string `json:"title,omitempty"`
+	SourceFile string `json:"source_file,omitempty"`
 }
 
 type markdownMatter struct {
-	ID      string   `yaml:"id"`
-	Title   string   `yaml:"title"`
-	Sources []string `yaml:"sources"`
-	Source  string   `yaml:"source"`
+	ID         string   `yaml:"id"`
+	Title      string   `yaml:"title"`
+	SourceFile string   `yaml:"source_file"`
+	Sources    []string `yaml:"sources"`
+	Source     string   `yaml:"source"`
 }
 
 func Rebuild(ctx context.Context, store Store) (IDMap, error) {
@@ -63,15 +71,16 @@ func Rebuild(ctx context.Context, store Store) (IDMap, error) {
 
 func BuildIDMap(ctx context.Context, store Store) (IDMap, error) {
 	next := IDMap{
-		Concept:   map[string]string{},
-		Source:    map[string]string{},
-		Redirects: map[string][]string{},
+		Concept:    map[string]string{},
+		Source:     map[string]string{},
+		SourceMeta: map[string]SourceMeta{},
+		Redirects:  map[string][]string{},
 	}
 
 	if err := addIDMapEntries(ctx, store, "wiki/", next.Concept); err != nil {
 		return next, err
 	}
-	if err := addIDMapEntries(ctx, store, "wiki/sources/", next.Source); err != nil {
+	if err := addSourceEntries(ctx, store, next.Source, next.SourceMeta); err != nil {
 		return next, err
 	}
 
@@ -84,6 +93,28 @@ func BuildIDMap(ctx context.Context, store Store) (IDMap, error) {
 	appendChangedRedirects(next.Redirects, old.Source, next.Source)
 
 	return next, nil
+}
+
+// addSourceEntries intentionally parses the source collection once: the index
+// needs both its stable ID map and source metadata from the same files.
+func addSourceEntries(ctx context.Context, store Store, ids map[string]string, entries map[string]SourceMeta) error {
+	files, err := store.ListMarkdownFiles(ctx, "wiki/sources/")
+	if err != nil {
+		return fmt.Errorf("list wiki/sources/: %w", err)
+	}
+	for _, file := range files {
+		matter, err := parseMarkdownMatter(file.Data)
+		if err != nil {
+			return fmt.Errorf("parse %s: %w", file.Path, err)
+		}
+		id := strings.TrimSpace(matter.ID)
+		if id == "" {
+			id = generateID(file.Data)
+		}
+		ids[id] = file.Slug
+		entries[id] = SourceMeta{Slug: file.Slug, Title: strings.TrimSpace(matter.Title), SourceFile: strings.TrimSpace(matter.SourceFile)}
+	}
+	return nil
 }
 
 func addIDMapEntries(ctx context.Context, store Store, dir string, entries map[string]string) error {
@@ -116,9 +147,10 @@ func parseMarkdownMatter(data []byte) (markdownMatter, error) {
 
 func readOldIDMap(ctx context.Context, store Store) (IDMap, error) {
 	old := IDMap{
-		Concept:   map[string]string{},
-		Source:    map[string]string{},
-		Redirects: map[string][]string{},
+		Concept:    map[string]string{},
+		Source:     map[string]string{},
+		SourceMeta: map[string]SourceMeta{},
+		Redirects:  map[string][]string{},
 	}
 	data, err := store.ReadFile(ctx, IDMapPath)
 	if err != nil {
@@ -138,6 +170,9 @@ func readOldIDMap(ctx context.Context, store Store) (IDMap, error) {
 	}
 	if old.Source == nil {
 		old.Source = map[string]string{}
+	}
+	if old.SourceMeta == nil {
+		old.SourceMeta = map[string]SourceMeta{}
 	}
 	if old.Redirects == nil {
 		old.Redirects = map[string][]string{}
