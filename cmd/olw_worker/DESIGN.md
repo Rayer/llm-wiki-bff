@@ -5,12 +5,15 @@
 This change adds `cmd/olw_worker` as the Cloud Run Job entrypoint for running
 OLW against a project vault mounted from GCS. The worker is filesystem-first:
 it does not write to GCS through the Storage API. In Cloud Run, gcsfuse mounts
-the bucket at `/data`; locally, `--vault` points at a project directory.
+the bucket at `/data`; locally, `--vault` points at a project directory. Cloud
+runs set `WORKSPACE=true`: OLW never runs against that mounted vault directly.
 
 The active pipeline path is now:
 
 ```text
-BFF v1 endpoint -> Cloud Run Jobs API -> olw-pipeline job -> /data gcsfuse vault -> OLW -> worker postprocess
+BFF v1 endpoint -> Cloud Run Jobs API -> olw-pipeline-dev job -> mounted /data vault
+  -> per-vault exclusive lease -> private copied workspace -> OLW + postprocess
+  -> staged atomic durable-output publish -> worker-owned receipt
 ```
 
 The old trigger-file path has been removed. BFF no longer writes
@@ -76,18 +79,50 @@ The worker resolves the vault in this order:
 
 ## Run Flow
 
-1. Parse the JSON command batch.
-2. Resolve and validate the vault directory.
-3. Remove `.olw/pipeline.lock` only when it is older than five minutes.
-4. Ensure `wiki.toml` exists. Existing config is never overwritten.
-5. Run each OLW command in order.
-6. If all OLW commands succeed and postprocess is enabled, rebuild BFF artifacts.
+1. Parse the JSON command batch and resolve the mounted/local vault. Workspace
+   mode requires the first parsed OLW command to be `run`; the production contract is
+   `[ ["run", "--auto-approve"], ["approve", "--all"] ]`.
+2. With `WORKSPACE=true`, acquire an exclusive create-only per-vault lease in
+   `.olw/lwc-worker-lease.json` before taking any snapshot. The lease records
+   owner/execution metadata and is held through success/failure receipts and
+   failure-log publication. It fails closed on overlap and is never
+   automatically stolen based only on age; an abandoned lease needs operator
+   inspection rather than risking a live long-running job.
+3. Snapshot mapped source raw bytes and annotation
+   digests, then copy `raw/`, `wiki/`, `cache/`, `.olw/`, and `wiki.toml` into
+   a private directory under `WORKSPACE_DIR` (default `/tmp`). Symlinks and
+   escaping paths are rejected.
+4. Every mapped source with a non-empty annotation receives one deterministic,
+   timestamp-free human annotation trailer on every fresh workspace run,
+   independent of its receipt. Empty annotations receive no trailer. Stored
+   `raw/**` is never changed or synced back.
+5. Remove a stale workspace `.olw/pipeline.lock`, ensure `wiki.toml`, and run
+   every OLW command plus postprocess in the workspace.
+6. On success, stage and validate the complete explicit output set under a
+   sibling directory in the mounted vault, then publish it using same-filesystem
+   atomic renames and a journal/backup. `wiki/` is mirrored so removed
+   pages are removed; the only OLW state file published is `.olw/state.db`.
+   The allowlist is `wiki/`, `wiki.toml`, `cache/id_map.json`,
+   `cache/concepts.jsonl`, `cache/raw_status.json`,
+   `cache/suggested_queries.json`, the current bounded pipeline log, and
+   `.olw/state.db`. Uncommitted journals are rolled back when the next lease
+   holder starts; committed journals only clean up their stage and backup files.
+   This is recovery for normal filesystem interruption, not a
+   claim of a crash-proof global transaction on every mounted filesystem.
+7. After that publish succeeds, atomically merge `cache/source_status.json` with
+   exact start raw/annotation fingerprints. Concurrent raw or annotation edits
+   remain dirty because the receipt retains the start pair. Failures retain the
+   last success and record only the attempted fingerprint/error. On workspace
+   failure, the closed current execution log alone is atomically published with
+   a size cap and configured-secret redaction before cleanup.
 
 `--stop-on-error` defaults to true. When false, the worker continues through the
 batch, records failures, skips postprocess if any command failed, and exits
 non-zero at the end.
 
 `--no-postprocess` skips artifact generation after a successful batch.
+It is intentionally rejected in workspace mode, because an ingestion receipt
+is valid only after OLW, postprocess, and the explicit sync all succeed.
 
 ## Generated Artifacts
 
@@ -144,7 +179,7 @@ BFF invokes the Cloud Run Job with:
 
 ```json
 {
-  "args": ["run", "[[\"run\",\"--auto-approve\"]]"],
+  "args": ["run", "[[\"run\",\"--auto-approve\"],[\"approve\",\"--all\"]]"],
   "env": [
     {"name": "USER_ID", "value": "..."},
     {"name": "PROJECT_ID", "value": "..."},
@@ -170,7 +205,10 @@ They do not write request files and do not rely on a periodic worker.
 
 Manual rebuild endpoints remain available for repair and admin workflows.
 
-## Deployment Used For Verification
+## Historical Pre-LWC-170 Verification Evidence
+
+This section records pre-LWC-170 verification only. It does not describe the
+current development deployment or establish a new live deployment.
 
 Project:
 
