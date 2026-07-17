@@ -421,8 +421,8 @@ func cachedContexts(conceptCache *conceptcache.Cache, reader conceptcache.Reader
 
 // ListSources handles GET /api/v1/sources using the request's GCS scope.
 //
-//	@Summary		List wiki sources
-//	@Description	Returns all compiled wiki sources.
+//	@Summary		List compiled sources and pending raw files
+//	@Description	Returns compiled wiki sources plus pending raw rows that have not been compiled.
 //	@Tags			sources
 //	@Produce		json
 //	@Success		200		{object}	handler.SourcesListResponse
@@ -448,11 +448,48 @@ func (h *Handler) ListSources(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: err.Error()})
 		return
 	}
+	if missingSourceRawPath(sources) {
+		key := c.GetString("userID") + "_" + c.GetString("projectID")
+		if err := h.hydrateLegacySourceMetadata(ctx, gcsClient, sources, key); err != nil {
+			c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: err.Error()})
+			return
+		}
+	}
+	if sources, _, err = sourceLifecycle(ctx, gcsClient, sources); err != nil {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: err.Error()})
+		return
+	}
 	if sources == nil {
 		sources = []gcs.WikiPage{}
 	}
 
 	c.JSON(http.StatusOK, handler.SourcesListResponse{Sources: sources, Count: len(sources)})
+}
+
+// hydrateLegacySourceMetadata shares the one-per-project fallback for id maps
+// produced before source_meta existed. Both listing and quota evaluation must
+// use it so a legacy project never re-scans source Markdown on every request.
+func (h *Handler) hydrateLegacySourceMetadata(ctx context.Context, reader sourceListReader, sources []gcs.WikiPage, key string) error {
+	legacy := h.listCacheGet(key).legacySourceMeta
+	if len(legacy) == 0 {
+		listed, err := reader.ListSources(ctx)
+		if err != nil {
+			return err
+		}
+		legacy = listed
+		h.listCacheSet(key, func(cache *cachedLists) { cache.legacySourceMeta = cloneWikiPages(listed) })
+	}
+	hydrateSourceMetadata(sources, legacy)
+	return nil
+}
+
+func missingSourceRawPath(sources []gcs.WikiPage) bool {
+	for _, source := range sources {
+		if strings.TrimSpace(source.RawPath) == "" {
+			return true
+		}
+	}
+	return false
 }
 
 type sourceListReader interface {
@@ -505,10 +542,50 @@ func addWikiPageIDsFromIDMap(ctx context.Context, reader indexReader, pages []gc
 		mergeWikiPageIDs(pages, source.Concept)
 	case "source":
 		mergeWikiPageIDs(pages, source.Source)
+		mergeSourceMetadata(pages, source.SourceMeta)
 	default:
 		return fmt.Errorf("unknown wiki page type: %s", pageType)
 	}
 	return nil
+}
+
+func mergeSourceMetadata(pages []gcs.WikiPage, entries map[string]wikiindex.SourceMeta) {
+	if len(pages) == 0 || len(entries) == 0 {
+		return
+	}
+	bySlug := make(map[string]wikiindex.SourceMeta, len(entries))
+	for _, meta := range entries {
+		if slug := strings.TrimSpace(meta.Slug); slug != "" {
+			bySlug[slug] = meta
+		}
+	}
+	for i := range pages {
+		meta, ok := bySlug[pages[i].Slug]
+		if !ok {
+			continue
+		}
+		if pages[i].RawPath == "" {
+			pages[i].RawPath = strings.TrimSpace(meta.SourceFile)
+		}
+		if pages[i].Title == pages[i].Slug && strings.TrimSpace(meta.Title) != "" {
+			pages[i].Title = strings.TrimSpace(meta.Title)
+		}
+	}
+}
+
+func hydrateSourceMetadata(pages, metadata []gcs.WikiPage) {
+	bySlug := make(map[string]gcs.WikiPage, len(metadata))
+	for _, page := range metadata {
+		bySlug[page.Slug] = page
+	}
+	for i := range pages {
+		if page, ok := bySlug[pages[i].Slug]; ok {
+			pages[i].RawPath = page.RawPath
+			if pages[i].Title == pages[i].Slug {
+				pages[i].Title = page.Title
+			}
+		}
+	}
 }
 
 func mergeWikiPageIDs(pages []gcs.WikiPage, entries map[string]string) {
@@ -563,7 +640,7 @@ func (h *Handler) GetSource(c *gin.Context) {
 	if h.handleIDRoutedPage(c, gcsClient, "source", slug) {
 		return
 	}
-	_, data, err := gcsClient.GetPage(c.Request.Context(), slug, "sources")
+	page, data, err := gcsClient.GetPage(c.Request.Context(), slug, "sources")
 	if err != nil {
 		c.JSON(http.StatusNotFound, handler.ErrorResponse{Error: "source not found: " + slug})
 		return
@@ -574,15 +651,12 @@ func (h *Handler) GetSource(c *gin.Context) {
 		return
 	}
 
-	frontmatter, body := parseFrontmatter(string(data))
-	c.JSON(http.StatusOK, handler.SourceDetailResponse{
-		Slug:        slug,
-		Title:       slug,
-		Type:        "source",
-		Frontmatter: frontmatter,
-		Body:        body,
-		Raw:         string(data),
-	})
+	response, err := h.sourceDetailResponse(c, gcsClient, *page, data)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, response)
 }
 
 // ListConcepts handles GET /api/v1/concepts using the request's GCS scope.

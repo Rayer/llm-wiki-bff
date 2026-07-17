@@ -90,15 +90,31 @@ definitions:
     type: object
   gcs.WikiPage:
     properties:
+      ann_updated_at:
+        type: string
+      annotation_allowed:
+        type: boolean
+      annotation_dirty:
+        type: boolean
       concepts:
         items:
           type: string
         type: array
+      dirty:
+        type: boolean
+      has_annotation:
+        type: boolean
       id:
+        type: string
+      lifecycle_status:
         type: string
       path:
         type: string
       quality:
+        type: string
+      raw_dirty:
+        type: boolean
+      raw_path:
         type: string
       raw_source:
         type: string
@@ -109,6 +125,42 @@ definitions:
       status:
         type: string
       title:
+        type: string
+    type: object
+  handler.AnnotationRequest:
+    properties:
+      body:
+        type: string
+      expected_generation:
+        type: string
+    required:
+    - expected_generation
+    type: object
+  handler.AnnotationResponse:
+    properties:
+      ann_sha256:
+        type: string
+      annotation_dirty:
+        type: boolean
+      body:
+        type: string
+      dirty:
+        type: boolean
+      generation:
+        type: string
+      has_annotation:
+        type: boolean
+      lifecycle_status:
+        type: string
+      raw_dirty:
+        type: boolean
+      raw_path:
+        type: string
+      source_id:
+        type: string
+      updated_at:
+        type: string
+      updated_by:
         type: string
     type: object
   handler.ConceptDetailResponse:
@@ -237,12 +289,30 @@ definitions:
     type: object
   handler.SourceDetailResponse:
     properties:
+      ann_updated_at:
+        type: string
+      annotation_allowed:
+        type: boolean
+      annotation_dirty:
+        type: boolean
       body:
         type: string
+      dirty:
+        type: boolean
       frontmatter:
         additionalProperties: true
         type: object
+      has_annotation:
+        type: boolean
+      id:
+        type: string
+      lifecycle_status:
+        type: string
       raw:
+        type: string
+      raw_dirty:
+        type: boolean
+      raw_path:
         type: string
       slug:
         type: string
@@ -328,6 +398,8 @@ definitions:
         type: boolean
       already_running:
         type: boolean
+      annotation_dirty_files:
+        type: integer
       cooldown_until:
         type: string
       daily_limit:
@@ -342,6 +414,10 @@ definitions:
         type: integer
       next_reset:
         type: string
+      pending_work:
+        type: integer
+      raw_dirty_files:
+        type: integer
       reason:
         $ref: '#/definitions/pipelinequota.Reason'
       runs_today:
@@ -1324,7 +1400,8 @@ paths:
       - health
   /api/v1/sources:
     get:
-      description: Returns all compiled wiki sources.
+      description: Returns compiled wiki sources plus pending raw rows that have not
+        been compiled.
       produces:
       - application/json
       responses:
@@ -1339,7 +1416,92 @@ paths:
       security:
       - DevUserAuth: []
       - ProjectHeader: []
-      summary: List wiki sources
+      summary: List compiled sources and pending raw files
+      tags:
+      - sources
+  /api/v1/sources/{id}/annotation:
+    get:
+      parameters:
+      - description: Source ID
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/handler.AnnotationResponse'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+        "409":
+          description: Conflict
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+      security:
+      - DevUserAuth: []
+      - ProjectHeader: []
+      summary: Get a source annotation
+      tags:
+      - sources
+    put:
+      consumes:
+      - application/json
+      parameters:
+      - description: Source ID
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: Annotation
+        in: body
+        name: annotation
+        required: true
+        schema:
+          $ref: '#/definitions/handler.AnnotationRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/handler.AnnotationResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+        "409":
+          description: Conflict
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+        "412":
+          description: Precondition Failed
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+        "413":
+          description: Request Entity Too Large
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+      security:
+      - DevUserAuth: []
+      - ProjectHeader: []
+      summary: Save or clear a source annotation
       tags:
       - sources
   /api/v1/sources/{slug}:

@@ -8,13 +8,27 @@ import (
 )
 
 type fakeStore struct {
-	files  map[string][]MarkdownFile
-	reads  map[string][]byte
-	writes map[string][]byte
+	files     map[string][]MarkdownFile
+	reads     map[string][]byte
+	writes    map[string][]byte
+	listCalls map[string]int
 }
 
 func (s *fakeStore) ListMarkdownFiles(_ context.Context, dir string) ([]MarkdownFile, error) {
+	if s.listCalls != nil {
+		s.listCalls[dir]++
+	}
 	return append([]MarkdownFile(nil), s.files[dir]...), nil
+}
+
+func TestRebuildCollectsSourcesOnce(t *testing.T) {
+	store := &fakeStore{files: map[string][]MarkdownFile{"wiki/": {}, "wiki/sources/": {{Slug: "s", Path: "wiki/sources/s.md", Data: []byte("---\nid: id\nsource_file: raw/s.md\n---")}}}, reads: map[string][]byte{}, listCalls: map[string]int{}}
+	if _, err := Rebuild(context.Background(), store); err != nil {
+		t.Fatal(err)
+	}
+	if got := store.listCalls["wiki/sources/"]; got != 1 {
+		t.Fatalf("source traversals = %d, want 1", got)
+	}
 }
 
 func (s *fakeStore) ReadFile(_ context.Context, relPath string) ([]byte, error) {

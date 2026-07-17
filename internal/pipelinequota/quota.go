@@ -23,29 +23,34 @@ type Limits struct {
 }
 
 type Input struct {
-	Now            time.Time
-	Limits         Limits
-	IsDemo         bool
-	AlreadyRunning bool
-	RunsToday      int
-	DayKey         string // UTC YYYY-MM-DD stored on doc
-	LastRunAt      time.Time
-	NewRawFiles    int
-	Enforced       bool // if false, always allow (local no firestore)
+	Now                  time.Time
+	Limits               Limits
+	IsDemo               bool
+	AlreadyRunning       bool
+	RunsToday            int
+	DayKey               string // UTC YYYY-MM-DD stored on doc
+	LastRunAt            time.Time
+	NewRawFiles          int
+	RawDirtyFiles        int
+	AnnotationDirtyFiles int
+	Enforced             bool // if false, always allow (local no firestore)
 }
 
 type Snapshot struct {
-	Enforced       bool       `json:"enforced"`
-	Allowed        bool       `json:"allowed"`
-	Reason         Reason     `json:"reason,omitempty"`
-	Message        string     `json:"message,omitempty"`
-	RunsToday      int        `json:"runs_today"`
-	DailyLimit     int        `json:"daily_limit"`
-	CooldownUntil  *time.Time `json:"cooldown_until,omitempty"`
-	NextReset      time.Time  `json:"next_reset"`
-	NewRawFiles    int        `json:"new_raw_files"`
-	MinNewRaw      int        `json:"min_new_raw"`
-	AlreadyRunning bool       `json:"already_running"`
+	Enforced             bool       `json:"enforced"`
+	Allowed              bool       `json:"allowed"`
+	Reason               Reason     `json:"reason,omitempty"`
+	Message              string     `json:"message,omitempty"`
+	RunsToday            int        `json:"runs_today"`
+	DailyLimit           int        `json:"daily_limit"`
+	CooldownUntil        *time.Time `json:"cooldown_until,omitempty"`
+	NextReset            time.Time  `json:"next_reset"`
+	NewRawFiles          int        `json:"new_raw_files"`
+	RawDirtyFiles        int        `json:"raw_dirty_files"`
+	AnnotationDirtyFiles int        `json:"annotation_dirty_files"`
+	PendingWork          int        `json:"pending_work"`
+	MinNewRaw            int        `json:"min_new_raw"`
+	AlreadyRunning       bool       `json:"already_running"`
 }
 
 func DayKeyUTC(t time.Time) string {
@@ -88,13 +93,16 @@ func Evaluate(in Input) Snapshot {
 		runs = 0
 	}
 	snap := Snapshot{
-		Enforced:       in.Enforced,
-		RunsToday:      runs,
-		DailyLimit:     lim.DailyLimit,
-		NextReset:      NextResetUTC(now),
-		NewRawFiles:    in.NewRawFiles,
-		MinNewRaw:      lim.MinNewRaw,
-		AlreadyRunning: in.AlreadyRunning,
+		Enforced:             in.Enforced,
+		RunsToday:            runs,
+		DailyLimit:           lim.DailyLimit,
+		NextReset:            NextResetUTC(now),
+		NewRawFiles:          in.NewRawFiles,
+		RawDirtyFiles:        in.RawDirtyFiles,
+		AnnotationDirtyFiles: in.AnnotationDirtyFiles,
+		PendingWork:          in.NewRawFiles + in.RawDirtyFiles + in.AnnotationDirtyFiles,
+		MinNewRaw:            lim.MinNewRaw,
+		AlreadyRunning:       in.AlreadyRunning,
 	}
 	if !in.Enforced {
 		snap.Allowed = true
@@ -120,7 +128,7 @@ func Evaluate(in Input) Snapshot {
 			return block(snap, ReasonCooldown, fmt.Sprintf("Cooldown active; try again in %d minutes", mins))
 		}
 	}
-	if in.NewRawFiles < lim.MinNewRaw {
+	if in.NewRawFiles+in.RawDirtyFiles < lim.MinNewRaw && in.AnnotationDirtyFiles == 0 {
 		return block(snap, ReasonNoNewRaw, "Upload at least one new or modified raw file before running")
 	}
 	snap.Allowed = true

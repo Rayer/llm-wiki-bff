@@ -49,12 +49,43 @@ type SourcesListResponse struct {
 
 // SourceDetailResponse is the response for a source detail endpoint.
 type SourceDetailResponse struct {
-	Slug        string                 `json:"slug"`
-	Title       string                 `json:"title"`
-	Type        string                 `json:"type"`
-	Frontmatter map[string]interface{} `json:"frontmatter"`
-	Body        string                 `json:"body"`
-	Raw         string                 `json:"raw"`
+	ID                string                 `json:"id"`
+	Slug              string                 `json:"slug"`
+	Title             string                 `json:"title"`
+	Type              string                 `json:"type"`
+	Frontmatter       map[string]interface{} `json:"frontmatter"`
+	Body              string                 `json:"body"`
+	Raw               string                 `json:"raw"`
+	RawPath           string                 `json:"raw_path"`
+	AnnotationAllowed bool                   `json:"annotation_allowed"`
+	HasAnnotation     bool                   `json:"has_annotation"`
+	AnnotationDirty   bool                   `json:"annotation_dirty"`
+	RawDirty          bool                   `json:"raw_dirty"`
+	Dirty             bool                   `json:"dirty"`
+	LifecycleStatus   string                 `json:"lifecycle_status"`
+	AnnUpdatedAt      string                 `json:"ann_updated_at,omitempty"`
+}
+
+// AnnotationRequest is the body for PUT /sources/:id/annotation.
+type AnnotationRequest struct {
+	Body               string `json:"body"`
+	ExpectedGeneration string `json:"expected_generation" validate:"required"`
+}
+
+// AnnotationResponse is returned by GET and PUT source annotation endpoints.
+type AnnotationResponse struct {
+	SourceID        string `json:"source_id"`
+	RawPath         string `json:"raw_path"`
+	Body            string `json:"body"`
+	SHA256          string `json:"ann_sha256"`
+	UpdatedAt       string `json:"updated_at"`
+	UpdatedBy       string `json:"updated_by"`
+	HasAnnotation   bool   `json:"has_annotation"`
+	Generation      string `json:"generation"`
+	AnnotationDirty bool   `json:"annotation_dirty"`
+	RawDirty        bool   `json:"raw_dirty"`
+	Dirty           bool   `json:"dirty"`
+	LifecycleStatus string `json:"lifecycle_status"`
 }
 
 // ConceptsListResponse is the response for a concepts list endpoint.

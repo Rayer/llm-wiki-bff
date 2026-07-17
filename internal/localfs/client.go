@@ -3,12 +3,14 @@ package localfs
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"cloud.google.com/go/storage"
@@ -23,9 +25,207 @@ type Client struct {
 	projectID string
 }
 
+type conditionalMeta struct {
+	Generation    int64     `json:"generation"`
+	Updated       time.Time `json:"updated"`
+	ContentSHA256 string    `json:"content_sha256"`
+	SHA256        string    `json:"ann_sha256,omitempty"`
+	RawPath       string    `json:"raw_path,omitempty"`
+	HasAnnotation bool      `json:"has_annotation"`
+}
+
+func conditionalMetaPath(path string) string { return path + ".meta" }
+func conditionalLockPath(path string) string { return path + ".lock" }
+
+// withConditionalLock serializes conditional operations across processes. flock
+// is advisory, which is sufficient because every local conditional operation
+// takes this lock before inspecting either the object or its sidecar.
+func withConditionalLock(path string, fn func() error) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	lock, err := os.OpenFile(conditionalLockPath(path), os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
+		return err
+	}
+	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+	return fn()
+}
+
+func (c *Client) ReadFileWithGeneration(ctx context.Context, relPath string) ([]byte, int64, error) {
+	path, err := c.fullPath(relPath)
+	if err != nil {
+		return nil, 0, err
+	}
+	var data []byte
+	var generation int64
+	err = withConditionalLock(path, func() error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		data, err = os.ReadFile(path)
+		if errors.Is(err, os.ErrNotExist) {
+			return storage.ErrObjectNotExist
+		}
+		if err != nil {
+			return fmt.Errorf("read %s: %w", relPath, err)
+		}
+		generation, err = recoverConditionalMeta(path, data)
+		return err
+	})
+	return data, generation, err
+}
+
+func (c *Client) WriteFileIfGeneration(ctx context.Context, data []byte, relPath string, expected int64) (int64, error) {
+	path, err := c.fullPath(relPath)
+	if err != nil {
+		return 0, err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return 0, err
+	}
+	var next int64
+	err = withConditionalLock(path, func() error {
+		currentData, readErr := os.ReadFile(path)
+		current := int64(0)
+		if readErr == nil {
+			current, readErr = recoverConditionalMeta(path, currentData)
+		}
+		if expected == 0 {
+			if readErr == nil {
+				return store.ErrGenerationMismatch
+			}
+			if !errors.Is(readErr, os.ErrNotExist) {
+				return readErr
+			}
+		} else if readErr != nil || current != expected {
+			return store.ErrGenerationMismatch
+		}
+		if err := writeFileAtomic(path, data); err != nil {
+			return err
+		}
+		next = current + 1
+		return writeConditionalMeta(path, data, next)
+	})
+	return next, err
+}
+
+func recoverConditionalMeta(path string, data []byte) (int64, error) {
+	contentSHA := digest(data)
+	meta, valid := readConditionalMeta(path)
+	if valid && meta.ContentSHA256 == contentSHA {
+		return meta.Generation, nil
+	}
+	next := int64(1)
+	if valid {
+		next = meta.Generation + 1
+	}
+	if err := writeConditionalMeta(path, data, next); err != nil {
+		return 0, err
+	}
+	return next, nil
+}
+
+func readConditionalMeta(path string) (conditionalMeta, bool) {
+	data, err := os.ReadFile(conditionalMetaPath(path))
+	if err == nil {
+		var meta conditionalMeta
+		if json.Unmarshal(data, &meta) == nil && meta.Generation > 0 {
+			return meta, true
+		}
+	}
+	return conditionalMeta{}, false
+}
+
+func writeConditionalMeta(path string, data []byte, generation int64) error {
+	meta := conditionalMeta{Generation: generation, Updated: time.Now().UTC(), ContentSHA256: digest(data)}
+	var annotationMeta struct {
+		SHA256  string `json:"ann_sha256"`
+		RawPath string `json:"raw_path"`
+		Body    string `json:"body"`
+	}
+	if json.Unmarshal(data, &annotationMeta) == nil {
+		meta.SHA256 = annotationMeta.SHA256
+		meta.RawPath = annotationMeta.RawPath
+		meta.HasAnnotation = annotationMeta.Body != ""
+	}
+	encoded, err := json.Marshal(meta)
+	if err != nil {
+		return err
+	}
+	return writeFileAtomic(conditionalMetaPath(path), encoded)
+}
+
+func writeFileAtomic(path string, data []byte) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".lwc-168-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(0o644); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, path)
+}
+
+func (c *Client) ListObjectMeta(ctx context.Context, prefix string) ([]store.ObjectMeta, error) {
+	dir, err := c.fullPath(prefix)
+	if err != nil {
+		return nil, err
+	}
+	entries, err := os.ReadDir(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return []store.ObjectMeta{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	out := make([]store.ObjectMeta, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		path := filepath.Join(dir, entry.Name())
+		var sidecar conditionalMeta
+		err := withConditionalLock(path, func() error {
+			data, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			generation, err := recoverConditionalMeta(path, data)
+			if err != nil {
+				return err
+			}
+			sidecar, _ = readConditionalMeta(path)
+			sidecar.Generation = generation
+			return nil
+		})
+		if err != nil {
+			return nil, err
+		}
+		meta := store.ObjectMeta{Path: filepath.ToSlash(filepath.Join(prefix, entry.Name())), Generation: sidecar.Generation, Updated: sidecar.Updated, SHA256: sidecar.SHA256, RawPath: sidecar.RawPath, HasAnnotation: sidecar.HasAnnotation}
+		out = append(out, meta)
+	}
+	return out, nil
+}
+
 type wikiPageFrontmatter struct {
-	ID    string `yaml:"id"`
-	Title string `yaml:"title"`
+	ID         string `yaml:"id"`
+	Title      string `yaml:"title"`
+	SourceFile string `yaml:"source_file"`
 }
 
 func New(root string) *Client {
@@ -445,6 +645,9 @@ func applyWikiPageFrontmatter(page store.WikiPage, data []byte) (store.WikiPage,
 	}
 	if title := strings.TrimSpace(matter.Title); title != "" {
 		page.Title = title
+	}
+	if raw := strings.TrimSpace(matter.SourceFile); raw != "" {
+		page.RawPath = raw
 	}
 	return page, nil
 }

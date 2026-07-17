@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"cloud.google.com/go/storage"
+	store "github.com/rayer/llm-wiki-bff/internal/storage"
 )
 
 func TestRejectsUnsafeRelativePaths(t *testing.T) {
@@ -171,6 +172,77 @@ func TestMissingFileUsesStorageNotFound(t *testing.T) {
 	_, err := New(t.TempDir()).WithScope("u", "p").ReadFile(context.Background(), "wiki/missing.md")
 	if !errors.Is(err, storage.ErrObjectNotExist) {
 		t.Fatalf("ReadFile() error = %v, want storage.ErrObjectNotExist", err)
+	}
+}
+
+func TestConditionalAnnotationWrites(t *testing.T) {
+	client := New(t.TempDir()).WithScope("u", "p")
+	ctx := context.Background()
+	if _, err := client.WriteFileIfGeneration(ctx, []byte("one"), "cache/annotations/id.json", 0); err != nil {
+		t.Fatal(err)
+	}
+	_, generation, err := client.ReadFileWithGeneration(ctx, "cache/annotations/id.json")
+	if err != nil || generation == 0 {
+		t.Fatalf("read generation: %d %v", generation, err)
+	}
+	if _, err := client.WriteFileIfGeneration(ctx, []byte("two"), "cache/annotations/id.json", 0); !errors.Is(err, store.ErrGenerationMismatch) {
+		t.Fatalf("create conflict = %v", err)
+	}
+	if _, err := client.WriteFileIfGeneration(ctx, []byte("two"), "cache/annotations/id.json", generation+1); !errors.Is(err, store.ErrGenerationMismatch) {
+		t.Fatalf("stale update = %v", err)
+	}
+	next, err := client.WriteFileIfGeneration(ctx, []byte("two"), "cache/annotations/id.json", generation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next <= generation {
+		t.Fatalf("next generation = %d, want greater than %d", next, generation)
+	}
+	if _, err := client.WriteFileIfGeneration(ctx, []byte("three"), "cache/annotations/id.json", generation); !errors.Is(err, store.ErrGenerationMismatch) {
+		t.Fatalf("old generation accepted after rapid writes: %v", err)
+	}
+}
+
+func TestConditionalWriteRecoversStaleSidecarBeforeAcceptingGeneration(t *testing.T) {
+	client := New(t.TempDir()).WithScope("u", "p")
+	ctx := context.Background()
+	path := "cache/annotations/id.json"
+	if _, err := client.WriteFileIfGeneration(ctx, []byte("one"), path, 0); err != nil {
+		t.Fatal(err)
+	}
+	_, generation, err := client.ReadFileWithGeneration(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	full, err := client.fullPath(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a crash after object rename but before the old sidecar changed.
+	if err := os.WriteFile(full, []byte("two"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	data, recovered, err := client.ReadFileWithGeneration(ctx, path)
+	if err != nil || string(data) != "two" || recovered <= generation {
+		t.Fatalf("recovery data=%q generation=%d old=%d err=%v", data, recovered, generation, err)
+	}
+	if _, err := client.WriteFileIfGeneration(ctx, []byte("three"), path, generation); !errors.Is(err, store.ErrGenerationMismatch) {
+		t.Fatalf("stale generation accepted after recovery: %v", err)
+	}
+}
+
+func TestListObjectMetaDoesNotExposeOrReadAnnotationSidecars(t *testing.T) {
+	client := New(t.TempDir()).WithScope("u", "p")
+	ctx := context.Background()
+	if _, err := client.WriteFileIfGeneration(ctx, []byte(`{"ann_sha256":"abc","raw_path":"raw/a.md","body":"note"}`), "cache/annotations/id.json", 0); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := client.ListObjectMeta(ctx, "cache/annotations/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Path != "cache/annotations/id.json" || entries[0].SHA256 != "abc" || !entries[0].HasAnnotation {
+		t.Fatalf("metadata entries = %#v", entries)
 	}
 }
 
