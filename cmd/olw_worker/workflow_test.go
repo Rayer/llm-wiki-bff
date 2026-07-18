@@ -55,4 +55,43 @@ func TestDeployWorkerWorkflowContract(t *testing.T) {
 	if strings.Contains(workflow, "olw-pipeline-prod") {
 		t.Fatal("dev worker workflow must not update production")
 	}
+
+	for _, line := range strings.Split(workflow, "\n") {
+		if line == "env:" {
+			t.Fatal("application runtime/deploy env must not be workflow-global and contaminate source verification")
+		}
+	}
+	verifyStep := workflowSection(t, workflow, "      - name: Verify worker source", "      - name: Authenticate to Google Cloud")
+	for _, forbidden := range []string{"PROJECT_ID:", "REGION:", "JOB_NAME:", "BUCKET:", "AR_REPO:"} {
+		if strings.Contains(verifyStep, forbidden) {
+			t.Fatalf("source verification inherited application env %q", forbidden)
+		}
+	}
+	authStep := workflowSection(t, workflow, "      - name: Authenticate to Google Cloud", "      - name: Set up Cloud SDK")
+	setupStep := workflowSection(t, workflow, "      - name: Set up Cloud SDK", "      - name: Configure Artifact Registry Docker auth")
+	for name, section := range map[string]string{"auth": authStep, "setup": setupStep} {
+		if !strings.Contains(section, "PROJECT_ID: llm-wiki-cloud") {
+			t.Fatalf("%s step missing scoped PROJECT_ID", name)
+		}
+	}
+	buildStep := workflowSection(t, workflow, "      - name: Build and push immutable worker image", "      - name: Update dev worker without GCSFuse")
+	if !strings.Contains(buildStep, "AR_REPO: asia-east1-docker.pkg.dev/llm-wiki-cloud/cloud-run-images") {
+		t.Fatal("image build step must receive its explicit Artifact Registry repository")
+	}
+	updateStep := workflow[strings.Index(workflow, "      - name: Update dev worker without GCSFuse"):]
+	for _, want := range []string{"REGION: asia-east1", "JOB_NAME: olw-pipeline-dev", "BUCKET: llm-wiki-data-dev"} {
+		if !strings.Contains(updateStep, want) {
+			t.Fatalf("worker update step missing scoped env %q", want)
+		}
+	}
+}
+
+func workflowSection(t *testing.T, workflow, start, end string) string {
+	t.Helper()
+	startAt := strings.Index(workflow, start)
+	endAt := strings.Index(workflow, end)
+	if startAt < 0 || endAt <= startAt {
+		t.Fatalf("invalid workflow section %q .. %q", start, end)
+	}
+	return workflow[startAt:endAt]
 }
