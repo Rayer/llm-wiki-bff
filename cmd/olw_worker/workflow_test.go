@@ -31,6 +31,7 @@ func TestDeployWorkerWorkflowContract(t *testing.T) {
 		"--update-env-vars \"BUCKET=${BUCKET}\"",
 		"--remove-env-vars \"DATA_DIR,WORKSPACE,VAULT_PATH,WORKSPACE_DIR\"",
 		"--args \"^@^run@[[\\\"run\\\",\\\"--auto-approve\\\"]]\"",
+		"--clear-volume-mounts",
 		"--clear-volumes",
 		"worker must not retain GCSFuse volumes",
 		"worker args do not match the cloud worker contract",
@@ -79,6 +80,11 @@ func TestDeployWorkerWorkflowContract(t *testing.T) {
 		t.Fatal("image build step must receive its explicit Artifact Registry repository")
 	}
 	updateStep := workflow[strings.Index(workflow, "      - name: Update dev worker without GCSFuse"):]
+	clearMountsAt := strings.Index(updateStep, "--clear-volume-mounts")
+	clearVolumesAt := strings.Index(updateStep, "--clear-volumes")
+	if clearMountsAt < 0 || clearVolumesAt <= clearMountsAt {
+		t.Fatal("worker update must clear volume mounts before clearing their referenced volumes")
+	}
 	for _, want := range []string{"REGION: asia-east1", "JOB_NAME: olw-pipeline-dev", "BUCKET: llm-wiki-data-dev"} {
 		if !strings.Contains(updateStep, want) {
 			t.Fatalf("worker update step missing scoped env %q", want)

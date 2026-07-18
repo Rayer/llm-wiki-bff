@@ -94,6 +94,7 @@ jobs:
             --update-env-vars "BUCKET=${BUCKET}" \
             --remove-env-vars "DATA_DIR,WORKSPACE,VAULT_PATH,WORKSPACE_DIR" \
             --args "^@^run@[[\"run\",\"--auto-approve\"]]" \
+            --clear-volume-mounts \
             --clear-volumes \
             --region "${REGION}" \
             --quiet
