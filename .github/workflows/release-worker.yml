@@ -129,8 +129,8 @@ jobs:
               | if (.containers[0].image | type) != "string" then error("container image must be a string") else . end
               | if (.containers[0].env | type) != "array" then error("container env must be an array") else . end
               | if (.containers[0].args | type) != "array" then error("container args must be an array") else . end
-              | if (.volumes | type) != "array" then error("volumes must be an array") else . end
-              | if (.containers[0].volumeMounts | type) != "array" then error("volume mounts must be an array") else . end
+              | if ((.volumes // []) | type) != "array" then error("volumes must be missing/null or an array") else . end
+              | if ((.containers[0].volumeMounts // []) | type) != "array" then error("volume mounts must be missing/null or an array") else . end
             ' <<<"$1" >/dev/null
           }
           if ! validate_job_contract "$JOB_CONTRACT"; then
@@ -215,8 +215,8 @@ jobs:
                     end
                 ],
                 args: $template.containers[0].args,
-                volumes: $template.volumes,
-                volumeMounts: $template.containers[0].volumeMounts
+                volumes: ($template.volumes // []),
+                volumeMounts: ($template.containers[0].volumeMounts // [])
               }
           ' <<<"$JOB_CONTRACT" > "$ROLLBACK_DIR/production-job-contract.json"
           if jq -e '
@@ -270,8 +270,8 @@ jobs:
             | if (.containers[0].image | type) != "string" then error("container image must be a string") else . end
             | if (.containers[0].env | type) != "array" then error("container env must be an array") else . end
             | if (.containers[0].args | type) != "array" then error("container args must be an array") else . end
-            | if (.volumes | type) != "array" then error("volumes must be an array") else . end
-            | if (.containers[0].volumeMounts | type) != "array" then error("volume mounts must be an array") else . end
+            | if ((.volumes // []) | type) != "array" then error("volumes must be missing/null or an array") else . end
+            | if ((.containers[0].volumeMounts // []) | type) != "array" then error("volume mounts must be missing/null or an array") else . end
           ' <<<"$JOB_CONTRACT" >/dev/null; then
             echo "production job contract has an invalid Cloud Run shape"
             exit 1
@@ -293,7 +293,7 @@ jobs:
             echo "production args do not match the cloud worker contract"
             exit 1
           fi
-          if ! jq -e '.spec.template.spec.template.spec.volumes == [] and .spec.template.spec.template.spec.containers[0].volumeMounts == []' <<<"$JOB_CONTRACT" >/dev/null; then
+          if ! jq -e '(.spec.template.spec.template.spec.volumes // []) == [] and (.spec.template.spec.template.spec.containers[0].volumeMounts // []) == []' <<<"$JOB_CONTRACT" >/dev/null; then
             echo "production job retains volumes or volume mounts"
             exit 1
           fi

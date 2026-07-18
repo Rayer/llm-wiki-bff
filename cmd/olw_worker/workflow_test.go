@@ -199,8 +199,8 @@ func TestWorkerPromotionWorkflowsContract(t *testing.T) {
 		".containers[0].image | type",
 		".containers[0].env | type",
 		".containers[0].args | type",
-		".volumes | type",
-		".containers[0].volumeMounts | type",
+		"(.volumes // []) | type",
+		"(.containers[0].volumeMounts // []) | type",
 		"JOB_CONTRACT_AFTER_RESOLVE",
 		"PRIOR_IMAGE_AFTER_RESOLVE",
 		"RESOLVED_DIGEST_AGAIN",
@@ -260,8 +260,8 @@ const workerJobShapeFilter = `
 | if (.containers[0].image | type) != "string" then error("container image must be a string") else . end
 | if (.containers[0].env | type) != "array" then error("container env must be an array") else . end
 | if (.containers[0].args | type) != "array" then error("container args must be an array") else . end
-| if (.volumes | type) != "array" then error("volumes must be an array") else . end
-| if (.containers[0].volumeMounts | type) != "array" then error("volume mounts must be an array") else . end
+| if ((.volumes // []) | type) != "array" then error("volumes must be missing/null or an array") else . end
+| if ((.containers[0].volumeMounts // []) | type) != "array" then error("volume mounts must be missing/null or an array") else . end
 `
 
 func TestWorkerJobContractFixtures(t *testing.T) {
@@ -293,6 +293,13 @@ func TestWorkerJobContractFixtures(t *testing.T) {
 			volumeCount:      0,
 			mountCount:       0,
 		},
+		"desired-prod-omitted.json": {
+			image:            "asia-east1-docker.pkg.dev/llm-wiki-cloud/cloud-run-images/olw-pipeline@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			envNames:         []string{"BUCKET"},
+			artifactEnvNames: []string{"BUCKET"},
+			volumeCount:      0,
+			mountCount:       0,
+		},
 	}
 	for name, want := range valid {
 		var got struct {
@@ -303,7 +310,7 @@ func TestWorkerJobContractFixtures(t *testing.T) {
 			Volumes      []json.RawMessage `json:"volumes"`
 			VolumeMounts []json.RawMessage `json:"volumeMounts"`
 		}
-		out := runJQFixture(t, name, workerJobShapeFilter+` | {image: .containers[0].image, env: .containers[0].env, volumes: .volumes, volumeMounts: .containers[0].volumeMounts}`)
+		out := runJQFixture(t, name, workerJobShapeFilter+` | {image: .containers[0].image, env: .containers[0].env, volumes: (.volumes // []), volumeMounts: (.containers[0].volumeMounts // [])}`)
 		if err := json.Unmarshal([]byte(out), &got); err != nil {
 			t.Fatalf("%s extraction was not JSON: %v", name, err)
 		}
@@ -330,8 +337,8 @@ func TestWorkerJobContractFixtures(t *testing.T) {
 			image: .containers[0].image,
 			env: [.containers[0].env[] | select(.name == "BUCKET" or .name == "DATA_DIR" or .name == "WORKSPACE" or .name == "VAULT_PATH" or .name == "WORKSPACE_DIR") | {name, value}],
 			args: .containers[0].args,
-			volumes: .volumes,
-			volumeMounts: .containers[0].volumeMounts
+			volumes: (.volumes // []),
+			volumeMounts: (.containers[0].volumeMounts // [])
 		}`
 		artifactOut := runJQFixture(t, name, artifactFilter)
 		if err := json.Unmarshal([]byte(artifactOut), &artifact); err != nil {

@@ -126,8 +126,8 @@ jobs:
             | if (.containers[0].image | type) != "string" then error("container image must be a string") else . end
             | if (.containers[0].env | type) != "array" then error("container env must be an array") else . end
             | if (.containers[0].args | type) != "array" then error("container args must be an array") else . end
-            | if (.volumes | type) != "array" then error("volumes must be an array") else . end
-            | if (.containers[0].volumeMounts | type) != "array" then error("volume mounts must be an array") else . end
+            | if ((.volumes // []) | type) != "array" then error("volumes must be missing/null or an array") else . end
+            | if ((.containers[0].volumeMounts // []) | type) != "array" then error("volume mounts must be missing/null or an array") else . end
           ' <<<"$JOB_CONTRACT" >/dev/null; then
             echo "worker job contract has an invalid Cloud Run shape"
             exit 1
@@ -137,11 +137,11 @@ jobs:
             echo "deployed image does not match immutable digest: ${DEPLOYED}"
             exit 1
           fi
-          if jq -e '.spec.template.spec.template.spec.volumes | length > 0' <<<"$JOB_CONTRACT" >/dev/null; then
+          if jq -e '(.spec.template.spec.template.spec.volumes // []) | length > 0' <<<"$JOB_CONTRACT" >/dev/null; then
             echo "worker must not retain GCSFuse volumes"
             exit 1
           fi
-          if jq -e '.spec.template.spec.template.spec.containers[0].volumeMounts | length > 0' <<<"$JOB_CONTRACT" >/dev/null; then
+          if jq -e '(.spec.template.spec.template.spec.containers[0].volumeMounts // []) | length > 0' <<<"$JOB_CONTRACT" >/dev/null; then
             echo "worker must not retain volume mounts"
             exit 1
           fi
