@@ -5,13 +5,6 @@ on:
     branches: [develop/1.0]
   workflow_dispatch:
 
-env:
-  PROJECT_ID: llm-wiki-cloud
-  REGION: asia-east1
-  JOB_NAME: olw-pipeline-dev
-  BUCKET: llm-wiki-data-dev
-  AR_REPO: asia-east1-docker.pkg.dev/llm-wiki-cloud/cloud-run-images
-
 concurrency:
   group: deploy-olw-pipeline-dev
   cancel-in-progress: true
@@ -43,6 +36,8 @@ jobs:
           go build ./...
 
       - name: Authenticate to Google Cloud
+        env:
+          PROJECT_ID: llm-wiki-cloud
         uses: google-github-actions/auth@v3
         with:
           project_id: ${{ env.PROJECT_ID }}
@@ -50,6 +45,8 @@ jobs:
           service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
 
       - name: Set up Cloud SDK
+        env:
+          PROJECT_ID: llm-wiki-cloud
         uses: google-github-actions/setup-gcloud@v2
         with:
           project_id: ${{ env.PROJECT_ID }}
@@ -59,6 +56,8 @@ jobs:
 
       - name: Build and push immutable worker image
         id: image
+        env:
+          AR_REPO: asia-east1-docker.pkg.dev/llm-wiki-cloud/cloud-run-images
         run: |
           set -euo pipefail
           SHA="${GITHUB_SHA}"
@@ -80,6 +79,9 @@ jobs:
       - name: Update dev worker without GCSFuse
         env:
           IMMUTABLE_IMAGE: ${{ steps.image.outputs.immutable_image }}
+          REGION: asia-east1
+          JOB_NAME: olw-pipeline-dev
+          BUCKET: llm-wiki-data-dev
         run: |
           set -euo pipefail
           git fetch --no-tags origin develop/1.0
