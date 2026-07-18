@@ -25,6 +25,19 @@ const (
 
 var errRebuildIndexLocked = errors.New("rebuild index already running")
 
+func finishRebuild(primary error, cleanup ...func() error) error {
+	result := primary
+	for _, release := range cleanup {
+		if release == nil {
+			continue
+		}
+		if err := release(); err != nil {
+			result = errors.Join(result, store.ErrLeaseCleanup)
+		}
+	}
+	return result
+}
+
 type idMap = wikiindex.IDMap
 
 type idMapStore interface {

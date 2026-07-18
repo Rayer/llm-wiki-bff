@@ -41,6 +41,79 @@ func TestParseCommandBatchRejectsEmptyCommandName(t *testing.T) {
 	}
 }
 
+func TestCloudCommandValidationHappensBeforeDecode(t *testing.T) {
+	cfg := workerConfig{Bucket: "bucket", UserID: "user", ProjectID: "project", Postprocess: true}
+	for _, tc := range []struct {
+		name string
+		cfg  workerConfig
+		raw  string
+	}{
+		{name: "empty execution id", cfg: cfg, raw: "not-json"},
+		{name: "oversized raw command", cfg: workerConfig{Bucket: "bucket", UserID: "user", ProjectID: "project", ExecutionID: "exec-1", Postprocess: true}, raw: strings.Repeat("x", maxWorkerCommandBytes+1)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := runWorkerBatch(context.Background(), tc.cfg, tc.raw); err == nil || err.Error() != "worker input is invalid" {
+				t.Fatalf("runWorkerBatch() error = %v, want fixed pre-decode rejection", err)
+			}
+		})
+	}
+}
+
+func TestCloudCommandStructuralLimits(t *testing.T) {
+	var manyCommands strings.Builder
+	manyCommands.WriteByte('[')
+	for i := 0; i <= maxWorkerCommands; i++ {
+		if i > 0 {
+			manyCommands.WriteByte(',')
+		}
+		manyCommands.WriteString(`["run"]`)
+	}
+	manyCommands.WriteByte(']')
+	if _, err := parseCommandBatch(manyCommands.String()); err == nil {
+		t.Fatal("parseCommandBatch accepted command count overflow")
+	}
+
+	var manyArgs strings.Builder
+	manyArgs.WriteString("[[\"run\"")
+	for i := 0; i < maxWorkerArgs; i++ {
+		manyArgs.WriteString(`,"arg"`)
+	}
+	manyArgs.WriteString(",\"overflow\"]]")
+	if _, err := parseCommandBatch(manyArgs.String()); err == nil {
+		t.Fatal("parseCommandBatch accepted argument count overflow")
+	}
+
+	if _, err := parseCommandBatch(`[["run","` + strings.Repeat("x", maxWorkerArgBytes+1) + `"]]`); err == nil {
+		t.Fatal("parseCommandBatch accepted argument byte overflow")
+	}
+	var cumulative strings.Builder
+	cumulative.WriteString("[[\"run\"")
+	for i := 0; i < maxWorkerArgs; i++ {
+		cumulative.WriteString(`,"`)
+		cumulative.WriteString(strings.Repeat("x", maxWorkerArgBytes))
+		cumulative.WriteByte('"')
+	}
+	cumulative.WriteString("]]")
+	if _, err := parseCommandBatch(cumulative.String()); err == nil {
+		t.Fatal("parseCommandBatch accepted cumulative argument byte overflow")
+	}
+}
+
+func TestExplicitAPIKeyExcludesInheritedDiagnosticSecrets(t *testing.T) {
+	inherited := strings.Repeat("oversized-inherited-secret", maxWorkerKeyBytes)
+	t.Setenv("LLM_API_KEY", inherited)
+	t.Setenv("DEEPSEEK_API_KEY", inherited+"-deepseek")
+	cfg := workerConfig{APIKey: "small-explicit-key", apiKeySet: true}
+	if err := validateWorkerInput(cfg, [][]string{{"run"}}); err != nil {
+		t.Fatalf("explicit key validation error = %v", err)
+	}
+	for _, secret := range diagnosticSecrets(cfg, [][]string{{"run"}}) {
+		if strings.Contains(secret, inherited) {
+			t.Fatalf("diagnostic secret collection retained inherited key %q", secret)
+		}
+	}
+}
+
 func TestResolveVaultPathPrefersExplicitVault(t *testing.T) {
 	cfg := workerConfig{VaultPath: "/tmp/explicit", DataDir: "/data", UserID: "u", ProjectID: "p"}
 	got, err := resolveVaultPath(cfg)
@@ -836,6 +909,99 @@ func TestCappedRedactingWriterCapsAndRedacts(t *testing.T) {
 	}
 }
 
+func TestDiagnosticSinkRedactsSplitAlternatingOutputAndArguments(t *testing.T) {
+	var output bytes.Buffer
+	sink := newDiagnosticSink([]io.Writer{&output}, []string{"api-secret", "user-secret", "project-secret", "/tmp/private", "--secret-arg"})
+	for _, part := range []string{strings.Repeat("safe", 3000), "api-", "secret user-", "secret project-", "secret /tmp/", "private --secret-", "arg"} {
+		if _, err := sink.Write([]byte(part)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := sink.Close(); err != nil {
+		t.Fatal(err)
+	}
+	text := output.String()
+	for _, raw := range []string{"api-secret", "user-secret", "project-secret", "/tmp/private", "--secret-arg"} {
+		if strings.Contains(text, raw) {
+			t.Fatalf("diagnostic leaked %q: %q", raw, text)
+		}
+	}
+	if !strings.Contains(text, "[REDACTED]") {
+		t.Fatalf("diagnostic was not redacted: %q", text)
+	}
+}
+
+func TestWorkerCommandErrorsAreFixedAndSilent(t *testing.T) {
+	for _, args := range [][]string{{"run"}, {"run", `[["run"]]`, "payload-secret"}, {"--stop-on-error=not-a-bool", "run", `[["run"]]`}, {"unknown-secret-command"}} {
+		cmd := newRootCommand()
+		var output bytes.Buffer
+		cmd.SetOut(&output)
+		cmd.SetErr(&output)
+		cmd.SetArgs(args)
+		err := executeWorkerCommand(cmd)
+		if err == nil || err.Error() != "worker command rejected" {
+			t.Fatalf("args=%q error=%v", args, err)
+		}
+		if output.Len() != 0 || strings.Contains(err.Error(), "secret") {
+			t.Fatalf("args=%q output=%q error=%v", args, output.String(), err)
+		}
+	}
+}
+
+func TestConfigEnvironmentDoesNotBecomeFlagDefaultAndExplicitWins(t *testing.T) {
+	t.Setenv("BUCKET", "env-bucket")
+	t.Setenv("USER_ID", "env-user")
+	t.Setenv("PROJECT_ID", "env-project")
+	cfg := configFromEnvironment(workerConfig{Bucket: "flag-bucket", UserID: "flag-user", ProjectID: "flag-project"})
+	if cfg.Bucket != "flag-bucket" || cfg.UserID != "flag-user" || cfg.ProjectID != "flag-project" {
+		t.Fatalf("explicit config lost: %+v", cfg)
+	}
+	cmd := newRootCommand()
+	if f := cmd.PersistentFlags().Lookup("bucket"); f == nil || f.DefValue != "" {
+		t.Fatalf("bucket default=%v", f)
+	}
+}
+
+func TestCloudConfigIgnoresInheritedLocalRoutingAndHonorsExplicitFalse(t *testing.T) {
+	t.Setenv("VAULT_PATH", "/mounted/vault")
+	t.Setenv("DATA_DIR", "/data")
+	t.Setenv("WORKSPACE", "true")
+	got := configFromEnvironment(workerConfig{Bucket: "bucket"})
+	if got.VaultPath != "" || got.DataDir != "" || got.Workspace {
+		t.Fatalf("cloud inherited local routing: %+v", got)
+	}
+	got = configFromEnvironment(workerConfig{Bucket: "bucket", Workspace: false, workspaceSet: true})
+	if got.Workspace {
+		t.Fatalf("explicit workspace=false lost to env: %+v", got)
+	}
+	got = configFromEnvironment(workerConfig{Bucket: "bucket", VaultPath: "/explicit", vaultSet: true})
+	if got.VaultPath != "/explicit" {
+		t.Fatalf("explicit vault lost: %+v", got)
+	}
+}
+
+func TestExplicitEmptyAndFalseFlagsSuppressInheritedEnvironment(t *testing.T) {
+	t.Setenv("BUCKET", "inherited-bucket")
+	t.Setenv("LLM_API_KEY", "inherited-api-key")
+	t.Setenv("USER_ID", "inherited-user")
+	t.Setenv("PROJECT_ID", "inherited-project")
+	t.Setenv("EXECUTION_ID", "inherited-execution")
+	t.Setenv("CLOUD_RUN_EXECUTION", "cloud-execution-sentinel")
+	t.Setenv("WORKSPACE_DIR", "/inherited/workspace")
+	t.Setenv("WORKSPACE", "true")
+	t.Setenv("VAULT_PATH", "/inherited/vault")
+	t.Setenv("DATA_DIR", "/inherited/data")
+
+	got := configFromEnvironment(workerConfig{
+		bucketSet: true, apiKeySet: true, userIDSet: true, projectIDSet: true,
+		executionIDSet: true, workspaceDirSet: true, workspaceSet: true,
+		vaultSet: true, dataDirSet: true,
+	})
+	if got.Bucket != "" || got.APIKey != "" || got.UserID != "" || got.ProjectID != "" || got.ExecutionID != "" || got.WorkspaceDir != "" || got.VaultPath != "" || got.DataDir != "" || got.Workspace {
+		t.Fatalf("explicit empty/false flags were replaced by environment: %+v", got)
+	}
+}
+
 func TestWorkspaceConcurrentAnnotationRemainsDirtyAndIsNotSyncedBack(t *testing.T) {
 	old := execOLW
 	defer func() { execOLW = old }()
@@ -971,6 +1137,60 @@ func TestNoWorkspaceRunsAgainstOriginalVault(t *testing.T) {
 	}
 	if got != want {
 		t.Fatalf("OLW vault=%q, want %q", got, want)
+	}
+}
+
+func TestBucketConfigurationRejectsVaultAndMountedRoutingBeforeChild(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cfg  workerConfig
+		env  map[string]string
+	}{
+		{"explicit vault", workerConfig{VaultPath: t.TempDir(), APIKey: "secret", ExecutionID: "exec-1", Postprocess: true}, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("BUCKET", "bucket")
+			for key, value := range tc.env {
+				t.Setenv(key, value)
+			}
+			called := false
+			old := execOLW
+			defer func() { execOLW = old }()
+			execOLW = func(context.Context, string, []string, []string, io.Writer, io.Writer) error {
+				called = true
+				return nil
+			}
+			err := runWorkerBatch(context.Background(), tc.cfg, `[["run"]]`)
+			if err == nil || err.Error() != "worker configuration is invalid" || called {
+				t.Fatalf("error=%v child=%v", err, called)
+			}
+		})
+	}
+}
+
+func TestRecordFailurePersistsOnlySafeErrorAndKeepsSuccessFields(t *testing.T) {
+	vault := workspaceVault(t, "raw")
+	prior := sourcestatus.Receipt{RawPath: "raw/source.md", LastIngestFingerprint: "prior", LastSuccessAt: "2026-01-01T00:00:00Z"}
+	writeWorkspaceStatus(t, vault, prior)
+	snapshot := sourceSnapshot{SourceID: "s1", RawPath: "raw/source.md", Fingerprint: "failed"}
+	sentinel := errors.New("tenant-secret /private/path object-key --argument")
+	if err := recordFailure(vault, []sourceSnapshot{snapshot}, fmt.Errorf("wrapped: %w", sentinel)); err != nil {
+		t.Fatal(err)
+	}
+	artifact, err := readSourceStatus(vault)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := artifact.Sources["s1"]
+	if got.Error != "pipeline failed" || got.LastSuccessAt != prior.LastSuccessAt || got.LastIngestFingerprint != prior.LastIngestFingerprint {
+		t.Fatalf("receipt=%+v", got)
+	}
+	data, err := os.ReadFile(filepath.Join(vault, filepath.FromSlash(sourcestatus.Path)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), sentinel.Error()) {
+		t.Fatalf("unsafe failure persisted: %s", data)
 	}
 }
 

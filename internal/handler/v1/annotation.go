@@ -22,7 +22,7 @@ const maxAnnotationRequestBytes = 256 << 10
 func (h *Handler) annotationTarget(c *gin.Context) (store.Store, store.ConditionalWriter, string, string, bool) {
 	s, err := h.GetStore(c)
 	if err != nil {
-		c.JSON(500, handler.ErrorResponse{Error: err.Error()})
+		c.JSON(500, handler.ErrorResponse{Error: generatedDataUnavailableMessage})
 		return nil, nil, "", "", false
 	}
 	w, ok := s.(store.ConditionalWriter)
@@ -32,7 +32,7 @@ func (h *Handler) annotationTarget(c *gin.Context) (store.Store, store.Condition
 	}
 	dual, err := h.getIDRoutingMap(c.Request.Context(), s)
 	if err != nil {
-		c.JSON(500, handler.ErrorResponse{Error: err.Error()})
+		c.JSON(500, handler.ErrorResponse{Error: generatedDataUnavailableMessage})
 		return nil, nil, "", "", false
 	}
 	id := strings.TrimSpace(c.Param("id"))
@@ -86,7 +86,7 @@ func (h *Handler) GetAnnotation(c *gin.Context) {
 		return
 	}
 	if err != nil {
-		c.JSON(500, handler.ErrorResponse{Error: "read annotation: " + err.Error()})
+		c.JSON(500, handler.ErrorResponse{Error: generatedDataUnavailableMessage})
 		return
 	}
 	var object annotation.Object
@@ -141,7 +141,7 @@ func (h *Handler) PutAnnotation(c *gin.Context) {
 			return
 		}
 	} else if !errors.Is(err, storage.ErrObjectNotExist) {
-		c.JSON(500, handler.ErrorResponse{Error: "read annotation: " + err.Error()})
+		c.JSON(500, handler.ErrorResponse{Error: generatedDataUnavailableMessage})
 		return
 	}
 	object := annotation.Object{Version: 1, SourceID: id, RawPath: raw, Body: body, SHA256: annotation.Digest(body), UpdatedAt: time.Now().UTC().Format(time.RFC3339), UpdatedBy: c.GetString("userID")}
@@ -151,7 +151,7 @@ func (h *Handler) PutAnnotation(c *gin.Context) {
 		if errors.Is(err, store.ErrGenerationMismatch) {
 			c.JSON(412, handler.ErrorResponse{Error: "annotation generation mismatch"})
 		} else {
-			c.JSON(500, handler.ErrorResponse{Error: "write annotation: " + err.Error()})
+			c.JSON(500, handler.ErrorResponse{Error: generatedDataUnavailableMessage})
 		}
 		return
 	}
@@ -236,7 +236,7 @@ func hex16(raw []byte) (rune, bool) {
 func (h *Handler) writeAnnotationResponse(c *gin.Context, s store.Store, id, raw string, object annotation.Object, generation int64) {
 	response, err := h.annotationResponse(c, s, id, raw, object, generation)
 	if err != nil {
-		c.JSON(500, handler.ErrorResponse{Error: "calculate annotation lifecycle: " + err.Error()})
+		c.JSON(500, handler.ErrorResponse{Error: generatedDataUnavailableMessage})
 		return
 	}
 	c.JSON(200, response)

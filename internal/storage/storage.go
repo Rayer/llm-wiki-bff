@@ -6,7 +6,31 @@ import (
 	"time"
 )
 
+var ErrObjectNotExist = errors.New("object does not exist")
 var ErrGenerationMismatch = errors.New("object generation mismatch")
+var ErrGenerationManaged = errors.New("generated output is managed by the pipeline")
+var ErrGenerationStateUnavailable = errors.New("generation state unavailable")
+var ErrDeclaredObjectUnavailable = errors.New("declared generation object unavailable")
+var ErrLeaseCleanup = errors.New("lease cleanup failed")
+
+// RetryGenerationCleanup performs bounded, exact-generation cleanup with a
+// fresh background timeout for every attempt. Cleanup must remain possible
+// after a request or worker context is cancelled, but provider errors never
+// cross this shared seam.
+func RetryGenerationCleanup(generation int64, timeout time.Duration, attempts int, remove func(context.Context, int64) error) error {
+	if generation <= 0 || timeout <= 0 || attempts <= 0 || remove == nil {
+		return ErrLeaseCleanup
+	}
+	for attempt := 0; attempt < attempts; attempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		err := remove(ctx, generation)
+		cancel()
+		if err == nil {
+			return nil
+		}
+	}
+	return ErrLeaseCleanup
+}
 
 // WikiPage represents a wiki source or concept page.
 type WikiPage struct {
@@ -71,6 +95,32 @@ type ConditionalWriter interface {
 // ObjectLister exposes metadata-only prefix listing.
 type ObjectLister interface {
 	ListObjectMeta(context.Context, string) ([]ObjectMeta, error)
+}
+
+// GenerationAware reports whether a project has committed immutable output.
+// It is intentionally optional so local filesystem development remains legacy.
+type GenerationAware interface {
+	HasCurrentManifest(context.Context) (bool, error)
+}
+
+// LegacyGenerationWriteSession is a narrow migration capability. It is used
+// only while rebuilding a pre-manifest project so generated paths cannot race
+// the worker's manifest commit.
+type LegacyGenerationWriteSession interface {
+	BeginLegacyGenerationWrite(context.Context) (Store, func(context.Context) error, error)
+}
+
+// ViewPinner captures the immutable generated-output view for one operation.
+// Implementations return a Store whose generated reads cannot observe a later
+// manifest commit. Local filesystem stores intentionally return themselves.
+type ViewPinner interface {
+	Pin(context.Context) (Store, error)
+}
+
+// ViewToken identifies a pinned immutable view without exposing paths or
+// tenant identity. It is used only for process-local cache partitioning.
+type ViewToken interface {
+	ViewToken() string
 }
 
 // Store is the project-scoped wiki storage contract used by BFF read/write paths.

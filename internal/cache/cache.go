@@ -2,6 +2,8 @@
 package cache
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -13,6 +15,7 @@ import (
 
 	fm "github.com/adrg/frontmatter"
 	"github.com/rayer/llm-wiki-bff/internal/gcs"
+	"github.com/rayer/llm-wiki-bff/internal/generation"
 	"github.com/rayer/llm-wiki-bff/internal/search"
 )
 
@@ -320,7 +323,13 @@ func (c *Cache) loadJSONL(ctx context.Context, reader conceptReader) error {
 
 func prefixForReader(reader conceptReader) string {
 	if prefixed, ok := reader.(interface{ Prefix() string }); ok {
-		return prefixed.Prefix()
+		prefix := prefixed.Prefix()
+		if tokenized, ok := reader.(interface{ ViewToken() string }); ok {
+			if token := tokenized.ViewToken(); token != "" && token != "legacy" {
+				return prefix + ":" + token
+			}
+		}
+		return prefix
 	}
 	return ""
 }
@@ -460,18 +469,26 @@ func marshalJSONL(entries []Entry) []byte {
 }
 
 func unmarshalJSONL(data []byte) ([]Entry, error) {
-	lines := strings.Split(string(data), "\n")
-	entries := make([]Entry, 0, len(lines))
-	for _, line := range lines {
+	scanner := bufio.NewScanner(bytes.NewReader(data))
+	scanner.Buffer(make([]byte, 64*1024), 16*1024*1024)
+	entries := make([]Entry, 0)
+	for scanner.Scan() {
+		line := scanner.Text()
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
+		}
+		if len(entries) >= generation.MaxFiles {
+			return nil, generation.ErrLogicalEntryLimit
 		}
 		var entry Entry
 		if err := json.Unmarshal([]byte(line), &entry); err != nil {
 			return nil, err
 		}
 		entries = append(entries, entry)
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
 	}
 	return entries, nil
 }

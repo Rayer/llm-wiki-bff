@@ -27,11 +27,21 @@ func TestDeployWorkerWorkflowContract(t *testing.T) {
 		"git rev-parse origin/develop/1.0",
 		"--image \"$IMMUTABLE_IMAGE\"",
 		"gcloud run jobs describe \"${JOB_NAME}\"",
+		"BUCKET: llm-wiki-data-dev",
+		"--update-env-vars \"BUCKET=${BUCKET}\"",
+		"--remove-env-vars \"DATA_DIR,WORKSPACE,VAULT_PATH,WORKSPACE_DIR\"",
+		"--args \"^@^run@[[\\\"run\\\",\\\"--auto-approve\\\"]]\"",
+		"--clear-volumes",
+		"worker must not retain GCSFuse volumes",
+		"worker args do not match the cloud worker contract",
 		"${DEPLOYED}\" != \"${IMMUTABLE_IMAGE}",
 	} {
 		if !strings.Contains(workflow, want) {
 			t.Fatalf("workflow missing %q", want)
 		}
+	}
+	if !strings.Contains(workflow, `select(.name == "DATA_DIR" or .name == "WORKSPACE" or .name == "VAULT_PATH" or .name == "WORKSPACE_DIR")`) {
+		t.Fatal("workflow does not read back removed legacy env")
 	}
 	if strings.Index(workflow, "go test ./... -count=1") > strings.Index(workflow, "Authenticate to Google Cloud") {
 		t.Fatal("source verification must run before cloud authentication")

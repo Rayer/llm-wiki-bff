@@ -1,6 +1,7 @@
 package wikiindex
 
 import (
+	"bytes"
 	"context"
 	"crypto/md5"
 	"encoding/hex"
@@ -12,6 +13,7 @@ import (
 	"cloud.google.com/go/storage"
 	fm "github.com/adrg/frontmatter"
 	conceptcache "github.com/rayer/llm-wiki-bff/internal/cache"
+	"github.com/rayer/llm-wiki-bff/internal/generation"
 )
 
 const (
@@ -45,6 +47,53 @@ type SourceMeta struct {
 	Slug       string `json:"slug"`
 	Title      string `json:"title,omitempty"`
 	SourceFile string `json:"source_file,omitempty"`
+}
+
+// DecodeIDMap bounds every collection while it is being decoded. Generated
+// cache byte limits alone do not bound the number of map and slice entries.
+func DecodeIDMap(data []byte) (IDMap, error) {
+	result := IDMap{Concept: map[string]string{}, Source: map[string]string{}, SourceMeta: map[string]SourceMeta{}, Redirects: map[string][]string{}}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	token, err := dec.Token()
+	if err != nil {
+		return result, err
+	}
+	if delim, ok := token.(json.Delim); !ok || delim != '{' {
+		return result, errors.New("expected JSON object")
+	}
+	for dec.More() {
+		key, err := dec.Token()
+		if err != nil {
+			return result, err
+		}
+		name, ok := key.(string)
+		if !ok {
+			return result, errors.New("expected JSON object key")
+		}
+		switch name {
+		case "concept":
+			result.Concept, err = generation.DecodeBoundedMap[string](dec)
+		case "source":
+			result.Source, err = generation.DecodeBoundedMap[string](dec)
+		case "source_meta":
+			result.SourceMeta, err = generation.DecodeBoundedMap[SourceMeta](dec)
+		case "redirects":
+			result.Redirects, err = generation.DecodeBoundedStringLists(dec)
+		default:
+			var ignored json.RawMessage
+			err = dec.Decode(&ignored)
+		}
+		if err != nil {
+			return result, err
+		}
+	}
+	if _, err := dec.Token(); err != nil {
+		return result, err
+	}
+	if err := generation.EnsureJSONEOF(dec); err != nil {
+		return result, err
+	}
+	return result, nil
 }
 
 type markdownMatter struct {
@@ -162,7 +211,8 @@ func readOldIDMap(ctx context.Context, store Store) (IDMap, error) {
 	if len(data) == 0 {
 		return old, nil
 	}
-	if err := json.Unmarshal(data, &old); err != nil {
+	old, err = DecodeIDMap(data)
+	if err != nil {
 		return old, fmt.Errorf("decode old id map: %w", err)
 	}
 	if old.Concept == nil {
