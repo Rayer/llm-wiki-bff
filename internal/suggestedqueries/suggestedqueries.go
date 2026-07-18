@@ -1,6 +1,8 @@
 package suggestedqueries
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"sort"
@@ -8,6 +10,7 @@ import (
 	"time"
 
 	conceptcache "github.com/rayer/llm-wiki-bff/internal/cache"
+	"github.com/rayer/llm-wiki-bff/internal/generation"
 )
 
 const (
@@ -72,7 +75,40 @@ func BuildFromConceptsJSONL(data []byte, mtimes map[string]time.Time, now time.T
 
 func Decode(data []byte) (Artifact, error) {
 	var artifact Artifact
-	if err := json.Unmarshal(data, &artifact); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	token, err := dec.Token()
+	if err != nil {
+		return Artifact{}, err
+	}
+	if delim, ok := token.(json.Delim); !ok || delim != '{' {
+		return Artifact{}, fmt.Errorf("expected JSON object")
+	}
+	for dec.More() {
+		key, err := dec.Token()
+		if err != nil {
+			return Artifact{}, err
+		}
+		name, ok := key.(string)
+		if !ok {
+			return Artifact{}, fmt.Errorf("expected JSON object key")
+		}
+		switch name {
+		case "queries":
+			artifact.Queries, err = generation.DecodeBoundedStrings(dec)
+		case "updated_at":
+			err = dec.Decode(&artifact.UpdatedAt)
+		default:
+			var ignored json.RawMessage
+			err = dec.Decode(&ignored)
+		}
+		if err != nil {
+			return Artifact{}, err
+		}
+	}
+	if _, err := dec.Token(); err != nil {
+		return Artifact{}, err
+	}
+	if err := generation.EnsureJSONEOF(dec); err != nil {
 		return Artifact{}, err
 	}
 	return artifact, nil
@@ -86,18 +122,26 @@ func Queries(artifact Artifact) []string {
 }
 
 func parseConceptsJSONL(data []byte) ([]conceptcache.Entry, error) {
-	lines := strings.Split(string(data), "\n")
-	entries := make([]conceptcache.Entry, 0, len(lines))
-	for _, line := range lines {
+	scanner := bufio.NewScanner(bytes.NewReader(data))
+	scanner.Buffer(make([]byte, 64*1024), 16*1024*1024)
+	entries := make([]conceptcache.Entry, 0)
+	for scanner.Scan() {
+		line := scanner.Text()
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
+		}
+		if len(entries) >= generation.MaxFiles {
+			return nil, generation.ErrLogicalEntryLimit
 		}
 		var entry conceptcache.Entry
 		if err := json.Unmarshal([]byte(line), &entry); err != nil {
 			return nil, fmt.Errorf("decode concepts jsonl line: %w", err)
 		}
 		entries = append(entries, entry)
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
 	}
 	return entries, nil
 }

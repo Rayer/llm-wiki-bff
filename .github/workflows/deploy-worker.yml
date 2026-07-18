@@ -1,0 +1,168 @@
+name: Deploy OLW worker to Cloud Run (dev)
+
+on:
+  push:
+    branches: [develop/1.0, main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-olw-pipeline-dev
+  cancel-in-progress: true
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Verify worker source
+        run: |
+          set -euo pipefail
+          go test ./... -count=1
+          go vet ./...
+          go build ./...
+
+      - name: Authenticate to Google Cloud
+        env:
+          PROJECT_ID: llm-wiki-cloud
+        uses: google-github-actions/auth@v3
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        env:
+          PROJECT_ID: llm-wiki-cloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+
+      - name: Configure Artifact Registry Docker auth
+        run: gcloud auth configure-docker asia-east1-docker.pkg.dev --quiet
+
+      - name: Build and push immutable worker image
+        id: image
+        env:
+          AR_REPO: asia-east1-docker.pkg.dev/llm-wiki-cloud/cloud-run-images
+        run: |
+          set -euo pipefail
+          SHA="${GITHUB_SHA}"
+          if [[ ! "$SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "GITHUB_SHA is invalid"
+            exit 1
+          fi
+          TAG="${SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          IMAGE="${AR_REPO}/olw-pipeline:${TAG}"
+          docker build --target worker -f cmd/olw_worker/Dockerfile -t "$IMAGE" .
+          docker push "$IMAGE"
+          DIGEST=$(gcloud artifacts docker images describe "$IMAGE" --format='value(image_summary.digest)' --quiet)
+          if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "image digest is missing or invalid"
+            exit 1
+          fi
+          echo "immutable_image=${AR_REPO}/olw-pipeline@${DIGEST}" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "$DIGEST" > "worker-image-digest-${GITHUB_SHA}.txt"
+
+      - name: Upload exact image digest provenance
+        uses: actions/upload-artifact@v4
+        with:
+          name: worker-image-digest-${{ github.sha }}
+          path: worker-image-digest-${{ github.sha }}.txt
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Update dev worker without GCSFuse
+        env:
+          IMMUTABLE_IMAGE: ${{ steps.image.outputs.immutable_image }}
+          REGION: asia-east1
+          JOB_NAME: olw-pipeline-dev
+          BUCKET: llm-wiki-data-dev
+        run: |
+          set -euo pipefail
+          SHA="${GITHUB_SHA}"
+          if [[ ! "$SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "GITHUB_SHA is invalid"
+            exit 1
+          fi
+          case "${GITHUB_REF_NAME}" in
+            develop/1.0|main) SOURCE_BRANCH="${GITHUB_REF_NAME}" ;;
+            *) echo "unsupported source branch: ${GITHUB_REF_NAME}"; exit 1 ;;
+          esac
+          git fetch --no-tags origin "${SOURCE_BRANCH}"
+          if [[ "$(git rev-parse "origin/${SOURCE_BRANCH}")" != "${SHA}" ]]; then
+            echo "${SOURCE_BRANCH} advanced; refusing an out-of-order deployment"
+            exit 1
+          fi
+          gcloud run jobs update "${JOB_NAME}" \
+            --image "$IMMUTABLE_IMAGE" \
+            --update-env-vars "BUCKET=${BUCKET}" \
+            --remove-env-vars "DATA_DIR,WORKSPACE,VAULT_PATH,WORKSPACE_DIR" \
+            --args "^@^run@[[\"run\",\"--auto-approve\"]]" \
+            --clear-volume-mounts \
+            --clear-volumes \
+            --region "${REGION}" \
+            --quiet
+
+          JOB_CONTRACT=$(gcloud run jobs describe "${JOB_NAME}" \
+            --region "${REGION}" --format=json --quiet)
+          if ! jq -e '
+            .spec.template.spec.template.spec
+            | if type != "object" then error("missing Cloud Run job template spec") else . end
+            | if (.containers | type) != "array" or (.containers | length) != 1 then error("expected exactly one container") else . end
+            | if (.containers[0].image | type) != "string" then error("container image must be a string") else . end
+            | if (.containers[0].env | type) != "array" then error("container env must be an array") else . end
+            | if (.containers[0].args | type) != "array" then error("container args must be an array") else . end
+            | if ((.volumes // []) | type) != "array" then error("volumes must be missing/null or an array") else . end
+            | if ((.containers[0].volumeMounts // []) | type) != "array" then error("volume mounts must be missing/null or an array") else . end
+          ' <<<"$JOB_CONTRACT" >/dev/null; then
+            echo "worker job contract has an invalid Cloud Run shape"
+            exit 1
+          fi
+          DEPLOYED=$(jq -er '.spec.template.spec.template.spec.containers[0].image | select(type == "string")' <<<"$JOB_CONTRACT")
+          if [[ "${DEPLOYED}" != "${IMMUTABLE_IMAGE}" ]]; then
+            echo "deployed image does not match immutable digest: ${DEPLOYED}"
+            exit 1
+          fi
+          if jq -e '(.spec.template.spec.template.spec.volumes // []) | length > 0' <<<"$JOB_CONTRACT" >/dev/null; then
+            echo "worker must not retain GCSFuse volumes"
+            exit 1
+          fi
+          if jq -e '(.spec.template.spec.template.spec.containers[0].volumeMounts // []) | length > 0' <<<"$JOB_CONTRACT" >/dev/null; then
+            echo "worker must not retain volume mounts"
+            exit 1
+          fi
+          if [[ $(jq -r '.spec.template.spec.template.spec.containers[0].env[]? | select(.name == "BUCKET") | .value' <<<"$JOB_CONTRACT") != "${BUCKET}" ]]; then
+            echo "worker BUCKET is missing or incorrect"
+            exit 1
+          fi
+          if jq -e '.spec.template.spec.template.spec.containers[0].env[]? | select(.name == "DATA_DIR" or .name == "WORKSPACE" or .name == "VAULT_PATH" or .name == "WORKSPACE_DIR")' <<<"$JOB_CONTRACT" >/dev/null; then
+            echo "worker must not retain legacy local-routing env"
+            exit 1
+          fi
+          if jq -e '.spec.template.spec.template.spec.containers[0].args[]? | select(test("--(vault|data-dir|workspace)"))' <<<"$JOB_CONTRACT" >/dev/null; then
+            echo "worker must not retain legacy local-routing args"
+            exit 1
+          fi
+          if [[ $(jq -c '.spec.template.spec.template.spec.containers[0].args' <<<"$JOB_CONTRACT") != '["run","[[\"run\",\"--auto-approve\"]]"]' ]]; then
+            echo "worker args do not match the cloud worker contract"
+            exit 1
+          fi
+          git fetch --no-tags origin "${SOURCE_BRANCH}"
+          if [[ "$(git rev-parse "origin/${SOURCE_BRANCH}")" != "${SHA}" ]]; then
+            echo "${SOURCE_BRANCH} advanced; the newer serialized workflow must supersede this deployment"
+            exit 1
+          fi

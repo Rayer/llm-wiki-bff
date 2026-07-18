@@ -113,6 +113,16 @@ make all
 
 Production mode expects GCP credentials and uses GCS/Firestore. Local mode is selected only when `--local` or `LOCAL_DATA_DIR` is set.
 
+### Immutable worker generations
+
+The Cloud Run worker uses the GCS API directly; it does not mount the bucket.
+Cloud mode requires `BUCKET`, `USER_ID`, and `PROJECT_ID` and publishes a
+create-only generation under `.lwc/publish/generations/`, then commits
+`.lwc/publish/current.json` with a GCS generation precondition. The BFF reads
+the manifest view when it exists and retains direct legacy reads only for
+projects that have not yet published a manifest. `--vault` remains the local
+developer workflow and is never used by the deployed worker.
+
 The BFF supports `FIRESTORE_DATABASE_ID`, `PIPELINE_JOB_URL`, and `ALLOWED_ORIGINS` environment overrides. Empty database and pipeline values preserve the legacy defaults; configured pipeline URLs must be HTTPS Cloud Run Jobs `:run` URLs on `run.googleapis.com` with the expected resource path.
 
 ## Useful Commands

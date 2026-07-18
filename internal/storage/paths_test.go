@@ -33,3 +33,16 @@ func TestProjectObjectPath(t *testing.T) {
 		t.Fatalf("ProjectObjectPath = %q, want %q", got, want)
 	}
 }
+
+func TestSafeRawPath(t *testing.T) {
+	for _, raw := range []string{"raw/a..b.md", "raw/nested/file.md"} {
+		if !SafeRawPath(raw) {
+			t.Fatalf("safe raw path rejected: %q", raw)
+		}
+	}
+	for _, raw := range []string{"raw/", "raw/../secret", "raw/a/../../secret", "/raw/a.md", `raw\\a.md`, "raw//a.md"} {
+		if SafeRawPath(raw) {
+			t.Fatalf("unsafe raw path accepted: %q", raw)
+		}
+	}
+}

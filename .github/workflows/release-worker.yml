@@ -1,0 +1,310 @@
+name: Promote OLW worker to Cloud Run (production)
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: Full lowercase commit SHA for an image already built by the main dev workflow
+        required: true
+        type: string
+
+env:
+  PROJECT_ID: llm-wiki-cloud
+  REGION: asia-east1
+  AR_REPO: asia-east1-docker.pkg.dev/llm-wiki-cloud/cloud-run-images
+  JOB_NAME: olw-pipeline
+
+concurrency:
+  group: promote-olw-pipeline-production
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    name: Promote immutable worker image
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: production
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Validate promotion commit
+        id: commit
+        env:
+          COMMIT_SHA: ${{ inputs.commit_sha }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$COMMIT_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "commit_sha must be a 40-character lowercase commit SHA"
+            exit 1
+          fi
+          git fetch origin main --force --no-tags
+          if ! git cat-file -e "$COMMIT_SHA^{commit}"; then
+            echo "commit_sha does not identify a commit"
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$COMMIT_SHA" origin/main; then
+            echo "commit_sha is not an ancestor of main"
+            exit 1
+          fi
+          echo "commit_sha=$COMMIT_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Locate successful main dev deployment
+        id: dev_run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMIT_SHA: ${{ steps.commit.outputs.commit_sha }}
+        run: |
+          set -euo pipefail
+          RUN_ID=$(gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/deploy-worker.yml/runs?event=push&status=completed&head_sha=${COMMIT_SHA}&per_page=100" \
+            | jq -r --arg sha "$COMMIT_SHA" 'first(.workflow_runs[] | select(.event == "push" and .head_branch == "main" and .head_sha == $sha and .conclusion == "success") | .id) // empty')
+          if [[ -z "$RUN_ID" ]]; then
+            echo "no successful main push run of deploy-worker.yml found for $COMMIT_SHA"
+            exit 1
+          fi
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Download exact dev image digest
+        id: image
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMIT_SHA: ${{ steps.commit.outputs.commit_sha }}
+          DEV_RUN_ID: ${{ steps.dev_run.outputs.run_id }}
+        run: |
+          set -euo pipefail
+          ARTIFACT_DIR="$RUNNER_TEMP/worker-image-digest"
+          rm -rf "$ARTIFACT_DIR"
+          mkdir -p "$ARTIFACT_DIR"
+          gh run download "$DEV_RUN_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            --name "worker-image-digest-$COMMIT_SHA" \
+            --dir "$ARTIFACT_DIR"
+          DIGEST_FILE="$ARTIFACT_DIR/worker-image-digest-$COMMIT_SHA.txt"
+          if [[ ! -f "$DIGEST_FILE" ]] || [[ $(find "$ARTIFACT_DIR" -type f | wc -l) -ne 1 ]]; then
+            echo "digest artifact contents are missing or unexpected"
+            exit 1
+          fi
+          DIGEST=$(tr -d '[:space:]' < "$DIGEST_FILE")
+          if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "digest artifact is missing or invalid"
+            exit 1
+          fi
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          echo "image=${AR_REPO}/olw-pipeline@${DIGEST}" >> "$GITHUB_OUTPUT"
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v3
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+
+      - name: Freeze production rollback artifact
+        env:
+          ROLLBACK_DIR: ${{ runner.temp }}/worker-production-rollback
+        run: |
+          set -euo pipefail
+          mkdir -p "$ROLLBACK_DIR"
+          JOB_CONTRACT=$(gcloud run jobs describe "${JOB_NAME}" --region "${REGION}" --format=json --quiet)
+
+          validate_job_contract() {
+            jq -e '
+              .spec.template.spec.template.spec
+              | if type != "object" then error("missing Cloud Run job template spec") else . end
+              | if (.containers | type) != "array" or (.containers | length) != 1 then error("expected exactly one container") else . end
+              | if (.containers[0].image | type) != "string" then error("container image must be a string") else . end
+              | if (.containers[0].env | type) != "array" then error("container env must be an array") else . end
+              | if (.containers[0].args | type) != "array" then error("container args must be an array") else . end
+              | if ((.volumes // []) | type) != "array" then error("volumes must be missing/null or an array") else . end
+              | if ((.containers[0].volumeMounts // []) | type) != "array" then error("volume mounts must be missing/null or an array") else . end
+            ' <<<"$1" >/dev/null
+          }
+          if ! validate_job_contract "$JOB_CONTRACT"; then
+            echo "prior production job contract has an invalid Cloud Run shape"
+            exit 1
+          fi
+
+          PRIOR_IMAGE=$(jq -er '.spec.template.spec.template.spec.containers[0].image | select(type == "string")' <<<"$JOB_CONTRACT")
+          IMAGE_PREFIX="${AR_REPO}/olw-pipeline"
+          case "$PRIOR_IMAGE" in
+            "$IMAGE_PREFIX@sha256:"*)
+              PRIOR_DIGEST="${PRIOR_IMAGE#"$IMAGE_PREFIX@"}"
+              if ! [[ "$PRIOR_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+                echo "prior production image digest is invalid"
+                exit 1
+              fi
+              ROLLBACK_IMAGE="${IMAGE_PREFIX}@${PRIOR_DIGEST}"
+              ;;
+            "$IMAGE_PREFIX:"*)
+              PRIOR_TAG="${PRIOR_IMAGE#"$IMAGE_PREFIX:"}"
+              if ! [[ "$PRIOR_TAG" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+                echo "prior production image tag is invalid"
+                exit 1
+              fi
+              RESOLVED_DIGEST=$(gcloud artifacts docker images describe "${PRIOR_IMAGE}" --format='value(image_summary.digest)' --quiet)
+              if ! [[ "$RESOLVED_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+                echo "prior production image tag could not be resolved to sha256"
+                exit 1
+              fi
+
+              JOB_CONTRACT_AFTER_RESOLVE=$(gcloud run jobs describe "${JOB_NAME}" --region "${REGION}" --format=json --quiet)
+              if ! validate_job_contract "$JOB_CONTRACT_AFTER_RESOLVE"; then
+                echo "production job contract changed to an invalid Cloud Run shape during rollback resolution"
+                exit 1
+              fi
+              PRIOR_IMAGE_AFTER_RESOLVE=$(jq -er '.spec.template.spec.template.spec.containers[0].image | select(type == "string")' <<<"$JOB_CONTRACT_AFTER_RESOLVE")
+              if [[ "$PRIOR_IMAGE_AFTER_RESOLVE" != "$PRIOR_IMAGE" ]]; then
+                echo "prior production image reference moved during rollback resolution"
+                exit 1
+              fi
+              RESOLVED_DIGEST_AGAIN=$(gcloud artifacts docker images describe "${PRIOR_IMAGE_AFTER_RESOLVE}" --format='value(image_summary.digest)' --quiet)
+              if ! [[ "$RESOLVED_DIGEST_AGAIN" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+                echo "prior production image tag could not be resolved on the second read"
+                exit 1
+              fi
+              if [[ "$RESOLVED_DIGEST" != "$RESOLVED_DIGEST_AGAIN" ]]; then
+                echo "both prior image resolutions differ; refusing rollback freeze"
+                exit 1
+              fi
+              JOB_CONTRACT="$JOB_CONTRACT_AFTER_RESOLVE"
+              ROLLBACK_IMAGE="${IMAGE_PREFIX}@${RESOLVED_DIGEST}"
+              ;;
+            *)
+              echo "prior production image must be from ${IMAGE_PREFIX} as either @sha256 or a mutable tag"
+              exit 1
+              ;;
+          esac
+          case "$ROLLBACK_IMAGE" in
+            "$IMAGE_PREFIX@sha256:"*)
+              ROLLBACK_DIGEST="${ROLLBACK_IMAGE#"$IMAGE_PREFIX@"}"
+              if ! [[ "$ROLLBACK_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+                echo "prior production rollback image is not immutable"
+                exit 1
+              fi
+              ;;
+            *)
+              echo "prior production rollback image has the wrong repository or is not immutable"
+              exit 1
+              ;;
+          esac
+
+          jq --arg image "$ROLLBACK_IMAGE" '
+            .spec.template.spec.template.spec as $template
+            | {
+                image: $image,
+                env: [
+                  $template.containers[0].env[]
+                  | select(.name == "BUCKET" or .name == "DATA_DIR" or .name == "WORKSPACE" or .name == "VAULT_PATH" or .name == "WORKSPACE_DIR")
+                  | if ((.name | type) != "string" or (.value | type) != "string" or has("valueFrom"))
+                    then error("allowlisted rollback env must be a name/value pair")
+                    else {name: .name, value: .value}
+                    end
+                ],
+                args: $template.containers[0].args,
+                volumes: ($template.volumes // []),
+                volumeMounts: ($template.containers[0].volumeMounts // [])
+              }
+          ' <<<"$JOB_CONTRACT" > "$ROLLBACK_DIR/production-job-contract.json"
+          if jq -e '
+            .env | all(.name == "BUCKET" or .name == "DATA_DIR" or .name == "WORKSPACE" or .name == "VAULT_PATH" or .name == "WORKSPACE_DIR")
+          ' "$ROLLBACK_DIR/production-job-contract.json" >/dev/null; then
+            : # validation passes
+          else
+            echo "rollback artifact contains disallowed environment variable names"
+            exit 1
+          fi
+          if jq -e 'tostring | test("(?i)(secret|token|password|key|valueFrom)")' "$ROLLBACK_DIR/production-job-contract.json" >/dev/null; then
+            echo "rollback artifact contains prohibited secret-like fields"
+            exit 1
+          fi
+
+      - name: Preserve production rollback artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: worker-production-rollback-${{ steps.commit.outputs.commit_sha }}
+          path: ${{ runner.temp }}/worker-production-rollback/production-job-contract.json
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Update production worker
+        env:
+          IMMUTABLE_IMAGE: ${{ steps.image.outputs.image }}
+          BUCKET: llm-wiki-data
+        run: |
+          set -euo pipefail
+          gcloud run jobs update "${JOB_NAME}" \
+            --image "$IMMUTABLE_IMAGE" \
+            --update-env-vars "BUCKET=${BUCKET}" \
+            --remove-env-vars "DATA_DIR,WORKSPACE,VAULT_PATH,WORKSPACE_DIR" \
+            --args "^@^run@[[\"run\",\"--auto-approve\"]]" \
+            --clear-volume-mounts \
+            --clear-volumes \
+            --region "${REGION}" \
+            --quiet
+
+      - name: Read back production worker contract
+        env:
+          IMMUTABLE_IMAGE: ${{ steps.image.outputs.image }}
+          BUCKET: llm-wiki-data
+        run: |
+          set -euo pipefail
+          JOB_CONTRACT=$(gcloud run jobs describe "${JOB_NAME}" --region "${REGION}" --format=json --quiet)
+          if ! jq -e '
+            .spec.template.spec.template.spec
+            | if type != "object" then error("missing Cloud Run job template spec") else . end
+            | if (.containers | type) != "array" or (.containers | length) != 1 then error("expected exactly one container") else . end
+            | if (.containers[0].image | type) != "string" then error("container image must be a string") else . end
+            | if (.containers[0].env | type) != "array" then error("container env must be an array") else . end
+            | if (.containers[0].args | type) != "array" then error("container args must be an array") else . end
+            | if ((.volumes // []) | type) != "array" then error("volumes must be missing/null or an array") else . end
+            | if ((.containers[0].volumeMounts // []) | type) != "array" then error("volume mounts must be missing/null or an array") else . end
+          ' <<<"$JOB_CONTRACT" >/dev/null; then
+            echo "production job contract has an invalid Cloud Run shape"
+            exit 1
+          fi
+          DEPLOYED=$(jq -er '.spec.template.spec.template.spec.containers[0].image | select(type == "string")' <<<"$JOB_CONTRACT")
+          if [[ "$DEPLOYED" != "$IMMUTABLE_IMAGE" ]]; then
+            echo "production job image is not the requested immutable digest: $DEPLOYED"
+            exit 1
+          fi
+          if ! jq -e --arg bucket "$BUCKET" '[.spec.template.spec.template.spec.containers[0].env[] | select(.name == "BUCKET" and (.value | type) == "string") | .value] | length == 1 and .[0] == $bucket' <<<"$JOB_CONTRACT" >/dev/null; then
+            echo "production BUCKET is missing or incorrect"
+            exit 1
+          fi
+          if jq -e '.spec.template.spec.template.spec.containers[0].env[]? | select(.name == "DATA_DIR" or .name == "WORKSPACE" or .name == "VAULT_PATH" or .name == "WORKSPACE_DIR")' <<<"$JOB_CONTRACT" >/dev/null; then
+            echo "production job retains forbidden legacy env"
+            exit 1
+          fi
+          if ! jq -e '.spec.template.spec.template.spec.containers[0].args == ["run", "[[\"run\",\"--auto-approve\"]]"]' <<<"$JOB_CONTRACT" >/dev/null; then
+            echo "production args do not match the cloud worker contract"
+            exit 1
+          fi
+          if ! jq -e '(.spec.template.spec.template.spec.volumes // []) == [] and (.spec.template.spec.template.spec.containers[0].volumeMounts // []) == []' <<<"$JOB_CONTRACT" >/dev/null; then
+            echo "production job retains volumes or volume mounts"
+            exit 1
+          fi
+
+      - name: Tag promoted production image
+        env:
+          IMMUTABLE_IMAGE: ${{ steps.image.outputs.image }}
+          COMMIT_SHA: ${{ steps.commit.outputs.commit_sha }}
+        run: |
+          set -euo pipefail
+          gcloud artifacts docker tags add \
+            "$IMMUTABLE_IMAGE" \
+            "${AR_REPO}/olw-pipeline:prod-${COMMIT_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --quiet

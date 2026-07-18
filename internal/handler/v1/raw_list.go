@@ -20,12 +20,12 @@ type rawListResponse struct {
 func (h *Handler) RawList(c *gin.Context) {
 	wikiStore, err := h.GetStore(c)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: err.Error()})
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: generatedDataUnavailableMessage})
 		return
 	}
 	files, err := wikiStore.ListRawFiles(c.Request.Context())
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "list raw files: " + err.Error()})
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: generatedDataUnavailableMessage})
 		return
 	}
 
@@ -33,13 +33,13 @@ func (h *Handler) RawList(c *gin.Context) {
 	data, err := wikiStore.ReadFile(c.Request.Context(), rawstatus.Path)
 	if err != nil {
 		if !errors.Is(err, storage.ErrObjectNotExist) {
-			c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "read raw status: " + err.Error()})
+			c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: generatedDataUnavailableMessage})
 			return
 		}
 	} else {
 		artifact, err = rawstatus.Decode(data)
 		if err != nil {
-			c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "decode raw status: " + err.Error()})
+			c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: generatedDataUnavailableMessage})
 			return
 		}
 	}
@@ -56,7 +56,7 @@ func (h *Handler) RawPreview(c *gin.Context) {
 
 	wikiStore, err := h.GetStore(c)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: err.Error()})
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "raw file unavailable"})
 		return
 	}
 
@@ -66,7 +66,7 @@ func (h *Handler) RawPreview(c *gin.Context) {
 			c.JSON(http.StatusNotFound, handler.ErrorResponse{Error: "raw file not found"})
 			return
 		}
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "read raw file: " + err.Error()})
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "raw file unavailable"})
 		return
 	}
 

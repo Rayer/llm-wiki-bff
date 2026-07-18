@@ -1,6 +1,7 @@
 package wikiindex
 
 import (
+	"bytes"
 	"context"
 	"crypto/md5"
 	"encoding/hex"
@@ -12,6 +13,7 @@ import (
 	"cloud.google.com/go/storage"
 	fm "github.com/adrg/frontmatter"
 	conceptcache "github.com/rayer/llm-wiki-bff/internal/cache"
+	"github.com/rayer/llm-wiki-bff/internal/generation"
 )
 
 const (
@@ -35,16 +37,126 @@ type Store interface {
 }
 
 type IDMap struct {
-	Concept   map[string]string   `json:"concept"`
-	Source    map[string]string   `json:"source"`
-	Redirects map[string][]string `json:"redirects"`
+	Concept    map[string]string     `json:"concept"`
+	Source     map[string]string     `json:"source"`
+	SourceMeta map[string]SourceMeta `json:"source_meta,omitempty"`
+	Redirects  map[string][]string   `json:"redirects"`
+}
+
+type SourceMeta struct {
+	Slug       string `json:"slug"`
+	Title      string `json:"title,omitempty"`
+	SourceFile string `json:"source_file,omitempty"`
+}
+
+// UnmarshalJSON keeps the nested source metadata bounded and rejects duplicate
+// fields without changing the existing ignore-unknown-fields contract.
+func (m *SourceMeta) UnmarshalJSON(data []byte) error {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	token, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	delim, ok := token.(json.Delim)
+	if !ok || delim != '{' {
+		return errors.New("expected JSON object")
+	}
+	seen := make(map[string]struct{})
+	for dec.More() {
+		key, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		name, ok := key.(string)
+		if !ok {
+			return errors.New("expected JSON object key")
+		}
+		if _, exists := seen[name]; exists {
+			return errors.New("duplicate JSON object key")
+		}
+		seen[name] = struct{}{}
+		switch name {
+		case "slug":
+			err = dec.Decode(&m.Slug)
+		case "title":
+			err = dec.Decode(&m.Title)
+		case "source_file":
+			err = dec.Decode(&m.SourceFile)
+		default:
+			var ignored json.RawMessage
+			err = dec.Decode(&ignored)
+		}
+		if err != nil {
+			return err
+		}
+	}
+	if token, err := dec.Token(); err != nil || token != json.Delim('}') {
+		if err != nil {
+			return err
+		}
+		return errors.New("expected JSON object end")
+	}
+	return generation.EnsureJSONEOF(dec)
+}
+
+// DecodeIDMap bounds every collection while it is being decoded. Generated
+// cache byte limits alone do not bound the number of map and slice entries.
+func DecodeIDMap(data []byte) (IDMap, error) {
+	result := IDMap{Concept: map[string]string{}, Source: map[string]string{}, SourceMeta: map[string]SourceMeta{}, Redirects: map[string][]string{}}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	token, err := dec.Token()
+	if err != nil {
+		return result, err
+	}
+	if delim, ok := token.(json.Delim); !ok || delim != '{' {
+		return result, errors.New("expected JSON object")
+	}
+	seen := make(map[string]struct{})
+	for dec.More() {
+		key, err := dec.Token()
+		if err != nil {
+			return result, err
+		}
+		name, ok := key.(string)
+		if !ok {
+			return result, errors.New("expected JSON object key")
+		}
+		if _, exists := seen[name]; exists {
+			return result, errors.New("duplicate JSON object key")
+		}
+		seen[name] = struct{}{}
+		switch name {
+		case "concept":
+			result.Concept, err = generation.DecodeBoundedMap[string](dec)
+		case "source":
+			result.Source, err = generation.DecodeBoundedMap[string](dec)
+		case "source_meta":
+			result.SourceMeta, err = generation.DecodeBoundedMap[SourceMeta](dec)
+		case "redirects":
+			result.Redirects, err = generation.DecodeBoundedStringLists(dec)
+		default:
+			var ignored json.RawMessage
+			err = dec.Decode(&ignored)
+		}
+		if err != nil {
+			return result, err
+		}
+	}
+	if _, err := dec.Token(); err != nil {
+		return result, err
+	}
+	if err := generation.EnsureJSONEOF(dec); err != nil {
+		return result, err
+	}
+	return result, nil
 }
 
 type markdownMatter struct {
-	ID      string   `yaml:"id"`
-	Title   string   `yaml:"title"`
-	Sources []string `yaml:"sources"`
-	Source  string   `yaml:"source"`
+	ID         string   `yaml:"id"`
+	Title      string   `yaml:"title"`
+	SourceFile string   `yaml:"source_file"`
+	Sources    []string `yaml:"sources"`
+	Source     string   `yaml:"source"`
 }
 
 func Rebuild(ctx context.Context, store Store) (IDMap, error) {
@@ -63,15 +175,16 @@ func Rebuild(ctx context.Context, store Store) (IDMap, error) {
 
 func BuildIDMap(ctx context.Context, store Store) (IDMap, error) {
 	next := IDMap{
-		Concept:   map[string]string{},
-		Source:    map[string]string{},
-		Redirects: map[string][]string{},
+		Concept:    map[string]string{},
+		Source:     map[string]string{},
+		SourceMeta: map[string]SourceMeta{},
+		Redirects:  map[string][]string{},
 	}
 
 	if err := addIDMapEntries(ctx, store, "wiki/", next.Concept); err != nil {
 		return next, err
 	}
-	if err := addIDMapEntries(ctx, store, "wiki/sources/", next.Source); err != nil {
+	if err := addSourceEntries(ctx, store, next.Source, next.SourceMeta); err != nil {
 		return next, err
 	}
 
@@ -84,6 +197,28 @@ func BuildIDMap(ctx context.Context, store Store) (IDMap, error) {
 	appendChangedRedirects(next.Redirects, old.Source, next.Source)
 
 	return next, nil
+}
+
+// addSourceEntries intentionally parses the source collection once: the index
+// needs both its stable ID map and source metadata from the same files.
+func addSourceEntries(ctx context.Context, store Store, ids map[string]string, entries map[string]SourceMeta) error {
+	files, err := store.ListMarkdownFiles(ctx, "wiki/sources/")
+	if err != nil {
+		return fmt.Errorf("list wiki/sources/: %w", err)
+	}
+	for _, file := range files {
+		matter, err := parseMarkdownMatter(file.Data)
+		if err != nil {
+			return fmt.Errorf("parse %s: %w", file.Path, err)
+		}
+		id := strings.TrimSpace(matter.ID)
+		if id == "" {
+			id = generateID(file.Data)
+		}
+		ids[id] = file.Slug
+		entries[id] = SourceMeta{Slug: file.Slug, Title: strings.TrimSpace(matter.Title), SourceFile: strings.TrimSpace(matter.SourceFile)}
+	}
+	return nil
 }
 
 func addIDMapEntries(ctx context.Context, store Store, dir string, entries map[string]string) error {
@@ -116,9 +251,10 @@ func parseMarkdownMatter(data []byte) (markdownMatter, error) {
 
 func readOldIDMap(ctx context.Context, store Store) (IDMap, error) {
 	old := IDMap{
-		Concept:   map[string]string{},
-		Source:    map[string]string{},
-		Redirects: map[string][]string{},
+		Concept:    map[string]string{},
+		Source:     map[string]string{},
+		SourceMeta: map[string]SourceMeta{},
+		Redirects:  map[string][]string{},
 	}
 	data, err := store.ReadFile(ctx, IDMapPath)
 	if err != nil {
@@ -130,7 +266,8 @@ func readOldIDMap(ctx context.Context, store Store) (IDMap, error) {
 	if len(data) == 0 {
 		return old, nil
 	}
-	if err := json.Unmarshal(data, &old); err != nil {
+	old, err = DecodeIDMap(data)
+	if err != nil {
 		return old, fmt.Errorf("decode old id map: %w", err)
 	}
 	if old.Concept == nil {
@@ -138,6 +275,9 @@ func readOldIDMap(ctx context.Context, store Store) (IDMap, error) {
 	}
 	if old.Source == nil {
 		old.Source = map[string]string{}
+	}
+	if old.SourceMeta == nil {
+		old.SourceMeta = map[string]SourceMeta{}
 	}
 	if old.Redirects == nil {
 		old.Redirects = map[string][]string{}
