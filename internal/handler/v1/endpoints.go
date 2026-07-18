@@ -43,6 +43,7 @@ var (
 	errIndexNotFound             = errors.New("index not found")
 	errFirestoreNotConfigured    = errors.New("Firestore client is not configured")
 	errPipelineExecutionNotFound = errors.New("pipeline execution not found")
+	errWikiStorageNotConfigured  = errors.New("wiki storage is not configured")
 )
 
 // Health handles GET /api/v1/health.
@@ -74,7 +75,7 @@ func (h *Handler) Health(c *gin.Context) {
 func (h *Handler) Index(c *gin.Context) {
 	gcsClient, err := h.GetGCSClient(c)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: err.Error()})
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "generated data unavailable"})
 		return
 	}
 
@@ -84,7 +85,7 @@ func (h *Handler) Index(c *gin.Context) {
 			c.JSON(http.StatusNotFound, handler.ErrorResponse{Error: "index not found"})
 			return
 		}
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: err.Error()})
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: generatedDataUnavailableMessage})
 		return
 	}
 
@@ -126,7 +127,7 @@ func (h *Handler) ListProjects(c *gin.Context) {
 	if h.firestore != nil && h.firestore.Raw() != nil {
 		resp, err := h.listFirestoreProjects(c.Request.Context(), userID)
 		if err != nil {
-			c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: err.Error()})
+			c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "projects unavailable"})
 			return
 		}
 		if len(resp) > 0 {
@@ -141,7 +142,7 @@ func (h *Handler) ListProjects(c *gin.Context) {
 
 	projects, err := h.store.ListProjects(c.Request.Context(), userID)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: err.Error()})
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "projects unavailable"})
 		return
 	}
 
@@ -277,7 +278,7 @@ func (h *Handler) Ready(c *gin.Context) {
 	if err != nil {
 		c.JSON(http.StatusServiceUnavailable, handler.ReadyResponse{
 			Ready:   false,
-			Message: "GCS client unavailable: " + err.Error(),
+			Message: "generated data unavailable",
 		})
 		return
 	}
@@ -290,7 +291,7 @@ func (h *Handler) Ready(c *gin.Context) {
 		})
 		return
 	}
-	if h.cache.IsReady(prefix) {
+	if h.cache.IsReady(viewCacheKey(gcsClient)) {
 		c.JSON(http.StatusOK, handler.ReadyResponse{
 			Ready:  true,
 			Prefix: prefix,
@@ -322,7 +323,7 @@ func (h *Handler) Ready(c *gin.Context) {
 func (h *Handler) Query(c *gin.Context) {
 	gcsClient, err := h.GetGCSClient(c)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: err.Error()})
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "generated data unavailable"})
 		return
 	}
 
@@ -358,7 +359,7 @@ func (h *Handler) Query(c *gin.Context) {
 	}
 	results, err := h.cache.Search(c.Request.Context(), gcsClient, searchQuery, 10)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "concept cache: " + err.Error()})
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "generated data unavailable"})
 		return
 	}
 	log.Printf("Search query: %s, results: %v\n", searchQuery, results)
@@ -421,8 +422,8 @@ func cachedContexts(conceptCache *conceptcache.Cache, reader conceptcache.Reader
 
 // ListSources handles GET /api/v1/sources using the request's GCS scope.
 //
-//	@Summary		List wiki sources
-//	@Description	Returns all compiled wiki sources.
+//	@Summary		List compiled sources and pending raw files
+//	@Description	Returns compiled wiki sources plus pending raw rows that have not been compiled.
 //	@Tags			sources
 //	@Produce		json
 //	@Success		200		{object}	handler.SourcesListResponse
@@ -435,17 +436,28 @@ func (h *Handler) ListSources(c *gin.Context) {
 
 	gcsClient, err := h.GetGCSClient(c)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: err.Error()})
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "generated data unavailable"})
 		return
 	}
 
 	sources, err := listSourcesCacheFirst(ctx, gcsClient)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: err.Error()})
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "generated data unavailable"})
 		return
 	}
 	if err := addWikiPageIDsFromIDMap(ctx, gcsClient, sources, "source"); err != nil {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: err.Error()})
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "generated data unavailable"})
+		return
+	}
+	if missingSourceRawPath(sources) {
+		key := viewCacheKey(gcsClient)
+		if err := h.hydrateLegacySourceMetadata(ctx, gcsClient, sources, key); err != nil {
+			c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "generated data unavailable"})
+			return
+		}
+	}
+	if sources, _, err = sourceLifecycle(ctx, gcsClient, sources); err != nil {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "generated data unavailable"})
 		return
 	}
 	if sources == nil {
@@ -453,6 +465,32 @@ func (h *Handler) ListSources(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, handler.SourcesListResponse{Sources: sources, Count: len(sources)})
+}
+
+// hydrateLegacySourceMetadata shares the one-per-project fallback for id maps
+// produced before source_meta existed. Both listing and quota evaluation must
+// use it so a legacy project never re-scans source Markdown on every request.
+func (h *Handler) hydrateLegacySourceMetadata(ctx context.Context, reader sourceListReader, sources []gcs.WikiPage, key string) error {
+	legacy := h.listCacheGet(key).legacySourceMeta
+	if len(legacy) == 0 {
+		listed, err := reader.ListSources(ctx)
+		if err != nil {
+			return err
+		}
+		legacy = listed
+		h.listCacheSet(key, func(cache *cachedLists) { cache.legacySourceMeta = cloneWikiPages(listed) })
+	}
+	hydrateSourceMetadata(sources, legacy)
+	return nil
+}
+
+func missingSourceRawPath(sources []gcs.WikiPage) bool {
+	for _, source := range sources {
+		if strings.TrimSpace(source.RawPath) == "" {
+			return true
+		}
+	}
+	return false
 }
 
 type sourceListReader interface {
@@ -496,8 +534,8 @@ func addWikiPageIDsFromIDMap(ctx context.Context, reader indexReader, pages []gc
 		return fmt.Errorf("read id map: %w", err)
 	}
 
-	var source idMap
-	if err := json.Unmarshal(data, &source); err != nil {
+	source, err := wikiindex.DecodeIDMap(data)
+	if err != nil {
 		return fmt.Errorf("decode id map: %w", err)
 	}
 	switch pageType {
@@ -505,10 +543,50 @@ func addWikiPageIDsFromIDMap(ctx context.Context, reader indexReader, pages []gc
 		mergeWikiPageIDs(pages, source.Concept)
 	case "source":
 		mergeWikiPageIDs(pages, source.Source)
+		mergeSourceMetadata(pages, source.SourceMeta)
 	default:
 		return fmt.Errorf("unknown wiki page type: %s", pageType)
 	}
 	return nil
+}
+
+func mergeSourceMetadata(pages []gcs.WikiPage, entries map[string]wikiindex.SourceMeta) {
+	if len(pages) == 0 || len(entries) == 0 {
+		return
+	}
+	bySlug := make(map[string]wikiindex.SourceMeta, len(entries))
+	for _, meta := range entries {
+		if slug := strings.TrimSpace(meta.Slug); slug != "" {
+			bySlug[slug] = meta
+		}
+	}
+	for i := range pages {
+		meta, ok := bySlug[pages[i].Slug]
+		if !ok {
+			continue
+		}
+		if pages[i].RawPath == "" {
+			pages[i].RawPath = strings.TrimSpace(meta.SourceFile)
+		}
+		if pages[i].Title == pages[i].Slug && strings.TrimSpace(meta.Title) != "" {
+			pages[i].Title = strings.TrimSpace(meta.Title)
+		}
+	}
+}
+
+func hydrateSourceMetadata(pages, metadata []gcs.WikiPage) {
+	bySlug := make(map[string]gcs.WikiPage, len(metadata))
+	for _, page := range metadata {
+		bySlug[page.Slug] = page
+	}
+	for i := range pages {
+		if page, ok := bySlug[pages[i].Slug]; ok {
+			pages[i].RawPath = page.RawPath
+			if pages[i].Title == pages[i].Slug {
+				pages[i].Title = page.Title
+			}
+		}
+	}
 }
 
 func mergeWikiPageIDs(pages []gcs.WikiPage, entries map[string]string) {
@@ -552,7 +630,7 @@ func mergeWikiPageIDs(pages []gcs.WikiPage, entries map[string]string) {
 func (h *Handler) GetSource(c *gin.Context) {
 	gcsClient, err := h.GetGCSClient(c)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: err.Error()})
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: generatedDataUnavailableMessage})
 		return
 	}
 
@@ -563,9 +641,9 @@ func (h *Handler) GetSource(c *gin.Context) {
 	if h.handleIDRoutedPage(c, gcsClient, "source", slug) {
 		return
 	}
-	_, data, err := gcsClient.GetPage(c.Request.Context(), slug, "sources")
+	page, data, err := gcsClient.GetPage(c.Request.Context(), slug, "sources")
 	if err != nil {
-		c.JSON(http.StatusNotFound, handler.ErrorResponse{Error: "source not found: " + slug})
+		writeGeneratedReadError(c, err, "source not found: "+slug)
 		return
 	}
 	if rewritten, ok := h.rewriteMarkdownForResponse(c, gcsClient, data); ok {
@@ -574,15 +652,12 @@ func (h *Handler) GetSource(c *gin.Context) {
 		return
 	}
 
-	frontmatter, body := parseFrontmatter(string(data))
-	c.JSON(http.StatusOK, handler.SourceDetailResponse{
-		Slug:        slug,
-		Title:       slug,
-		Type:        "source",
-		Frontmatter: frontmatter,
-		Body:        body,
-		Raw:         string(data),
-	})
+	response, err := h.sourceDetailResponse(c, gcsClient, *page, data)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "generated data unavailable"})
+		return
+	}
+	c.JSON(http.StatusOK, response)
 }
 
 // ListConcepts handles GET /api/v1/concepts using the request's GCS scope.
@@ -609,17 +684,17 @@ func (h *Handler) ListConcepts(c *gin.Context) {
 
 	gcsClient, err := h.GetGCSClient(c)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: err.Error()})
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "generated data unavailable"})
 		return
 	}
 
 	concepts, err := listConceptsCacheFirst(ctx, gcsClient, includeDrafts)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: err.Error()})
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "generated data unavailable"})
 		return
 	}
 	if err := addWikiPageIDsFromIDMap(ctx, gcsClient, concepts, "concept"); err != nil {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: err.Error()})
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "generated data unavailable"})
 		return
 	}
 	if concepts == nil {
@@ -645,7 +720,7 @@ func (h *Handler) ListConcepts(c *gin.Context) {
 func (h *Handler) GetConcept(c *gin.Context) {
 	gcsClient, err := h.GetGCSClient(c)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: err.Error()})
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "generated data unavailable"})
 		return
 	}
 
@@ -658,7 +733,7 @@ func (h *Handler) GetConcept(c *gin.Context) {
 	}
 	page, data, err := gcsClient.GetPage(c.Request.Context(), slug, "concepts")
 	if err != nil {
-		c.JSON(http.StatusNotFound, handler.ErrorResponse{Error: "concept not found: " + slug})
+		writeGeneratedReadError(c, err, "concept not found: "+slug)
 		return
 	}
 	// Set ID from id_map
@@ -730,7 +805,7 @@ func (h *Handler) PipelineRun(c *gin.Context) {
 	snap, reserved, prev, err := h.evaluateQuota(ctx, userID, projectID, true)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{
-			Error: "pipeline failed: " + err.Error(),
+			Error: pipelineUnavailableMessage,
 		})
 		return
 	}
@@ -750,12 +825,12 @@ func (h *Handler) PipelineRun(c *gin.Context) {
 		if reserved {
 			if qs := h.effectiveQuotaStore(); qs != nil {
 				if refundErr := qs.RefundQuotaPrev(ctx, userID, projectID, prev); refundErr != nil {
-					log.Printf("pipeline quota refund failed for %s/%s: %v", userID, projectID, refundErr)
+					log.Print("pipeline quota refund failed")
 				}
 			}
 		}
 		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{
-			Error: fmt.Sprintf("pipeline failed: %s", err),
+			Error: pipelineUnavailableMessage,
 		})
 		return
 	}
@@ -915,9 +990,12 @@ func (h *Handler) PipelineStatus(c *gin.Context) {
 			return
 		}
 	}
-	response := pipelineStatusResponse{
-		ProjectID:        projectID,
-		SuggestedQueries: h.loadSuggestedQueries(ctx, c),
+	response := pipelineStatusResponse{ProjectID: projectID}
+	var suggestedErr error
+	response.SuggestedQueries, suggestedErr = h.loadSuggestedQueries(ctx, c)
+	if suggestedErr != nil {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: pipelineStatusUnavailableMessage})
+		return
 	}
 	lastExecution, err := h.pipelineExecutionStatusForOwner(ctx, executionID, userID, projectID)
 	if err != nil {
@@ -925,7 +1003,7 @@ func (h *Handler) PipelineStatus(c *gin.Context) {
 			c.JSON(http.StatusNotFound, handler.ErrorResponse{Error: errPipelineExecutionNotFound.Error()})
 			return
 		}
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "pipeline status failed: " + err.Error()})
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: pipelineStatusUnavailableMessage})
 		return
 	}
 	response.LastExecution = lastExecution
@@ -933,7 +1011,7 @@ func (h *Handler) PipelineStatus(c *gin.Context) {
 	// Evaluate-only quota snapshot for frontend Run-button gating (never mutates).
 	snap, _, _, err := h.evaluateQuota(ctx, userID, projectID, false)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "pipeline status failed: " + err.Error()})
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: pipelineStatusUnavailableMessage})
 		return
 	}
 	response.Quota = &snap
@@ -959,12 +1037,25 @@ func (h *Handler) RebuildIndex(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, handler.ErrorResponse{Error: "project is required"})
 		return
 	}
+	if h.store != nil {
+		if guarded, ok := h.store.Scope(userID, projectID).(store.GenerationAware); ok {
+			exists, err := guarded.HasCurrentManifest(c.Request.Context())
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "generated output unavailable"})
+				return
+			}
+			if exists {
+				c.JSON(http.StatusConflict, handler.ErrorResponse{Error: "generated output is managed by the pipeline; run the pipeline"})
+				return
+			}
+		}
+	}
 
 	ctx := c.Request.Context()
 	if h.rebuildIndex != nil {
 		next, err := h.rebuildIndex(ctx, userID, projectID)
 		if err != nil {
-			c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: err.Error()})
+			c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: generatedDataUnavailableMessage})
 			return
 		}
 		h.invalidateCachesAfterRebuild(userID, projectID)
@@ -992,19 +1083,32 @@ func (h *Handler) RebuildIndex(c *gin.Context) {
 			c.JSON(http.StatusConflict, handler.ErrorResponse{Error: "rebuild index already running"})
 			return
 		}
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "acquire rebuild index lock: " + err.Error()})
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: generatedDataUnavailableMessage})
 		return
 	}
-	defer func() {
-		if err := releaseRebuildIndexLock(context.Background(), fs, userID, projectID); err != nil {
-			log.Printf("[rebuild-index] release lock failed for %s/%s: %v", userID, projectID, err)
-		}
-	}()
-
 	wikiStore := h.store.Scope(userID, projectID)
+	var releaseLegacy func() error
+	if session, ok := wikiStore.(store.LegacyGenerationWriteSession); ok {
+		locked, release, err := session.BeginLegacyGenerationWrite(ctx)
+		if err != nil {
+			cleanupErr := finishRebuild(nil, func() error { return releaseRebuildIndexLock(context.Background(), fs, userID, projectID) })
+			if cleanupErr != nil || errors.Is(err, store.ErrLeaseCleanup) {
+				c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: generatedDataUnavailableMessage})
+				return
+			}
+			if errors.Is(err, store.ErrGenerationManaged) {
+				c.JSON(http.StatusConflict, handler.ErrorResponse{Error: "generated output is managed by the pipeline; run the pipeline"})
+			} else {
+				c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: generatedDataUnavailableMessage})
+			}
+			return
+		}
+		releaseLegacy = func() error { return release(context.Background()) }
+		wikiStore = locked
+	}
 	next, err := wikiindex.Rebuild(ctx, newWikiIndexStore(wikiStore))
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: err.Error()})
+	if err = finishRebuild(err, releaseLegacy, func() error { return releaseRebuildIndexLock(context.Background(), fs, userID, projectID) }); err != nil {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: generatedDataUnavailableMessage})
 		return
 	}
 
@@ -1326,13 +1430,13 @@ func (h *Handler) PipelineLog(c *gin.Context) {
 			c.JSON(http.StatusNotFound, handler.ErrorResponse{Error: errPipelineExecutionNotFound.Error()})
 			return
 		}
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "pipeline execution lookup failed: " + err.Error()})
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: pipelineExecutionUnavailableMessage})
 		return
 	}
 
 	wikiStore, err := h.GetStore(c)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: err.Error()})
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: generatedDataUnavailableMessage})
 		return
 	}
 	data, err := wikiStore.ReadFile(c.Request.Context(), logPath)
@@ -1341,7 +1445,7 @@ func (h *Handler) PipelineLog(c *gin.Context) {
 			c.JSON(http.StatusNotFound, handler.ErrorResponse{Error: "pipeline log not found"})
 			return
 		}
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "read pipeline log: " + err.Error()})
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: generatedDataUnavailableMessage})
 		return
 	}
 	c.Data(http.StatusOK, "text/plain; charset=utf-8", data)
@@ -1362,7 +1466,7 @@ func validatePipelineExecutionID(executionID string) (string, error) {
 		return "", errors.New("execution_id is required")
 	}
 	if strings.ContainsAny(executionID, `/\`+"\x00") || executionID == "." || executionID == ".." || strings.Contains(executionID, "..") {
-		return "", fmt.Errorf("unsafe execution_id: %s", executionID)
+		return "", errors.New("invalid execution_id")
 	}
 	return executionID, nil
 }
@@ -1450,7 +1554,7 @@ func executionDuration(startTime, endTime string) string {
 func (h *Handler) Status(c *gin.Context) {
 	gcsClient, err := h.GetGCSClient(c)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: err.Error()})
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "generated data unavailable"})
 		return
 	}
 
@@ -1486,20 +1590,26 @@ func (h *Handler) Status(c *gin.Context) {
 	c.JSON(http.StatusOK, resp)
 }
 
-func (h *Handler) loadSuggestedQueries(ctx context.Context, c *gin.Context) []string {
+func (h *Handler) loadSuggestedQueries(ctx context.Context, c *gin.Context) ([]string, error) {
 	wikiStore, err := h.GetStore(c)
 	if err != nil {
-		return []string{}
+		if errors.Is(err, errWikiStorageNotConfigured) {
+			return []string{}, nil
+		}
+		return nil, err
 	}
 	data, err := wikiStore.ReadFile(ctx, suggestedqueries.Path)
 	if err != nil {
-		return []string{}
+		if errors.Is(err, storage.ErrObjectNotExist) {
+			return []string{}, nil
+		}
+		return nil, err
 	}
 	artifact, err := suggestedqueries.Decode(data)
 	if err != nil {
-		return []string{}
+		return nil, err
 	}
-	return suggestedqueries.Queries(artifact)
+	return suggestedqueries.Queries(artifact), nil
 }
 
 // rawFileCount returns the live number of files under project raw/ (ListRawFiles).
@@ -1602,6 +1712,11 @@ func loadAdminProjectStatistics(ctx context.Context, root store.RootStore, proje
 		if scoped == nil {
 			return nil, fmt.Errorf("wiki storage is not configured for project %s", adminProjectRecordKey(project.userID, project.projectID))
 		}
+		var err error
+		scoped, err = pinStore(ctx, scoped)
+		if err != nil {
+			return nil, fmt.Errorf("pin project %s: %w", adminProjectRecordKey(project.userID, project.projectID), err)
+		}
 
 		concepts, err := listConceptsCacheFirst(ctx, scoped, false)
 		if err != nil {
@@ -1669,20 +1784,27 @@ func (h *Handler) listAdminProjectRecords(ctx context.Context) ([]adminProjectRe
 //	@Security		BearerAuth
 //	@Router			/api/v1/admin/projects [get]
 func (h *Handler) AdminProjects(c *gin.Context) {
-	if h.firestore == nil || h.firestore.Raw() == nil {
+	if (h.firestore == nil || h.firestore.Raw() == nil) && (h.adminProjectRecordsLoader == nil || h.adminProjectStatisticsLoader == nil) {
 		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "Firestore client is not configured"})
 		return
 	}
 
-	fs := h.firestore.Raw()
+	var fs *firestore.Client
+	if h.firestore != nil {
+		fs = h.firestore.Raw()
+	}
 	ctx := c.Request.Context()
 	filterUserID := strings.TrimSpace(c.Query("user_id"))
 
 	rawProjects := make([]adminProjectRecord, 0)
 	userIDs := make(map[string]bool)
-	projectRecords, err := h.listAdminProjectRecords(ctx)
+	projectRecordsLoader := h.listAdminProjectRecords
+	if h.adminProjectRecordsLoader != nil {
+		projectRecordsLoader = h.adminProjectRecordsLoader
+	}
+	projectRecords, err := projectRecordsLoader(ctx)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "list projects: " + err.Error()})
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "project list unavailable"})
 		return
 	}
 	for _, project := range projectRecords {
@@ -1693,15 +1815,22 @@ func (h *Handler) AdminProjects(c *gin.Context) {
 		userIDs[project.userID] = true
 	}
 
-	statistics, err := loadAdminProjectStatistics(ctx, h.store, rawProjects)
+	statisticsLoader := loadAdminProjectStatistics
+	if h.adminProjectStatisticsLoader != nil {
+		statisticsLoader = h.adminProjectStatisticsLoader
+	}
+	statistics, err := statisticsLoader(ctx, h.store, rawProjects)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "count project statistics: " + err.Error()})
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: projectStatisticsUnavailableMessage})
 		return
 	}
 
 	// Batch-fetch user names and emails
 	userMap := make(map[string]struct{ name, email string })
 	for uid := range userIDs {
+		if fs == nil {
+			break
+		}
 		userDoc, err := fs.Collection("users").Doc(uid).Get(ctx)
 		if err != nil {
 			continue // user might be deleted
@@ -1770,10 +1899,10 @@ func (h *Handler) AdminDeleteProject(c *gin.Context) {
 	dsnap, err := docRef.Get(ctx)
 	if err != nil {
 		if status.Code(err) == codes.NotFound {
-			c.JSON(http.StatusNotFound, handler.ErrorResponse{Error: "project not found: " + docID})
+			c.JSON(http.StatusNotFound, handler.ErrorResponse{Error: "project not found"})
 			return
 		}
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "read project: " + err.Error()})
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "project unavailable"})
 		return
 	}
 
@@ -1784,19 +1913,19 @@ func (h *Handler) AdminDeleteProject(c *gin.Context) {
 	if h.store != nil {
 		prefix := store.ProjectPrefixWithSlash(uid, pid)
 		if err := deleteGCSPrefix(ctx, h.store, prefix); err != nil {
-			log.Printf("[admin] GCS cleanup warning for %s: %v", docID, err)
+			log.Print("admin generated cleanup warning")
 		}
 	}
 
 	// Delete lock doc
 	lockRef := fs.Collection("locks").Doc(fmt.Sprintf("%s__%s", uid, pid))
 	if _, err := lockRef.Delete(ctx); err != nil && status.Code(err) != codes.NotFound {
-		log.Printf("[admin] lock cleanup warning for %s: %v", docID, err)
+		log.Print("admin lock cleanup warning")
 	}
 
 	// Delete project doc
 	if _, err := docRef.Delete(ctx); err != nil {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "delete project: " + err.Error()})
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "project delete unavailable"})
 		return
 	}
 
@@ -1856,17 +1985,17 @@ func (h *Handler) AdminRenameProject(c *gin.Context) {
 	_, err := docRef.Get(ctx)
 	if err != nil {
 		if status.Code(err) == codes.NotFound {
-			c.JSON(http.StatusNotFound, handler.ErrorResponse{Error: "project not found: " + docID})
+			c.JSON(http.StatusNotFound, handler.ErrorResponse{Error: "project not found"})
 			return
 		}
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "read project: " + err.Error()})
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "project unavailable"})
 		return
 	}
 
 	if _, err := docRef.Update(ctx, []firestore.Update{
 		{Path: "name", Value: body.Name},
 	}); err != nil {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "update project: " + err.Error()})
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "project update unavailable"})
 		return
 	}
 
@@ -1902,24 +2031,41 @@ func (h *Handler) AdminRebuildIndex(c *gin.Context) {
 		return
 	}
 	ctx := c.Request.Context()
-	if err := h.verifyAdminProjectExists(ctx, docID); err != nil {
-		if errors.Is(err, errFirestoreNotConfigured) {
-			c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: err.Error()})
+	// Production verifies the project before touching storage. The injected
+	// rebuild seam is a local/test-only authorization substitute.
+	if h.rebuildIndex == nil || h.projectExists != nil {
+		if err := h.verifyAdminProjectExists(ctx, docID); err != nil {
+			if errors.Is(err, errFirestoreNotConfigured) {
+				c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "Firestore client is not configured"})
+				return
+			}
+			if status.Code(err) == codes.NotFound {
+				c.JSON(http.StatusNotFound, handler.ErrorResponse{Error: "project not found"})
+				return
+			}
+			c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: generatedDataUnavailableMessage})
 			return
 		}
-		if status.Code(err) == codes.NotFound {
-			c.JSON(http.StatusNotFound, handler.ErrorResponse{Error: "project not found: " + docID})
-			return
+	}
+	if h.store != nil {
+		if guarded, ok := h.store.Scope(uid, pid).(store.GenerationAware); ok {
+			exists, err := guarded.HasCurrentManifest(ctx)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "generated output unavailable"})
+				return
+			}
+			if exists {
+				c.JSON(http.StatusConflict, handler.ErrorResponse{Error: "generated output is managed by the pipeline; run the pipeline"})
+				return
+			}
 		}
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "read project: " + err.Error()})
-		return
 	}
 
 	// Use injected rebuildIndex if available
 	if h.rebuildIndex != nil {
 		next, err := h.rebuildIndex(ctx, uid, pid)
 		if err != nil {
-			c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: err.Error()})
+			c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: generatedDataUnavailableMessage})
 			return
 		}
 		h.invalidateCachesAfterRebuild(uid, pid)
@@ -1949,19 +2095,32 @@ func (h *Handler) AdminRebuildIndex(c *gin.Context) {
 			c.JSON(http.StatusConflict, handler.ErrorResponse{Error: "rebuild index already running"})
 			return
 		}
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "acquire rebuild index lock: " + err.Error()})
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: generatedDataUnavailableMessage})
 		return
 	}
-	defer func() {
-		if err := releaseRebuildIndexLock(context.Background(), fs, uid, pid); err != nil {
-			log.Printf("[admin] release rebuild index lock failed for %s/%s: %v", uid, pid, err)
-		}
-	}()
-
 	wikiStore := h.store.Scope(uid, pid)
+	var releaseLegacy func() error
+	if session, ok := wikiStore.(store.LegacyGenerationWriteSession); ok {
+		locked, release, err := session.BeginLegacyGenerationWrite(ctx)
+		if err != nil {
+			cleanupErr := finishRebuild(nil, func() error { return releaseRebuildIndexLock(context.Background(), fs, uid, pid) })
+			if cleanupErr != nil || errors.Is(err, store.ErrLeaseCleanup) {
+				c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: generatedDataUnavailableMessage})
+				return
+			}
+			if errors.Is(err, store.ErrGenerationManaged) {
+				c.JSON(http.StatusConflict, handler.ErrorResponse{Error: "generated output is managed by the pipeline; run the pipeline"})
+			} else {
+				c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "generated data unavailable"})
+			}
+			return
+		}
+		releaseLegacy = func() error { return release(context.Background()) }
+		wikiStore = locked
+	}
 	next, err := wikiindex.Rebuild(ctx, newWikiIndexStore(wikiStore))
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: err.Error()})
+	if err = finishRebuild(err, releaseLegacy, func() error { return releaseRebuildIndexLock(context.Background(), fs, uid, pid) }); err != nil {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "generated data unavailable"})
 		return
 	}
 
@@ -2002,21 +2161,21 @@ func (h *Handler) AdminPipelineTrigger(c *gin.Context) {
 	ctx := c.Request.Context()
 	if err := h.verifyAdminProjectExists(ctx, docID); err != nil {
 		if errors.Is(err, errFirestoreNotConfigured) {
-			c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: err.Error()})
+			c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "Firestore client is not configured"})
 			return
 		}
 		if status.Code(err) == codes.NotFound {
-			c.JSON(http.StatusNotFound, handler.ErrorResponse{Error: "project not found: " + docID})
+			c.JSON(http.StatusNotFound, handler.ErrorResponse{Error: "project not found"})
 			return
 		}
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "read project: " + err.Error()})
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: pipelineUnavailableMessage})
 		return
 	}
 
 	// Admin bypasses daily/cooldown/new-raw/demo quota but still blocks concurrent runs.
 	alreadyRunning, err := h.isPipelineRunning(ctx, uid, pid)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "pipeline status: " + err.Error()})
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: pipelineStatusUnavailableMessage})
 		return
 	}
 	if alreadyRunning {
@@ -2026,10 +2185,10 @@ func (h *Handler) AdminPipelineTrigger(c *gin.Context) {
 
 	executionID, err := h.invokePipelineJob(ctx, uid, pid)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "invoke failed: " + err.Error()})
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: pipelineUnavailableMessage})
 		return
 	}
-	log.Printf("Admin pipeline triggered: %s/%s execution=%s", uid, pid, executionID)
+	log.Print("admin pipeline triggered")
 
 	c.JSON(http.StatusOK, gin.H{
 		"status":       "ok",
@@ -2062,7 +2221,7 @@ func (h *Handler) AdminListUsers(c *gin.Context) {
 	filterRole := strings.TrimSpace(c.Query("role"))
 	projectRecords, err := h.listAdminProjectRecords(ctx)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "count user projects: " + err.Error()})
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "user project list unavailable"})
 		return
 	}
 	projectCounts := adminProjectCountsByUser(projectRecords)
@@ -2082,7 +2241,7 @@ func (h *Handler) AdminListUsers(c *gin.Context) {
 			if status.Code(err) == codes.NotFound || errors.Is(err, iterator.Done) {
 				break
 			}
-			c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "list users: " + err.Error()})
+			c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "user list unavailable"})
 			return
 		}
 		data := doc.Data()
@@ -2219,7 +2378,7 @@ func (h *Handler) AdminDeleteUser(c *gin.Context) {
 			if status.Code(err) == codes.NotFound || errors.Is(err, iterator.Done) {
 				break
 			}
-			c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "list projects: " + err.Error()})
+			c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "project list unavailable"})
 			return
 		}
 
@@ -2232,25 +2391,25 @@ func (h *Handler) AdminDeleteUser(c *gin.Context) {
 		if h.store != nil && pid != "" {
 			prefix := store.ProjectPrefixWithSlash(userID, pid)
 			if err := deleteGCSPrefix(ctx, h.store, prefix); err != nil {
-				log.Printf("[admin] GCS cleanup warning for %s/%s: %v", userID, pid, err)
+				log.Print("admin generated cleanup warning")
 			}
 		}
 
 		// Delete lock doc
 		lockRef := fs.Collection("locks").Doc(fmt.Sprintf("%s__%s", userID, pid))
 		if _, err := lockRef.Delete(ctx); err != nil && status.Code(err) != codes.NotFound {
-			log.Printf("[admin] lock cleanup warning for %s/%s: %v", userID, pid, err)
+			log.Print("admin lock cleanup warning")
 		}
 
 		// Delete project doc
 		if _, err := doc.Ref.Delete(ctx); err != nil {
-			log.Printf("[admin] project delete warning for %s: %v", doc.Ref.ID, err)
+			log.Print("admin project delete warning")
 		}
 	}
 
 	// Delete user doc
 	if _, err := fs.Collection("users").Doc(userID).Delete(ctx); err != nil {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "delete user: " + err.Error()})
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "user delete unavailable"})
 		return
 	}
 

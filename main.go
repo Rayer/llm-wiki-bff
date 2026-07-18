@@ -230,6 +230,8 @@ func main() {
 		v1.GET("/index", hV1.Index)
 		v1.POST("/query", hV1.Query)
 		v1.GET("/sources", hV1.ListSources)
+		v1.GET("/sources/:id/annotation", hV1.GetAnnotation)
+		v1.PUT("/sources/:id/annotation", hV1.PutAnnotation)
 		v1.GET("/sources/:id", hV1.GetSource)
 		v1.GET("/concepts", hV1.ListConcepts)
 		v1.GET("/concepts/:id", hV1.GetConcept)

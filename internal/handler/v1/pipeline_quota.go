@@ -23,7 +23,7 @@ type pipelineQuotaStore interface {
 		limits pipelinequota.Limits,
 		now time.Time,
 		isDemo, alreadyRunning bool,
-		newRawFiles int,
+		newRawFiles, rawDirtyFiles, annotationDirtyFiles int,
 	) (prev firestore.QuotaPrev, snap pipelinequota.Snapshot, reserved bool, err error)
 	RefundQuotaPrev(ctx context.Context, userID, projectID string, prev firestore.QuotaPrev) error
 }
@@ -66,29 +66,29 @@ func (h *Handler) pipelineLimits() pipelinequota.Limits {
 	}
 }
 
-// countNewRawForProject counts raw files newer than the project's last accepted run.
-// When last_run_at is zero (never run), all listed raw files count.
-func (h *Handler) countNewRawForProject(ctx context.Context, userID, projectID string) (int, error) {
-	var lastRunAt time.Time
-	if qs := h.effectiveQuotaStore(); qs != nil {
-		_, _, at, err := qs.LoadQuotaState(ctx, userID, projectID)
-		if err != nil {
-			return 0, err
-		}
-		lastRunAt = at
-	}
+func (h *Handler) pendingWorkForProject(ctx context.Context, userID, projectID string) (newRaw, rawDirty, annotationDirty int, err error) {
 	if h.store == nil {
-		return 0, nil
+		return 0, 0, 0, nil
 	}
-	files, err := h.store.Scope(userID, projectID).ListRawFiles(ctx)
+	s, err := pinStore(ctx, h.store.Scope(userID, projectID))
 	if err != nil {
-		return 0, err
+		return 0, 0, 0, err
 	}
-	updated := make([]time.Time, 0, len(files))
-	for _, f := range files {
-		updated = append(updated, f.Updated)
+	sources, err := listSourcesCacheFirst(ctx, s)
+	if err != nil {
+		return 0, 0, 0, err
 	}
-	return pipelinequota.CountNewRaw(updated, lastRunAt), nil
+	if missingSourceRawPath(sources) {
+		key := userID + "_" + projectID
+		if err := h.hydrateLegacySourceMetadata(ctx, s, sources, key); err != nil {
+			return 0, 0, 0, err
+		}
+	}
+	_, counts, err := sourceLifecycle(ctx, s, sources)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	return counts.NewRaw, counts.RawDirty, counts.AnnotationDirty, nil
 }
 
 // isPipelineRunning reports whether the project has an active lock or any owned
@@ -105,7 +105,7 @@ func (h *Handler) isPipelineRunning(ctx context.Context, userID, projectID strin
 		// Cloud Run status may be unavailable (local/dev, metadata missing).
 		// Rely on the lock signal only in that case; log so transient API
 		// failures are visible when diagnosing a false-allow.
-		log.Printf("pipeline activity scan for running check %s/%s: %v (using lock only)", userID, projectID, err)
+		log.Print("pipeline activity unavailable; using lock only")
 		return locked, nil
 	}
 
@@ -201,7 +201,7 @@ func (h *Handler) evaluateQuota(
 		return pipelinequota.Snapshot{}, false, firestore.QuotaPrev{}, err
 	}
 
-	newRaw, err := h.countNewRawForProject(ctx, userID, projectID)
+	newRaw, rawDirty, annotationDirty, err := h.pendingWorkForProject(ctx, userID, projectID)
 	if err != nil {
 		return pipelinequota.Snapshot{}, false, firestore.QuotaPrev{}, err
 	}
@@ -209,19 +209,21 @@ func (h *Handler) evaluateQuota(
 	qs := h.effectiveQuotaStore()
 	if qs == nil {
 		snap = pipelinequota.Evaluate(pipelinequota.Input{
-			Now:            now,
-			Limits:         limits,
-			IsDemo:         isDemo,
-			AlreadyRunning: alreadyRunning,
-			NewRawFiles:    newRaw,
-			Enforced:       false,
+			Now:                  now,
+			Limits:               limits,
+			IsDemo:               isDemo,
+			AlreadyRunning:       alreadyRunning,
+			NewRawFiles:          newRaw,
+			RawDirtyFiles:        rawDirty,
+			AnnotationDirtyFiles: annotationDirty,
+			Enforced:             false,
 		})
 		return snap, false, firestore.QuotaPrev{}, nil
 	}
 
 	if reserve {
 		prev, snap, reserved, err = qs.ReserveQuota(
-			ctx, userID, projectID, limits, now, isDemo, alreadyRunning, newRaw,
+			ctx, userID, projectID, limits, now, isDemo, alreadyRunning, newRaw, rawDirty, annotationDirty,
 		)
 		if err != nil {
 			return pipelinequota.Snapshot{}, false, firestore.QuotaPrev{}, err
@@ -234,15 +236,17 @@ func (h *Handler) evaluateQuota(
 		return pipelinequota.Snapshot{}, false, firestore.QuotaPrev{}, err
 	}
 	snap = pipelinequota.Evaluate(pipelinequota.Input{
-		Now:            now,
-		Limits:         limits,
-		IsDemo:         isDemo,
-		AlreadyRunning: alreadyRunning,
-		RunsToday:      runsToday,
-		DayKey:         dayKey,
-		LastRunAt:      lastRunAt,
-		NewRawFiles:    newRaw,
-		Enforced:       true,
+		Now:                  now,
+		Limits:               limits,
+		IsDemo:               isDemo,
+		AlreadyRunning:       alreadyRunning,
+		RunsToday:            runsToday,
+		DayKey:               dayKey,
+		LastRunAt:            lastRunAt,
+		NewRawFiles:          newRaw,
+		RawDirtyFiles:        rawDirty,
+		AnnotationDirtyFiles: annotationDirty,
+		Enforced:             true,
 	})
 	return snap, false, firestore.QuotaPrev{}, nil
 }

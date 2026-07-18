@@ -1,6 +1,8 @@
 package rawstatus
 
 import (
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -85,5 +87,20 @@ func TestCountPrefersExplicitFileCount(t *testing.T) {
 	artifact := Artifact{FileCount: 3, Files: map[string]FileStatus{}}
 	if Count(artifact) != 3 {
 		t.Fatalf("Count() = %d, want 3", Count(artifact))
+	}
+}
+
+func TestDecodeRejectsLogicalEntryOverflow(t *testing.T) {
+	var b strings.Builder
+	b.WriteString(`{"version":1,"files":{`)
+	for i := 0; i < 10001; i++ {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		fmt.Fprintf(&b, `"file-%d.md":{"path":"raw/file-%d.md"}`, i, i)
+	}
+	b.WriteString("}}")
+	if _, err := Decode([]byte(b.String())); err == nil || err.Error() != "generated cache logical entry limit exceeded" {
+		t.Fatalf("Decode() error = %v, want fixed logical-entry error", err)
 	}
 }

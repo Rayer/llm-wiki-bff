@@ -1,9 +1,12 @@
 package rawstatus
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
 	"time"
 
+	"github.com/rayer/llm-wiki-bff/internal/generation"
 	store "github.com/rayer/llm-wiki-bff/internal/storage"
 )
 
@@ -44,7 +47,44 @@ func EmptyArtifact(now time.Time) Artifact {
 
 func Decode(data []byte) (Artifact, error) {
 	var artifact Artifact
-	if err := json.Unmarshal(data, &artifact); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	token, err := dec.Token()
+	if err != nil {
+		return Artifact{}, err
+	}
+	if delim, ok := token.(json.Delim); !ok || delim != '{' {
+		return Artifact{}, fmt.Errorf("expected JSON object")
+	}
+	for dec.More() {
+		key, err := dec.Token()
+		if err != nil {
+			return Artifact{}, err
+		}
+		name, ok := key.(string)
+		if !ok {
+			return Artifact{}, fmt.Errorf("expected JSON object key")
+		}
+		switch name {
+		case "version":
+			err = dec.Decode(&artifact.Version)
+		case "generated_at":
+			err = dec.Decode(&artifact.GeneratedAt)
+		case "file_count":
+			err = dec.Decode(&artifact.FileCount)
+		case "files":
+			artifact.Files, err = generation.DecodeBoundedMap[FileStatus](dec)
+		default:
+			var ignored json.RawMessage
+			err = dec.Decode(&ignored)
+		}
+		if err != nil {
+			return Artifact{}, err
+		}
+	}
+	if _, err := dec.Token(); err != nil {
+		return Artifact{}, err
+	}
+	if err := generation.EnsureJSONEOF(dec); err != nil {
 		return Artifact{}, err
 	}
 	if artifact.Files == nil {

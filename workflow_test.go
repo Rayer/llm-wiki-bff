@@ -238,3 +238,114 @@ func TestCloudRunWorkflowsUsePrivateRangesOnlyEgress(t *testing.T) {
 		})
 	}
 }
+
+func TestBFFWorkflowsGrantOnlyMatchingRuntimeServiceAccountJobExecution(t *testing.T) {
+	testCases := []struct {
+		name              string
+		workflow          string
+		pipelineJob       string
+		runtimeServiceAcc string
+	}{
+		{
+			name:              "development",
+			workflow:          ".github/workflows/deploy-bff.yml",
+			pipelineJob:       "olw-pipeline-dev",
+			runtimeServiceAcc: "lwc-bff-dev@llm-wiki-cloud.iam.gserviceaccount.com",
+		},
+		{
+			name:              "production",
+			workflow:          ".github/workflows/release-bff.yml",
+			pipelineJob:       "olw-pipeline",
+			runtimeServiceAcc: "lwc-bff-prod@llm-wiki-cloud.iam.gserviceaccount.com",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			contents := readWorkflow(t, tc.workflow)
+			assertWorkflowEnvDeclaration(t, contents, "PROJECT_ID", "llm-wiki-cloud")
+			assertWorkflowEnvDeclaration(t, contents, "REGION", "asia-east1")
+			assertWorkflowEnvDeclaration(t, contents, "PIPELINE_JOB_NAME", tc.pipelineJob)
+			assertWorkflowEnvDeclaration(t, contents, "RUNTIME_SERVICE_ACCOUNT", tc.runtimeServiceAcc)
+
+			commands := iamBindingCommands(contents)
+			if len(commands) != 1 {
+				t.Fatalf("workflow has %d gcloud run jobs add-iam-policy-binding commands, want exactly 1", len(commands))
+			}
+			wantCommand := []string{
+				`gcloud run jobs add-iam-policy-binding "${{ env.PIPELINE_JOB_NAME }}" \`,
+				`--region "${{ env.REGION }}" \`,
+				`--project "${{ env.PROJECT_ID }}" \`,
+				`--member "serviceAccount:${{ env.RUNTIME_SERVICE_ACCOUNT }}" \`,
+				`--role roles/run.jobsExecutorWithOverrides \`,
+				"--quiet",
+			}
+			if got := strings.Join(commands[0], "\n"); got != strings.Join(wantCommand, "\n") {
+				t.Errorf("job execution IAM command =\n%s\nwant exactly:\n%s", got, strings.Join(wantCommand, "\n"))
+			}
+			for _, forbidden := range []string{
+				"gcloud projects add-iam-policy-binding",
+				"roles/editor",
+				"roles/owner",
+				"roles/run.admin",
+				"roles/run.developer",
+			} {
+				if strings.Contains(contents, forbidden) {
+					t.Errorf("workflow must not grant project-wide Developer/Admin access %q", forbidden)
+				}
+			}
+		})
+	}
+}
+
+func assertWorkflowEnvDeclaration(t *testing.T, contents, key, want string) {
+	t.Helper()
+	values := workflowEnvValues(contents, key)
+	if len(values) != 1 || values[0] != want {
+		t.Fatalf("workflow env %s declarations = %q, want exactly [%q]", key, values, want)
+	}
+}
+
+func workflowEnvValues(contents, key string) []string {
+	var values []string
+	envIndent := -1
+	for _, line := range strings.Split(contents, "\n") {
+		trimmed := strings.TrimSpace(line)
+		indent := len(line) - len(strings.TrimLeft(line, " "))
+		if envIndent >= 0 && trimmed != "" && indent <= envIndent {
+			envIndent = -1
+		}
+		if trimmed == "env:" {
+			envIndent = indent
+			continue
+		}
+		if envIndent < 0 || trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		declaration, value, found := strings.Cut(trimmed, ": ")
+		if found && declaration == key {
+			values = append(values, value)
+		}
+	}
+	return values
+}
+
+func iamBindingCommands(contents string) [][]string {
+	var commands [][]string
+	lines := strings.Split(contents, "\n")
+	for i := 0; i < len(lines); i++ {
+		line := strings.TrimSpace(lines[i])
+		if !strings.HasPrefix(line, "gcloud run jobs add-iam-policy-binding") {
+			continue
+		}
+
+		command := []string{line}
+		for strings.HasSuffix(line, "\\") && i+1 < len(lines) {
+			i++
+			line = strings.TrimSpace(lines[i])
+			command = append(command, line)
+		}
+		commands = append(commands, command)
+	}
+	return commands
+}

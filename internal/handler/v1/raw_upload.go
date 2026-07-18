@@ -29,6 +29,7 @@ const (
 	rawUploadMaxFilenameBytes     = 512
 	rawUploadStatusCreated        = "created"
 	rawUploadStatusAlreadyExists  = "already_exists"
+	rawUploadStatusReplaced       = "replaced"
 	rawUploadConflictErrorMessage = "filename already exists with different content"
 )
 
@@ -46,7 +47,8 @@ type rawUploadResponse struct {
 	Status   string `json:"status"`
 }
 
-// RawUpload handles POST /api/v1/raw/upload.
+// RawUpload handles POST /api/v1/raw/upload. Set overwrite=true as a form
+// field or query parameter to replace an existing file with different content.
 func (h *Handler) RawUpload(c *gin.Context) {
 	userID := strings.TrimSpace(c.GetString("userID"))
 	projectID := strings.TrimSpace(c.GetString("projectID"))
@@ -73,7 +75,7 @@ func (h *Handler) RawUpload(c *gin.Context) {
 			c.JSON(http.StatusNotFound, handler.ErrorResponse{Error: "project not found"})
 			return
 		}
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: err.Error()})
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "raw upload unavailable"})
 		return
 	}
 	if !ready {
@@ -114,36 +116,54 @@ func (h *Handler) RawUpload(c *gin.Context) {
 		case errors.Is(err, errRawUploadEmptyFile):
 			c.JSON(http.StatusBadRequest, handler.ErrorResponse{Error: "empty file"})
 		default:
-			c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "read file: " + err.Error()})
+			c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "raw upload unavailable"})
 		}
 		return
 	}
 
 	wikiStore, err := h.GetGCSClient(c)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: err.Error()})
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "raw upload unavailable"})
 		return
 	}
 	relPath := rawUploadRelativePath(filename)
 	existingDigest, exists, err := resolveExistingRawDigest(c.Request.Context(), wikiStore, relPath)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "check existing raw file: " + err.Error()})
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "raw upload unavailable"})
 		return
 	}
-	if exists {
-		if existingDigest == digest {
-			c.JSON(http.StatusOK, newRawUploadResponse(userID, projectID, filename, size, digest, rawUploadStatusAlreadyExists))
-			return
+	statusCode, uploadStatus, write := rawUploadDecision(exists, existingDigest, digest, rawUploadOverwrite(c))
+	if !write {
+		if statusCode == http.StatusConflict {
+			c.JSON(http.StatusConflict, handler.ErrorResponse{Error: rawUploadConflictErrorMessage})
+		} else {
+			c.JSON(statusCode, newRawUploadResponse(userID, projectID, filename, size, digest, uploadStatus))
 		}
-		c.JSON(http.StatusConflict, handler.ErrorResponse{Error: rawUploadConflictErrorMessage})
 		return
 	}
 	if _, err := wikiStore.WriteBytes(c.Request.Context(), data, relPath); err != nil {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "upload to GCS: " + err.Error()})
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "raw upload unavailable"})
 		return
 	}
 
-	c.JSON(http.StatusCreated, newRawUploadResponse(userID, projectID, filename, size, digest, rawUploadStatusCreated))
+	c.JSON(statusCode, newRawUploadResponse(userID, projectID, filename, size, digest, uploadStatus))
+}
+
+func rawUploadOverwrite(c *gin.Context) bool {
+	return c.PostForm("overwrite") == "true" || c.Query("overwrite") == "true"
+}
+
+func rawUploadDecision(exists bool, existingDigest, digest string, overwrite bool) (statusCode int, uploadStatus string, write bool) {
+	if !exists {
+		return http.StatusCreated, rawUploadStatusCreated, true
+	}
+	if existingDigest == digest {
+		return http.StatusOK, rawUploadStatusAlreadyExists, false
+	}
+	if overwrite {
+		return http.StatusOK, rawUploadStatusReplaced, true
+	}
+	return http.StatusConflict, "", false
 }
 
 func (h *Handler) rawUploadProjectReady(c *gin.Context, userID, projectID string) (bool, error) {

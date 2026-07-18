@@ -15,5 +15,5 @@ RUN git config --system user.email "worker@llm-wiki.local" \
     && git config --system user.name "LWC Worker"
 
 COPY --from=build /out/worker /worker
-WORKDIR /data
+WORKDIR /tmp
 ENTRYPOINT ["/worker"]

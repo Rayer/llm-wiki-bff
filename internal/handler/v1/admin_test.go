@@ -25,6 +25,9 @@ type adminStatsProjectStore struct {
 	sourceErr       error
 	cacheConceptErr error
 	cacheSourceErr  error
+	hasManifest     bool
+	manifestErr     error
+	manifestCalls   int
 }
 
 func (s *adminStatsProjectStore) Prefix() string { return s.prefix }
@@ -79,6 +82,11 @@ func (s *adminStatsProjectStore) BucketStats(context.Context) (int64, int64, err
 
 func (s *adminStatsProjectStore) GetMetaSHA256(context.Context, string) (string, error) {
 	return "", errors.New("not implemented")
+}
+
+func (s *adminStatsProjectStore) HasCurrentManifest(context.Context) (bool, error) {
+	s.manifestCalls++
+	return s.hasManifest, s.manifestErr
 }
 
 type adminStatsRootStore struct {
@@ -466,6 +474,78 @@ func TestAdminRebuildIndex_NoFirestore(t *testing.T) {
 	err := json.Unmarshal(recorder.Body.Bytes(), &resp)
 	assert.NoError(t, err)
 	assert.Equal(t, "Firestore client is not configured", resp["error"])
+}
+
+func TestGenerationProjectsRejectManualRebuildWithoutCallingWriter(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	project := &adminStatsProjectStore{hasManifest: true}
+	root := &adminStatsRootStore{adminStatsProjectStore: project, scoped: map[string]*adminStatsProjectStore{"request-user/demo": project}}
+	calls := 0
+	h := &Handler{store: root, rebuildIndex: func(context.Context, string, string) (idMap, error) {
+		calls++
+		return idMap{}, nil
+	}}
+
+	request := func(admin bool) *httptest.ResponseRecorder {
+		recorder := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(recorder)
+		if admin {
+			c.Request = httptest.NewRequest(http.MethodPost, "/admin/projects/request-user_demo/rebuild-index", nil)
+			c.Params = gin.Params{{Key: "id", Value: "request-user_demo"}}
+			h.AdminRebuildIndex(c)
+		} else {
+			c.Request = httptest.NewRequest(http.MethodPost, "/api/v1/pipeline/rebuild-index", nil)
+			c.Set("userID", "request-user")
+			c.Set("projectID", "demo")
+			h.RebuildIndex(c)
+		}
+		return recorder
+	}
+	for _, recorder := range []*httptest.ResponseRecorder{request(false), request(true)} {
+		if recorder.Code != http.StatusConflict {
+			t.Fatalf("manual rebuild status = %d, want 409; body = %s", recorder.Code, recorder.Body.String())
+		}
+		if !strings.Contains(recorder.Body.String(), "run the pipeline") {
+			t.Fatalf("manual rebuild body = %s", recorder.Body.String())
+		}
+	}
+	if calls != 0 {
+		t.Fatalf("rebuild invoked %d times for generation project", calls)
+	}
+
+	project.hasManifest = false
+	if recorder := request(false); recorder.Code != http.StatusOK || calls != 1 {
+		t.Fatalf("legacy rebuild = %d, calls = %d; want 200 and 1", recorder.Code, calls)
+	}
+	project.hasManifest = true
+	if recorder := request(false); recorder.Code != http.StatusConflict || calls != 1 {
+		t.Fatalf("malformed manifest rebuild = %d, calls = %d; want 409 and 1", recorder.Code, calls)
+	}
+}
+
+func TestRebuildIndexAuthenticatesBeforeGenerationProbeAndSanitizesProbeErrors(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	project := &adminStatsProjectStore{manifestErr: errors.New("sentinel-provider-path/users/tenant")}
+	root := &adminStatsRootStore{adminStatsProjectStore: project, scoped: map[string]*adminStatsProjectStore{"user/project": project}}
+	h := &Handler{store: root}
+
+	unauthenticated := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(unauthenticated)
+	c.Request = httptest.NewRequest(http.MethodPost, "/api/v1/pipeline/rebuild-index", nil)
+	h.RebuildIndex(c)
+	if unauthenticated.Code != http.StatusUnauthorized || project.manifestCalls != 0 {
+		t.Fatalf("unauthenticated rebuild = %d probes=%d, want 401 and 0", unauthenticated.Code, project.manifestCalls)
+	}
+
+	authenticated := httptest.NewRecorder()
+	c, _ = gin.CreateTestContext(authenticated)
+	c.Request = httptest.NewRequest(http.MethodPost, "/api/v1/pipeline/rebuild-index", nil)
+	c.Set("userID", "user")
+	c.Set("projectID", "project")
+	h.RebuildIndex(c)
+	if authenticated.Code != http.StatusInternalServerError || strings.Contains(authenticated.Body.String(), "sentinel-provider-path") {
+		t.Fatalf("authenticated rebuild = %d body=%s", authenticated.Code, authenticated.Body.String())
+	}
 }
 
 // TestAdminRebuildIndex_MissingProject_Route404 tests that a POST request

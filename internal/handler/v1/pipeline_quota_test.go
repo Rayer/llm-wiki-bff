@@ -1,6 +1,9 @@
 package v1
 
 import (
+	"bytes"
+	"errors"
+	"log"
 	"net/http"
 	"testing"
 	"time"
@@ -75,5 +78,31 @@ func TestEvaluateQuotaUnenforcedWithoutStore(t *testing.T) {
 	}
 	if !snap.Allowed {
 		t.Fatalf("expected Allowed when unenforced, got reason=%q", snap.Reason)
+	}
+}
+
+func TestPipelineRunningFallbackLogIsSanitized(t *testing.T) {
+	var output bytes.Buffer
+	previous := log.Writer()
+	previousFlags := log.Flags()
+	log.SetOutput(&output)
+	log.SetFlags(0)
+	defer func() {
+		log.SetOutput(previous)
+		log.SetFlags(previousFlags)
+	}()
+
+	h := &Handler{httpClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("provider denied users/tenant-secret/projects/project-secret/executions/execution-secret")
+	})}}
+	running, err := h.isPipelineRunning(t.Context(), "tenant-secret", "project-secret")
+	if err != nil {
+		t.Fatalf("isPipelineRunning() error = %v, want lock-only fallback", err)
+	}
+	if running {
+		t.Fatal("isPipelineRunning() = true, want false without a lock")
+	}
+	if got := output.String(); got != "pipeline activity unavailable; using lock only\n" {
+		t.Fatalf("log = %q, want fixed sanitized event", got)
 	}
 }

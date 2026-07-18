@@ -7,9 +7,51 @@ import (
 	"testing"
 
 	"github.com/gin-gonic/gin"
+	"github.com/rayer/llm-wiki-bff/internal/gcs"
 	"github.com/rayer/llm-wiki-bff/internal/search"
 	store "github.com/rayer/llm-wiki-bff/internal/storage"
 )
+
+type sourceMetadataView struct{ listed []gcs.WikiPage }
+
+func (s sourceMetadataView) ListSourcesFromCache(context.Context) ([]gcs.WikiPage, error) {
+	return nil, nil
+}
+func (s sourceMetadataView) ListSources(context.Context) ([]gcs.WikiPage, error) {
+	return append([]gcs.WikiPage(nil), s.listed...), nil
+}
+
+func TestLegacySourceMetadataCacheIsPinnedToView(t *testing.T) {
+	h := New(nil, nil, search.NewIndex(), nil, nil, nil)
+	ctx := context.Background()
+	aKey := store.ProjectPrefix("user", "project") + ":manifest-a"
+	bKey := store.ProjectPrefix("user", "project") + ":manifest-b"
+	aSources := []gcs.WikiPage{{Slug: "source"}}
+	bSources := []gcs.WikiPage{{Slug: "source"}}
+	if err := h.hydrateLegacySourceMetadata(ctx, sourceMetadataView{listed: []gcs.WikiPage{{Slug: "source", RawPath: "raw/a.md", Title: "A"}}}, aSources, aKey); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.hydrateLegacySourceMetadata(ctx, sourceMetadataView{listed: []gcs.WikiPage{{Slug: "source", RawPath: "raw/b.md", Title: "B"}}}, bSources, bKey); err != nil {
+		t.Fatal(err)
+	}
+	if aSources[0].RawPath != "raw/a.md" || bSources[0].RawPath != "raw/b.md" {
+		t.Fatalf("mixed view metadata: A=%+v B=%+v", aSources[0], bSources[0])
+	}
+	stillA := []gcs.WikiPage{{Slug: "source"}}
+	if err := h.hydrateLegacySourceMetadata(ctx, sourceMetadataView{listed: []gcs.WikiPage{{Slug: "source", RawPath: "raw/incorrect.md"}}}, stillA, aKey); err != nil {
+		t.Fatal(err)
+	}
+	if stillA[0].RawPath != "raw/a.md" {
+		t.Fatalf("pinned A changed after B: %+v", stillA[0])
+	}
+	h.invalidateCachesAfterRebuild("user", "project")
+	if _, ok := h.listCache[aKey]; ok {
+		t.Fatal("A view cache survived project invalidation")
+	}
+	if _, ok := h.listCache[bKey]; ok {
+		t.Fatal("B view cache survived project invalidation")
+	}
+}
 
 func seedRebuildCaches(h *Handler, uid, pid string) {
 	h.idRoutingMaps = map[string]dualIDMap{
@@ -20,14 +62,16 @@ func seedRebuildCaches(h *Handler, uid, pid string) {
 			Concept: map[string]string{"b7e2c9a4d113": "other-slug"},
 		}),
 	}
+	projectKey := store.ProjectPrefix(uid, pid) + ":manifest-7"
 	h.listCache = map[string]cachedLists{
-		uid + "_" + pid: {
+		projectKey: {
 			concepts: []store.WikiPage{{Slug: "stale-slug"}},
 		},
 		"other-user_other": {
 			concepts: []store.WikiPage{{Slug: "other-slug"}},
 		},
 	}
+	h.listCacheKeys = map[string]map[string]struct{}{store.ProjectPrefix(uid, pid): {projectKey: {}}}
 }
 
 func assertProjectCachesCleared(t *testing.T, h *Handler, uid, pid string) {
@@ -35,8 +79,8 @@ func assertProjectCachesCleared(t *testing.T, h *Handler, uid, pid string) {
 	if _, ok := h.idRoutingMaps[store.ProjectPrefix(uid, pid)]; ok {
 		t.Fatalf("idRoutingMaps still has key %q", store.ProjectPrefix(uid, pid))
 	}
-	if _, ok := h.listCache[uid+"_"+pid]; ok {
-		t.Fatalf("listCache still has key %q", uid+"_"+pid)
+	if _, ok := h.listCache[store.ProjectPrefix(uid, pid)+":manifest-7"]; ok {
+		t.Fatalf("listCache still has project view key")
 	}
 }
 

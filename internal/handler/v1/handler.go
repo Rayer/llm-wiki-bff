@@ -26,17 +26,20 @@ type Handler struct {
 	llm       *llm.Client
 	expander  *llm.QueryExpander
 
-	httpClient       *http.Client
-	metadataTokenURL string
-	cloudRunJobURL   string
-	projectExists    func(context.Context, string) error
-	rebuildIndex     func(context.Context, string, string) (wikiindex.IDMap, error)
-	idRoutingMu      sync.Mutex
-	idRoutingMaps    map[string]dualIDMap
+	httpClient                   *http.Client
+	metadataTokenURL             string
+	cloudRunJobURL               string
+	projectExists                func(context.Context, string) error
+	rebuildIndex                 func(context.Context, string, string) (wikiindex.IDMap, error)
+	adminProjectRecordsLoader    func(context.Context) ([]adminProjectRecord, error)
+	adminProjectStatisticsLoader func(context.Context, store.RootStore, []adminProjectRecord) (map[string]adminProjectStatistics, error)
+	idRoutingMu                  sync.Mutex
+	idRoutingMaps                map[string]dualIDMap
 
 	// Per-project list cache (invalidated on rebuild-index)
-	listCacheMu sync.RWMutex
-	listCache   map[string]cachedLists // key: "uid_pid"
+	listCacheMu   sync.RWMutex
+	listCache     map[string]cachedLists // key: "uid_pid"
+	listCacheKeys map[string]map[string]struct{}
 
 	// Pipeline quota (LWC-138). Zero values mean defaults via pipelineLimits().
 	pipelineDailyLimit int
@@ -49,9 +52,12 @@ type Handler struct {
 }
 
 type cachedLists struct {
-	concepts []store.WikiPage
-	sources  []store.WikiPage
+	concepts         []store.WikiPage
+	sources          []store.WikiPage
+	legacySourceMeta []store.WikiPage
 }
+
+const requestPinnedStoreKey = "lwc.requestPinnedStore"
 
 // New creates a V1 Handler with the given dependencies.
 func New(wikiStore store.RootStore, fs *firestore.Client, idx *search.Index, cache *conceptcache.Cache, llmClient *llm.Client, expander *llm.QueryExpander) *Handler {
@@ -64,6 +70,7 @@ func New(wikiStore store.RootStore, fs *firestore.Client, idx *search.Index, cac
 		expander:      expander,
 		idRoutingMaps: make(map[string]dualIDMap),
 		listCache:     make(map[string]cachedLists),
+		listCacheKeys: make(map[string]map[string]struct{}),
 		httpClient:    &http.Client{Timeout: 30 * time.Second},
 	}
 }
@@ -113,6 +120,11 @@ func (h *Handler) SetPipelineQuotaStore(store pipelineQuotaStore) {
 
 // GetStore returns the request-scoped wiki store.
 func (h *Handler) GetStore(c *gin.Context) (store.Store, error) {
+	if pinned, ok := c.Get(requestPinnedStoreKey); ok {
+		if scoped, ok := pinned.(store.Store); ok {
+			return scoped, nil
+		}
+	}
 	userID := c.GetString("userID")
 	projectID := c.GetString("projectID")
 	if userID == "" && projectID == "" {
@@ -122,9 +134,27 @@ func (h *Handler) GetStore(c *gin.Context) (store.Store, error) {
 		return nil, fmt.Errorf("incomplete storage request scope")
 	}
 	if h.store == nil {
-		return nil, fmt.Errorf("wiki storage is not configured")
+		return nil, errWikiStorageNotConfigured
 	}
-	return h.store.Scope(userID, projectID), nil
+	scoped := h.store.Scope(userID, projectID)
+	ctx := context.Background()
+	if c.Request != nil {
+		ctx = c.Request.Context()
+	}
+	var err error
+	scoped, err = pinStore(ctx, scoped)
+	if err != nil {
+		return nil, err
+	}
+	c.Set(requestPinnedStoreKey, scoped)
+	return scoped, nil
+}
+
+func pinStore(ctx context.Context, scoped store.Store) (store.Store, error) {
+	if pinner, ok := scoped.(store.ViewPinner); ok {
+		return pinner.Pin(ctx)
+	}
+	return scoped, nil
 }
 
 // GetGCSClient is kept as a compatibility wrapper while handlers migrate to
@@ -147,6 +177,24 @@ func (h *Handler) listCacheSet(key string, fn func(*cachedLists)) {
 	cl := h.listCache[key]
 	fn(&cl)
 	h.listCache[key] = cl
+	base, _, _ := strings.Cut(key, ":")
+	if h.listCacheKeys == nil {
+		h.listCacheKeys = make(map[string]map[string]struct{})
+	}
+	if h.listCacheKeys[base] == nil {
+		h.listCacheKeys[base] = make(map[string]struct{})
+	}
+	h.listCacheKeys[base][key] = struct{}{}
+}
+
+func (h *Handler) listCacheInvalidateProject(uid, pid string) {
+	base := store.ProjectPrefix(uid, pid)
+	h.listCacheMu.Lock()
+	defer h.listCacheMu.Unlock()
+	for key := range h.listCacheKeys[base] {
+		delete(h.listCache, key)
+	}
+	delete(h.listCacheKeys, base)
 }
 
 func (h *Handler) listCacheInvalidate(key string) {
@@ -158,12 +206,27 @@ func (h *Handler) listCacheInvalidate(key string) {
 func (h *Handler) idRoutingCacheInvalidateForProject(uid, pid string) {
 	h.idRoutingMu.Lock()
 	defer h.idRoutingMu.Unlock()
-	delete(h.idRoutingMaps, store.ProjectPrefix(uid, pid))
+	prefix := store.ProjectPrefix(uid, pid)
+	for key := range h.idRoutingMaps {
+		if key == prefix || strings.HasPrefix(key, prefix+":") {
+			delete(h.idRoutingMaps, key)
+		}
+	}
+}
+
+func viewCacheKey(s store.Store) string {
+	key := s.Prefix()
+	if view, ok := s.(store.ViewToken); ok {
+		if token := view.ViewToken(); token != "" && token != "legacy" {
+			return key + ":" + token
+		}
+	}
+	return key
 }
 
 func (h *Handler) invalidateCachesAfterRebuild(uid, pid string) {
 	h.idRoutingCacheInvalidateForProject(uid, pid)
-	h.listCacheInvalidate(uid + "_" + pid)
+	h.listCacheInvalidateProject(uid, pid)
 }
 
 func cloneWikiPages(src []store.WikiPage) []store.WikiPage {
