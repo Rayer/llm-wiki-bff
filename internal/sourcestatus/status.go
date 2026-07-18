@@ -1,11 +1,15 @@
 package sourcestatus
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"time"
+
+	"github.com/rayer/llm-wiki-bff/internal/generation"
 )
 
 const Path = "cache/source_status.json"
@@ -27,7 +31,42 @@ type Artifact struct {
 
 func Decode(data []byte) (Artifact, error) {
 	var a Artifact
-	err := json.Unmarshal(data, &a)
+	dec := json.NewDecoder(bytes.NewReader(data))
+	token, err := dec.Token()
+	if err == nil {
+		var ok bool
+		var delim json.Delim
+		delim, ok = token.(json.Delim)
+		if !ok || delim != '{' {
+			err = fmt.Errorf("expected JSON object")
+		}
+	}
+	for err == nil && dec.More() {
+		var key interface{}
+		key, err = dec.Token()
+		name, ok := key.(string)
+		if err == nil && !ok {
+			err = fmt.Errorf("expected JSON object key")
+		}
+		if err != nil {
+			break
+		}
+		switch name {
+		case "version":
+			err = dec.Decode(&a.Version)
+		case "sources":
+			a.Sources, err = generation.DecodeBoundedMap[Receipt](dec)
+		default:
+			var ignored json.RawMessage
+			err = dec.Decode(&ignored)
+		}
+	}
+	if err == nil {
+		_, err = dec.Token()
+	}
+	if err == nil {
+		err = generation.EnsureJSONEOF(dec)
+	}
 	if a.Sources == nil {
 		a.Sources = map[string]Receipt{}
 	}

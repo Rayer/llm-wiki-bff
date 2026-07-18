@@ -261,7 +261,7 @@ func TestGetSourceReturnsInternalServerErrorForLifecycleStorageErrors(t *testing
 
 	for _, path := range []string{"source", "aaaaaaaaaaaa-source"} {
 		t.Run(path, func(t *testing.T) {
-			h := New(lifecycleErrorRoot{RootStore: localfs.New(root), err: errors.New("read lifecycle")}, nil, search.NewIndex(), conceptcache.New(), nil, nil)
+			h := New(lifecycleErrorRoot{RootStore: localfs.New(root), err: errors.New("provider denied users/tenant-secret/projects/project-secret/cache/source_status.json generation generation-secret")}, nil, search.NewIndex(), conceptcache.New(), nil, nil)
 			recorder := httptest.NewRecorder()
 			c, _ := gin.CreateTestContext(recorder)
 			c.Request = httptest.NewRequest(http.MethodGet, "/sources/"+path, nil)
@@ -272,6 +272,9 @@ func TestGetSourceReturnsInternalServerErrorForLifecycleStorageErrors(t *testing
 			h.GetSource(c)
 			if recorder.Code != http.StatusInternalServerError {
 				t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusInternalServerError, recorder.Body.String())
+			}
+			if got := recorder.Body.String(); got != `{"error":"generated data unavailable"}` {
+				t.Fatalf("body = %q, want fixed generated-data error", got)
 			}
 		})
 	}
@@ -324,6 +327,9 @@ func TestAnnotationBackendFailuresAndProjectIsolation(t *testing.T) {
 	if r.Code != http.StatusInternalServerError {
 		t.Fatalf("backend read error = %d", r.Code)
 	}
+	if r.Body.String() != `{"error":"generated data unavailable"}` {
+		t.Fatalf("backend read body = %q, want fixed storage error", r.Body.String())
+	}
 	failingWrite := New(annotationErrorRoot{Client: localfs.New(root), writeErr: true}, nil, search.NewIndex(), conceptcache.New(), nil, nil)
 	r = httptest.NewRecorder()
 	c, _ = gin.CreateTestContext(r)
@@ -334,6 +340,9 @@ func TestAnnotationBackendFailuresAndProjectIsolation(t *testing.T) {
 	failingWrite.PutAnnotation(c)
 	if r.Code != http.StatusInternalServerError {
 		t.Fatalf("backend write error = %d", r.Code)
+	}
+	if r.Body.String() != `{"error":"generated data unavailable"}` {
+		t.Fatalf("backend write body = %q, want fixed storage error", r.Body.String())
 	}
 }
 

@@ -3,12 +3,27 @@ package v1
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/rayer/llm-wiki-bff/internal/gcs"
+	store "github.com/rayer/llm-wiki-bff/internal/storage"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
+
+func TestFinishRebuildObservesAllCleanupErrorsAfterPrimary(t *testing.T) {
+	primary := errors.New("primary rebuild failure")
+	called := 0
+	err := finishRebuild(primary,
+		func() error { called++; return errors.New("lease provider detail") },
+		func() error { called++; return errors.New("lock provider detail") },
+	)
+	if called != 2 || !errors.Is(err, primary) || !errors.Is(err, store.ErrLeaseCleanup) || strings.Contains(err.Error(), "provider") {
+		t.Fatalf("finishRebuild error=%v called=%d", err, called)
+	}
+}
 
 type fakeIDMapStore struct {
 	files        map[string][]gcs.MarkdownFile

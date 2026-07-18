@@ -2,7 +2,6 @@ package v1
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -13,6 +12,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/rayer/llm-wiki-bff/internal/handler"
 	store "github.com/rayer/llm-wiki-bff/internal/storage"
+	"github.com/rayer/llm-wiki-bff/internal/wikiindex"
 )
 
 var (
@@ -44,8 +44,8 @@ func loadDualIDMap(ctx context.Context, store idMapStore) (dualIDMap, error) {
 		return dualIDMap{}, fmt.Errorf("read id map: %w", err)
 	}
 
-	var source idMap
-	if err := json.Unmarshal(data, &source); err != nil {
+	source, err := wikiindex.DecodeIDMap(data)
+	if err != nil {
 		return dualIDMap{}, fmt.Errorf("decode id map: %w", err)
 	}
 	return buildDualIDMap(source), nil
@@ -157,7 +157,7 @@ func entryIDSlug(entry idRouteEntry) string {
 }
 
 func (h *Handler) getIDRoutingMap(ctx context.Context, gcsClient store.Store) (dualIDMap, error) {
-	prefix := gcsClient.Prefix()
+	prefix := viewCacheKey(gcsClient)
 
 	h.idRoutingMu.Lock()
 	defer h.idRoutingMu.Unlock()
@@ -180,7 +180,7 @@ func (h *Handler) rewriteMarkdownForResponse(c *gin.Context, gcsClient store.Sto
 	dual, err := h.getIDRoutingMap(c.Request.Context(), gcsClient)
 	if err != nil {
 		status := http.StatusInternalServerError
-		message := err.Error()
+		message := "generated data unavailable"
 		if errors.Is(err, errIDMapNotFound) {
 			status = http.StatusNotFound
 			message = "id map not found"
@@ -199,7 +199,7 @@ func (h *Handler) handleIDRoutedPage(c *gin.Context, gcsClient store.Store, curr
 	dual, err := h.getIDRoutingMap(c.Request.Context(), gcsClient)
 	if err != nil {
 		status := http.StatusInternalServerError
-		message := err.Error()
+		message := "generated data unavailable"
 		if errors.Is(err, errIDMapNotFound) {
 			status = http.StatusNotFound
 			message = "id map not found"
@@ -222,7 +222,7 @@ func (h *Handler) handleIDRoutedPage(c *gin.Context, gcsClient store.Store, curr
 	category := routePrefix(entry.Type)
 	page, data, err := gcsClient.GetPage(c.Request.Context(), entry.Slug, category)
 	if err != nil {
-		c.JSON(http.StatusNotFound, handler.ErrorResponse{Error: entry.Type + " not found: " + entry.Slug})
+		writeGeneratedReadError(c, err, entry.Type+" not found: "+entry.Slug)
 		return true
 	}
 	data = []byte(rewriteWikilinks(string(data), dual))
@@ -232,7 +232,7 @@ func (h *Handler) handleIDRoutedPage(c *gin.Context, gcsClient store.Store, curr
 		page.ID = entry.ID
 		response, err := h.sourceDetailResponse(c, gcsClient, *page, data)
 		if err != nil {
-			c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: err.Error()})
+			c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: generatedDataUnavailableMessage})
 			return true
 		}
 		c.JSON(http.StatusOK, response)

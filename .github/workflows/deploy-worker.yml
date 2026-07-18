@@ -9,6 +9,7 @@ env:
   PROJECT_ID: llm-wiki-cloud
   REGION: asia-east1
   JOB_NAME: olw-pipeline-dev
+  BUCKET: llm-wiki-data-dev
   AR_REPO: asia-east1-docker.pkg.dev/llm-wiki-cloud/cloud-run-images
 
 concurrency:
@@ -76,7 +77,7 @@ jobs:
           fi
           echo "immutable_image=${AR_REPO}/olw-pipeline@${DIGEST}" >> "$GITHUB_OUTPUT"
 
-      - name: Update only the dev worker image
+      - name: Update dev worker without GCSFuse
         env:
           IMMUTABLE_IMAGE: ${{ steps.image.outputs.immutable_image }}
         run: |
@@ -86,10 +87,12 @@ jobs:
             echo "develop/1.0 advanced; refusing an out-of-order deployment"
             exit 1
           fi
-          # Updating only --image preserves the existing job's mount, service
-          # account, secrets, args, and WORKSPACE/WORKSPACE_DIR environment.
           gcloud run jobs update "${JOB_NAME}" \
             --image "$IMMUTABLE_IMAGE" \
+            --update-env-vars "BUCKET=${BUCKET}" \
+            --remove-env-vars "DATA_DIR,WORKSPACE,VAULT_PATH,WORKSPACE_DIR" \
+            --args "^@^run@[[\"run\",\"--auto-approve\"]]" \
+            --clear-volumes \
             --region "${REGION}" \
             --quiet
 
@@ -99,6 +102,32 @@ jobs:
             --quiet)
           if [[ "${DEPLOYED}" != "${IMMUTABLE_IMAGE}" ]]; then
             echo "deployed image does not match immutable digest: ${DEPLOYED}"
+            exit 1
+          fi
+          JOB_CONTRACT=$(gcloud run jobs describe "${JOB_NAME}" \
+            --region "${REGION}" --format=json --quiet)
+          if jq -e '.spec.template.spec.template.spec.volumes | length > 0' <<<"$JOB_CONTRACT" >/dev/null; then
+            echo "worker must not retain GCSFuse volumes"
+            exit 1
+          fi
+          if jq -e '.spec.template.spec.template.spec.containers[0].volumeMounts | length > 0' <<<"$JOB_CONTRACT" >/dev/null; then
+            echo "worker must not retain volume mounts"
+            exit 1
+          fi
+          if [[ $(jq -r '.spec.template.spec.template.spec.containers[0].env[]? | select(.name == "BUCKET") | .value' <<<"$JOB_CONTRACT") != "${BUCKET}" ]]; then
+            echo "worker BUCKET is missing or incorrect"
+            exit 1
+          fi
+          if jq -e '.spec.template.spec.template.spec.containers[0].env[]? | select(.name == "DATA_DIR" or .name == "WORKSPACE" or .name == "VAULT_PATH" or .name == "WORKSPACE_DIR")' <<<"$JOB_CONTRACT" >/dev/null; then
+            echo "worker must not retain legacy local-routing env"
+            exit 1
+          fi
+          if jq -e '.spec.template.spec.template.spec.containers[0].args[]? | select(test("--(vault|data-dir|workspace)"))' <<<"$JOB_CONTRACT" >/dev/null; then
+            echo "worker must not retain legacy local-routing args"
+            exit 1
+          fi
+          if [[ $(jq -c '.spec.template.spec.template.spec.containers[0].args' <<<"$JOB_CONTRACT") != '["run","[[\"run\",\"--auto-approve\"]]"]' ]]; then
+            echo "worker args do not match the cloud worker contract"
             exit 1
           fi
           git fetch --no-tags origin develop/1.0

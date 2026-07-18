@@ -70,7 +70,10 @@ func (h *Handler) pendingWorkForProject(ctx context.Context, userID, projectID s
 	if h.store == nil {
 		return 0, 0, 0, nil
 	}
-	s := h.store.Scope(userID, projectID)
+	s, err := pinStore(ctx, h.store.Scope(userID, projectID))
+	if err != nil {
+		return 0, 0, 0, err
+	}
 	sources, err := listSourcesCacheFirst(ctx, s)
 	if err != nil {
 		return 0, 0, 0, err
@@ -102,7 +105,7 @@ func (h *Handler) isPipelineRunning(ctx context.Context, userID, projectID strin
 		// Cloud Run status may be unavailable (local/dev, metadata missing).
 		// Rely on the lock signal only in that case; log so transient API
 		// failures are visible when diagnosing a false-allow.
-		log.Printf("pipeline activity scan for running check %s/%s: %v (using lock only)", userID, projectID, err)
+		log.Print("pipeline activity unavailable; using lock only")
 		return locked, nil
 	}
 

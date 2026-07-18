@@ -2,19 +2,22 @@ package gcs
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
+	"path"
 	"sort"
 	"strings"
 	"time"
 
 	"cloud.google.com/go/storage"
 	fm "github.com/adrg/frontmatter"
+	"github.com/rayer/llm-wiki-bff/internal/annotation"
+	"github.com/rayer/llm-wiki-bff/internal/generation"
 	store "github.com/rayer/llm-wiki-bff/internal/storage"
 	"google.golang.org/api/googleapi"
 	"google.golang.org/api/iterator"
@@ -24,9 +27,12 @@ import (
 
 // Client wraps GCS operations for a specific user/project.
 type Client struct {
-	bucket    *storage.BucketHandle
-	userID    string
-	projectID string
+	bucket           *storage.BucketHandle
+	userID           string
+	projectID        string
+	backend          clientBackend
+	view             *generationView
+	legacyWriteLease *legacyGenerationLease
 }
 
 type WikiPage = store.WikiPage
@@ -61,6 +67,19 @@ type sourceMeta struct {
 	SourceFile string `json:"source_file"`
 }
 
+type generationView struct {
+	manifest *generation.Manifest
+	token    string
+}
+
+type legacyGenerationLease struct{ generation int64 }
+
+const maxLegacyStatsObjects = 1000
+const legacyLeaseReleaseAttempts = 3
+
+var errBucketObjectLimit = errors.New("bucket object limit exceeded")
+var errBucketByteLimit = errors.New("bucket byte limit exceeded")
+
 // NewClient creates a new GCS client for the given bucket.
 func NewClient(bucket string) (*Client, error) {
 	ctx := context.Background()
@@ -77,16 +96,112 @@ func NewClient(bucket string) (*Client, error) {
 // supplied user/project prefix.
 func (c *Client) WithScope(userID, projectID string) *Client {
 	return &Client{
-		bucket:    c.bucket,
-		userID:    userID,
-		projectID: projectID,
+		bucket:           c.bucket,
+		userID:           userID,
+		projectID:        projectID,
+		backend:          c.backend,
+		view:             c.view,
+		legacyWriteLease: c.legacyWriteLease,
 	}
+}
+
+// BeginLegacyGenerationWrite serializes pre-manifest generated writes with the
+// worker using the same create-only lease object. The returned scope is the
+// only GCS scope permitted to write generated canonical paths.
+func (c *Client) BeginLegacyGenerationWrite(ctx context.Context) (store.Store, func(context.Context) error, error) {
+	leaseName := c.prefix() + "/" + generation.LeasePath
+	attrs, err := c.writeObject(ctx, leaseName, []byte(`{"started_at":"redacted"}`), "application/json", nil, writeCondition{DoesNotExist: true})
+	if err != nil {
+		return nil, nil, store.ErrGenerationManaged
+	}
+	lease := legacyGenerationLease{generation: attrs.Generation}
+	if exists, err := c.HasCurrentManifest(ctx); err != nil || exists {
+		release := func(context.Context) error {
+			return store.RetryGenerationCleanup(lease.generation, generation.LeaseReleaseTimeout, legacyLeaseReleaseAttempts, func(releaseCtx context.Context, objectGeneration int64) error {
+				return c.deleteObject(releaseCtx, leaseName, objectGeneration)
+			})
+		}
+		if err != nil {
+			return nil, nil, errors.Join(store.ErrGenerationStateUnavailable, release(context.Background()))
+		}
+		return nil, nil, errors.Join(store.ErrGenerationManaged, release(context.Background()))
+	}
+	scoped := *c
+	scoped.legacyWriteLease = &lease
+	release := func(context.Context) error {
+		return store.RetryGenerationCleanup(lease.generation, generation.LeaseReleaseTimeout, legacyLeaseReleaseAttempts, func(releaseCtx context.Context, objectGeneration int64) error {
+			return c.deleteObject(releaseCtx, leaseName, objectGeneration)
+		})
+	}
+	return &scoped, release, nil
+}
+
+func (c *Client) withGenerationWriteLease(ctx context.Context, paths []string, write func(*Client) error) error {
+	managed := false
+	for _, path := range paths {
+		if generation.GenerationOwnedWritePath(path) {
+			managed = true
+			break
+		}
+	}
+	if !managed {
+		return write(c)
+	}
+
+	if c.legacyWriteLease != nil {
+		exists, err := c.HasCurrentManifest(ctx)
+		if err != nil {
+			return err
+		}
+		if exists {
+			return store.ErrGenerationManaged
+		}
+		return write(c)
+	}
+
+	lockedStore, release, err := c.BeginLegacyGenerationWrite(ctx)
+	if err != nil {
+		return err
+	}
+	locked, ok := lockedStore.(*Client)
+	if !ok {
+		return errors.Join(errors.New("invalid legacy generation write scope"), release(context.Background()))
+	}
+	writeErr := write(locked)
+	releaseErr := release(context.Background())
+	return errors.Join(writeErr, releaseErr)
 }
 
 // Scope returns a project-scoped storage interface while preserving the
 // concrete WithScope API used by GCS-specific tools.
 func (c *Client) Scope(userID, projectID string) store.Store {
 	return c.WithScope(userID, projectID)
+}
+
+// Pin resolves current.json once and returns a copy whose generated reads use
+// exactly that manifest (or the explicit legacy view) for the operation.
+func (c *Client) Pin(ctx context.Context) (store.Store, error) {
+	if c.view != nil {
+		return c, nil
+	}
+	// Keep the zero-value client usable as the storage-neutral test placeholder.
+	if c.bucket == nil && c.backend == nil {
+		return c, nil
+	}
+	view, err := c.operationView(ctx)
+	if err != nil {
+		return nil, err
+	}
+	pinned := *c
+	pinned.view = &view
+	return &pinned, nil
+}
+
+func (c *Client) ViewToken() string {
+	if c.view == nil {
+		return ""
+	}
+	return c.view.token
 }
 
 // NewScopedClient returns a client that shares the bucket connection but uses
@@ -101,13 +216,21 @@ func (c *Client) prefix() string {
 
 // ListSources returns all compiled wiki sources.
 func (c *Client) ListSources(ctx context.Context) ([]WikiPage, error) {
-	return c.listDir(ctx, "wiki/sources/")
+	view, err := c.operationView(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return c.listDir(ctx, view, "wiki/sources/")
 }
 
 // ListConcepts returns wiki concepts. Drafts are included when includeDrafts is true.
 func (c *Client) ListConcepts(ctx context.Context, includeDrafts bool) ([]WikiPage, error) {
+	view, err := c.operationView(ctx)
+	if err != nil {
+		return nil, err
+	}
 	// Always list both dirs to work around GCS iterator issue with directOnly
-	published, err := c.listConceptDir(ctx, "wiki/", "published", false)
+	published, err := c.listConceptDir(ctx, view, "wiki/", "published", false)
 	if err != nil {
 		return nil, err
 	}
@@ -117,7 +240,7 @@ func (c *Client) ListConcepts(ctx context.Context, includeDrafts bool) ([]WikiPa
 		seen[page.Slug] = struct{}{}
 	}
 
-	drafts, err := c.listConceptDir(ctx, "wiki/.drafts/", "draft", false)
+	drafts, err := c.listConceptDir(ctx, view, "wiki/.drafts/", "draft", false)
 	if err != nil {
 		return nil, err
 	}
@@ -143,7 +266,11 @@ func (c *Client) ListConcepts(ctx context.Context, includeDrafts bool) ([]WikiPa
 
 // ListConceptsFromCache returns wiki concepts from the generated JSONL cache.
 func (c *Client) ListConceptsFromCache(ctx context.Context) ([]WikiPage, error) {
-	data, err := c.ReadFile(ctx, conceptsCachePath)
+	view, err := c.operationView(ctx)
+	if err != nil {
+		return nil, err
+	}
+	data, err := c.readFileWithView(ctx, conceptsCachePath, view)
 	if err != nil {
 		return nil, err
 	}
@@ -152,7 +279,11 @@ func (c *Client) ListConceptsFromCache(ctx context.Context) ([]WikiPage, error) 
 
 // ListSourcesFromCache returns wiki sources from the generated ID map cache.
 func (c *Client) ListSourcesFromCache(ctx context.Context) ([]WikiPage, error) {
-	data, err := c.ReadFile(ctx, idMapCachePath)
+	view, err := c.operationView(ctx)
+	if err != nil {
+		return nil, err
+	}
+	data, err := c.readFileWithView(ctx, idMapCachePath, view)
 	if err != nil {
 		return nil, err
 	}
@@ -161,18 +292,22 @@ func (c *Client) ListSourcesFromCache(ctx context.Context) ([]WikiPage, error) {
 
 // GetPage reads a wiki page by slug from sources or concepts.
 func (c *Client) GetPage(ctx context.Context, slug, category string) (*WikiPage, []byte, error) {
+	view, err := c.operationView(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
 	switch category {
 	case "sources":
-		return c.getPageFromDir(ctx, slug, "wiki/sources/", "")
+		return c.getPageFromDir(ctx, view, slug, "wiki/sources/", "")
 	case "concepts":
-		page, data, err := c.getPageFromDir(ctx, slug, "wiki/", "published")
+		page, data, err := c.getPageFromDir(ctx, view, slug, "wiki/", "published")
 		if err == nil {
 			return page, data, nil
 		}
 		if !errors.Is(err, storage.ErrObjectNotExist) {
 			return nil, nil, err
 		}
-		return c.getPageFromDir(ctx, slug, "wiki/.drafts/", "draft")
+		return c.getPageFromDir(ctx, view, slug, "wiki/.drafts/", "draft")
 	default:
 		return nil, nil, fmt.Errorf("unknown category: %s", category)
 	}
@@ -187,24 +322,17 @@ func (c *Client) ReadMetaIndex(ctx context.Context) (string, error) {
 	return string(data), nil
 }
 
-func (c *Client) getPageFromDir(ctx context.Context, slug, dir, status string) (*WikiPage, []byte, error) {
-	path := fmt.Sprintf("%s/%s%s.md", c.prefix(), dir, slug)
-	obj := c.bucket.Object(path)
-	r, err := obj.NewReader(ctx)
+func (c *Client) getPageFromDir(ctx context.Context, view generationView, slug, dir, status string) (*WikiPage, []byte, error) {
+	rel := fmt.Sprintf("%s%s.md", dir, slug)
+	data, err := c.readFileWithView(ctx, rel, view)
 	if err != nil {
-		return nil, nil, fmt.Errorf("read %s: %w", path, err)
-	}
-	defer r.Close()
-
-	data, err := io.ReadAll(r)
-	if err != nil {
-		return nil, nil, fmt.Errorf("read all %s: %w", path, err)
+		return nil, nil, err
 	}
 
 	return &WikiPage{
 		Slug:   slug,
 		Title:  slug,
-		Path:   fmt.Sprintf("%s%s.md", dir, slug),
+		Path:   rel,
 		Status: status,
 	}, data, nil
 }
@@ -212,46 +340,197 @@ func (c *Client) getPageFromDir(ctx context.Context, slug, dir, status string) (
 // ReadRaw reads a raw source file.
 func (c *Client) ReadRaw(ctx context.Context, name string) ([]byte, error) {
 	path := fmt.Sprintf("%s/raw/%s", c.prefix(), name)
-	obj := c.bucket.Object(path)
-	r, err := obj.NewReader(ctx)
+	object, err := c.readObject(ctx, path, 0, generation.MaxFileBytes)
 	if err != nil {
 		return nil, fmt.Errorf("read raw %s: %w", path, err)
 	}
-	defer r.Close()
-	return io.ReadAll(r)
+	return object.Data, nil
 }
 
 // ReadFile reads any file under the user/project prefix.
 func (c *Client) ReadFile(ctx context.Context, relPath string) ([]byte, error) {
-	path := fmt.Sprintf("%s/%s", c.prefix(), relPath)
-	obj := c.bucket.Object(path)
-	r, err := obj.NewReader(ctx)
+	if !generation.GenerationOwned(relPath) {
+		return c.readFileWithView(ctx, relPath, generationView{})
+	}
+	view, err := c.operationView(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return c.readFileWithView(ctx, relPath, view)
+}
+
+func (c *Client) readFileWithView(ctx context.Context, relPath string, view generationView) ([]byte, error) {
+	path, expected, err := c.resolveReadPath(relPath, view)
+	if err != nil {
+		return nil, err
+	}
+	object, err := c.readObject(ctx, path, expected, readLimitForView(relPath, view))
 	if err != nil {
 		if objectNotFound(err) {
+			if view.manifest != nil {
+				return nil, store.ErrDeclaredObjectUnavailable
+			}
 			return nil, storage.ErrObjectNotExist
+		}
+		if view.manifest != nil {
+			return nil, store.ErrDeclaredObjectUnavailable
 		}
 		return nil, fmt.Errorf("read %s: %w", path, err)
 	}
-	defer r.Close()
-	return io.ReadAll(r)
+	if err := c.verifyGenerationRead(relPath, view, object); err != nil {
+		return nil, err
+	}
+	return object.Data, nil
 }
 
 func (c *Client) ReadFileWithGeneration(ctx context.Context, relPath string) ([]byte, int64, error) {
-	path := fmt.Sprintf("%s/%s", c.prefix(), relPath)
-	obj := c.bucket.Object(path)
-	r, err := obj.NewReader(ctx)
-	if err != nil {
-		if objectNotFound(err) {
-			return nil, 0, storage.ErrObjectNotExist
+	view := generationView{}
+	var err error
+	if generation.GenerationOwned(relPath) {
+		view, err = c.operationView(ctx)
+		if err != nil {
+			return nil, 0, err
 		}
-		return nil, 0, fmt.Errorf("read %s: %w", path, err)
 	}
-	defer r.Close()
-	data, err := io.ReadAll(r)
+	path, expected, err := c.resolveReadPath(relPath, view)
 	if err != nil {
 		return nil, 0, err
 	}
-	return data, r.Attrs.Generation, nil
+	object, err := c.readObject(ctx, path, expected, readLimitForView(relPath, view))
+	if err != nil {
+		if objectNotFound(err) {
+			if view.manifest != nil {
+				return nil, 0, store.ErrDeclaredObjectUnavailable
+			}
+			return nil, 0, storage.ErrObjectNotExist
+		}
+		if view.manifest != nil {
+			return nil, 0, store.ErrDeclaredObjectUnavailable
+		}
+		return nil, 0, fmt.Errorf("read %s: %w", path, err)
+	}
+	if err := c.verifyGenerationRead(relPath, view, object); err != nil {
+		return nil, 0, err
+	}
+	return object.Data, object.Generation, nil
+}
+
+func (c *Client) verifyGenerationRead(relPath string, view generationView, object backendObject) error {
+	if view.manifest == nil {
+		return nil
+	}
+	file, ok := view.manifest.File(relPath)
+	if !ok || file.Generation != object.Generation || file.Size != int64(len(object.Data)) {
+		return store.ErrDeclaredObjectUnavailable
+	}
+	sum := sha256.Sum256(object.Data)
+	if fmt.Sprintf("%x", sum[:]) != file.SHA256 {
+		return store.ErrDeclaredObjectUnavailable
+	}
+	return nil
+}
+
+func readLimitForView(relPath string, view generationView) int64 {
+	if view.manifest != nil {
+		if file, ok := view.manifest.File(relPath); ok && file.Size < generation.MaxFileBytes {
+			return file.Size
+		}
+	}
+	return generation.MaxFileBytes
+}
+
+// HasCurrentManifest is deliberately a cheap existence check for write paths.
+func (c *Client) HasCurrentManifest(ctx context.Context) (bool, error) {
+	_, err := c.objectAttrs(ctx, c.prefix()+"/"+generation.ManifestPath, 0)
+	if objectNotFound(err) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+func (c *Client) currentManifest(ctx context.Context) (generation.Manifest, int64, bool, error) {
+	object, err := c.readObject(ctx, c.prefix()+"/"+generation.ManifestPath, 0, generation.MaxManifestBytes)
+	if objectNotFound(err) {
+		return generation.Manifest{}, 0, false, nil
+	}
+	if err != nil {
+		return generation.Manifest{}, 0, false, fmt.Errorf("read generation manifest: %w", err)
+	}
+	m, err := generation.Decode(object.Data)
+	if err != nil {
+		return generation.Manifest{}, 0, true, err
+	}
+	return m, object.Generation, true, nil
+}
+
+func (c *Client) captureGenerationView(ctx context.Context) (generationView, error) {
+	m, manifestGeneration, exists, err := c.currentManifest(ctx)
+	if err != nil {
+		return generationView{}, err
+	}
+	if !exists {
+		return generationView{token: "legacy"}, nil
+	}
+	return generationView{manifest: &m, token: fmt.Sprintf("manifest-%d", manifestGeneration)}, nil
+}
+
+func (c *Client) operationView(ctx context.Context) (generationView, error) {
+	if c.view != nil {
+		return *c.view, nil
+	}
+	return c.captureGenerationView(ctx)
+}
+
+func (c *Client) resolveReadPath(relPath string, view generationView) (string, int64, error) {
+	if !generation.GenerationOwned(relPath) {
+		if generationNamespacePath(relPath) && !canonicalReadPath(relPath) {
+			return "", 0, store.ErrDeclaredObjectUnavailable
+		}
+		return c.prefix() + "/" + relPath, 0, nil
+	}
+	if view.manifest == nil {
+		return c.prefix() + "/" + relPath, 0, nil
+	}
+	file, ok := view.manifest.File(relPath)
+	if !ok {
+		return "", 0, storage.ErrObjectNotExist
+	}
+	return c.prefix() + "/" + view.manifest.ObjectPath(file), file.Generation, nil
+}
+
+func generationNamespacePath(relPath string) bool {
+	return relPath == "wiki" || strings.HasPrefix(relPath, "wiki/") ||
+		relPath == "cache" || strings.HasPrefix(relPath, "cache/") ||
+		relPath == ".olw" || strings.HasPrefix(relPath, ".olw/") ||
+		relPath == "wiki.toml" || strings.HasPrefix(relPath, "wiki.toml/")
+}
+
+func canonicalReadPath(relPath string) bool {
+	if store.SafeRawPath(relPath) || relPath == "cache/source_status.json" {
+		return true
+	}
+	if strings.HasPrefix(relPath, "cache/annotations/") && strings.HasSuffix(relPath, ".json") {
+		sourceID := strings.TrimSuffix(strings.TrimPrefix(relPath, "cache/annotations/"), ".json")
+		return annotation.ValidSourceID(sourceID)
+	}
+	if strings.HasPrefix(relPath, "cache/pipeline-") && strings.HasSuffix(relPath, ".log") {
+		executionID := strings.TrimSuffix(strings.TrimPrefix(relPath, "cache/pipeline-"), ".log")
+		return executionID != "" && executionID != "." && executionID != ".." && path.Clean(relPath) == relPath && !strings.ContainsAny(executionID, `/\\`) && !strings.Contains(executionID, "..")
+	}
+	return false
+}
+
+func currentGenerationFiles(view generationView, relPrefix string) ([]generation.File, bool) {
+	if view.manifest == nil {
+		return nil, false
+	}
+	files := make([]generation.File, 0)
+	for _, file := range view.manifest.Files {
+		if strings.HasPrefix(file.Path, relPrefix) {
+			files = append(files, file)
+		}
+	}
+	return files, true
 }
 
 func objectNotFound(err error) bool {
@@ -259,32 +538,26 @@ func objectNotFound(err error) bool {
 }
 
 func (c *Client) WriteFileIfGeneration(ctx context.Context, data []byte, relPath string, expected int64) (int64, error) {
-	obj := c.bucket.Object(fmt.Sprintf("%s/%s", c.prefix(), relPath))
-	obj = obj.If(storage.Conditions{GenerationMatch: expected})
-	w := obj.NewWriter(ctx)
-	var annotationMeta struct {
-		SHA256  string `json:"ann_sha256"`
-		RawPath string `json:"raw_path"`
-		Body    string `json:"body"`
-	}
-	_ = json.Unmarshal(data, &annotationMeta)
-	if annotationMeta.SHA256 != "" {
-		w.Metadata = map[string]string{"ann_sha256": annotationMeta.SHA256, "raw_path": annotationMeta.RawPath, "has_annotation": fmt.Sprintf("%t", annotationMeta.Body != "")}
-	}
-	if _, err := w.Write(data); err != nil {
-		closeErr := w.Close()
-		if mapped := conditionalWriteError(err); errors.Is(mapped, store.ErrGenerationMismatch) {
-			return 0, mapped
+	var result int64
+	err := c.withGenerationWriteLease(ctx, []string{relPath}, func(writer *Client) error {
+		var annotationMeta struct {
+			SHA256  string `json:"ann_sha256"`
+			RawPath string `json:"raw_path"`
+			Body    string `json:"body"`
 		}
-		if mapped := conditionalWriteError(closeErr); errors.Is(mapped, store.ErrGenerationMismatch) {
-			return 0, mapped
+		_ = json.Unmarshal(data, &annotationMeta)
+		metadata := map[string]string(nil)
+		if annotationMeta.SHA256 != "" {
+			metadata = map[string]string{"ann_sha256": annotationMeta.SHA256, "raw_path": annotationMeta.RawPath, "has_annotation": fmt.Sprintf("%t", annotationMeta.Body != "")}
 		}
-		return 0, err
-	}
-	if err := w.Close(); err != nil {
-		return 0, conditionalWriteError(err)
-	}
-	return w.Attrs().Generation, nil
+		attrs, err := writer.writeObject(ctx, fmt.Sprintf("%s/%s", writer.prefix(), relPath), data, contentTypeForPath(relPath), metadata, createOrGenerationCondition(expected))
+		if err != nil {
+			return conditionalWriteError(err)
+		}
+		result = attrs.Generation
+		return nil
+	})
+	return result, err
 }
 
 // conditionalWriteError normalizes the two error surfaces used by GCS clients:
@@ -306,16 +579,12 @@ func conditionalWriteError(err error) error {
 
 func (c *Client) ListObjectMeta(ctx context.Context, relPrefix string) ([]store.ObjectMeta, error) {
 	prefix := fmt.Sprintf("%s/%s", c.prefix(), relPrefix)
-	it := c.bucket.Objects(ctx, &storage.Query{Prefix: prefix})
+	objects, err := c.listObjects(ctx, prefix)
+	if err != nil {
+		return nil, err
+	}
 	var out []store.ObjectMeta
-	for {
-		attrs, err := it.Next()
-		if errors.Is(err, iterator.Done) {
-			break
-		}
-		if err != nil {
-			return nil, err
-		}
+	for _, attrs := range objects {
 		out = append(out, store.ObjectMeta{Path: strings.TrimPrefix(attrs.Name, c.prefix()+"/"), Generation: attrs.Generation, Updated: attrs.Updated.UTC(), SHA256: attrs.Metadata["ann_sha256"], RawPath: attrs.Metadata["raw_path"], HasAnnotation: attrs.Metadata["has_annotation"] == "true"})
 	}
 	return out, nil
@@ -324,18 +593,36 @@ func (c *Client) ListObjectMeta(ctx context.Context, relPrefix string) ([]store.
 // ListMarkdownFiles reads direct .md files under dir, relative to the
 // user/project prefix. Nested files are ignored.
 func (c *Client) ListMarkdownFiles(ctx context.Context, dir string) ([]MarkdownFile, error) {
-	prefix := fmt.Sprintf("%s/%s", c.prefix(), dir)
-	it := c.bucket.Objects(ctx, &storage.Query{Prefix: prefix})
-
-	var files []MarkdownFile
-	for {
-		attrs, err := it.Next()
+	view := generationView{}
+	var err error
+	if strings.HasPrefix(dir, "wiki/") {
+		view, err = c.operationView(ctx)
 		if err != nil {
-			if errors.Is(err, iterator.Done) {
-				break
-			}
 			return nil, err
 		}
+	}
+	if files, exists := currentGenerationFiles(view, dir); exists {
+		out := make([]MarkdownFile, 0, len(files))
+		for _, file := range files {
+			rel := strings.TrimPrefix(file.Path, dir)
+			if !strings.HasSuffix(file.Path, ".md") || rel == "" || strings.Contains(rel, "/") {
+				continue
+			}
+			data, err := c.readFileWithView(ctx, file.Path, view)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, MarkdownFile{Slug: strings.TrimSuffix(rel, ".md"), Path: file.Path, Data: data})
+		}
+		return out, nil
+	}
+	prefix := fmt.Sprintf("%s/%s", c.prefix(), dir)
+	objects, err := c.listObjects(ctx, prefix)
+	if err != nil {
+		return nil, err
+	}
+	var files []MarkdownFile
+	for _, attrs := range objects {
 		if !strings.HasSuffix(attrs.Name, ".md") {
 			continue
 		}
@@ -344,7 +631,7 @@ func (c *Client) ListMarkdownFiles(ctx context.Context, dir string) ([]MarkdownF
 			continue
 		}
 
-		data, err := c.ReadFile(ctx, dir+rel)
+		data, err := c.readFileWithView(ctx, dir+rel, view)
 		if err != nil {
 			return nil, err
 		}
@@ -359,17 +646,12 @@ func (c *Client) ListMarkdownFiles(ctx context.Context, dir string) ([]MarkdownF
 
 func (c *Client) ListRawFiles(ctx context.Context) ([]store.RawFile, error) {
 	prefix := c.prefix() + "/raw/"
-	it := c.bucket.Objects(ctx, &storage.Query{Prefix: prefix})
-
+	objects, err := c.listObjects(ctx, prefix)
+	if err != nil {
+		return nil, err
+	}
 	files := make([]store.RawFile, 0)
-	for {
-		attrs, err := it.Next()
-		if err != nil {
-			if errors.Is(err, iterator.Done) {
-				break
-			}
-			return nil, err
-		}
+	for _, attrs := range objects {
 		name, ok := c.rawFileNameFromObject(attrs.Name)
 		if !ok {
 			continue
@@ -401,19 +683,37 @@ func (c *Client) rawFileNameFromObject(objectName string) (string, bool) {
 }
 
 // listDir lists .md files under the given directory prefix.
-func (c *Client) listDir(ctx context.Context, dir string) ([]WikiPage, error) {
-	prefix := fmt.Sprintf("%s/%s", c.prefix(), dir)
-	it := c.bucket.Objects(ctx, &storage.Query{Prefix: prefix})
-
-	var pages []WikiPage
-	for {
-		attrs, err := it.Next()
-		if err != nil {
-			if errors.Is(err, iterator.Done) {
-				break
+func (c *Client) listDir(ctx context.Context, view generationView, dir string) ([]WikiPage, error) {
+	if files, exists := currentGenerationFiles(view, dir); exists {
+		pages := make([]WikiPage, 0, len(files))
+		for _, file := range files {
+			if !strings.HasSuffix(file.Path, ".md") {
+				continue
 			}
-			return nil, err
+			slug := strings.TrimSuffix(strings.TrimPrefix(file.Path, dir), ".md")
+			if slug == "" || strings.Contains(slug, "/") {
+				continue
+			}
+			page := WikiPage{Slug: slug, Title: slug, Path: file.Path}
+			data, err := c.readFileWithView(ctx, file.Path, view)
+			if err != nil {
+				return nil, err
+			}
+			page, err = applyWikiPageFrontmatter(page, data)
+			if err != nil {
+				return nil, fmt.Errorf("parse %s: %w", page.Path, err)
+			}
+			pages = append(pages, page)
 		}
+		return pages, nil
+	}
+	prefix := fmt.Sprintf("%s/%s", c.prefix(), dir)
+	objects, err := c.listObjects(ctx, prefix)
+	if err != nil {
+		return nil, err
+	}
+	var pages []WikiPage
+	for _, attrs := range objects {
 		if !strings.HasSuffix(attrs.Name, ".md") {
 			continue
 		}
@@ -423,7 +723,7 @@ func (c *Client) listDir(ctx context.Context, dir string) ([]WikiPage, error) {
 			Title: slug,
 			Path:  fmt.Sprintf("%s%s.md", dir, slug),
 		}
-		data, err := c.ReadFile(ctx, page.Path)
+		data, err := c.readFileWithView(ctx, page.Path, view)
 		if err != nil {
 			return nil, err
 		}
@@ -462,12 +762,17 @@ func WikiPagesFromConceptsJSONL(data []byte) ([]WikiPage, error) {
 	scanner.Buffer(make([]byte, 64*1024), 16*1024*1024)
 	pages := make([]WikiPage, 0)
 	lineNumber := 0
+	rows := 0
 	for scanner.Scan() {
 		lineNumber++
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
 			continue
 		}
+		if rows >= generation.MaxFiles {
+			return nil, generation.ErrLogicalEntryLimit
+		}
+		rows++
 
 		var entry conceptCacheEntry
 		if err := json.Unmarshal([]byte(line), &entry); err != nil {
@@ -496,8 +801,8 @@ func WikiPagesFromConceptsJSONL(data []byte) ([]WikiPage, error) {
 }
 
 func WikiPagesFromSourceIDMap(data []byte) ([]WikiPage, error) {
-	var source wikiIDMap
-	if err := json.Unmarshal(data, &source); err != nil {
+	source, err := decodeWikiIDMap(data)
+	if err != nil {
 		return nil, fmt.Errorf("decode source id map: %w", err)
 	}
 
@@ -525,6 +830,55 @@ func WikiPagesFromSourceIDMap(data []byte) ([]WikiPage, error) {
 		return pages[i].Slug < pages[j].Slug
 	})
 	return pages, nil
+}
+
+func decodeWikiIDMap(data []byte) (wikiIDMap, error) {
+	var source wikiIDMap
+	dec := json.NewDecoder(bytes.NewReader(data))
+	token, err := dec.Token()
+	if err != nil {
+		return source, err
+	}
+	if delim, ok := token.(json.Delim); !ok || delim != '{' {
+		return source, errors.New("expected JSON object")
+	}
+	for dec.More() {
+		key, err := dec.Token()
+		if err != nil {
+			return source, err
+		}
+		name, ok := key.(string)
+		if !ok {
+			return source, errors.New("expected JSON object key")
+		}
+		switch name {
+		case "source":
+			source.Source, err = generation.DecodeBoundedMap[string](dec)
+		case "source_meta":
+			source.SourceMeta, err = generation.DecodeBoundedMap[sourceMeta](dec)
+		case "concept":
+			_, err = generation.DecodeBoundedMap[string](dec)
+		case "redirects":
+			_, err = decodeBoundedRedirects(dec)
+		default:
+			var ignored json.RawMessage
+			err = dec.Decode(&ignored)
+		}
+		if err != nil {
+			return source, err
+		}
+	}
+	if _, err := dec.Token(); err != nil {
+		return source, err
+	}
+	if err := generation.EnsureJSONEOF(dec); err != nil {
+		return source, err
+	}
+	return source, nil
+}
+
+func decodeBoundedRedirects(dec *json.Decoder) (map[string][]string, error) {
+	return generation.DecodeBoundedStringLists(dec)
 }
 
 func frontmatterStringValue(frontmatter map[string]interface{}, key string) string {
@@ -569,22 +923,16 @@ func (c *Client) uploadBytes(ctx context.Context, data []byte, gcsRelPath string
 }
 
 func (c *Client) uploadBytesWithDigest(ctx context.Context, data []byte, gcsRelPath, digest string) error {
-	path := fmt.Sprintf("%s/%s", c.prefix(), gcsRelPath)
-	obj := c.bucket.Object(path)
-
-	w := obj.NewWriter(ctx)
-	w.ContentType = contentTypeForPath(gcsRelPath)
-	w.Metadata = map[string]string{
-		"sha256": digest,
-	}
-	if _, err := w.Write(data); err != nil {
-		w.Close()
-		return fmt.Errorf("write %s: %w", path, err)
-	}
-	if err := w.Close(); err != nil {
-		return fmt.Errorf("close %s: %w", path, err)
-	}
-	return nil
+	return c.withGenerationWriteLease(ctx, []string{gcsRelPath}, func(writer *Client) error {
+		path := fmt.Sprintf("%s/%s", writer.prefix(), gcsRelPath)
+		_, err := writer.writeObject(ctx, path, data, contentTypeForPath(gcsRelPath), map[string]string{
+			"sha256": digest,
+		}, writeCondition{})
+		if err != nil {
+			return fmt.Errorf("write %s: %w", path, err)
+		}
+		return nil
+	})
 }
 
 // WriteBytes uploads bytes to GCS under the user/project prefix and returns the
@@ -597,45 +945,87 @@ func (c *Client) WriteBytes(ctx context.Context, data []byte, gcsRelPath string)
 // final object with a generation precondition so the final replacement is atomic.
 func (c *Client) WriteBytesAtomic(ctx context.Context, data []byte, tmpPath, finalPath string) (string, error) {
 	digest := fmt.Sprintf("%x", sha256.Sum256(data))
-	tmpFullPath := fmt.Sprintf("%s/%s", c.prefix(), tmpPath)
-	finalFullPath := fmt.Sprintf("%s/%s", c.prefix(), finalPath)
-
-	tmpObj := c.bucket.Object(tmpFullPath)
-	w := tmpObj.NewWriter(ctx)
-	w.ContentType = contentTypeForPath(finalPath)
-	w.Metadata = map[string]string{
-		"sha256": digest,
-	}
-	if _, err := w.Write(data); err != nil {
-		w.Close()
-		return "", fmt.Errorf("write %s: %w", tmpFullPath, err)
-	}
-	if err := w.Close(); err != nil {
-		return "", fmt.Errorf("close %s: %w", tmpFullPath, err)
-	}
-	tmpAttrs := w.Attrs()
-	tmpSource := tmpObj
-	if tmpAttrs != nil && tmpAttrs.Generation > 0 {
-		tmpSource = tmpObj.Generation(tmpAttrs.Generation)
-	}
-	defer func() {
-		_ = tmpObj.Delete(context.Background())
-	}()
-
-	finalObj := c.bucket.Object(finalFullPath)
-	attrs, err := finalObj.Attrs(ctx)
-	if err != nil {
-		if !errors.Is(err, storage.ErrObjectNotExist) {
-			return "", fmt.Errorf("attrs %s: %w", finalFullPath, err)
+	err := c.withGenerationWriteLease(ctx, []string{tmpPath, finalPath}, func(writer *Client) error {
+		if writer.backend != nil {
+			tmpFullPath := fmt.Sprintf("%s/%s", writer.prefix(), tmpPath)
+			tmpAttrs, err := writer.writeObject(ctx, tmpFullPath, data, contentTypeForPath(finalPath), map[string]string{"sha256": digest}, writeCondition{})
+			if err != nil {
+				return err
+			}
+			defer func() {
+				bestEffortTemporaryCleanup(tmpAttrs.Generation, func(ctx context.Context) error {
+					return writer.deleteObject(ctx, tmpFullPath, tmpAttrs.Generation)
+				})
+			}()
+			finalFullPath := fmt.Sprintf("%s/%s", writer.prefix(), finalPath)
+			finalAttrs, err := writer.objectAttrs(ctx, finalFullPath, 0)
+			condition := writeCondition{DoesNotExist: true}
+			if err == nil {
+				condition = createOrGenerationCondition(finalAttrs.Generation)
+			} else if !objectNotFound(err) {
+				return err
+			}
+			_, err = writer.writeObject(ctx, finalFullPath, data, contentTypeForPath(finalPath), map[string]string{"sha256": digest}, condition)
+			return err
 		}
-		finalObj = finalObj.If(storage.Conditions{DoesNotExist: true})
-	} else {
-		finalObj = finalObj.If(storage.Conditions{GenerationMatch: attrs.Generation})
-	}
-	if _, err := finalObj.CopierFrom(tmpSource).Run(ctx); err != nil {
-		return "", fmt.Errorf("copy %s to %s: %w", tmpFullPath, finalFullPath, err)
+		tmpFullPath := fmt.Sprintf("%s/%s", writer.prefix(), tmpPath)
+		finalFullPath := fmt.Sprintf("%s/%s", writer.prefix(), finalPath)
+
+		tmpObj := writer.bucket.Object(tmpFullPath)
+		w := tmpObj.NewWriter(ctx)
+		w.ContentType = contentTypeForPath(finalPath)
+		w.Metadata = map[string]string{
+			"sha256": digest,
+		}
+		if _, err := w.Write(data); err != nil {
+			w.Close()
+			return conditionalWriteError(fmt.Errorf("write %s: %w", tmpFullPath, err))
+		}
+		if err := w.Close(); err != nil {
+			return conditionalWriteError(fmt.Errorf("close %s: %w", tmpFullPath, err))
+		}
+		tmpAttrs := w.Attrs()
+		tmpSource := tmpObj
+		if tmpAttrs != nil && tmpAttrs.Generation > 0 {
+			tmpSource = tmpObj.Generation(tmpAttrs.Generation)
+		}
+		if tmpAttrs != nil && tmpAttrs.Generation > 0 {
+			defer func() {
+				bestEffortTemporaryCleanup(tmpAttrs.Generation, func(ctx context.Context) error {
+					return tmpObj.If(temporaryObjectDeleteConditions(tmpAttrs.Generation)).Delete(ctx)
+				})
+			}()
+		}
+
+		finalObj := writer.bucket.Object(finalFullPath)
+		attrs, err := finalObj.Attrs(ctx)
+		if err != nil {
+			if !errors.Is(err, storage.ErrObjectNotExist) {
+				return conditionalWriteError(fmt.Errorf("attrs %s: %w", finalFullPath, err))
+			}
+			finalObj = finalObj.If(storage.Conditions{DoesNotExist: true})
+		} else {
+			finalObj = finalObj.If(storage.Conditions{GenerationMatch: attrs.Generation})
+		}
+		if _, err := finalObj.CopierFrom(tmpSource).Run(ctx); err != nil {
+			return conditionalWriteError(fmt.Errorf("copy %s to %s: %w", tmpFullPath, finalFullPath, err))
+		}
+		return nil
+	})
+	if err != nil {
+		return "", err
 	}
 	return digest, nil
+}
+
+func bestEffortTemporaryCleanup(objectGeneration int64, remove func(context.Context) error) {
+	_ = store.RetryGenerationCleanup(objectGeneration, generation.LeaseReleaseTimeout, 1, func(ctx context.Context, _ int64) error {
+		return remove(ctx)
+	})
+}
+
+func temporaryObjectDeleteConditions(generation int64) storage.Conditions {
+	return storage.Conditions{GenerationMatch: generation}
 }
 
 func contentTypeForPath(gcsRelPath string) string {
@@ -651,14 +1041,36 @@ func contentTypeForPath(gcsRelPath string) string {
 // GetMetaSHA256 returns the SHA256 digest from GCS object metadata, or "" if the
 // object doesn't exist or has no sha256 metadata.
 func (c *Client) GetMetaSHA256(ctx context.Context, gcsRelPath string) (string, error) {
-	path := fmt.Sprintf("%s/%s", c.prefix(), gcsRelPath)
-	obj := c.bucket.Object(path)
-	attrs, err := obj.Attrs(ctx)
+	view := generationView{}
+	var err error
+	if generation.GenerationOwned(gcsRelPath) {
+		view, err = c.operationView(ctx)
+		if err != nil {
+			return "", err
+		}
+	}
+	path, expectedGeneration, err := c.resolveReadPath(gcsRelPath, view)
+	if err != nil {
+		return "", err
+	}
+	attrs, err := c.objectAttrs(ctx, path, expectedGeneration)
 	if err != nil {
 		if errors.Is(err, storage.ErrObjectNotExist) {
+			if view.manifest != nil {
+				return "", store.ErrDeclaredObjectUnavailable
+			}
 			return "", nil
 		}
+		if view.manifest != nil {
+			return "", store.ErrDeclaredObjectUnavailable
+		}
 		return "", fmt.Errorf("attrs %s: %w", path, err)
+	}
+	if view.manifest != nil {
+		file, ok := view.manifest.File(gcsRelPath)
+		if !ok || file.Generation != attrs.Generation || file.Size != attrs.Size || attrs.Metadata["sha256"] != file.SHA256 {
+			return "", store.ErrDeclaredObjectUnavailable
+		}
 	}
 	return attrs.Metadata["sha256"], nil
 }
@@ -699,6 +1111,8 @@ func (c *Client) ListProjects(ctx context.Context, userID string) ([]Project, er
 	})
 
 	seen := make(map[string]struct{})
+	var listedBytes int64
+	listedObjects := 0
 	for {
 		attrs, err := it.Next()
 		if err != nil {
@@ -707,6 +1121,11 @@ func (c *Client) ListProjects(ctx context.Context, userID string) ([]Project, er
 			}
 			return nil, err
 		}
+		if attrs.Size < 0 || attrs.Size > generation.MaxTotalSize || listedBytes > generation.MaxTotalSize-attrs.Size || listedObjects >= generation.MaxFiles {
+			return nil, errors.New("object list exceeds limit")
+		}
+		listedObjects++
+		listedBytes += attrs.Size
 
 		prefix := attrs.Prefix
 		if prefix == "" {
@@ -749,36 +1168,109 @@ func (c *Client) projectCreatedAt(ctx context.Context, userID, projectID string)
 	return attrs.Created.UTC().Format(time.RFC3339)
 }
 
-// BucketStats returns object count for the user/project prefix.
-// Does NOT iterate to sum bytes — uses a single paged listing.
+// BucketStats counts canonical objects plus the current generation's logical
+// files. Historical immutable generations are deliberately excluded.
 func (c *Client) BucketStats(ctx context.Context) (int64, int64, error) {
-	prefix := fmt.Sprintf("%s/", c.prefix())
-	it := c.bucket.Objects(ctx, &storage.Query{Prefix: prefix})
-	var count int64
-	for i := 0; i < 1000; i++ {
-		_, err := it.Next()
+	m, _, hasManifest, err := c.currentManifest(ctx)
+	if err != nil {
+		return 0, 0, err
+	}
+	if hasManifest {
+		var bytes, count int64
+		for _, file := range m.Files {
+			if file.Size < 0 || file.Size > generation.MaxTotalSize || bytes > generation.MaxTotalSize-file.Size {
+				return 0, 0, errBucketByteLimit
+			}
+			bytes += file.Size
+			count++
+		}
+		prefix := c.prefix() + "/"
+		canonical := int64(0)
+		countCanonical := func(attrs backendObject) error {
+			rel := strings.TrimPrefix(attrs.Name, prefix)
+			if strings.HasPrefix(rel, generation.Prefix) || generation.GenerationOwned(rel) || rel == generation.ManifestPath || rel == generation.LeasePath {
+				return nil
+			}
+			if attrs.Size < 0 || attrs.Size > generation.MaxTotalSize || bytes > generation.MaxTotalSize-attrs.Size {
+				return errBucketByteLimit
+			}
+			canonical++
+			if canonical > generation.MaxFiles {
+				return errBucketObjectLimit
+			}
+			count++
+			bytes += attrs.Size
+			return nil
+		}
+		// Do not enumerate immutable generation history. Generation-owned
+		// legacy paths are intentionally omitted, while canonical raw/cache
+		// namespaces and direct root objects retain their quota semantics.
+		for _, relPrefix := range []string{"raw/", "cache/"} {
+			if err := c.visitObjectsWithBudget(ctx, prefix+relPrefix, false, generation.MaxFiles, generation.MaxTotalSize, errBucketObjectLimit, errBucketByteLimit, countCanonical); err != nil {
+				return 0, 0, err
+			}
+		}
+		err := c.visitObjectsWithBudget(ctx, prefix, true, generation.MaxFiles, generation.MaxTotalSize, errBucketObjectLimit, errBucketByteLimit, countCanonical)
 		if err != nil {
-			break
+			return 0, 0, err
+		}
+		return bytes, count, nil
+	}
+	var bytes, count int64
+	visit := func(attrs backendObject) error {
+		if count >= maxLegacyStatsObjects {
+			return errors.New("bucket object limit exceeded")
+		}
+		if attrs.Size < 0 || attrs.Size > generation.MaxTotalSize || bytes > generation.MaxTotalSize-attrs.Size {
+			return errors.New("bucket byte limit exceeded")
 		}
 		count++
+		bytes += attrs.Size
+		return nil
 	}
-	return 0, count, nil // bytes=0 (skip expensive size summation)
+	prefix := fmt.Sprintf("%s/", c.prefix())
+	if err := c.visitObjectsWithBudget(ctx, prefix, false, maxLegacyStatsObjects, generation.MaxTotalSize, errBucketObjectLimit, errBucketByteLimit, visit); err != nil {
+		return 0, 0, err
+	}
+	return bytes, count, nil
 }
 
 // listConceptDir lists concept markdown files from either wiki/ or wiki/.drafts/.
-func (c *Client) listConceptDir(ctx context.Context, dir, status string, directOnly bool) ([]WikiPage, error) {
-	prefix := fmt.Sprintf("%s/%s", c.prefix(), dir)
-	it := c.bucket.Objects(ctx, &storage.Query{Prefix: prefix})
-
-	var pages []WikiPage
-	for {
-		attrs, err := it.Next()
-		if err != nil {
-			if errors.Is(err, iterator.Done) {
-				break
+func (c *Client) listConceptDir(ctx context.Context, view generationView, dir, status string, directOnly bool) ([]WikiPage, error) {
+	if files, exists := currentGenerationFiles(view, dir); exists {
+		pages := make([]WikiPage, 0, len(files))
+		for _, file := range files {
+			if !strings.HasSuffix(file.Path, ".md") {
+				continue
 			}
-			return nil, err
+			rel := strings.TrimPrefix(file.Path, dir)
+			if rel == "" || (dir == "wiki/" && strings.Contains(rel, "sources/")) || (directOnly && strings.Contains(rel, "/")) {
+				continue
+			}
+			slug := strings.TrimSuffix(rel, ".md")
+			if slug == "index" || slug == "log" {
+				continue
+			}
+			page := WikiPage{Slug: slug, Title: slug, Path: file.Path, Status: status}
+			data, err := c.readFileWithView(ctx, page.Path, view)
+			if err != nil {
+				return nil, err
+			}
+			page, err = applyWikiPageFrontmatter(page, data)
+			if err != nil {
+				return nil, fmt.Errorf("parse %s: %w", page.Path, err)
+			}
+			pages = append(pages, page)
 		}
+		return pages, nil
+	}
+	prefix := fmt.Sprintf("%s/%s", c.prefix(), dir)
+	objects, err := c.listObjects(ctx, prefix)
+	if err != nil {
+		return nil, err
+	}
+	var pages []WikiPage
+	for _, attrs := range objects {
 		if !strings.HasSuffix(attrs.Name, ".md") {
 			continue
 		}
@@ -805,7 +1297,7 @@ func (c *Client) listConceptDir(ctx context.Context, dir, status string, directO
 			Path:   fmt.Sprintf("%s%s.md", dir, slug),
 			Status: status,
 		}
-		data, err := c.ReadFile(ctx, page.Path)
+		data, err := c.readFileWithView(ctx, page.Path, view)
 		if err != nil {
 			return nil, err
 		}

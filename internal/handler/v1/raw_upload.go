@@ -75,7 +75,7 @@ func (h *Handler) RawUpload(c *gin.Context) {
 			c.JSON(http.StatusNotFound, handler.ErrorResponse{Error: "project not found"})
 			return
 		}
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: err.Error()})
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "raw upload unavailable"})
 		return
 	}
 	if !ready {
@@ -116,20 +116,20 @@ func (h *Handler) RawUpload(c *gin.Context) {
 		case errors.Is(err, errRawUploadEmptyFile):
 			c.JSON(http.StatusBadRequest, handler.ErrorResponse{Error: "empty file"})
 		default:
-			c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "read file: " + err.Error()})
+			c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "raw upload unavailable"})
 		}
 		return
 	}
 
 	wikiStore, err := h.GetGCSClient(c)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: err.Error()})
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "raw upload unavailable"})
 		return
 	}
 	relPath := rawUploadRelativePath(filename)
 	existingDigest, exists, err := resolveExistingRawDigest(c.Request.Context(), wikiStore, relPath)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "check existing raw file: " + err.Error()})
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "raw upload unavailable"})
 		return
 	}
 	statusCode, uploadStatus, write := rawUploadDecision(exists, existingDigest, digest, rawUploadOverwrite(c))
@@ -142,7 +142,7 @@ func (h *Handler) RawUpload(c *gin.Context) {
 		return
 	}
 	if _, err := wikiStore.WriteBytes(c.Request.Context(), data, relPath); err != nil {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "upload to GCS: " + err.Error()})
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "raw upload unavailable"})
 		return
 	}
 

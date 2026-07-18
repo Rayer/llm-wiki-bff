@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -16,6 +17,7 @@ import (
 	"cloud.google.com/go/storage"
 	fm "github.com/adrg/frontmatter"
 	"github.com/rayer/llm-wiki-bff/internal/gcs"
+	"github.com/rayer/llm-wiki-bff/internal/generation"
 	store "github.com/rayer/llm-wiki-bff/internal/storage"
 )
 
@@ -186,21 +188,33 @@ func (c *Client) ListObjectMeta(ctx context.Context, prefix string) ([]store.Obj
 	if err != nil {
 		return nil, err
 	}
-	entries, err := os.ReadDir(dir)
+	dirHandle, err := os.Open(dir)
 	if errors.Is(err, os.ErrNotExist) {
 		return []store.ObjectMeta{}, nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	out := make([]store.ObjectMeta, 0, len(entries))
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+	defer dirHandle.Close()
+	names, err := dirHandle.Readdirnames(generation.MaxFiles + 1)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, err
+	}
+	if len(names) > generation.MaxFiles {
+		return nil, generation.ErrLogicalEntryLimit
+	}
+	out := make([]store.ObjectMeta, 0, len(names))
+	for _, name := range names {
+		info, err := os.Lstat(filepath.Join(dir, name))
+		if err != nil {
+			return nil, err
+		}
+		if info.IsDir() || !strings.HasSuffix(name, ".json") {
 			continue
 		}
-		path := filepath.Join(dir, entry.Name())
+		path := filepath.Join(dir, name)
 		var sidecar conditionalMeta
-		err := withConditionalLock(path, func() error {
+		err = withConditionalLock(path, func() error {
 			data, err := os.ReadFile(path)
 			if err != nil {
 				return err
@@ -216,7 +230,7 @@ func (c *Client) ListObjectMeta(ctx context.Context, prefix string) ([]store.Obj
 		if err != nil {
 			return nil, err
 		}
-		meta := store.ObjectMeta{Path: filepath.ToSlash(filepath.Join(prefix, entry.Name())), Generation: sidecar.Generation, Updated: sidecar.Updated, SHA256: sidecar.SHA256, RawPath: sidecar.RawPath, HasAnnotation: sidecar.HasAnnotation}
+		meta := store.ObjectMeta{Path: filepath.ToSlash(filepath.Join(prefix, name)), Generation: sidecar.Generation, Updated: sidecar.Updated, SHA256: sidecar.SHA256, RawPath: sidecar.RawPath, HasAnnotation: sidecar.HasAnnotation}
 		out = append(out, meta)
 	}
 	return out, nil
@@ -243,6 +257,12 @@ func (c *Client) WithScope(userID, projectID string) *Client {
 func (c *Client) Scope(userID, projectID string) store.Store {
 	return c.WithScope(userID, projectID)
 }
+
+// Pin preserves local filesystem's legacy stable view behavior. Unlike GCS,
+// it has no manifest pointer to resolve.
+func (c *Client) Pin(context.Context) (store.Store, error) { return c, nil }
+
+func (c *Client) ViewToken() string { return "legacy" }
 
 func (c *Client) Prefix() string {
 	return store.ProjectPrefix(c.userID, c.projectID)

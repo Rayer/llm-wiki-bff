@@ -2,6 +2,7 @@ package suggestedqueries
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -120,6 +121,13 @@ func TestDecodeReturnsQueries(t *testing.T) {
 	}
 	if len(artifact.Queries) != 2 || artifact.Queries[0] != "One" {
 		t.Fatalf("artifact = %#v", artifact)
+	}
+}
+
+func TestDecodeRejectsLogicalEntryOverflow(t *testing.T) {
+	data := `{"queries":[` + strings.Repeat(`"q",`, 10000) + `"overflow"],"updated_at":"2026-07-10T00:00:00Z"}`
+	if _, err := Decode([]byte(data)); err == nil || err.Error() != "generated cache logical entry limit exceeded" {
+		t.Fatalf("Decode() error = %v, want fixed logical-entry error", err)
 	}
 }
 

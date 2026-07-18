@@ -1,11 +1,13 @@
 package v1
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -24,6 +26,7 @@ import (
 	"github.com/rayer/llm-wiki-bff/internal/localfs"
 	"github.com/rayer/llm-wiki-bff/internal/pipelinequota"
 	"github.com/rayer/llm-wiki-bff/internal/search"
+	store "github.com/rayer/llm-wiki-bff/internal/storage"
 )
 
 func TestGetGCSClientUsesRequestContextIdentity(t *testing.T) {
@@ -67,6 +70,79 @@ func TestGetGCSClientRejectsPartialContextIdentity(t *testing.T) {
 	if _, err := h.GetGCSClient(c); err == nil {
 		t.Fatal("GetGCSClient returned nil error for a partial request scope")
 	}
+}
+
+func TestGetStorePinsOneImmutableViewPerRequest(t *testing.T) {
+	root := &viewPinRoot{Client: localfs.New(t.TempDir()), pins: new(int)}
+	h := New(root, nil, search.NewIndex(), conceptcache.New(), nil, nil)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodGet, "/", nil)
+	c.Set("userID", "user")
+	c.Set("projectID", "project")
+
+	first, err := h.GetStore(c)
+	if err != nil {
+		t.Fatalf("first GetStore: %v", err)
+	}
+	second, err := h.GetStore(c)
+	if err != nil {
+		t.Fatalf("second GetStore: %v", err)
+	}
+	if first != second || *root.pins != 1 {
+		t.Fatalf("GetStore did not reuse one pinned view: first=%T second=%T pins=%d", first, second, *root.pins)
+	}
+}
+
+func TestIDRoutingCacheIsPartitionedByPinnedGeneration(t *testing.T) {
+	base := localfs.New(t.TempDir()).WithScope("user", "project")
+	h := New(base, nil, search.NewIndex(), conceptcache.New(), nil, nil)
+	a := &routingViewStore{Store: base, token: "manifest-7", data: []byte(`{"concept":{"aaaaaaaaaaaa":"from-a"}}`)}
+	b := &routingViewStore{Store: base, token: "manifest-8", data: []byte(`{"concept":{"bbbbbbbbbbbb":"from-b"}}`)}
+	first, err := h.getIDRoutingMap(context.Background(), a)
+	if err != nil || first.byID["aaaaaaaaaaaa"].Slug != "from-a" {
+		t.Fatalf("generation A route = %#v, %v", first, err)
+	}
+	next, err := h.getIDRoutingMap(context.Background(), b)
+	if err != nil || next.byID["bbbbbbbbbbbb"].Slug != "from-b" || next.byID["aaaaaaaaaaaa"].Slug != "" {
+		t.Fatalf("generation B route reused A cache = %#v, %v", next, err)
+	}
+	if got := rewriteWikilinks("[[from-a]]", first); !strings.Contains(got, "aaaaaaaaaaaa-from-a") {
+		t.Fatalf("generation A rewrite = %q", got)
+	}
+	if got := rewriteWikilinks("[[from-b]]", next); !strings.Contains(got, "bbbbbbbbbbbb-from-b") {
+		t.Fatalf("generation B rewrite = %q", got)
+	}
+}
+
+type viewPinRoot struct {
+	*localfs.Client
+	pins *int
+}
+
+func (r *viewPinRoot) Scope(userID, projectID string) store.Store {
+	return &viewPinStore{Store: r.Client.Scope(userID, projectID), pins: r.pins}
+}
+
+type viewPinStore struct {
+	store.Store
+	pins *int
+}
+
+func (s *viewPinStore) Pin(context.Context) (store.Store, error) {
+	*s.pins++
+	return &viewPinStore{Store: s.Store, pins: s.pins}, nil
+}
+
+type routingViewStore struct {
+	store.Store
+	token string
+	data  []byte
+}
+
+func (s *routingViewStore) ViewToken() string { return s.token }
+
+func (s *routingViewStore) ReadFile(context.Context, string) ([]byte, error) {
+	return append([]byte(nil), s.data...), nil
 }
 
 func TestHealthReturnsOK(t *testing.T) {
@@ -150,6 +226,27 @@ func TestPipelineURLsKeepLegacyDefaultTarget(t *testing.T) {
 
 	if got, want := h.pipelineJobURL(), defaultCloudRunJobURL; got != want {
 		t.Fatalf("pipelineJobURL() = %q, want %q", got, want)
+	}
+}
+
+func TestPipelineStatusRejectsInvalidGeneratedSuggestedQueries(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "users", "user", "projects", "project", "cache", "suggested_queries.json")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(`{"queries":[`+strings.Repeat(`"q",`, 10000)+`"overflow"]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h := New(localfs.New(root), nil, search.NewIndex(), conceptcache.New(), nil, nil)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/api/v1/pipeline/status", nil)
+	c.Set("userID", "user")
+	c.Set("projectID", "project")
+	h.PipelineStatus(c)
+	if recorder.Code != http.StatusInternalServerError || recorder.Body.String() != `{"error":"pipeline status unavailable"}` {
+		t.Fatalf("status=%d body=%s, want fixed 500 status error", recorder.Code, recorder.Body.String())
 	}
 }
 
@@ -284,6 +381,42 @@ func TestReadIndexJSONReturnsNotFoundForMissingIDMap(t *testing.T) {
 	if !errors.Is(err, errIndexNotFound) {
 		t.Fatalf("read index JSON error = %v, want errIndexNotFound", err)
 	}
+}
+
+func TestIndexHandlerSanitizesGeneratedReadFailures(t *testing.T) {
+	root := generatedIndexErrorRoot{RootStore: localfs.New(t.TempDir()), err: errors.New("provider denied users/tenant-secret/projects/project-secret/.lwc/publish/generations/generation-secret/cache/id_map.json")}
+	h := New(root, nil, search.NewIndex(), conceptcache.New(), nil, nil)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/api/v1/index", nil)
+	c.Set("userID", "tenant-secret")
+	c.Set("projectID", "project-secret")
+
+	h.Index(c)
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusInternalServerError, recorder.Body.String())
+	}
+	if got := recorder.Body.String(); got != `{"error":"generated data unavailable"}` {
+		t.Fatalf("body = %q, want fixed generated-data error", got)
+	}
+}
+
+type generatedIndexErrorRoot struct {
+	store.RootStore
+	err error
+}
+
+func (r generatedIndexErrorRoot) Scope(userID, projectID string) store.Store {
+	return generatedIndexErrorStore{Store: r.RootStore.Scope(userID, projectID), err: r.err}
+}
+
+type generatedIndexErrorStore struct {
+	store.Store
+	err error
+}
+
+func (s generatedIndexErrorStore) ReadFile(context.Context, string) ([]byte, error) {
+	return nil, s.err
 }
 
 func TestMergeWikiPageIDsFillsEmptyIDsFromIDMap(t *testing.T) {
@@ -799,8 +932,8 @@ func TestPipelineRunReturnsCloudRunResponseOnFailure(t *testing.T) {
 	if recorder.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusInternalServerError, recorder.Body.String())
 	}
-	if body := recorder.Body.String(); !strings.Contains(body, "pipeline failed: permission denied") {
-		t.Fatalf("body = %s", body)
+	if body := recorder.Body.String(); body != `{"error":"pipeline unavailable"}` {
+		t.Fatalf("body = %s, want fixed pipeline error", body)
 	}
 }
 
@@ -812,6 +945,7 @@ type stubQuotaStore struct {
 	reserveCalls int
 	refundCalls  int
 	lastRefund   firestore.QuotaPrev
+	refundErr    error
 }
 
 func (s *stubQuotaStore) LoadQuotaState(context.Context, string, string) (int, string, time.Time, error) {
@@ -875,7 +1009,7 @@ func (s *stubQuotaStore) RefundQuotaPrev(_ context.Context, _, _ string, prev fi
 	s.runsToday = prev.RunsToday
 	s.dayKey = prev.DayKey
 	s.lastRunAt = prev.LastRunAt
-	return nil
+	return s.refundErr
 }
 
 func pipelineRunHTTPClient(t *testing.T, runHits *int) *http.Client {
@@ -1005,7 +1139,16 @@ func TestPipelineRunRefundsOnInvokeFailure(t *testing.T) {
 	stub := &stubQuotaStore{
 		runsToday: 0,
 		dayKey:    pipelinequota.DayKeyUTC(now),
+		refundErr: errors.New(securitySentinel),
 	}
+	var output bytes.Buffer
+	previousWriter, previousFlags := log.Writer(), log.Flags()
+	log.SetOutput(&output)
+	log.SetFlags(0)
+	defer func() {
+		log.SetOutput(previousWriter)
+		log.SetFlags(previousFlags)
+	}()
 	root := t.TempDir()
 	rawDir := filepath.Join(root, "users", "request-user", "projects", "proj-1", "raw")
 	if err := os.MkdirAll(rawDir, 0o755); err != nil {
@@ -1056,6 +1199,10 @@ func TestPipelineRunRefundsOnInvokeFailure(t *testing.T) {
 	if stub.runsToday != 0 {
 		t.Fatalf("runsToday after refund = %d, want 0", stub.runsToday)
 	}
+	if output.String() != "pipeline quota refund failed\n" {
+		t.Fatalf("refund log = %q, want fixed event", output.String())
+	}
+	assertSecuritySentinelsAbsent(t, output.String())
 }
 
 func TestPipelineStatusIncludesSuggestedQueries(t *testing.T) {
@@ -1142,6 +1289,52 @@ func TestPipelineStatusReturnsEmptySuggestedQueriesWhenArtifactMissing(t *testin
 	if len(body.SuggestedQueries) != 0 {
 		t.Fatalf("suggested_queries = %#v, want []", body.SuggestedQueries)
 	}
+}
+
+func TestPipelineStatusFailsClosedWhenSuggestedQueryStoreStateFails(t *testing.T) {
+	for _, stateErr := range []error{errors.New("invalid generation manifest"), errors.New("provider state unavailable")} {
+		t.Run(stateErr.Error(), func(t *testing.T) {
+			root := &suggestedQueriesStateFailureRoot{Client: localfs.New(t.TempDir()), err: stateErr}
+			h := New(root, nil, search.NewIndex(), conceptcache.New(), nil, nil)
+			h.httpClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				if r.URL.Path == "/token" {
+					return testHTTPResponse(http.StatusOK, `{"access_token":"test-token"}`), nil
+				}
+				return testHTTPResponse(http.StatusOK, `{}`), nil
+			})}
+			h.metadataTokenURL = "http://metadata.test/token"
+			h.cloudRunJobURL = "https://run.googleapis.com/v2/projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline:run"
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodGet, "/api/v1/pipeline/status", nil)
+			c.Set("userID", "request-user")
+			c.Set("projectID", "demo-project")
+
+			h.PipelineStatus(c)
+
+			if recorder.Code != http.StatusInternalServerError || recorder.Body.String() != `{"error":"pipeline status unavailable"}` {
+				t.Fatalf("status=%d body=%s, want fixed 500 status error", recorder.Code, recorder.Body.String())
+			}
+		})
+	}
+}
+
+type suggestedQueriesStateFailureRoot struct {
+	*localfs.Client
+	err error
+}
+
+func (r *suggestedQueriesStateFailureRoot) Scope(userID, projectID string) store.Store {
+	return &suggestedQueriesStateFailureStore{Store: r.Client.Scope(userID, projectID), err: r.err}
+}
+
+type suggestedQueriesStateFailureStore struct {
+	store.Store
+	err error
+}
+
+func (s *suggestedQueriesStateFailureStore) Pin(context.Context) (store.Store, error) {
+	return nil, s.err
 }
 
 func TestPipelineStatusIncludesQuota(t *testing.T) {

@@ -55,6 +55,14 @@ func makeJSONL(entries []Entry) string {
 	return buf.String()
 }
 
+func TestUnmarshalJSONLRejectsLogicalEntryOverflow(t *testing.T) {
+	data := makeJSONL([]Entry{{Slug: "seed", Title: "Seed"}})
+	data += strings.Repeat(`{"slug":"overflow","title":"Overflow"}`+"\n", 10000)
+	if _, err := unmarshalJSONL([]byte(data)); err == nil || err.Error() != "generated cache logical entry limit exceeded" {
+		t.Fatalf("unmarshalJSONL() error = %v, want fixed logical-entry error", err)
+	}
+}
+
 func TestQueryReadsJSONLAndReturnsRankedResults(t *testing.T) {
 	entries := []Entry{
 		{Slug: "alpha", Title: "Alpha", Body: "shared topic alpha"},
@@ -82,6 +90,30 @@ func TestQueryReadsJSONLAndReturnsRankedResults(t *testing.T) {
 		}
 	}
 }
+
+func TestPinnedGenerationTokenSeparatesProjectCaches(t *testing.T) {
+	reader := &tokenReader{fakeReader: fakeReader{jsonl: makeJSONL([]Entry{{Slug: "from-a", Title: "A", Body: "shared"}})}, prefix: "users/u/projects/p", token: "manifest-7"}
+	cache := New()
+	first, err := cache.Search(context.Background(), reader, "shared", 10)
+	if err != nil || len(first) != 1 || first[0].Slug != "from-a" {
+		t.Fatalf("generation A search = %#v, %v", first, err)
+	}
+	reader.token = "manifest-8"
+	reader.jsonl = makeJSONL([]Entry{{Slug: "from-b", Title: "B", Body: "shared"}})
+	next, err := cache.Search(context.Background(), reader, "shared", 10)
+	if err != nil || len(next) != 1 || next[0].Slug != "from-b" {
+		t.Fatalf("generation B search reused A cache = %#v, %v", next, err)
+	}
+}
+
+type tokenReader struct {
+	fakeReader
+	prefix string
+	token  string
+}
+
+func (r *tokenReader) Prefix() string    { return r.prefix }
+func (r *tokenReader) ViewToken() string { return r.token }
 
 func TestQueryBuildsOnCacheMiss(t *testing.T) {
 	reader := &fakeReader{
