@@ -1,0 +1,32 @@
+{
+  "apiVersion": "run.googleapis.com/v1",
+  "kind": "Job",
+  "metadata": {"name": "olw-pipeline"},
+  "spec": {
+    "template": {
+      "spec": {
+        "template": {
+          "spec": {
+            "containers": [{
+              "image": "asia-east1-docker.pkg.dev/llm-wiki-cloud/cloud-run-images/olw-pipeline:latest",
+              "env": [
+                {"name": "WORKSPACE", "value": "legacy-executable-workspace"},
+                {"name": "WORKSPACE_DIR", "value": "/legacy-workspace"},
+                {"name": "LLM_API_KEY", "valueFrom": {"secretKeyRef": {"name": "llm-api", "key": "token"}}},
+                {"name": "DEEPSEEK_API_KEY", "valueFrom": {"secretKeyRef": {"name": "deepseek", "key": "token"}}},
+                {"name": "USER_ID", "value": "executable-user"},
+                {"name": "PROJECT_ID", "value": "executable-project"},
+                {"name": "TASK_TYPE", "value": "build"},
+                {"name": "UNRELATED", "value": "must-not-enter-rollback-artifact"}
+              ],
+              "args": ["run", "[[\"run\",\"--auto-approve\"]]"],
+              "volumeMounts": [{"name": "gcs", "mountPath": "/legacy-data"}]
+            }],
+            "volumes": [{"name": "gcs", "csi": {"driver": "gcsfuse.run.googleapis.com"}}]
+          }
+        }
+      }
+    }
+  },
+  "status": {}
+}
