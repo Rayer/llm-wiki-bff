@@ -49,6 +49,56 @@ type SourceMeta struct {
 	SourceFile string `json:"source_file,omitempty"`
 }
 
+// UnmarshalJSON keeps the nested source metadata bounded and rejects duplicate
+// fields without changing the existing ignore-unknown-fields contract.
+func (m *SourceMeta) UnmarshalJSON(data []byte) error {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	token, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	delim, ok := token.(json.Delim)
+	if !ok || delim != '{' {
+		return errors.New("expected JSON object")
+	}
+	seen := make(map[string]struct{})
+	for dec.More() {
+		key, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		name, ok := key.(string)
+		if !ok {
+			return errors.New("expected JSON object key")
+		}
+		if _, exists := seen[name]; exists {
+			return errors.New("duplicate JSON object key")
+		}
+		seen[name] = struct{}{}
+		switch name {
+		case "slug":
+			err = dec.Decode(&m.Slug)
+		case "title":
+			err = dec.Decode(&m.Title)
+		case "source_file":
+			err = dec.Decode(&m.SourceFile)
+		default:
+			var ignored json.RawMessage
+			err = dec.Decode(&ignored)
+		}
+		if err != nil {
+			return err
+		}
+	}
+	if token, err := dec.Token(); err != nil || token != json.Delim('}') {
+		if err != nil {
+			return err
+		}
+		return errors.New("expected JSON object end")
+	}
+	return generation.EnsureJSONEOF(dec)
+}
+
 // DecodeIDMap bounds every collection while it is being decoded. Generated
 // cache byte limits alone do not bound the number of map and slice entries.
 func DecodeIDMap(data []byte) (IDMap, error) {
@@ -61,6 +111,7 @@ func DecodeIDMap(data []byte) (IDMap, error) {
 	if delim, ok := token.(json.Delim); !ok || delim != '{' {
 		return result, errors.New("expected JSON object")
 	}
+	seen := make(map[string]struct{})
 	for dec.More() {
 		key, err := dec.Token()
 		if err != nil {
@@ -70,6 +121,10 @@ func DecodeIDMap(data []byte) (IDMap, error) {
 		if !ok {
 			return result, errors.New("expected JSON object key")
 		}
+		if _, exists := seen[name]; exists {
+			return result, errors.New("duplicate JSON object key")
+		}
+		seen[name] = struct{}{}
 		switch name {
 		case "concept":
 			result.Concept, err = generation.DecodeBoundedMap[string](dec)

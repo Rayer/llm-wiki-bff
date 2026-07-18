@@ -314,6 +314,13 @@ func runWorkerBatchWorkspace(ctx context.Context, cfg workerConfig, commands [][
 		}
 		return err
 	}
+	if err := reconcileWorkspaceSources(workspace, snapshots); err != nil {
+		recordErr := recordFailure(vault, snapshots, err)
+		if recordErr != nil {
+			return errors.Join(err, recordErr)
+		}
+		return err
+	}
 	if err := syncWorkspaceOutputs(workspace, vault, cfg.ExecutionID); err != nil {
 		recordErr := recordFailure(vault, snapshots, err)
 		if recordErr != nil {
@@ -979,6 +986,7 @@ type sourceSnapshot struct {
 	AnnotationSHA  string
 	Fingerprint    string
 	Dirty          bool
+	Tombstone      bool
 }
 
 func canonicalExistingDir(dir string) (string, error) {
@@ -1004,12 +1012,8 @@ func snapshotSources(vault string) ([]sourceSnapshot, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read source map: %w", err)
 	}
-	var ids struct {
-		SourceMeta map[string]struct {
-			SourceFile string `json:"source_file"`
-		} `json:"source_meta"`
-	}
-	if err := json.Unmarshal(data, &ids); err != nil {
+	ids, err := wikiindex.DecodeIDMap(data)
+	if err != nil {
 		return nil, fmt.Errorf("decode source map: %w", err)
 	}
 
@@ -1026,6 +1030,7 @@ func snapshotSources(vault string) ([]sourceSnapshot, error) {
 		mappedRawPaths[rawPath] = sourceID
 		raw, err := readRegularFileWithin(vault, rawPath)
 		if errors.Is(err, os.ErrNotExist) {
+			snapshots = append(snapshots, sourceSnapshot{SourceID: sourceID, RawPath: rawPath, Tombstone: true})
 			continue
 		}
 		if err != nil {
@@ -1108,6 +1113,9 @@ func createWorkspace(parent, vault string) (string, error) {
 
 func materializeSnapshots(workspace string, snapshots []sourceSnapshot) error {
 	for _, snapshot := range snapshots {
+		if snapshot.Tombstone {
+			continue
+		}
 		data := append([]byte(nil), snapshot.RawBytes...)
 		// Every non-empty annotation is materialized for every fresh workspace.
 		// Receipts only determine BFF dirty state; they must never change the OLW
@@ -1144,6 +1152,9 @@ func recordSuccess(vault string, snapshots []sourceSnapshot, now time.Time) erro
 		return err
 	}
 	for _, snapshot := range snapshots {
+		if snapshot.Tombstone {
+			continue
+		}
 		artifact.Sources[snapshot.SourceID] = sourcestatus.Receipt{
 			RawPath: snapshot.RawPath, LastIngestedRawSHA256: snapshot.RawSHA256,
 			LastIngestedAnnSHA256: snapshot.AnnotationSHA, LastIngestFingerprint: snapshot.Fingerprint,
@@ -1159,6 +1170,9 @@ func recordFailure(vault string, snapshots []sourceSnapshot, _ error) error {
 		return err
 	}
 	for _, snapshot := range snapshots {
+		if snapshot.Tombstone {
+			continue
+		}
 		receipt := artifact.Sources[snapshot.SourceID]
 		receipt.RawPath = snapshot.RawPath
 		receipt.FailedFingerprint = snapshot.Fingerprint

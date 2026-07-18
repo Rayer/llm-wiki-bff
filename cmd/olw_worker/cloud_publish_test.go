@@ -1063,7 +1063,9 @@ func TestCloudReceiptCASRetriesOnlyConflictsAndPreservesConcurrentReceipts(t *te
 
 	conflict := &receiptContentionStore{objectStore: m, name: prefix + sourcestatus.Path, mutate: func() {
 		current := cloudStatus(t, m, prefix)
-		current.Sources["other"] = sourcestatus.Receipt{RawPath: "raw/other.md", LastIngestFingerprint: strings.Repeat("d", 64), LastSuccessAt: "2026-01-01T00:00:00Z"}
+		otherRaw := sha256Text("other")
+		otherAnn := annotation.Digest("")
+		current.Sources["other"] = sourcestatus.Receipt{RawPath: "raw/other.md", LastIngestedRawSHA256: otherRaw, LastIngestedAnnSHA256: otherAnn, LastIngestFingerprint: sourcestatus.Fingerprint(otherRaw, otherAnn), LastSuccessAt: "2026-01-01T00:00:00Z"}
 		data, _ := json.Marshal(current)
 		writeCloudObject(t, m, prefix+sourcestatus.Path, data)
 	}}
@@ -1074,7 +1076,7 @@ func TestCloudReceiptCASRetriesOnlyConflictsAndPreservesConcurrentReceipts(t *te
 		t.Fatalf("conflicts=%d writes=%d, want one conflict then success", conflict.conflicts, conflict.writes)
 	}
 	status := cloudStatus(t, m, prefix)
-	if status.Sources["other"].LastIngestFingerprint != strings.Repeat("d", 64) {
+	if status.Sources["other"].LastIngestFingerprint != sourcestatus.Fingerprint(sha256Text("other"), annotation.Digest("")) {
 		t.Fatalf("unrelated receipt lost: %+v", status.Sources)
 	}
 	if status.Sources["s1"].LastIngestFingerprint != start.Fingerprint {
@@ -1093,7 +1095,7 @@ func TestCloudReceiptCASRetriesOnlyConflictsAndPreservesConcurrentReceipts(t *te
 	}
 }
 
-func TestMergeCloudReceiptsNormalizesExistingSentinels(t *testing.T) {
+func TestMergeCloudReceiptsRejectsMalformedExistingSentinels(t *testing.T) {
 	m := newMemoryObjects()
 	prefix := "p/"
 	artifact := sourcestatus.Artifact{Version: 1, Sources: map[string]sourcestatus.Receipt{
@@ -1115,16 +1117,8 @@ func TestMergeCloudReceiptsNormalizesExistingSentinels(t *testing.T) {
 		t.Fatal(err)
 	}
 	writeCloudObject(t, m, prefix+sourcestatus.Path, data)
-	if err := mergeCloudReceipts(context.Background(), m, prefix, func(*sourcestatus.Artifact) {}); err != nil {
-		t.Fatal(err)
-	}
-	got := cloudStatus(t, m, prefix)
-	if got.Sources["safe"].LastSuccessAt != artifact.Sources["safe"].LastSuccessAt {
-		t.Fatalf("valid receipt changed: %+v", got.Sources["safe"])
-	}
-	bad := got.Sources["sentinel-source"]
-	if bad.Error != "pipeline failed" || bad.FailedFingerprint != "" || strings.Contains(string(mustReceiptJSON(t, got)), "unknown-provider") {
-		t.Fatalf("existing receipt was not normalized: %+v", bad)
+	if err := mergeCloudReceipts(context.Background(), m, prefix, func(*sourcestatus.Artifact) {}); err == nil || strings.Contains(err.Error(), "unknown-provider") {
+		t.Fatalf("err=%q, want sanitized fail-closed error", err)
 	}
 }
 
@@ -1305,6 +1299,205 @@ func TestCloudSuccessExactStartRawAndAnnotationPairs(t *testing.T) {
 	}
 }
 
+func TestCloudPriorStatusInvalidEntryFailsClosedWithoutLeakingIdentifier(t *testing.T) {
+	workspace := t.TempDir()
+	mustWriteFile(t, filepath.Join(workspace, "raw", "source.md"), []byte("raw"))
+	data := []byte(`{"version":1,"sources":{"bad/id":{"raw_path":"raw/source.md"}}}`)
+	if _, err := snapshotCanonicalCloudSources(workspace, data); err == nil || strings.Contains(err.Error(), "bad/id") {
+		t.Fatalf("error=%q, want sanitized fail-closed status error", err)
+	}
+}
+
+func TestCloudPriorReceiptVariantsFailClosedExceptOneValidReceipt(t *testing.T) {
+	workspace := t.TempDir()
+	mustWriteFile(t, filepath.Join(workspace, "raw", "source.md"), []byte("raw"))
+	valid := sourcestatus.Receipt{
+		RawPath: "raw/source.md", LastIngestedRawSHA256: sha256Text("raw"),
+		LastIngestedAnnSHA256: annotation.Digest(""),
+		LastIngestFingerprint: sourcestatus.Fingerprint(sha256Text("raw"), annotation.Digest("")),
+		LastSuccessAt:         time.Now().UTC().Format(time.RFC3339),
+	}
+	tests := []struct {
+		name    string
+		receipt sourcestatus.Receipt
+		valid   bool
+	}{
+		{"raw path only", sourcestatus.Receipt{RawPath: "raw/source.md"}, false},
+		{"missing required field", func() sourcestatus.Receipt { r := valid; r.LastSuccessAt = ""; return r }(), false},
+		{"invalid digest", func() sourcestatus.Receipt { r := valid; r.LastIngestedRawSHA256 = "not-a-digest"; return r }(), false},
+		{"inconsistent fingerprint", func() sourcestatus.Receipt { r := valid; r.LastIngestFingerprint = strings.Repeat("a", 64); return r }(), false},
+		{"valid", valid, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			data, err := json.Marshal(sourcestatus.Artifact{Version: 1, Sources: map[string]sourcestatus.Receipt{"s1": tc.receipt}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			snapshots, err := snapshotCanonicalCloudSources(workspace, data)
+			if tc.valid {
+				if err != nil || len(snapshots) != 1 || snapshots[0].Tombstone {
+					t.Fatalf("snapshots=%+v err=%v, want one active receipt", snapshots, err)
+				}
+			} else if err == nil {
+				t.Fatalf("snapshots=%+v, want malformed prior receipt rejection", snapshots)
+			}
+		})
+	}
+}
+
+func TestCloudStatusOnlyReservationRejectsTransientReuseBeforePublish(t *testing.T) {
+	oldExec := execOLW
+	defer func() { execOLW = oldExec }()
+	m := newMemoryObjects()
+	prefix := "users/user-secret/projects/project-secret/"
+	oldRaw := []byte("old raw")
+	prior := sourcestatus.Receipt{
+		RawPath: "raw/old.md", LastIngestedRawSHA256: sha256Text(string(oldRaw)),
+		LastIngestedAnnSHA256: annotation.Digest(""),
+		LastIngestFingerprint: sourcestatus.Fingerprint(sha256Text(string(oldRaw)), annotation.Digest("")),
+		LastSuccessAt:         time.Now().UTC().Format(time.RFC3339),
+	}
+	writeCloudObject(t, m, prefix+"raw/new.md", []byte("new raw"))
+	writeCloudObject(t, m, prefix+sourcestatus.Path, mustJSON(t, sourcestatus.Artifact{Version: 1, Sources: map[string]sourcestatus.Receipt{"stable-old": prior}}))
+	writeCloudObject(t, m, prefix+"cache/id_map.json", []byte(`{"source":{"stable-old":"new"},"source_meta":{"stable-old":{"slug":"new","source_file":"raw/new.md"}}}`))
+	writeCloudObject(t, m, prefix+"wiki.toml", []byte("name = \"test\"\n"))
+
+	execOLW = func(_ context.Context, vault string, _ []string, _ []string, _, _ io.Writer) error {
+		writeCloudRequiredOutputs(t, vault)
+		mustWriteFile(t, filepath.Join(vault, "wiki", "sources", "new.md"), []byte("---\nid: stable-old\nsource_file: raw/new.md\n---\nnew\n"))
+		return nil
+	}
+	err := runCloudWorkerBatch(context.Background(), cloudCfg(), [][]string{{"run"}}, m)
+	if err == nil || !strings.Contains(err.Error(), "pipeline publish failed") {
+		t.Fatalf("err=%v, want sanitized pre-publish rejection", err)
+	}
+	if _, _, readErr := m.Read(context.Background(), prefix+generation.ManifestPath, 0, generation.MaxManifestBytes); !errors.Is(readErr, cloudstorage.ErrObjectNotExist) {
+		t.Fatalf("manifest read err=%v, want no publication", readErr)
+	}
+}
+
+func TestCloudMalformedPriorStatusPreventsPublish(t *testing.T) {
+	old := execOLW
+	defer func() { execOLW = old }()
+	m := newMemoryObjects()
+	prefix := "users/user-secret/projects/project-secret/"
+	seedCloudSource(t, m, prefix, "raw", "", sourcestatus.Receipt{})
+	writeCloudObject(t, m, prefix+sourcestatus.Path, []byte(`{"version":1,"sources":{"unsafe/prior":{"raw_path":"raw/source.md"}}}`))
+	called := false
+	execOLW = func(context.Context, string, []string, []string, io.Writer, io.Writer) error {
+		called = true
+		return nil
+	}
+	err := runCloudWorkerBatch(context.Background(), cloudCfg(), [][]string{{"run"}}, m)
+	if err == nil || strings.Contains(err.Error(), "unsafe/prior") || called {
+		t.Fatalf("err=%q called=%v, want sanitized pre-publish rejection", err, called)
+	}
+	if _, _, readErr := m.Read(context.Background(), prefix+generation.ManifestPath, 0, generation.MaxManifestBytes); !errors.Is(readErr, cloudstorage.ErrObjectNotExist) {
+		t.Fatalf("manifest read err=%v, want no publish", readErr)
+	}
+	log, _, readErr := m.Read(context.Background(), prefix+"cache/pipeline-execution-secret.log", 0, generation.MaxFileBytes)
+	if readErr != nil || strings.Contains(string(log), "unsafe/prior") {
+		t.Fatalf("failure log=%q err=%v", log, readErr)
+	}
+}
+
+func TestCloudTwoGenerationsReconcileStableSourceAndAnnotation(t *testing.T) {
+	old := execOLW
+	defer func() { execOLW = old }()
+	m := newMemoryObjects()
+	prefix := "users/user-secret/projects/project-secret/"
+	seedCloudSource(t, m, prefix, "raw", "saved note", priorCloudReceipt())
+	writeCloudObject(t, m, prefix+"cache/id_map.json", []byte(`{"source":{"s1":"source"},"source_meta":{"s1":{"slug":"source","source_file":"raw/source.md"}}}`))
+	var run int
+	var firstManifest []byte
+	execOLW = func(_ context.Context, vault string, _ []string, _ []string, _, _ io.Writer) error {
+		run++
+		transient := fmt.Sprintf("transient-%d", run)
+		if err := os.RemoveAll(filepath.Join(vault, "wiki", "sources")); err != nil {
+			return err
+		}
+		mustWriteFile(t, filepath.Join(vault, "wiki", "sources", "source.md"), []byte("---\nid: "+transient+"\nsource_file: raw/source.md\n---\nsource body\n"))
+		if err := os.RemoveAll(filepath.Join(vault, ".olw")); err != nil {
+			return err
+		}
+		writeCloudRequiredOutputs(t, vault)
+		mustWriteFile(t, filepath.Join(vault, "cache", "id_map.json"), []byte(`{"source":{"`+transient+`":"source"},"source_meta":{"`+transient+`":{"slug":"source","source_file":"raw/source.md"}},"redirects":{}}`))
+		mustWriteFile(t, filepath.Join(vault, "cache", "concepts.jsonl"), []byte(`{"slug":"concept","frontmatter":{"sources":["`+transient+`"]},"sources":["`+transient+`"]}`+"\n"))
+		return nil
+	}
+	if err := runCloudWorkerBatch(context.Background(), cloudCfg(), [][]string{{"run"}}, m); err != nil {
+		t.Fatal(err)
+	}
+	firstManifest, _, err := m.Read(context.Background(), prefix+generation.ManifestPath, 0, generation.MaxManifestBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := generation.Manifest{}
+	if err := json.Unmarshal(firstManifest, &first); err != nil {
+		t.Fatal(err)
+	}
+	oldSource, oldSourceAttrs := cloudGenerationFile(t, m, prefix, first, "wiki/sources/source.md")
+	oldMap, oldMapAttrs := cloudGenerationFile(t, m, prefix, first, "cache/id_map.json")
+	if err := runCloudWorkerBatch(context.Background(), cloudCfg(), [][]string{{"run"}}, m); err != nil {
+		t.Fatal(err)
+	}
+	secondManifest, _, err := m.Read(context.Background(), prefix+generation.ManifestPath, 0, generation.MaxManifestBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second := generation.Manifest{}
+	if err := json.Unmarshal(secondManifest, &second); err != nil {
+		t.Fatal(err)
+	}
+	if second.PreviousGenerationID != first.GenerationID || bytes.Equal(firstManifest, secondManifest) {
+		t.Fatalf("manifest chain first=%+v second=%+v", first, second)
+	}
+	currentSource, _ := cloudGenerationFile(t, m, prefix, second, "wiki/sources/source.md")
+	currentMap, _ := cloudGenerationFile(t, m, prefix, second, "cache/id_map.json")
+	currentConcepts, _ := cloudGenerationFile(t, m, prefix, second, "cache/concepts.jsonl")
+	if strings.Contains(string(currentSource), "transient-") || strings.Contains(string(currentMap), "transient-") || strings.Contains(string(currentConcepts), "transient-") || strings.Count(string(currentSource), "lwc-ann-v1 source_id=s1 ") != 1 {
+		t.Fatalf("current stable artifacts source=%q map=%q concepts=%q", currentSource, currentMap, currentConcepts)
+	}
+	if !bytes.Equal(oldSource, mustCloudGenerationFile(t, m, prefix, first, "wiki/sources/source.md")) || !bytes.Equal(oldMap, mustCloudGenerationFile(t, m, prefix, first, "cache/id_map.json")) || oldSourceAttrs.Generation <= 0 || oldMapAttrs.Generation <= 0 {
+		t.Fatal("prior generation was mutated")
+	}
+	annotationData, _, err := m.Read(context.Background(), prefix+annotation.Path("s1"), 0, generation.MaxFileBytes)
+	if err != nil || !strings.Contains(string(annotationData), `"source_id":"s1"`) {
+		t.Fatalf("annotation sidecar=%q err=%v", annotationData, err)
+	}
+	raw, _, err := m.Read(context.Background(), prefix+"raw/source.md", 0, generation.MaxFileBytes)
+	if err != nil || string(raw) != "raw" {
+		t.Fatalf("raw=%q err=%v", raw, err)
+	}
+}
+
+func cloudGenerationFile(t *testing.T, m *memoryObjects, prefix string, manifest generation.Manifest, path string) ([]byte, objectAttrs) {
+	t.Helper()
+	return mustCloudGenerationFileWithAttrs(t, m, prefix, manifest, path)
+}
+
+func mustCloudGenerationFile(t *testing.T, m *memoryObjects, prefix string, manifest generation.Manifest, path string) []byte {
+	t.Helper()
+	b, _ := cloudGenerationFile(t, m, prefix, manifest, path)
+	return b
+}
+
+func mustCloudGenerationFileWithAttrs(t *testing.T, m *memoryObjects, prefix string, manifest generation.Manifest, path string) ([]byte, objectAttrs) {
+	t.Helper()
+	for _, file := range manifest.Files {
+		if file.Path == path {
+			b, attrs, err := m.Read(context.Background(), prefix+manifest.ObjectPath(file), file.Generation, file.Size)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return b, attrs
+		}
+	}
+	t.Fatalf("manifest %q lacks %q", manifest.GenerationID, path)
+	return nil, objectAttrs{}
+}
+
 type failureStore struct {
 	objectStore
 	mu        sync.Mutex
@@ -1410,6 +1603,14 @@ func writeCloudObject(t *testing.T, m *memoryObjects, name string, data []byte) 
 		t.Fatal(err)
 	}
 }
+func mustJSON(t *testing.T, value any) []byte {
+	t.Helper()
+	b, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
 func cloudAnnotation(t *testing.T, body string) []byte {
 	t.Helper()
 	b, err := json.Marshal(annotation.Object{Version: 1, SourceID: "s1", RawPath: "raw/source.md", Body: body, SHA256: annotation.Digest(body), UpdatedAt: time.Now().UTC().Format(time.RFC3339), UpdatedBy: "safe"})
@@ -1431,7 +1632,7 @@ func seedCloudSource(t *testing.T, m *memoryObjects, prefix, raw, ann string, re
 	}
 }
 func priorCloudReceipt() sourcestatus.Receipt {
-	return sourcestatus.Receipt{RawPath: "raw/source.md", LastIngestedRawSHA256: "old", LastIngestedAnnSHA256: "old", LastIngestFingerprint: sourcestatus.Fingerprint("old", "old"), LastSuccessAt: time.Now().UTC().Format(time.RFC3339)}
+	return sourcestatus.Receipt{RawPath: "raw/source.md", LastIngestedRawSHA256: sha256Text("old"), LastIngestedAnnSHA256: annotation.Digest("old"), LastIngestFingerprint: sourcestatus.Fingerprint(sha256Text("old"), annotation.Digest("old")), LastSuccessAt: time.Now().UTC().Format(time.RFC3339)}
 }
 func seedCloudManifest(t *testing.T, m *memoryObjects, prefix, content string) []byte {
 	t.Helper()

@@ -11,7 +11,8 @@ import (
 )
 
 func TestCalculateUnionAndPrecedence(t *testing.T) {
-	raw := storage.RawFile{Name: "one.md", Path: "raw/one.md", SHA256: "raw"}
+	rawHash := annotation.Digest("raw")
+	raw := storage.RawFile{Name: "one.md", Path: "raw/one.md", SHA256: rawHash}
 	ann := annotation.Digest("note")
 	base := storage.WikiPage{ID: "id", RawPath: raw.Path}
 	receipt := func(rawHash, annHash string) sourcestatus.Receipt {
@@ -22,13 +23,13 @@ func TestCalculateUnionAndPrecedence(t *testing.T) {
 		receipt    sourcestatus.Receipt
 	}{
 		{"error", "error", func() sourcestatus.Receipt {
-			r := receipt("old", ann)
+			r := receipt(annotation.Digest("old"), ann)
 			r.FailedFingerprint = sourcestatus.Fingerprint(raw.SHA256, ann)
 			r.Error = "worker failed"
 			return r
 		}()},
-		{"raw", "content_pending", receipt("old", ann)},
-		{"annotation", "notes_pending", receipt(raw.SHA256, "old")},
+		{"raw", "content_pending", receipt(annotation.Digest("old"), ann)},
+		{"annotation", "notes_pending", receipt(raw.SHA256, annotation.Digest("old"))},
 		{"synced", "synced", receipt(raw.SHA256, ann)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

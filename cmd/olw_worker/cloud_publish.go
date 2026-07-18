@@ -305,6 +305,12 @@ func runCloudWorkerBatch(ctx context.Context, cfg workerConfig, commands [][]str
 		}
 		return primary
 	}
+	if err := reconcileWorkspaceSources(workspace, snapshots); err != nil {
+		if recordErr := writeCloudFailureReceipts(ctx, objects, prefix, workspace, cfg, snapshots); recordErr != nil {
+			return errors.Join(errCloudPipelinePublish, recordErr)
+		}
+		return errCloudPipelinePublish
+	}
 	if _, _, err := publishCloudGenerationFromStart(ctx, objects, prefix, workspace, snapshots, manifestData, manifestAttrs, manifestAttrs.Generation > 0); err != nil {
 		if errors.Is(err, errManifestCommitOutcomeUnknown) {
 			return errManifestCommitOutcomeUnknown
@@ -328,6 +334,7 @@ func materializeCloudWorkspace(ctx context.Context, objects objectStore, prefix,
 	if err != nil {
 		return snapshots, nil, objectAttrs{}, err
 	}
+	reservations := cloudTombstones(snapshots)
 	manifestData, manifestAttrs, err := objects.Read(ctx, prefix+generation.ManifestPath, 0, generation.MaxManifestBytes)
 	manifestExists := err == nil
 	if err != nil && !isObjectNotFound(err) {
@@ -350,12 +357,46 @@ func materializeCloudWorkspace(ctx context.Context, objects objectStore, prefix,
 	} else if err := materializeLegacyCloudOutputs(ctx, objects, prefix, workspace, &budget); err != nil {
 		return snapshots, nil, objectAttrs{}, err
 	}
+	err = nil
 	if len(snapshots) == 0 {
-		snapshots, err = snapshotSources(workspace)
-	} else {
-		err = nil
+		mapped, mapErr := snapshotSources(workspace)
+		if mapErr == nil && len(mapped) > 0 {
+			snapshots = mapped
+		} else if mapErr != nil {
+			err = mapErr
+		}
+	} else if mapped, mapErr := snapshotSources(workspace); mapErr != nil {
+		err = mapErr
+	} else if len(mapped) > 0 {
+		snapshots = appendCloudReservations(mapped, reservations)
 	}
 	return snapshots, manifestData, manifestAttrs, err
+}
+
+func cloudTombstones(snapshots []sourceSnapshot) []sourceSnapshot {
+	reservations := make([]sourceSnapshot, 0)
+	for _, snapshot := range snapshots {
+		if snapshot.Tombstone {
+			reservations = append(reservations, snapshot)
+		}
+	}
+	return reservations
+}
+
+func appendCloudReservations(snapshots, reservations []sourceSnapshot) []sourceSnapshot {
+	seen := make(map[string]struct{}, len(snapshots)+len(reservations))
+	for _, snapshot := range snapshots {
+		seen[snapshot.SourceID+"\x00"+snapshot.RawPath] = struct{}{}
+	}
+	for _, reservation := range reservations {
+		key := reservation.SourceID + "\x00" + reservation.RawPath
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		snapshots = append(snapshots, reservation)
+	}
+	return snapshots
 }
 
 type cloudMaterializationBudget struct {
@@ -443,11 +484,12 @@ func snapshotCanonicalCloudSources(workspace string, data []byte) ([]sourceSnaps
 	}
 	snapshots := make([]sourceSnapshot, 0, len(artifact.Sources))
 	for sourceID, receipt := range artifact.Sources {
-		if !annotation.ValidSourceID(sourceID) || len(sourceID) > maxWorkerIDBytes || !safeMappedRawPath(receipt.RawPath) {
-			continue
+		if !validCloudReceipt(sourceID, receipt) {
+			return nil, errors.New("invalid source status")
 		}
 		raw, err := readRegularFileWithin(workspace, receipt.RawPath)
 		if errors.Is(err, os.ErrNotExist) {
+			snapshots = append(snapshots, sourceSnapshot{SourceID: sourceID, RawPath: receipt.RawPath, Tombstone: true})
 			continue
 		}
 		if err != nil {
@@ -754,6 +796,9 @@ func digestBytes(b []byte) string { s := sha256.Sum256(b); return hex.EncodeToSt
 func snapshotFingerprint(s []sourceSnapshot) string {
 	h := sha256.New()
 	for _, x := range s {
+		if x.Tombstone {
+			continue
+		}
 		_, _ = io.WriteString(h, x.SourceID+"\x00"+x.Fingerprint+"\n")
 	}
 	return hex.EncodeToString(h.Sum(nil))
@@ -789,6 +834,9 @@ func writeCloudPipelineEvent(ctx context.Context, objects objectStore, prefix st
 func mergeCloudSuccess(ctx context.Context, objects objectStore, prefix string, snapshots []sourceSnapshot) error {
 	return mergeCloudReceipts(ctx, objects, prefix, func(artifact *sourcestatus.Artifact) {
 		for _, snapshot := range snapshots {
+			if snapshot.Tombstone {
+				continue
+			}
 			if !cloudSnapshotCurrent(ctx, objects, prefix, snapshot) {
 				continue
 			}
@@ -802,6 +850,9 @@ const cloudReceiptCASAttempts = 3
 func mergeCloudFailure(ctx context.Context, objects objectStore, prefix string, snapshots []sourceSnapshot) error {
 	return mergeCloudReceipts(ctx, objects, prefix, func(artifact *sourcestatus.Artifact) {
 		for _, s := range snapshots {
+			if s.Tombstone {
+				continue
+			}
 			if !cloudSnapshotCurrent(ctx, objects, prefix, s) {
 				continue
 			}
@@ -821,7 +872,9 @@ func mergeCloudReceipts(ctx context.Context, objects objectStore, prefix string,
 			if err != nil {
 				return errors.New("invalid source receipt")
 			}
-			normalizeCloudReceipts(&artifact)
+			if err := normalizeCloudReceipts(&artifact); err != nil {
+				return errors.New("invalid source receipt")
+			}
 		} else if !isObjectNotFound(err) {
 			return errors.New("source receipt read failed")
 		}
@@ -840,27 +893,46 @@ func mergeCloudReceipts(ctx context.Context, objects objectStore, prefix string,
 	return errors.New("source receipt conflict")
 }
 
-func normalizeCloudReceipts(artifact *sourcestatus.Artifact) {
-	artifact.Version = 1
+func normalizeCloudReceipts(artifact *sourcestatus.Artifact) error {
+	if artifact.Version != 1 {
+		return errors.New("invalid source receipt")
+	}
 	if artifact.Sources == nil {
 		artifact.Sources = map[string]sourcestatus.Receipt{}
 	}
+	seenRaw := make(map[string]string, len(artifact.Sources))
 	for sourceID, receipt := range artifact.Sources {
-		if !annotation.ValidSourceID(sourceID) || len(sourceID) > maxWorkerIDBytes {
-			delete(artifact.Sources, sourceID)
-			continue
+		if !validCloudReceipt(sourceID, receipt) {
+			return errors.New("invalid source receipt")
 		}
-		receipt.RawPath = normalizeCloudRawPath(receipt.RawPath)
-		receipt.LastIngestedRawSHA256 = normalizeCloudDigest(receipt.LastIngestedRawSHA256)
-		receipt.LastIngestedAnnSHA256 = normalizeCloudDigest(receipt.LastIngestedAnnSHA256)
-		receipt.LastIngestFingerprint = normalizeCloudDigest(receipt.LastIngestFingerprint)
-		receipt.FailedFingerprint = normalizeCloudDigest(receipt.FailedFingerprint)
-		receipt.LastSuccessAt = normalizeCloudTimestamp(receipt.LastSuccessAt)
-		if receipt.Error != "" && receipt.Error != "pipeline failed" {
-			receipt.Error = "pipeline failed"
+		if receipt.RawPath != "" {
+			if prior, exists := seenRaw[receipt.RawPath]; exists && prior != sourceID {
+				return errors.New("invalid source receipt")
+			}
+			seenRaw[receipt.RawPath] = sourceID
 		}
-		artifact.Sources[sourceID] = receipt
 	}
+	return nil
+}
+
+func validCloudReceipt(sourceID string, receipt sourcestatus.Receipt) bool {
+	if !annotation.ValidSourceID(sourceID) || len(sourceID) > maxWorkerIDBytes || !safeMappedRawPath(receipt.RawPath) {
+		return false
+	}
+	for _, digest := range []string{receipt.LastIngestedRawSHA256, receipt.LastIngestedAnnSHA256, receipt.LastIngestFingerprint, receipt.FailedFingerprint} {
+		if digest != "" && normalizeCloudDigest(digest) == "" {
+			return false
+		}
+	}
+	if receipt.LastSuccessAt != "" && normalizeCloudTimestamp(receipt.LastSuccessAt) == "" {
+		return false
+	}
+	if sourcestatus.ValidReceipt(receipt, receipt.RawPath) {
+		return receipt.Error == "" || receipt.Error == "pipeline failed"
+	}
+	return receipt.LastIngestedRawSHA256 == "" && receipt.LastIngestedAnnSHA256 == "" &&
+		receipt.LastIngestFingerprint == "" && receipt.LastSuccessAt == "" &&
+		receipt.Error == "pipeline failed" && normalizeCloudDigest(receipt.FailedFingerprint) != ""
 }
 
 func normalizeCloudRawPath(value string) string {

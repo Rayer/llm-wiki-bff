@@ -22,6 +22,7 @@ func DecodeBoundedMap[T any](dec *json.Decoder) (map[string]T, error) {
 		return nil, errors.New("expected JSON object")
 	}
 	result := make(map[string]T)
+	seen := make(map[string]struct{})
 	entries := 0
 	for dec.More() {
 		if entries >= MaxFiles {
@@ -35,6 +36,10 @@ func DecodeBoundedMap[T any](dec *json.Decoder) (map[string]T, error) {
 		if !ok {
 			return nil, errors.New("expected JSON object key")
 		}
+		if _, exists := seen[name]; exists {
+			return nil, errors.New("duplicate JSON object key")
+		}
+		seen[name] = struct{}{}
 		var value T
 		if err := dec.Decode(&value); err != nil {
 			return nil, err
@@ -89,6 +94,7 @@ func DecodeBoundedStringLists(dec *json.Decoder) (map[string][]string, error) {
 		return nil, errors.New("expected JSON object")
 	}
 	result := make(map[string][]string)
+	seen := make(map[string]struct{})
 	keys := 0
 	for dec.More() {
 		if keys >= MaxFiles {
@@ -102,6 +108,10 @@ func DecodeBoundedStringLists(dec *json.Decoder) (map[string][]string, error) {
 		if !ok {
 			return nil, errors.New("expected JSON object key")
 		}
+		if _, exists := seen[name]; exists {
+			return nil, errors.New("duplicate JSON object key")
+		}
+		seen[name] = struct{}{}
 		list, err := DecodeBoundedStrings(dec)
 		if err != nil {
 			return nil, err

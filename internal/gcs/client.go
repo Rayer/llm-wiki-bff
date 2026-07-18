@@ -842,6 +842,7 @@ func decodeWikiIDMap(data []byte) (wikiIDMap, error) {
 	if delim, ok := token.(json.Delim); !ok || delim != '{' {
 		return source, errors.New("expected JSON object")
 	}
+	seen := make(map[string]struct{})
 	for dec.More() {
 		key, err := dec.Token()
 		if err != nil {
@@ -851,6 +852,10 @@ func decodeWikiIDMap(data []byte) (wikiIDMap, error) {
 		if !ok {
 			return source, errors.New("expected JSON object key")
 		}
+		if _, exists := seen[name]; exists {
+			return source, errors.New("duplicate JSON object key")
+		}
+		seen[name] = struct{}{}
 		switch name {
 		case "source":
 			source.Source, err = generation.DecodeBoundedMap[string](dec)
