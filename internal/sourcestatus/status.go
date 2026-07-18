@@ -24,6 +24,64 @@ type Receipt struct {
 	Error                 string `json:"error,omitempty"`
 }
 
+// UnmarshalJSON rejects duplicate receipt fields while preserving the current
+// contract of ignoring unknown fields.
+func (r *Receipt) UnmarshalJSON(data []byte) error {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	token, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	delim, ok := token.(json.Delim)
+	if !ok || delim != '{' {
+		return fmt.Errorf("expected JSON object")
+	}
+	seen := make(map[string]struct{})
+	for dec.More() {
+		key, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		name, ok := key.(string)
+		if !ok {
+			return fmt.Errorf("expected JSON object key")
+		}
+		if _, exists := seen[name]; exists {
+			return fmt.Errorf("duplicate JSON object key")
+		}
+		seen[name] = struct{}{}
+		switch name {
+		case "raw_path":
+			err = dec.Decode(&r.RawPath)
+		case "last_ingested_raw_sha256":
+			err = dec.Decode(&r.LastIngestedRawSHA256)
+		case "last_ingested_ann_sha256":
+			err = dec.Decode(&r.LastIngestedAnnSHA256)
+		case "last_ingest_fingerprint":
+			err = dec.Decode(&r.LastIngestFingerprint)
+		case "last_success_at":
+			err = dec.Decode(&r.LastSuccessAt)
+		case "failed_fingerprint":
+			err = dec.Decode(&r.FailedFingerprint)
+		case "error":
+			err = dec.Decode(&r.Error)
+		default:
+			var ignored json.RawMessage
+			err = dec.Decode(&ignored)
+		}
+		if err != nil {
+			return err
+		}
+	}
+	if token, err := dec.Token(); err != nil || token != json.Delim('}') {
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("expected JSON object end")
+	}
+	return generation.EnsureJSONEOF(dec)
+}
+
 type Artifact struct {
 	Version int                `json:"version"`
 	Sources map[string]Receipt `json:"sources"`
@@ -41,6 +99,7 @@ func Decode(data []byte) (Artifact, error) {
 			err = fmt.Errorf("expected JSON object")
 		}
 	}
+	seen := make(map[string]struct{})
 	for err == nil && dec.More() {
 		var key interface{}
 		key, err = dec.Token()
@@ -51,6 +110,11 @@ func Decode(data []byte) (Artifact, error) {
 		if err != nil {
 			break
 		}
+		if _, exists := seen[name]; exists {
+			err = fmt.Errorf("duplicate JSON object key")
+			break
+		}
+		seen[name] = struct{}{}
 		switch name {
 		case "version":
 			err = dec.Decode(&a.Version)
@@ -85,10 +149,21 @@ func ValidReceipt(receipt Receipt, rawPath string) bool {
 		strings.TrimSpace(receipt.LastIngestedAnnSHA256) == "" || strings.TrimSpace(receipt.LastIngestFingerprint) == "" {
 		return false
 	}
+	if !validDigest(receipt.LastIngestedRawSHA256) || !validDigest(receipt.LastIngestedAnnSHA256) || !validDigest(receipt.LastIngestFingerprint) {
+		return false
+	}
 	if _, err := time.Parse(time.RFC3339, receipt.LastSuccessAt); err != nil {
 		return false
 	}
 	return receipt.LastIngestFingerprint == Fingerprint(receipt.LastIngestedRawSHA256, receipt.LastIngestedAnnSHA256)
+}
+
+func validDigest(value string) bool {
+	if len(value) != 64 {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
 }
 
 // ValidCurrentFailure verifies the independent failure receipt shape. A first

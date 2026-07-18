@@ -1194,6 +1194,51 @@ func TestRecordFailurePersistsOnlySafeErrorAndKeepsSuccessFields(t *testing.T) {
 	}
 }
 
+func TestWorkspaceSuccessiveGenerationRunsPreserveSourceIDAndAnnotation(t *testing.T) {
+	old := execOLW
+	defer func() { execOLW = old }()
+	vault := workspaceVault(t, "original raw")
+	writeWorkspaceAnnotation(t, vault, "s1", "raw/source.md", "saved note")
+	mustWriteFile(t, filepath.Join(vault, "wiki", "sources", "s1.md"), []byte("---\nid: s1\nsource_file: raw/source.md\n---\nbody\n"))
+	var run int
+	execOLW = func(_ context.Context, work string, _ []string, _ []string, _, _ io.Writer) error {
+		run++
+		transientID := fmt.Sprintf("transient-%d", run)
+		if err := os.RemoveAll(filepath.Join(work, "wiki", "sources")); err != nil {
+			return err
+		}
+		mustWriteFile(t, filepath.Join(work, "wiki", "sources", transientID+".md"), []byte("---\nid: "+transientID+"\nsource_file: raw/source.md\n---\nregenerated\n"))
+		return nil
+	}
+	cfg := workerConfig{VaultPath: vault, APIKey: "secret", Workspace: true, WorkspaceDir: t.TempDir(), Postprocess: true}
+	for i := 0; i < 2; i++ {
+		if err := runWorkerBatch(context.Background(), cfg, `[["run"]]`); err != nil {
+			t.Fatal(err)
+		}
+	}
+	idMap, err := os.ReadFile(filepath.Join(vault, "cache", "id_map.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(idMap), `"s1"`) || strings.Contains(string(idMap), `"transient-2":`) {
+		t.Fatalf("source ID drifted in id map: %s", idMap)
+	}
+	page, err := os.ReadFile(filepath.Join(vault, "wiki", "sources", "transient-2.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(string(page), "<!-- lwc-ann-v1 source_id=s1 ") != 1 || !strings.Contains(string(page), "saved note") {
+		t.Fatalf("stable annotation was not materialized exactly once: %s", page)
+	}
+	annotationData, err := os.ReadFile(filepath.Join(vault, filepath.FromSlash(annotation.Path("s1"))))
+	if err != nil || !strings.Contains(string(annotationData), `"source_id":"s1"`) {
+		t.Fatalf("stable annotation object was not retained: %s err=%v", annotationData, err)
+	}
+	if _, err := os.Stat(filepath.Join(vault, filepath.FromSlash(annotation.Path("transient-2")))); !os.IsNotExist(err) {
+		t.Fatalf("annotation was copied to transient source ID: %v", err)
+	}
+}
+
 func workspaceVault(t *testing.T, raw string) string {
 	t.Helper()
 	vault := t.TempDir()
