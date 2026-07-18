@@ -130,6 +130,12 @@ jobs:
             --update-secrets "JWT_SECRET=${{ env.JWT_SECRET_NAME }}:latest,DEEPSEEK_API_KEY=deepseek-apikey:latest" \
             --update-env-vars "^@^GCP_PROJECT=${{ env.PROJECT_ID }}@BUCKET=${{ env.BUCKET }}@FIRESTORE_DATABASE_ID=${{ env.FIRESTORE_DATABASE_ID }}@PIPELINE_JOB_URL=https://run.googleapis.com/v2/projects/${{ env.PROJECT_ID }}/locations/${{ env.REGION }}/jobs/${{ env.PIPELINE_JOB_NAME }}:run@ALLOWED_ORIGINS=${{ env.ALLOWED_ORIGINS }}@DEV_JWT=false" \
             --quiet
+          gcloud run jobs add-iam-policy-binding "${{ env.PIPELINE_JOB_NAME }}" \
+            --region "${{ env.REGION }}" \
+            --project "${{ env.PROJECT_ID }}" \
+            --member "serviceAccount:${{ env.RUNTIME_SERVICE_ACCOUNT }}" \
+            --role roles/run.jobsExecutorWithOverrides \
+            --quiet
           echo "✅ Promoted $IMMUTABLE_IMAGE to ${{ env.SERVICE_NAME }}"
 
       - name: Tag promoted production image (fail-closed)
