@@ -234,8 +234,10 @@ func rewriteConceptSourceReferences(workspace string, translations map[string]st
 			return generation.ErrLogicalEntryLimit
 		}
 		rows++
-		var entry map[string]any
-		if err := json.Unmarshal(line, &entry); err != nil {
+		// Fail closed on duplicate keys / trailing data before Source rewrite can
+		// sanitize the row into a form Concept reconciliation would accept.
+		entry, err := decodeStrictConceptCacheRow(line)
+		if err != nil {
 			return fmt.Errorf("decode concepts cache: %w", err)
 		}
 		rewriteSourceReferenceField(entry, "sources", translations)

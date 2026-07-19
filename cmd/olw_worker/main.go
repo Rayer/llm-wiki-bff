@@ -194,18 +194,18 @@ func runWorkerBatch(ctx context.Context, cfg workerConfig, rawCommands string) e
 	if cfg.Workspace {
 		return runWorkerBatchWorkspace(ctx, cfg, commands, vault)
 	}
-	// Default in-place path (Workspace=false): snapshot prior Concept IDs
-	// before generation and reconcile after postprocess, matching the
-	// workspace/cloud contract without inventing receipt semantics.
+	// Default in-place path (Workspace=false). Concept snapshot/reconcile only
+	// runs when postprocess is enabled — matching pre-LWC-186 no-postprocess
+	// semantics (do not require cache/id_map.json for plain OLW runs).
+	if !cfg.Postprocess {
+		return runWorkerBatchAtVault(ctx, cfg, commands, vault)
+	}
 	priorConcepts, err := snapshotConcepts(vault)
 	if err != nil {
 		return err
 	}
 	if err := runWorkerBatchAtVault(ctx, cfg, commands, vault); err != nil {
 		return err
-	}
-	if !cfg.Postprocess {
-		return nil
 	}
 	return reconcileWorkspaceConcepts(vault, priorConcepts)
 }

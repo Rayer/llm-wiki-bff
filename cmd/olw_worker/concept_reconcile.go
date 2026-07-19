@@ -9,7 +9,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strings"
 
@@ -29,10 +28,6 @@ type reconciledConcept struct {
 	StableID  string
 	Slug      string
 }
-
-// Matches Markdown wikilinks only. Plain URLs, inline code, and other prose
-// that merely contain the same text are left byte-for-byte untouched.
-var markdownWikilinkRE = regexp.MustCompile(`\[\[([^\[\]\n]+)\]\]`)
 
 func snapshotConcepts(vault string) ([]conceptSnapshot, error) {
 	data, err := readBoundedRegularFileWithin(vault, "cache/id_map.json")
@@ -160,8 +155,20 @@ func reconcileConceptIDMap(data []byte, prior []conceptSnapshot) ([]byte, []reco
 	}
 	sort.Strings(redirectKeys)
 	for _, from := range redirectKeys {
-		newFrom := normalizeTranslatedID(from, translated)
+		// Validate before any normalization/persistence.
+		if !annotation.ValidSourceID(from) {
+			return nil, nil, fmt.Errorf("unsafe redirect key %q", from)
+		}
 		targets := ids.Redirects[from]
+		for _, target := range targets {
+			if !safeConceptSlug(target) {
+				return nil, nil, fmt.Errorf("unsafe redirect target %q for %q", target, from)
+			}
+		}
+		newFrom := normalizeTranslatedID(from, translated)
+		if !annotation.ValidSourceID(newFrom) {
+			return nil, nil, fmt.Errorf("unsafe redirect key %q", newFrom)
+		}
 		normalizedTargets := make([]string, len(targets))
 		copy(normalizedTargets, targets)
 		if existing, ok := normalizedRedirects[newFrom]; ok && !equalStrings(existing, normalizedTargets) {
@@ -179,7 +186,14 @@ func reconcileConceptIDMap(data []byte, prior []conceptSnapshot) ([]byte, []reco
 	return out, reconciled, nil
 }
 
+type plannedWrite struct {
+	rel  string
+	data []byte
+}
+
 func reconcileWorkspaceConcepts(workspace string, prior []conceptSnapshot) error {
+	// Plan/validate every output first, then apply. Input validation errors
+	// must leave the live vault byte-identical (zero writes).
 	data, err := readBoundedRegularFileWithin(workspace, "cache/id_map.json")
 	if err != nil {
 		return fmt.Errorf("read generated concept map: %w", err)
@@ -188,9 +202,6 @@ func reconcileWorkspaceConcepts(workspace string, prior []conceptSnapshot) error
 	if err != nil {
 		return err
 	}
-	if err := writeFileAtomicWithin(workspace, "cache/id_map.json", reconciledMap); err != nil {
-		return fmt.Errorf("write reconciled concept map: %w", err)
-	}
 
 	translations := make(map[string]string, len(concepts))
 	for _, concept := range concepts {
@@ -198,6 +209,10 @@ func reconcileWorkspaceConcepts(workspace string, prior []conceptSnapshot) error
 			translations[concept.CurrentID] = concept.StableID
 		}
 	}
+
+	writes := make([]plannedWrite, 0, len(concepts)+2)
+	writes = append(writes, plannedWrite{rel: "cache/id_map.json", data: reconciledMap})
+
 	for _, concept := range concepts {
 		rel := filepath.ToSlash(filepath.Join("wiki", concept.Slug+".md"))
 		page, err := readBoundedRegularFileWithin(workspace, rel)
@@ -211,14 +226,31 @@ func reconcileWorkspaceConcepts(workspace string, prior []conceptSnapshot) error
 		if len(translations) > 0 {
 			page = rewriteConceptIDBearingWikilinks(page, concepts, translations)
 		}
-		if err := writeFileAtomicWithin(workspace, rel, page); err != nil {
+		writes = append(writes, plannedWrite{rel: rel, data: page})
+	}
+
+	otherWrites, err := planOtherConceptPageWikilinks(workspace, concepts, translations)
+	if err != nil {
+		return err
+	}
+	writes = append(writes, otherWrites...)
+
+	cacheData, cachePresent, err := planConceptCacheIDs(workspace, concepts, translations)
+	if err != nil {
+		return err
+	}
+	if cachePresent {
+		writes = append(writes, plannedWrite{rel: "cache/concepts.jsonl", data: cacheData})
+	}
+
+	// Deterministic apply order: id_map, concept pages (slug-sorted already),
+	// other pages (walk order collected deterministically), then cache.
+	for _, w := range writes {
+		if err := writeFileAtomicWithin(workspace, w.rel, w.data); err != nil {
 			return err
 		}
 	}
-	if err := rewriteOtherConceptPageWikilinks(workspace, concepts, translations); err != nil {
-		return err
-	}
-	return rewriteConceptCacheIDs(workspace, concepts, translations)
+	return nil
 }
 
 func rewriteConceptPageID(data []byte, currentID, stableID string) ([]byte, error) {
@@ -240,9 +272,6 @@ func rewriteConceptPageID(data []byte, currentID, stableID string) ([]byte, erro
 	if pageID != currentID && pageID != stableID {
 		return nil, fmt.Errorf("inconsistent concept page id %q (want %q or %q)", pageID, currentID, stableID)
 	}
-	if pageID == stableID {
-		return data, nil
-	}
 	lines := bytes.SplitAfter(data, []byte("\n"))
 	if len(lines) == 0 || strings.TrimSpace(string(lines[0])) != "---" {
 		return nil, errors.New("concept frontmatter is missing")
@@ -257,6 +286,8 @@ func rewriteConceptPageID(data []byte, currentID, stableID string) ([]byte, erro
 	if end < 0 {
 		return nil, errors.New("concept frontmatter is unterminated")
 	}
+	// Always scan for duplicate top-level id fields — even when the parsed
+	// page ID already equals stableID (YAML keeps only one value).
 	found := false
 	for i := 1; i < end; i++ {
 		line := lineWithoutEnding(lines[i])
@@ -265,19 +296,37 @@ func rewriteConceptPageID(data []byte, currentID, stableID string) ([]byte, erro
 			if found {
 				return nil, errors.New("duplicate concept frontmatter id")
 			}
-			lines[i] = rewriteTopLevelIDLine(lines[i], stableID)
+			if pageID != stableID {
+				lines[i] = rewriteTopLevelIDLine(lines[i], stableID)
+			}
 			found = true
 		}
 	}
 	if !found {
 		return nil, errors.New("concept frontmatter id is missing")
 	}
+	if pageID == stableID {
+		return data, nil
+	}
 	return bytes.Join(lines, nil), nil
 }
 
 func rewriteOtherConceptPageWikilinks(workspace string, concepts []reconciledConcept, translations map[string]string) error {
+	writes, err := planOtherConceptPageWikilinks(workspace, concepts, translations)
+	if err != nil {
+		return err
+	}
+	for _, w := range writes {
+		if err := writeFileAtomicWithin(workspace, w.rel, w.data); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func planOtherConceptPageWikilinks(workspace string, concepts []reconciledConcept, translations map[string]string) ([]plannedWrite, error) {
 	if len(translations) == 0 {
-		return nil
+		return nil, nil
 	}
 	owned := make(map[string]struct{}, len(concepts))
 	for _, concept := range concepts {
@@ -285,11 +334,12 @@ func rewriteOtherConceptPageWikilinks(workspace string, concepts []reconciledCon
 	}
 	root := filepath.Join(workspace, "wiki")
 	if _, err := os.Lstat(root); errors.Is(err, os.ErrNotExist) {
-		return nil
+		return nil, nil
 	} else if err != nil {
-		return err
+		return nil, err
 	}
-	return filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+	var writes []plannedWrite
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -336,8 +386,13 @@ func rewriteOtherConceptPageWikilinks(workspace string, concepts []reconciledCon
 		if bytes.Equal(updated, data) {
 			return nil
 		}
-		return writeFileAtomicWithin(workspace, relSlash, updated)
+		writes = append(writes, plannedWrite{rel: relSlash, data: updated})
+		return nil
 	})
+	if err != nil {
+		return nil, err
+	}
+	return writes, nil
 }
 
 func rewriteConceptIDBearingWikilinks(data []byte, concepts []reconciledConcept, translations map[string]string) []byte {
@@ -361,17 +416,15 @@ func rewriteConceptIDBearingWikilinks(data []byte, concepts []reconciledConcept,
 	if len(routes) == 0 {
 		return data
 	}
-	return markdownWikilinkRE.ReplaceAllFunc(data, func(match []byte) []byte {
-		inner := match[2 : len(match)-2]
-		target, alias, hasAlias := strings.Cut(string(inner), "|")
+	return rewriteWikilinksOutsideMarkdownCode(data, func(inner string) (string, bool) {
+		target, alias, hasAlias := strings.Cut(inner, "|")
 		base, anchor, hasAnchor := strings.Cut(target, "#")
 		to, ok := routes[strings.TrimSpace(base)]
 		if !ok {
-			return match
+			return "", false
 		}
 		var b strings.Builder
-		b.Grow(len(match) + len(to) - len(strings.TrimSpace(base)))
-		b.WriteString("[[")
+		b.Grow(len(inner) + len(to) - len(strings.TrimSpace(base)) + 4)
 		b.WriteString(to)
 		if hasAnchor {
 			b.WriteByte('#')
@@ -381,22 +434,178 @@ func rewriteConceptIDBearingWikilinks(data []byte, concepts []reconciledConcept,
 			b.WriteByte('|')
 			b.WriteString(alias)
 		}
-		b.WriteString("]]")
-		return []byte(b.String())
+		return b.String(), true
 	})
 }
 
-func rewriteConceptCacheIDs(workspace string, concepts []reconciledConcept, translations map[string]string) error {
-	const rel = "cache/concepts.jsonl"
-	info, err := lstatRegularWithin(workspace, rel)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
+// rewriteWikilinksOutsideMarkdownCode rewrites [[...]] only outside fenced
+// code blocks and inline code spans. Content inside code is left byte-identical.
+func rewriteWikilinksOutsideMarkdownCode(data []byte, rewrite func(inner string) (string, bool)) []byte {
+	var out bytes.Buffer
+	out.Grow(len(data))
+	i := 0
+	lineStart := true
+	for i < len(data) {
+		if lineStart {
+			if end, ok := scanFencedCodeBlock(data, i); ok {
+				out.Write(data[i:end])
+				i = end
+				lineStart = i == 0 || (i > 0 && data[i-1] == '\n')
+				continue
+			}
+		}
+		if data[i] == '`' {
+			end := scanInlineCodeSpan(data, i)
+			out.Write(data[i:end])
+			i = end
+			lineStart = i > 0 && data[i-1] == '\n'
+			continue
+		}
+		if i+1 < len(data) && data[i] == '[' && data[i+1] == '[' {
+			closeAt := indexWikilinkClose(data, i+2)
+			if closeAt >= 0 {
+				inner := string(data[i+2 : closeAt])
+				if replacement, ok := rewrite(inner); ok {
+					out.WriteString("[[")
+					out.WriteString(replacement)
+					out.WriteString("]]")
+				} else {
+					out.Write(data[i : closeAt+2])
+				}
+				i = closeAt + 2
+				lineStart = false
+				continue
+			}
+		}
+		b := data[i]
+		out.WriteByte(b)
+		i++
+		lineStart = b == '\n'
 	}
+	return out.Bytes()
+}
+
+func scanFencedCodeBlock(data []byte, i int) (int, bool) {
+	j := i
+	spaces := 0
+	for j < len(data) && data[j] == ' ' && spaces < 3 {
+		j++
+		spaces++
+	}
+	if j >= len(data) || (data[j] != '`' && data[j] != '~') {
+		return 0, false
+	}
+	fenceChar := data[j]
+	fenceLen := 0
+	for j < len(data) && data[j] == fenceChar {
+		j++
+		fenceLen++
+	}
+	if fenceLen < 3 {
+		return 0, false
+	}
+	// Consume the rest of the opening fence line.
+	for j < len(data) && data[j] != '\n' {
+		j++
+	}
+	if j < len(data) {
+		j++
+	}
+	for j < len(data) {
+		k := j
+		sp := 0
+		for k < len(data) && data[k] == ' ' && sp < 3 {
+			k++
+			sp++
+		}
+		closeLen := 0
+		for k < len(data) && data[k] == fenceChar {
+			k++
+			closeLen++
+		}
+		if closeLen >= fenceLen {
+			for k < len(data) && (data[k] == ' ' || data[k] == '\t') {
+				k++
+			}
+			if k >= len(data) || data[k] == '\n' {
+				if k < len(data) {
+					k++
+				}
+				return k, true
+			}
+		}
+		for j < len(data) && data[j] != '\n' {
+			j++
+		}
+		if j < len(data) {
+			j++
+		}
+	}
+	// Unclosed fence: treat remainder as code so wikilink-like text is preserved.
+	return len(data), true
+}
+
+func scanInlineCodeSpan(data []byte, i int) int {
+	n := 0
+	for i+n < len(data) && data[i+n] == '`' {
+		n++
+	}
+	if n == 0 {
+		return i + 1
+	}
+	j := i + n
+	for j < len(data) {
+		if data[j] != '`' {
+			j++
+			continue
+		}
+		m := 0
+		for j+m < len(data) && data[j+m] == '`' {
+			m++
+		}
+		if m == n {
+			return j + m
+		}
+		j += m
+	}
+	// Unclosed: not a code span; consume only the first backtick.
+	return i + 1
+}
+
+func indexWikilinkClose(data []byte, from int) int {
+	for i := from; i+1 < len(data); i++ {
+		if data[i] == '\n' {
+			return -1
+		}
+		if data[i] == ']' && data[i+1] == ']' {
+			return i
+		}
+	}
+	return -1
+}
+
+func rewriteConceptCacheIDs(workspace string, concepts []reconciledConcept, translations map[string]string) error {
+	data, present, err := planConceptCacheIDs(workspace, concepts, translations)
 	if err != nil {
 		return err
 	}
+	if !present {
+		return nil
+	}
+	return writeFileAtomicWithin(workspace, "cache/concepts.jsonl", data)
+}
+
+func planConceptCacheIDs(workspace string, concepts []reconciledConcept, translations map[string]string) ([]byte, bool, error) {
+	const rel = "cache/concepts.jsonl"
+	info, err := lstatRegularWithin(workspace, rel)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
 	if info.Size() < 0 || info.Size() > generation.MaxFileBytes {
-		return errors.New("concepts cache size exceeds generation limit")
+		return nil, false, errors.New("concepts cache size exceeds generation limit")
 	}
 	bySlug := make(map[string]reconciledConcept, len(concepts))
 	for _, concept := range concepts {
@@ -404,7 +613,7 @@ func rewriteConceptCacheIDs(workspace string, concepts []reconciledConcept, tran
 	}
 	file, err := openRegularFileWithin(workspace, rel)
 	if err != nil {
-		return err
+		return nil, false, err
 	}
 	defer file.Close()
 	scanner := bufio.NewScanner(io.LimitReader(file, generation.MaxFileBytes+1))
@@ -419,36 +628,36 @@ func rewriteConceptCacheIDs(workspace string, concepts []reconciledConcept, tran
 			continue
 		}
 		if rows >= generation.MaxFiles {
-			return generation.ErrLogicalEntryLimit
+			return nil, false, generation.ErrLogicalEntryLimit
 		}
 		rows++
 		entry, err := decodeStrictConceptCacheRow(line)
 		if err != nil {
-			return fmt.Errorf("decode concepts cache: %w", err)
+			return nil, false, fmt.Errorf("decode concepts cache: %w", err)
 		}
 		slug, _ := entry["slug"].(string)
 		if slug == "" {
-			return errors.New("concepts cache row is missing slug")
+			return nil, false, errors.New("concepts cache row is missing slug")
 		}
 		if _, dup := seenSlug[slug]; dup {
-			return fmt.Errorf("duplicate concepts cache slug %q", slug)
+			return nil, false, fmt.Errorf("duplicate concepts cache slug %q", slug)
 		}
 		seenSlug[slug] = struct{}{}
 		concept, ok := bySlug[slug]
 		if !ok {
-			return fmt.Errorf("concepts cache slug %q is not declared in id map", slug)
+			return nil, false, fmt.Errorf("concepts cache slug %q is not declared in id map", slug)
 		}
 		if frontmatter, ok := entry["frontmatter"].(map[string]any); ok {
 			if id, ok := frontmatter["id"].(string); ok {
 				if id != concept.CurrentID && id != concept.StableID {
-					return fmt.Errorf("inconsistent concepts cache id %q for slug %q", id, slug)
+					return nil, false, fmt.Errorf("inconsistent concepts cache id %q for slug %q", id, slug)
 				}
 				frontmatter["id"] = concept.StableID
 			}
 		}
 		if id, ok := entry["id"].(string); ok {
 			if id != concept.CurrentID && id != concept.StableID {
-				return fmt.Errorf("inconsistent concepts cache top-level id %q for slug %q", id, slug)
+				return nil, false, fmt.Errorf("inconsistent concepts cache top-level id %q for slug %q", id, slug)
 			}
 			entry["id"] = concept.StableID
 		}
@@ -457,32 +666,33 @@ func rewriteConceptCacheIDs(workspace string, concepts []reconciledConcept, tran
 		}
 		updated, err := json.Marshal(entry)
 		if err != nil {
-			return err
+			return nil, false, err
 		}
 		if output.Len() > generation.MaxFileBytes-len(updated)-1 {
-			return errors.New("concepts cache size exceeds generation limit")
+			return nil, false, errors.New("concepts cache size exceeds generation limit")
 		}
 		output.Write(updated)
 		output.WriteByte('\n')
 	}
 	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("scan concepts cache: %w", err)
+		return nil, false, fmt.Errorf("scan concepts cache: %w", err)
 	}
 	// Fail closed: when the cache artifact exists, every declared current
 	// concept must appear exactly once.
 	for _, concept := range concepts {
 		if _, ok := seenSlug[concept.Slug]; !ok {
-			return fmt.Errorf("concepts cache missing slug %q declared in id map", concept.Slug)
+			return nil, false, fmt.Errorf("concepts cache missing slug %q declared in id map", concept.Slug)
 		}
 	}
 	if len(seenSlug) != len(concepts) {
-		return errors.New("concepts cache rows do not match id map concepts")
+		return nil, false, errors.New("concepts cache rows do not match id map concepts")
 	}
-	return writeFileAtomicWithin(workspace, rel, output.Bytes())
+	return output.Bytes(), true, nil
 }
 
 func decodeStrictConceptCacheRow(line []byte) (map[string]any, error) {
 	dec := json.NewDecoder(bytes.NewReader(line))
+	dec.UseNumber()
 	value, err := decodeStrictJSONValue(dec)
 	if err != nil {
 		return nil, err
