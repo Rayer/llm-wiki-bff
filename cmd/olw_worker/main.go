@@ -194,7 +194,20 @@ func runWorkerBatch(ctx context.Context, cfg workerConfig, rawCommands string) e
 	if cfg.Workspace {
 		return runWorkerBatchWorkspace(ctx, cfg, commands, vault)
 	}
-	return runWorkerBatchAtVault(ctx, cfg, commands, vault)
+	// Default in-place path (Workspace=false). Concept snapshot/reconcile only
+	// runs when postprocess is enabled — matching pre-LWC-186 no-postprocess
+	// semantics (do not require cache/id_map.json for plain OLW runs).
+	if !cfg.Postprocess {
+		return runWorkerBatchAtVault(ctx, cfg, commands, vault)
+	}
+	priorConcepts, err := snapshotConcepts(vault)
+	if err != nil {
+		return err
+	}
+	if err := runWorkerBatchAtVault(ctx, cfg, commands, vault); err != nil {
+		return err
+	}
+	return reconcileWorkspaceConcepts(vault, priorConcepts)
 }
 
 func configFromEnvironment(cfg workerConfig) workerConfig {
@@ -292,6 +305,10 @@ func runWorkerBatchWorkspace(ctx context.Context, cfg workerConfig, commands [][
 	if err != nil {
 		return err
 	}
+	priorConcepts, err := snapshotConcepts(vault)
+	if err != nil {
+		return err
+	}
 	workspace, err := createWorkspace(cfg.WorkspaceDir, vault)
 	if err != nil {
 		return err
@@ -315,6 +332,13 @@ func runWorkerBatchWorkspace(ctx context.Context, cfg workerConfig, commands [][
 		return err
 	}
 	if err := reconcileWorkspaceSources(workspace, snapshots); err != nil {
+		recordErr := recordFailure(vault, snapshots, err)
+		if recordErr != nil {
+			return errors.Join(err, recordErr)
+		}
+		return err
+	}
+	if err := reconcileWorkspaceConcepts(workspace, priorConcepts); err != nil {
 		recordErr := recordFailure(vault, snapshots, err)
 		if recordErr != nil {
 			return errors.Join(err, recordErr)

@@ -289,6 +289,15 @@ func runCloudWorkerBatch(ctx context.Context, cfg workerConfig, commands [][]str
 		}
 		return errCloudMaterialization
 	}
+	// Capture concept IDs from the immediately prior committed/materialized
+	// workspace id_map before OLW regenerates transient concept identities.
+	priorConcepts, err := snapshotConcepts(workspace)
+	if err != nil {
+		if recordErr := writeCloudFailureReceipts(ctx, objects, prefix, workspace, cfg, snapshots); recordErr != nil {
+			return errors.Join(errCloudMaterialization, recordErr)
+		}
+		return errCloudMaterialization
+	}
 	if err := materializeSnapshots(workspace, snapshots); err != nil {
 		if recordErr := writeCloudFailureReceipts(ctx, objects, prefix, workspace, cfg, snapshots); recordErr != nil {
 			return errors.Join(errCloudMaterialization, recordErr)
@@ -306,6 +315,12 @@ func runCloudWorkerBatch(ctx context.Context, cfg workerConfig, commands [][]str
 		return primary
 	}
 	if err := reconcileWorkspaceSources(workspace, snapshots); err != nil {
+		if recordErr := writeCloudFailureReceipts(ctx, objects, prefix, workspace, cfg, snapshots); recordErr != nil {
+			return errors.Join(errCloudPipelinePublish, recordErr)
+		}
+		return errCloudPipelinePublish
+	}
+	if err := reconcileWorkspaceConcepts(workspace, priorConcepts); err != nil {
 		if recordErr := writeCloudFailureReceipts(ctx, objects, prefix, workspace, cfg, snapshots); recordErr != nil {
 			return errors.Join(errCloudPipelinePublish, recordErr)
 		}
