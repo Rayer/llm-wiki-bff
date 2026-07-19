@@ -292,6 +292,10 @@ func runWorkerBatchWorkspace(ctx context.Context, cfg workerConfig, commands [][
 	if err != nil {
 		return err
 	}
+	priorConcepts, err := snapshotConcepts(vault)
+	if err != nil {
+		return err
+	}
 	workspace, err := createWorkspace(cfg.WorkspaceDir, vault)
 	if err != nil {
 		return err
@@ -315,6 +319,13 @@ func runWorkerBatchWorkspace(ctx context.Context, cfg workerConfig, commands [][
 		return err
 	}
 	if err := reconcileWorkspaceSources(workspace, snapshots); err != nil {
+		recordErr := recordFailure(vault, snapshots, err)
+		if recordErr != nil {
+			return errors.Join(err, recordErr)
+		}
+		return err
+	}
+	if err := reconcileWorkspaceConcepts(workspace, priorConcepts); err != nil {
 		recordErr := recordFailure(vault, snapshots, err)
 		if recordErr != nil {
 			return errors.Join(err, recordErr)
