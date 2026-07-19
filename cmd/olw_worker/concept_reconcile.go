@@ -487,11 +487,9 @@ func rewriteWikilinksOutsideMarkdownCode(data []byte, rewrite func(inner string)
 
 func scanFencedCodeBlock(data []byte, i int) (int, bool) {
 	j := i
-	spaces := 0
-	for j < len(data) && data[j] == ' ' && spaces < 3 {
-		j++
-		spaces++
-	}
+	// Optional CommonMark indent (≤3 spaces) then optional blockquote markers
+	// (`>` with optional following space, including nested `>>`).
+	j = skipMarkdownBlockquotePrefix(data, j)
 	if j >= len(data) || (data[j] != '`' && data[j] != '~') {
 		return 0, false
 	}
@@ -512,12 +510,7 @@ func scanFencedCodeBlock(data []byte, i int) (int, bool) {
 		j++
 	}
 	for j < len(data) {
-		k := j
-		sp := 0
-		for k < len(data) && data[k] == ' ' && sp < 3 {
-			k++
-			sp++
-		}
+		k := skipMarkdownBlockquotePrefix(data, j)
 		closeLen := 0
 		for k < len(data) && data[k] == fenceChar {
 			k++
@@ -543,6 +536,35 @@ func scanFencedCodeBlock(data []byte, i int) (int, bool) {
 	}
 	// Unclosed fence: treat remainder as code so wikilink-like text is preserved.
 	return len(data), true
+}
+
+// skipMarkdownBlockquotePrefix advances past optional ≤3 leading spaces and
+// zero-or-more blockquote markers (`>` with optional following space). After
+// quote markers, optional ≤3 content-indent spaces are also consumed so a
+// nested fence can open. Bare fences keep only the initial indent.
+func skipMarkdownBlockquotePrefix(data []byte, i int) int {
+	j := i
+	spaces := 0
+	for j < len(data) && data[j] == ' ' && spaces < 3 {
+		j++
+		spaces++
+	}
+	sawQuote := false
+	for j < len(data) && data[j] == '>' {
+		sawQuote = true
+		j++
+		if j < len(data) && data[j] == ' ' {
+			j++
+		}
+	}
+	if sawQuote {
+		sp := 0
+		for j < len(data) && data[j] == ' ' && sp < 3 {
+			j++
+			sp++
+		}
+	}
+	return j
 }
 
 func scanInlineCodeSpan(data []byte, i int) int {

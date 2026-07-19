@@ -750,7 +750,8 @@ func TestSourceThenConceptReconcileRejectsDuplicateJSONKeysWithoutSanitizing(t *
 		t.Fatalf("error=%v, want duplicate-key rejection", err)
 	}
 
-	// Critical: Source must not sanitize duplicate keys into an acceptable cache row.
+	// Critical: Source must not sanitize duplicate keys into an acceptable cache row,
+	// and must not partially apply earlier planned outputs (including id_map).
 	cache, _ := os.ReadFile(filepath.Join(workspace, "cache", "concepts.jsonl"))
 	if !bytes.Equal(cache, malformedCache) {
 		t.Fatalf("concepts cache was sanitized/mutated:\nbefore=%s\nafter=%s", malformedCache, cache)
@@ -758,16 +759,8 @@ func TestSourceThenConceptReconcileRejectsDuplicateJSONKeysWithoutSanitizing(t *
 	if strings.Contains(string(cache), `"s-stable"`) || !strings.Contains(string(cache), `"slug":"alpha","slug":"evil"`) {
 		t.Fatalf("cache must keep raw duplicate keys and not accept Source translation: %s", cache)
 	}
-	// Concept pages / other pages must not be rewritten into a publishable accepted state either.
-	for _, rel := range []string{"wiki/alpha.md", "wiki/sources/source.md", "wiki/index.md"} {
-		got, err := os.ReadFile(filepath.Join(workspace, filepath.FromSlash(rel)))
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !bytes.Equal(got, before[rel]) {
-			t.Fatalf("%s mutated after fail-closed Source+Concept path", rel)
-		}
-	}
+	// Full plan/apply: id_map, concepts cache, concept pages, Source pages — all byte-identical.
+	assertVaultBytesUnchanged(t, workspace, before)
 }
 
 func TestDefaultInPlaceReconcileLateCacheFailureDoesNotPartiallyMutate(t *testing.T) {
@@ -1093,6 +1086,65 @@ func TestWikilinksInsideMarkdownCodeArePreservedByteForByte(t *testing.T) {
 	}
 	if strings.Count(got, "[[concepts/stable-a-alpha|Alpha]]") != 2 {
 		t.Fatalf("unexpected rewritten wikilink count in:\n%s", got)
+	}
+}
+
+func TestWikilinksInsideBlockquotedFencedCodeArePreservedByteForByte(t *testing.T) {
+	// Blockquoted fences (CommonMark: optional ≤3 spaces, `>` + optional space)
+	// must preserve interior wikilinks; genuine outside links still rewrite.
+	concepts := []reconciledConcept{{CurrentID: "transient-a", StableID: "stable-a", Slug: "alpha"}}
+	translations := map[string]string{"transient-a": "stable-a"}
+	input := strings.Join([]string{
+		"Before [[concepts/transient-a-alpha|Alpha]] outside.",
+		"> ~~~md",
+		"> [[concepts/transient-a-alpha|A]]",
+		"> ~~~",
+		"> ```",
+		"> [[concepts/transient-a-alpha|B]]",
+		"> ```",
+		"  > ~~~",
+		"  > [[concepts/transient-a|C]]",
+		"  > ~~~",
+		">> ```go",
+		">> [[concepts/transient-a-alpha|Nested]]",
+		">> ```",
+		// Ordinary blockquoted prose is NOT a fence — wikilink must still rewrite.
+		"> Quote with [[concepts/transient-a-alpha|Quoted]] prose.",
+		"After [[concepts/transient-a-alpha|Alpha]] again.",
+	}, "\n")
+	got := string(rewriteConceptIDBearingWikilinks([]byte(input), concepts, translations))
+
+	// Outside / non-fence blockquote prose rewritten.
+	if !strings.Contains(got, "Before [[concepts/stable-a-alpha|Alpha]] outside.") {
+		t.Fatalf("leading outside wikilink not rewritten:\n%s", got)
+	}
+	if !strings.Contains(got, "After [[concepts/stable-a-alpha|Alpha]] again.") {
+		t.Fatalf("trailing outside wikilink not rewritten:\n%s", got)
+	}
+	if !strings.Contains(got, "> Quote with [[concepts/stable-a-alpha|Quoted]] prose.") {
+		t.Fatalf("ordinary blockquoted prose wikilink not rewritten:\n%s", got)
+	}
+
+	// Interior of blockquoted fences preserved byte-for-byte (including prefixes).
+	for _, part := range []string{
+		"> ~~~md\n> [[concepts/transient-a-alpha|A]]\n> ~~~",
+		"> ```\n> [[concepts/transient-a-alpha|B]]\n> ```",
+		"  > ~~~\n  > [[concepts/transient-a|C]]\n  > ~~~",
+		">> ```go\n>> [[concepts/transient-a-alpha|Nested]]\n>> ```",
+	} {
+		if !strings.Contains(got, part) {
+			t.Fatalf("blockquoted fence region mutated, missing %q in:\n%s", part, got)
+		}
+	}
+	// Four preserved interior transients + zero extra rewrites into fences.
+	if strings.Count(got, "[[concepts/transient-a-alpha|A]]") != 1 ||
+		strings.Count(got, "[[concepts/transient-a-alpha|B]]") != 1 ||
+		strings.Count(got, "[[concepts/transient-a|C]]") != 1 ||
+		strings.Count(got, "[[concepts/transient-a-alpha|Nested]]") != 1 {
+		t.Fatalf("unexpected interior fence wikilink counts:\n%s", got)
+	}
+	if strings.Count(got, "[[concepts/stable-a-alpha|") != 3 { // Before, Quoted prose, After
+		t.Fatalf("unexpected rewritten outside wikilink count in:\n%s", got)
 	}
 }
 

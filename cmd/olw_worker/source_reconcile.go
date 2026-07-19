@@ -159,8 +159,9 @@ func equalStrings(a, b []string) bool {
 }
 
 func reconcileWorkspaceSources(workspace string, prior []sourceSnapshot) error {
-	mapPath := filepath.Join(workspace, "cache", "id_map.json")
-	data, err := os.ReadFile(mapPath)
+	// Plan/validate every output first, then apply. Input validation errors
+	// must leave the live vault byte-identical (zero writes).
+	data, err := readBoundedRegularFileWithin(workspace, "cache/id_map.json")
 	if err != nil {
 		return fmt.Errorf("read generated source map: %w", err)
 	}
@@ -168,56 +169,74 @@ func reconcileWorkspaceSources(workspace string, prior []sourceSnapshot) error {
 	if err != nil {
 		return err
 	}
-	if err := writeFileAtomicWithin(workspace, "cache/id_map.json", reconciledMap); err != nil {
-		return fmt.Errorf("write reconciled source map: %w", err)
-	}
 	translations := make(map[string]string, len(sources))
 	for _, source := range sources {
 		if source.CurrentID != source.StableID {
 			translations[source.CurrentID] = source.StableID
 		}
 	}
-	if err := rewriteConceptSourceReferences(workspace, translations); err != nil {
+
+	writes := make([]plannedWrite, 0, len(sources)+3)
+	writes = append(writes, plannedWrite{rel: "cache/id_map.json", data: reconciledMap})
+
+	cacheData, cachePresent, err := planConceptSourceReferences(workspace, translations)
+	if err != nil {
 		return err
 	}
-	if err := rewriteConceptPageSourceReferences(workspace, translations); err != nil {
+	if cachePresent {
+		writes = append(writes, plannedWrite{rel: "cache/concepts.jsonl", data: cacheData})
+	}
+
+	pageWrites, err := planConceptPageSourceReferences(workspace, translations)
+	if err != nil {
 		return err
 	}
-	for _, source := range sources {
-		path := filepath.Join(workspace, "wiki", "sources", source.Slug+".md")
-		page, err := os.ReadFile(path)
-		if err != nil {
-			return fmt.Errorf("read generated source %q: %w", source.RawPath, err)
-		}
-		page, err = rewriteSourcePageID(page, source.StableID, source.RawPath)
-		if err != nil {
-			return fmt.Errorf("reconcile generated source %q: %w", source.RawPath, err)
-		}
-		if err := writeFileAtomicWithin(workspace, filepath.ToSlash(filepath.Join("wiki", "sources", source.Slug+".md")), page); err != nil {
+	writes = append(writes, pageWrites...)
+
+	sourceWrites, err := planSourcePageIDAndAnnotations(workspace, sources, prior)
+	if err != nil {
+		return err
+	}
+	writes = append(writes, sourceWrites...)
+
+	// Deterministic apply only after all validation succeeds.
+	for _, w := range writes {
+		if err := writeFileAtomicWithin(workspace, w.rel, w.data); err != nil {
 			return err
 		}
 	}
-	return applyStableSourceAnnotations(workspace, sources, prior)
+	return nil
 }
 
 func rewriteConceptSourceReferences(workspace string, translations map[string]string) error {
-	if len(translations) == 0 {
-		return nil
-	}
-	path := filepath.Join(workspace, "cache", "concepts.jsonl")
-	info, err := os.Stat(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
+	data, present, err := planConceptSourceReferences(workspace, translations)
 	if err != nil {
 		return err
+	}
+	if !present {
+		return nil
+	}
+	return writeFileAtomicWithin(workspace, "cache/concepts.jsonl", data)
+}
+
+func planConceptSourceReferences(workspace string, translations map[string]string) ([]byte, bool, error) {
+	if len(translations) == 0 {
+		return nil, false, nil
+	}
+	const rel = "cache/concepts.jsonl"
+	info, err := lstatRegularWithin(workspace, rel)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
 	}
 	if info.Size() < 0 || info.Size() > generation.MaxFileBytes {
-		return errors.New("concepts cache size exceeds generation limit")
+		return nil, false, errors.New("concepts cache size exceeds generation limit")
 	}
-	file, err := os.Open(path)
+	file, err := openRegularFileWithin(workspace, rel)
 	if err != nil {
-		return err
+		return nil, false, err
 	}
 	defer file.Close()
 	scanner := bufio.NewScanner(io.LimitReader(file, generation.MaxFileBytes+1))
@@ -231,14 +250,14 @@ func rewriteConceptSourceReferences(workspace string, translations map[string]st
 			continue
 		}
 		if rows >= generation.MaxFiles {
-			return generation.ErrLogicalEntryLimit
+			return nil, false, generation.ErrLogicalEntryLimit
 		}
 		rows++
 		// Fail closed on duplicate keys / trailing data before Source rewrite can
 		// sanitize the row into a form Concept reconciliation would accept.
 		entry, err := decodeStrictConceptCacheRow(line)
 		if err != nil {
-			return fmt.Errorf("decode concepts cache: %w", err)
+			return nil, false, fmt.Errorf("decode concepts cache: %w", err)
 		}
 		rewriteSourceReferenceField(entry, "sources", translations)
 		if frontmatter, ok := entry["frontmatter"].(map[string]any); ok {
@@ -247,18 +266,18 @@ func rewriteConceptSourceReferences(workspace string, translations map[string]st
 		}
 		updated, err := json.Marshal(entry)
 		if err != nil {
-			return err
+			return nil, false, err
 		}
 		if output.Len() > generation.MaxFileBytes-len(updated)-1 {
-			return errors.New("concepts cache size exceeds generation limit")
+			return nil, false, errors.New("concepts cache size exceeds generation limit")
 		}
 		output.Write(updated)
 		output.WriteByte('\n')
 	}
 	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("scan concepts cache: %w", err)
+		return nil, false, fmt.Errorf("scan concepts cache: %w", err)
 	}
-	return writeFileAtomicWithin(workspace, "cache/concepts.jsonl", output.Bytes())
+	return output.Bytes(), true, nil
 }
 
 func rewriteSourceReferenceField(fields map[string]any, key string, translations map[string]string) bool {
@@ -287,13 +306,30 @@ func rewriteSourceReferenceField(fields map[string]any, key string, translations
 }
 
 func rewriteConceptPageSourceReferences(workspace string, translations map[string]string) error {
-	root := filepath.Join(workspace, "wiki")
-	if _, err := os.Stat(root); errors.Is(err, os.ErrNotExist) {
-		return nil
-	} else if err != nil {
+	writes, err := planConceptPageSourceReferences(workspace, translations)
+	if err != nil {
 		return err
 	}
-	return filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+	for _, w := range writes {
+		if err := writeFileAtomicWithin(workspace, w.rel, w.data); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func planConceptPageSourceReferences(workspace string, translations map[string]string) ([]plannedWrite, error) {
+	if len(translations) == 0 {
+		return nil, nil
+	}
+	root := filepath.Join(workspace, "wiki")
+	if _, err := os.Lstat(root); errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	} else if err != nil {
+		return nil, err
+	}
+	var writes []plannedWrite
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -303,10 +339,31 @@ func rewriteConceptPageSourceReferences(workspace string, translations map[strin
 			}
 			return nil
 		}
+		if entry.Type()&os.ModeSymlink != 0 {
+			return fmt.Errorf("symlink %q is not allowed", path)
+		}
 		if !strings.HasSuffix(entry.Name(), ".md") {
 			return nil
 		}
-		data, err := os.ReadFile(path)
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+			return fmt.Errorf("%q is not a regular file", path)
+		}
+		if info.Size() < 0 || info.Size() > generation.MaxFileBytes {
+			return fmt.Errorf("%q exceeds generation size limit", path)
+		}
+		rel, err := filepath.Rel(workspace, path)
+		if err != nil {
+			return err
+		}
+		relSlash := filepath.ToSlash(rel)
+		if err := safeRelativePath(relSlash); err != nil {
+			return err
+		}
+		data, err := readBoundedRegularFileWithin(workspace, relSlash)
 		if err != nil {
 			return err
 		}
@@ -315,10 +372,14 @@ func rewriteConceptPageSourceReferences(workspace string, translations map[strin
 			return fmt.Errorf("rewrite concept page %q: %w", path, err)
 		}
 		if changed {
-			return writeFileAtomicWithin(workspace, filepath.ToSlash(filepath.Join("wiki", strings.TrimPrefix(filepath.ToSlash(path), filepath.ToSlash(root)+"/"))), updated)
+			writes = append(writes, plannedWrite{rel: relSlash, data: updated})
 		}
 		return nil
 	})
+	if err != nil {
+		return nil, err
+	}
+	return writes, nil
 }
 
 func rewriteMarkdownFrontmatterSourceReferences(data []byte, translations map[string]string) ([]byte, bool, error) {
@@ -444,7 +505,49 @@ func rewriteTopLevelIDLine(line []byte, id string) []byte {
 	return []byte(content[:colon+1] + rest[:leading] + id + suffix + eol)
 }
 
+func planSourcePageIDAndAnnotations(workspace string, sources []reconciledSource, prior []sourceSnapshot) ([]plannedWrite, error) {
+	byRaw := make(map[string]sourceSnapshot, len(prior))
+	for _, snapshot := range prior {
+		byRaw[snapshot.RawPath] = snapshot
+	}
+	writes := make([]plannedWrite, 0, len(sources))
+	for _, source := range sources {
+		rel := filepath.ToSlash(filepath.Join("wiki", "sources", source.Slug+".md"))
+		page, err := readBoundedRegularFileWithin(workspace, rel)
+		if err != nil {
+			return nil, fmt.Errorf("read generated source %q: %w", source.RawPath, err)
+		}
+		page, err = rewriteSourcePageID(page, source.StableID, source.RawPath)
+		if err != nil {
+			return nil, fmt.Errorf("reconcile generated source %q: %w", source.RawPath, err)
+		}
+		// Combine Source page ID + annotation strip/append into one planned write.
+		if snapshot, ok := byRaw[source.RawPath]; ok {
+			page, err = planSourceAnnotationTransform(page, source.StableID, snapshot)
+			if err != nil {
+				return nil, err
+			}
+		}
+		writes = append(writes, plannedWrite{rel: rel, data: page})
+	}
+	return writes, nil
+}
+
+func planSourceAnnotationTransform(page []byte, stableID string, snapshot sourceSnapshot) ([]byte, error) {
+	page, err := stripSystemAnnotationTrailer(page, stableID)
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(snapshot.AnnotationBody) != "" {
+		trailer := "\n\n---\n\n## Human annotations (system)\n<!-- lwc-ann-v1 source_id=" + stableID + " ann_sha256=" + snapshot.AnnotationSHA + " -->\n" + annotation.Normalize(snapshot.AnnotationBody) + "\n"
+		page = append(page, []byte(trailer)...)
+	}
+	return page, nil
+}
+
 func applyStableSourceAnnotations(workspace string, sources []reconciledSource, prior []sourceSnapshot) error {
+	// Wrapper retained for existing unit tests. Production path plans ID +
+	// annotation transforms together via planSourcePageIDAndAnnotations.
 	byRaw := make(map[string]sourceSnapshot, len(prior))
 	for _, snapshot := range prior {
 		byRaw[snapshot.RawPath] = snapshot
@@ -454,20 +557,16 @@ func applyStableSourceAnnotations(workspace string, sources []reconciledSource, 
 		if !ok {
 			continue
 		}
-		path := filepath.Join(workspace, "wiki", "sources", source.Slug+".md")
-		page, err := os.ReadFile(path)
+		rel := filepath.ToSlash(filepath.Join("wiki", "sources", source.Slug+".md"))
+		page, err := readBoundedRegularFileWithin(workspace, rel)
 		if err != nil {
 			return err
 		}
-		page, err = stripSystemAnnotationTrailer(page, source.StableID)
+		page, err = planSourceAnnotationTransform(page, source.StableID, snapshot)
 		if err != nil {
 			return err
 		}
-		if strings.TrimSpace(snapshot.AnnotationBody) != "" {
-			trailer := "\n\n---\n\n## Human annotations (system)\n<!-- lwc-ann-v1 source_id=" + source.StableID + " ann_sha256=" + snapshot.AnnotationSHA + " -->\n" + annotation.Normalize(snapshot.AnnotationBody) + "\n"
-			page = append(page, []byte(trailer)...)
-		}
-		if err := writeFileAtomicWithin(workspace, filepath.ToSlash(filepath.Join("wiki", "sources", source.Slug+".md")), page); err != nil {
+		if err := writeFileAtomicWithin(workspace, rel, page); err != nil {
 			return err
 		}
 	}
