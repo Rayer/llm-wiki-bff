@@ -539,9 +539,8 @@ func scanFencedCodeBlock(data []byte, i int) (int, bool) {
 }
 
 // skipMarkdownBlockquotePrefix advances past optional ≤3 leading spaces and
-// zero-or-more blockquote markers (`>` with optional following space). After
-// quote markers, optional ≤3 content-indent spaces are also consumed so a
-// nested fence can open. Bare fences keep only the initial indent.
+// zero-or-more blockquote markers. Each nested `>` may have its own 0–3
+// spaces of indentation before the next marker or fenced-code content.
 func skipMarkdownBlockquotePrefix(data []byte, i int) int {
 	j := i
 	spaces := 0
@@ -549,19 +548,12 @@ func skipMarkdownBlockquotePrefix(data []byte, i int) int {
 		j++
 		spaces++
 	}
-	sawQuote := false
 	for j < len(data) && data[j] == '>' {
-		sawQuote = true
 		j++
-		if j < len(data) && data[j] == ' ' {
+		spaces = 0
+		for j < len(data) && data[j] == ' ' && spaces < 3 {
 			j++
-		}
-	}
-	if sawQuote {
-		sp := 0
-		for j < len(data) && data[j] == ' ' && sp < 3 {
-			j++
-			sp++
+			spaces++
 		}
 	}
 	return j

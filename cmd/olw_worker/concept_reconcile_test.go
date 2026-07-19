@@ -1108,6 +1108,9 @@ func TestWikilinksInsideBlockquotedFencedCodeArePreservedByteForByte(t *testing.
 		">> ```go",
 		">> [[concepts/transient-a-alpha|Nested]]",
 		">> ```",
+		">   > ~~~md",
+		">   > [[concepts/transient-a-alpha|IndentedNested]]",
+		">   > ~~~",
 		// Ordinary blockquoted prose is NOT a fence — wikilink must still rewrite.
 		"> Quote with [[concepts/transient-a-alpha|Quoted]] prose.",
 		"After [[concepts/transient-a-alpha|Alpha]] again.",
@@ -1131,6 +1134,7 @@ func TestWikilinksInsideBlockquotedFencedCodeArePreservedByteForByte(t *testing.
 		"> ```\n> [[concepts/transient-a-alpha|B]]\n> ```",
 		"  > ~~~\n  > [[concepts/transient-a|C]]\n  > ~~~",
 		">> ```go\n>> [[concepts/transient-a-alpha|Nested]]\n>> ```",
+		">   > ~~~md\n>   > [[concepts/transient-a-alpha|IndentedNested]]\n>   > ~~~",
 	} {
 		if !strings.Contains(got, part) {
 			t.Fatalf("blockquoted fence region mutated, missing %q in:\n%s", part, got)
@@ -1140,7 +1144,8 @@ func TestWikilinksInsideBlockquotedFencedCodeArePreservedByteForByte(t *testing.
 	if strings.Count(got, "[[concepts/transient-a-alpha|A]]") != 1 ||
 		strings.Count(got, "[[concepts/transient-a-alpha|B]]") != 1 ||
 		strings.Count(got, "[[concepts/transient-a|C]]") != 1 ||
-		strings.Count(got, "[[concepts/transient-a-alpha|Nested]]") != 1 {
+		strings.Count(got, "[[concepts/transient-a-alpha|Nested]]") != 1 ||
+		strings.Count(got, "[[concepts/transient-a-alpha|IndentedNested]]") != 1 {
 		t.Fatalf("unexpected interior fence wikilink counts:\n%s", got)
 	}
 	if strings.Count(got, "[[concepts/stable-a-alpha|") != 3 { // Before, Quoted prose, After
