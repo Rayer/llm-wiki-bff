@@ -194,7 +194,20 @@ func runWorkerBatch(ctx context.Context, cfg workerConfig, rawCommands string) e
 	if cfg.Workspace {
 		return runWorkerBatchWorkspace(ctx, cfg, commands, vault)
 	}
-	return runWorkerBatchAtVault(ctx, cfg, commands, vault)
+	// Default in-place path (Workspace=false): snapshot prior Concept IDs
+	// before generation and reconcile after postprocess, matching the
+	// workspace/cloud contract without inventing receipt semantics.
+	priorConcepts, err := snapshotConcepts(vault)
+	if err != nil {
+		return err
+	}
+	if err := runWorkerBatchAtVault(ctx, cfg, commands, vault); err != nil {
+		return err
+	}
+	if !cfg.Postprocess {
+		return nil
+	}
+	return reconcileWorkspaceConcepts(vault, priorConcepts)
 }
 
 func configFromEnvironment(cfg workerConfig) workerConfig {

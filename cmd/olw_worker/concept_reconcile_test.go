@@ -1,12 +1,15 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/rayer/llm-wiki-bff/internal/generation"
 	"github.com/rayer/llm-wiki-bff/internal/wikiindex"
 )
 
@@ -232,7 +235,7 @@ func TestReconcileWorkspaceConceptsRewritesIdentityAndReferences(t *testing.T) {
 	))
 	mustWriteFile(t, filepath.Join(workspace, "wiki", "alpha.md"), []byte("---\nid: transient-a\ntitle: Alpha New Title\nsources:\n  - s1\n---\nrewritten body [[concepts/transient-a-alpha|Alpha]]\nprose transient-a stays\n"))
 	mustWriteFile(t, filepath.Join(workspace, "wiki", "gamma.md"), []byte("---\nid: brand-new\ntitle: Gamma\n---\ngamma body\n"))
-	mustWriteFile(t, filepath.Join(workspace, "wiki", "sources", "source.md"), []byte("---\nid: s1\nsource_file: raw/a.md\n---\nsource body\n"))
+	mustWriteFile(t, filepath.Join(workspace, "wiki", "sources", "source.md"), []byte("---\nid: s1\nsource_file: raw/a.md\n---\nsource body mentions [[concepts/transient-a-alpha|Alpha]] and keeps prose transient-a\n"))
 
 	prior := []conceptSnapshot{{ConceptID: "stable-a", Slug: "alpha"}}
 	if err := reconcileWorkspaceConcepts(workspace, prior); err != nil {
@@ -292,6 +295,12 @@ func TestReconcileWorkspaceConceptsRewritesIdentityAndReferences(t *testing.T) {
 	sourcePage, _ := os.ReadFile(filepath.Join(workspace, "wiki", "sources", "source.md"))
 	if !strings.Contains(string(sourcePage), "id: s1\n") {
 		t.Fatalf("source page must remain: %s", sourcePage)
+	}
+	if !strings.Contains(string(sourcePage), "[[concepts/stable-a-alpha|Alpha]]") {
+		t.Fatalf("source page concept wikilink must be rewritten: %s", sourcePage)
+	}
+	if !strings.Contains(string(sourcePage), "prose transient-a") || strings.Contains(string(sourcePage), "id: stable-a") {
+		t.Fatalf("source IDs/frontmatter and non-wikilink prose must stay: %s", sourcePage)
 	}
 }
 
@@ -379,5 +388,323 @@ func TestSourceAndConceptReconciliationCompose(t *testing.T) {
 	sourcePage, _ := os.ReadFile(filepath.Join(workspace, "wiki", "sources", "source.md"))
 	if !strings.Contains(string(sourcePage), "id: s-stable\n") {
 		t.Fatalf("source page=%s", sourcePage)
+	}
+}
+
+func TestDefaultInPlacePathReconcilesConceptIDs(t *testing.T) {
+	// Issue 1: Workspace=false must snapshot/reconcile Concept IDs end-to-end.
+	old := execOLW
+	defer func() { execOLW = old }()
+
+	vault := t.TempDir()
+	mustWriteFile(t, filepath.Join(vault, "cache", "id_map.json"), []byte(`{"concept":{"stable-a":"alpha"},"source":{},"source_meta":{},"redirects":{}}`))
+	mustWriteFile(t, filepath.Join(vault, "wiki", "alpha.md"), []byte("---\nid: stable-a\ntitle: Alpha\n---\nprior body\n"))
+
+	execOLW = func(_ context.Context, work string, _ []string, _ []string, _, _ io.Writer) error {
+		// OLW regenerates the same slug under a transient concept ID.
+		mustWriteFile(t, filepath.Join(work, "wiki", "alpha.md"), []byte("---\nid: transient-a\ntitle: Alpha Regenerated\n---\nregenerated [[concepts/transient-a-alpha|Alpha]]\n"))
+		return nil
+	}
+
+	cfg := workerConfig{VaultPath: vault, APIKey: "secret", Workspace: false, Postprocess: true, StopOnError: true}
+	if err := runWorkerBatch(context.Background(), cfg, `[["run","--auto-approve"]]`); err != nil {
+		t.Fatalf("default in-place run failed: %v", err)
+	}
+
+	mapData, err := os.ReadFile(filepath.Join(vault, "cache", "id_map.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ids wikiindex.IDMap
+	if err := json.Unmarshal(mapData, &ids); err != nil {
+		t.Fatal(err)
+	}
+	if ids.Concept["stable-a"] != "alpha" {
+		t.Fatalf("stable concept missing from id_map: %#v (%s)", ids.Concept, mapData)
+	}
+	if _, exists := ids.Concept["transient-a"]; exists {
+		t.Fatalf("transient concept retained in id_map: %#v", ids.Concept)
+	}
+	page, err := os.ReadFile(filepath.Join(vault, "wiki", "alpha.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(page), "id: stable-a\n") || strings.Contains(string(page), "id: transient-a") {
+		t.Fatalf("page identity not stabilized on default path: %s", page)
+	}
+}
+
+func TestRewriteOtherConceptPageWikilinksIncludesSources(t *testing.T) {
+	// Issue 2: Source pages with canonical concept wikilinks must be rewritten.
+	workspace := t.TempDir()
+	mustWriteFile(t, filepath.Join(workspace, "wiki", "sources", "note.md"), []byte("---\nid: s1\nsource_file: raw/a.md\n---\nSee [[concepts/transient-a-alpha|Alpha]] and [[concepts/transient-a-alpha#sec|Sec]].\n"))
+	concepts := []reconciledConcept{{CurrentID: "transient-a", StableID: "stable-a", Slug: "alpha"}}
+	translations := map[string]string{"transient-a": "stable-a"}
+	if err := rewriteOtherConceptPageWikilinks(workspace, concepts, translations); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(filepath.Join(workspace, "wiki", "sources", "note.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(got), "id: s1\n") || !strings.Contains(string(got), "source_file: raw/a.md") {
+		t.Fatalf("source frontmatter mutated: %s", got)
+	}
+	if !strings.Contains(string(got), "[[concepts/stable-a-alpha|Alpha]]") || !strings.Contains(string(got), "[[concepts/stable-a-alpha#sec|Sec]]") {
+		t.Fatalf("source concept wikilinks not rewritten: %s", got)
+	}
+	if strings.Contains(string(got), "transient-a") {
+		t.Fatalf("transient concept id remains in source page: %s", got)
+	}
+}
+
+func TestReconcileWorkspaceConceptsRejectsSymlinksAndOversized(t *testing.T) {
+	// Issue 3: fail before symlink dereference / unbounded allocation.
+	t.Run("concept page symlink", func(t *testing.T) {
+		workspace := t.TempDir()
+		outside := filepath.Join(t.TempDir(), "secret.txt")
+		mustWriteFile(t, outside, []byte("outside-secret"))
+		mustWriteFile(t, filepath.Join(workspace, "cache", "id_map.json"), []byte(`{"concept":{"transient-a":"alpha"}}`))
+		if err := os.MkdirAll(filepath.Join(workspace, "wiki"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(outside, filepath.Join(workspace, "wiki", "alpha.md")); err != nil {
+			t.Fatal(err)
+		}
+		err := reconcileWorkspaceConcepts(workspace, []conceptSnapshot{{ConceptID: "stable-a", Slug: "alpha"}})
+		if err == nil || !strings.Contains(err.Error(), "not a regular file") {
+			t.Fatalf("error=%v, want regular-file rejection before dereference", err)
+		}
+		// Outside content must never be copied into the vault as a regular file.
+		if info, statErr := os.Lstat(filepath.Join(workspace, "wiki", "alpha.md")); statErr != nil || info.Mode()&os.ModeSymlink == 0 {
+			t.Fatalf("concept path should remain a rejected symlink, info=%v err=%v", info, statErr)
+		}
+	})
+
+	t.Run("other page symlink", func(t *testing.T) {
+		workspace := t.TempDir()
+		outside := filepath.Join(t.TempDir(), "secret.txt")
+		mustWriteFile(t, outside, []byte("outside-secret"))
+		mustWriteFile(t, filepath.Join(workspace, "cache", "id_map.json"), []byte(`{"concept":{"transient-a":"alpha"}}`))
+		mustWriteFile(t, filepath.Join(workspace, "wiki", "alpha.md"), []byte("---\nid: transient-a\n---\nbody\n"))
+		if err := os.MkdirAll(filepath.Join(workspace, "wiki", "sources"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(outside, filepath.Join(workspace, "wiki", "sources", "note.md")); err != nil {
+			t.Fatal(err)
+		}
+		err := reconcileWorkspaceConcepts(workspace, []conceptSnapshot{{ConceptID: "stable-a", Slug: "alpha"}})
+		if err == nil || !(strings.Contains(err.Error(), "symlink") || strings.Contains(err.Error(), "not a regular file")) {
+			t.Fatalf("error=%v, want symlink rejection for other pages", err)
+		}
+	})
+
+	t.Run("id_map symlink", func(t *testing.T) {
+		workspace := t.TempDir()
+		outside := filepath.Join(t.TempDir(), "id_map.json")
+		mustWriteFile(t, outside, []byte(`{"concept":{"transient-a":"alpha"}}`))
+		if err := os.MkdirAll(filepath.Join(workspace, "cache"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(outside, filepath.Join(workspace, "cache", "id_map.json")); err != nil {
+			t.Fatal(err)
+		}
+		err := reconcileWorkspaceConcepts(workspace, nil)
+		if err == nil || !strings.Contains(err.Error(), "not a regular file") {
+			t.Fatalf("error=%v, want id_map symlink rejection", err)
+		}
+	})
+
+	t.Run("concepts cache symlink", func(t *testing.T) {
+		workspace := t.TempDir()
+		outside := filepath.Join(t.TempDir(), "concepts.jsonl")
+		mustWriteFile(t, outside, []byte(`{"slug":"alpha","frontmatter":{"id":"transient-a"}}`+"\n"))
+		mustWriteFile(t, filepath.Join(workspace, "cache", "id_map.json"), []byte(`{"concept":{"transient-a":"alpha"}}`))
+		mustWriteFile(t, filepath.Join(workspace, "wiki", "alpha.md"), []byte("---\nid: transient-a\n---\nbody\n"))
+		if err := os.Symlink(outside, filepath.Join(workspace, "cache", "concepts.jsonl")); err != nil {
+			t.Fatal(err)
+		}
+		err := reconcileWorkspaceConcepts(workspace, []conceptSnapshot{{ConceptID: "stable-a", Slug: "alpha"}})
+		if err == nil || !strings.Contains(err.Error(), "not a regular file") {
+			t.Fatalf("error=%v, want concepts cache symlink rejection", err)
+		}
+	})
+
+	t.Run("oversized concept page", func(t *testing.T) {
+		workspace := t.TempDir()
+		mustWriteFile(t, filepath.Join(workspace, "cache", "id_map.json"), []byte(`{"concept":{"transient-a":"alpha"}}`))
+		// Frontmatter keeps a consistent id; payload exceeds generation.MaxFileBytes.
+		header := []byte("---\nid: transient-a\n---\n")
+		body := bytesRepeat(byte('x'), generation.MaxFileBytes)
+		mustWriteFile(t, filepath.Join(workspace, "wiki", "alpha.md"), append(header, body...))
+		err := reconcileWorkspaceConcepts(workspace, []conceptSnapshot{{ConceptID: "stable-a", Slug: "alpha"}})
+		if err == nil || !strings.Contains(err.Error(), "size limit") {
+			t.Fatalf("error=%v, want oversized page rejection", err)
+		}
+	})
+
+	t.Run("oversized concepts cache", func(t *testing.T) {
+		workspace := t.TempDir()
+		mustWriteFile(t, filepath.Join(workspace, "cache", "id_map.json"), []byte(`{"concept":{"transient-a":"alpha"}}`))
+		mustWriteFile(t, filepath.Join(workspace, "wiki", "alpha.md"), []byte("---\nid: transient-a\n---\nbody\n"))
+		mustWriteFile(t, filepath.Join(workspace, "cache", "concepts.jsonl"), bytesRepeat(byte('y'), generation.MaxFileBytes+1))
+		err := reconcileWorkspaceConcepts(workspace, []conceptSnapshot{{ConceptID: "stable-a", Slug: "alpha"}})
+		if err == nil || !strings.Contains(err.Error(), "size") {
+			t.Fatalf("error=%v, want oversized cache rejection", err)
+		}
+	})
+}
+
+func bytesRepeat(b byte, n int) []byte {
+	out := make([]byte, n)
+	for i := range out {
+		out[i] = b
+	}
+	return out
+}
+
+func TestRewriteConceptIDBearingWikilinksIsExactRouteOnly(t *testing.T) {
+	// Issue 4: prefix IDs and non-wikilink text must not be corrupted.
+	concepts := []reconciledConcept{
+		{CurrentID: "short", StableID: "stable-short", Slug: "alpha"},
+		{CurrentID: "short-other", StableID: "stable-other", Slug: "beta"},
+	}
+	translations := map[string]string{"short": "stable-short", "short-other": "stable-other"}
+	input := strings.Join([]string{
+		"[[concepts/short-alpha|Alpha]]",
+		"[[concepts/short-other-beta|Other]]",
+		"[[concepts/short-alpha#sec|Sec]]",
+		"[[concepts/short|Bare]]",
+		"[[concepts/unrelated-route|Keep]]",
+		"http://example.test/concepts/short-alpha",
+		"`concepts/short-alpha`",
+		"prose concepts/short-alpha stays",
+	}, "\n")
+	got := string(rewriteConceptIDBearingWikilinks([]byte(input), concepts, translations))
+	wantParts := []string{
+		"[[concepts/stable-short-alpha|Alpha]]",
+		"[[concepts/stable-other-beta|Other]]",
+		"[[concepts/stable-short-alpha#sec|Sec]]",
+		"[[concepts/stable-short|Bare]]",
+		"[[concepts/unrelated-route|Keep]]",
+		"http://example.test/concepts/short-alpha",
+		"`concepts/short-alpha`",
+		"prose concepts/short-alpha stays",
+	}
+	for _, part := range wantParts {
+		if !strings.Contains(got, part) {
+			t.Fatalf("missing preserved/rewritten part %q in:\n%s", part, got)
+		}
+	}
+	// Prefix corruption would rewrite short-other using the short mapping.
+	if strings.Contains(got, "concepts/stable-short-other") {
+		t.Fatalf("prefix ID corruption detected: %s", got)
+	}
+	if strings.Count(got, "stable-other-beta") != 1 {
+		t.Fatalf("short-other route not uniquely rewritten: %s", got)
+	}
+}
+
+func TestRewriteConceptCacheIDsFailClosedOnDuplicateAndIncomplete(t *testing.T) {
+	// Issue 5: duplicate/missing/extra cache rows vs id_map.
+	t.Run("duplicate slug rows", func(t *testing.T) {
+		workspace := t.TempDir()
+		mustWriteFile(t, filepath.Join(workspace, "cache", "id_map.json"), []byte(`{"concept":{"transient-a":"alpha"}}`))
+		mustWriteFile(t, filepath.Join(workspace, "wiki", "alpha.md"), []byte("---\nid: transient-a\n---\nbody\n"))
+		mustWriteFile(t, filepath.Join(workspace, "cache", "concepts.jsonl"), []byte(
+			`{"slug":"alpha","frontmatter":{"id":"transient-a"}}`+"\n"+
+				`{"slug":"alpha","frontmatter":{"id":"transient-a"}}`+"\n",
+		))
+		err := reconcileWorkspaceConcepts(workspace, []conceptSnapshot{{ConceptID: "stable-a", Slug: "alpha"}})
+		if err == nil || !strings.Contains(err.Error(), "duplicate") {
+			t.Fatalf("error=%v, want duplicate cache slug rejection", err)
+		}
+	})
+
+	t.Run("missing cache row", func(t *testing.T) {
+		workspace := t.TempDir()
+		mustWriteFile(t, filepath.Join(workspace, "cache", "id_map.json"), []byte(`{"concept":{"transient-a":"alpha","transient-b":"beta"}}`))
+		mustWriteFile(t, filepath.Join(workspace, "wiki", "alpha.md"), []byte("---\nid: transient-a\n---\nbody\n"))
+		mustWriteFile(t, filepath.Join(workspace, "wiki", "beta.md"), []byte("---\nid: transient-b\n---\nbody\n"))
+		mustWriteFile(t, filepath.Join(workspace, "cache", "concepts.jsonl"), []byte(
+			`{"slug":"alpha","frontmatter":{"id":"transient-a"}}`+"\n",
+		))
+		err := reconcileWorkspaceConcepts(workspace, nil)
+		if err == nil || !strings.Contains(err.Error(), "missing") {
+			t.Fatalf("error=%v, want missing cache row rejection", err)
+		}
+	})
+
+	t.Run("extra cache row", func(t *testing.T) {
+		workspace := t.TempDir()
+		mustWriteFile(t, filepath.Join(workspace, "cache", "id_map.json"), []byte(`{"concept":{"transient-a":"alpha"}}`))
+		mustWriteFile(t, filepath.Join(workspace, "wiki", "alpha.md"), []byte("---\nid: transient-a\n---\nbody\n"))
+		mustWriteFile(t, filepath.Join(workspace, "cache", "concepts.jsonl"), []byte(
+			`{"slug":"alpha","frontmatter":{"id":"transient-a"}}`+"\n"+
+				`{"slug":"ghost","frontmatter":{"id":"ghost-id"}}`+"\n",
+		))
+		err := reconcileWorkspaceConcepts(workspace, []conceptSnapshot{{ConceptID: "stable-a", Slug: "alpha"}})
+		if err == nil || !strings.Contains(err.Error(), "not declared") {
+			t.Fatalf("error=%v, want extra cache row rejection", err)
+		}
+	})
+}
+
+func TestRewriteConceptCacheIDsRejectsDuplicateJSONKeys(t *testing.T) {
+	// Issue 6: strict JSON — duplicate keys and trailing data fail closed.
+	t.Run("duplicate top-level slug key", func(t *testing.T) {
+		workspace := t.TempDir()
+		mustWriteFile(t, filepath.Join(workspace, "cache", "id_map.json"), []byte(`{"concept":{"transient-a":"alpha"}}`))
+		mustWriteFile(t, filepath.Join(workspace, "wiki", "alpha.md"), []byte("---\nid: transient-a\n---\nbody\n"))
+		mustWriteFile(t, filepath.Join(workspace, "cache", "concepts.jsonl"), []byte(
+			`{"slug":"alpha","slug":"beta","frontmatter":{"id":"transient-a"}}`+"\n",
+		))
+		err := reconcileWorkspaceConcepts(workspace, []conceptSnapshot{{ConceptID: "stable-a", Slug: "alpha"}})
+		if err == nil || !strings.Contains(err.Error(), "duplicate JSON object key") {
+			t.Fatalf("error=%v, want duplicate key rejection", err)
+		}
+	})
+
+	t.Run("duplicate nested frontmatter id key", func(t *testing.T) {
+		workspace := t.TempDir()
+		mustWriteFile(t, filepath.Join(workspace, "cache", "id_map.json"), []byte(`{"concept":{"transient-a":"alpha"}}`))
+		mustWriteFile(t, filepath.Join(workspace, "wiki", "alpha.md"), []byte("---\nid: transient-a\n---\nbody\n"))
+		mustWriteFile(t, filepath.Join(workspace, "cache", "concepts.jsonl"), []byte(
+			`{"slug":"alpha","frontmatter":{"id":"transient-a","id":"other"}}`+"\n",
+		))
+		err := reconcileWorkspaceConcepts(workspace, []conceptSnapshot{{ConceptID: "stable-a", Slug: "alpha"}})
+		if err == nil || !strings.Contains(err.Error(), "duplicate JSON object key") {
+			t.Fatalf("error=%v, want nested duplicate key rejection", err)
+		}
+	})
+
+	t.Run("trailing data", func(t *testing.T) {
+		workspace := t.TempDir()
+		mustWriteFile(t, filepath.Join(workspace, "cache", "id_map.json"), []byte(`{"concept":{"transient-a":"alpha"}}`))
+		mustWriteFile(t, filepath.Join(workspace, "wiki", "alpha.md"), []byte("---\nid: transient-a\n---\nbody\n"))
+		mustWriteFile(t, filepath.Join(workspace, "cache", "concepts.jsonl"), []byte(
+			`{"slug":"alpha","frontmatter":{"id":"transient-a"}} {"extra":true}`+"\n",
+		))
+		err := reconcileWorkspaceConcepts(workspace, []conceptSnapshot{{ConceptID: "stable-a", Slug: "alpha"}})
+		if err == nil || !(strings.Contains(err.Error(), "trailing") || strings.Contains(err.Error(), "decode")) {
+			t.Fatalf("error=%v, want trailing JSON rejection", err)
+		}
+	})
+}
+
+func TestDockerfilePinsExactOLWWheelHash(t *testing.T) {
+	// Issue 7: production install must pin the inspected 0.8.5 wheel digest.
+	data, err := os.ReadFile("Dockerfile")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	wantURL := "https://files.pythonhosted.org/packages/5c/5b/0d226bc92e3adeafeb8f0717a6968526bb5e7b4a09a313d888cacc422204/obsidian_llm_wiki-0.8.5-py3-none-any.whl"
+	wantHash := "sha256=a01375b9cc21107e3e1d33b0f3192ad18252406f47bee9ba6ecbd30e122eb337"
+	if !strings.Contains(text, wantURL) || !strings.Contains(text, wantHash) {
+		t.Fatalf("Dockerfile does not pin exact wheel URL+hash:\n%s", text)
+	}
+	if strings.Contains(text, `obsidian-llm-wiki==0.8.5"`) && !strings.Contains(text, wantURL) {
+		t.Fatal("Dockerfile still uses unpinned version-only install")
 	}
 }
