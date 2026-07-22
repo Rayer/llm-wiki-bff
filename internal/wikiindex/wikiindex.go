@@ -12,6 +12,7 @@ import (
 
 	"cloud.google.com/go/storage"
 	fm "github.com/adrg/frontmatter"
+	"github.com/rayer/llm-wiki-bff/internal/annotation"
 	conceptcache "github.com/rayer/llm-wiki-bff/internal/cache"
 	"github.com/rayer/llm-wiki-bff/internal/generation"
 )
@@ -37,10 +38,12 @@ type Store interface {
 }
 
 type IDMap struct {
-	Concept    map[string]string     `json:"concept"`
-	Source     map[string]string     `json:"source"`
-	SourceMeta map[string]SourceMeta `json:"source_meta,omitempty"`
-	Redirects  map[string][]string   `json:"redirects"`
+	Concept         map[string]string     `json:"concept"`
+	DormantConcept  map[string]string     `json:"dormant_concept,omitempty"`
+	ConceptEntityID map[string]string     `json:"concept_entity_id,omitempty"`
+	Source          map[string]string     `json:"source"`
+	SourceMeta      map[string]SourceMeta `json:"source_meta,omitempty"`
+	Redirects       map[string][]string   `json:"redirects"`
 }
 
 type SourceMeta struct {
@@ -102,7 +105,7 @@ func (m *SourceMeta) UnmarshalJSON(data []byte) error {
 // DecodeIDMap bounds every collection while it is being decoded. Generated
 // cache byte limits alone do not bound the number of map and slice entries.
 func DecodeIDMap(data []byte) (IDMap, error) {
-	result := IDMap{Concept: map[string]string{}, Source: map[string]string{}, SourceMeta: map[string]SourceMeta{}, Redirects: map[string][]string{}}
+	result := IDMap{Concept: map[string]string{}, DormantConcept: map[string]string{}, ConceptEntityID: map[string]string{}, Source: map[string]string{}, SourceMeta: map[string]SourceMeta{}, Redirects: map[string][]string{}}
 	dec := json.NewDecoder(bytes.NewReader(data))
 	token, err := dec.Token()
 	if err != nil {
@@ -128,6 +131,10 @@ func DecodeIDMap(data []byte) (IDMap, error) {
 		switch name {
 		case "concept":
 			result.Concept, err = generation.DecodeBoundedMap[string](dec)
+		case "dormant_concept":
+			result.DormantConcept, err = generation.DecodeBoundedMap[string](dec)
+		case "concept_entity_id":
+			result.ConceptEntityID, err = generation.DecodeBoundedMap[string](dec)
 		case "source":
 			result.Source, err = generation.DecodeBoundedMap[string](dec)
 		case "source_meta":
@@ -175,10 +182,12 @@ func Rebuild(ctx context.Context, store Store) (IDMap, error) {
 
 func BuildIDMap(ctx context.Context, store Store) (IDMap, error) {
 	next := IDMap{
-		Concept:    map[string]string{},
-		Source:     map[string]string{},
-		SourceMeta: map[string]SourceMeta{},
-		Redirects:  map[string][]string{},
+		Concept:         map[string]string{},
+		DormantConcept:  map[string]string{},
+		ConceptEntityID: map[string]string{},
+		Source:          map[string]string{},
+		SourceMeta:      map[string]SourceMeta{},
+		Redirects:       map[string][]string{},
 	}
 
 	if err := addIDMapEntries(ctx, store, "wiki/", next.Concept); err != nil {
@@ -190,6 +199,9 @@ func BuildIDMap(ctx context.Context, store Store) (IDMap, error) {
 
 	old, err := readOldIDMap(ctx, store)
 	if err != nil {
+		return next, err
+	}
+	if err := preserveConceptLifecycle(&next, old); err != nil {
 		return next, err
 	}
 	next.Redirects = cloneRedirects(old.Redirects)
@@ -235,8 +247,92 @@ func addIDMapEntries(ctx context.Context, store Store, dir string, entries map[s
 		if id == "" {
 			id = generateID(file.Data)
 		}
+		if !annotation.ValidSourceID(id) {
+			return fmt.Errorf("unsafe ID %q in %s", id, file.Path)
+		}
+		if !validConceptSlug(file.Slug) {
+			return fmt.Errorf("unsafe concept slug %q in %s", file.Slug, file.Path)
+		}
+		if oldSlug, exists := entries[id]; exists {
+			return fmt.Errorf("duplicate concept ID %q for %q and %q", id, oldSlug, file.Slug)
+		}
+		for oldID, oldSlug := range entries {
+			if oldSlug == file.Slug {
+				return fmt.Errorf("duplicate concept slug %q for %q and %q", file.Slug, oldID, id)
+			}
+		}
 		entries[id] = file.Slug
 	}
+	return nil
+}
+
+func validConceptSlug(slug string) bool {
+	return slug != "" && slug == strings.TrimSpace(slug) &&
+		!strings.ContainsAny(slug, "/\\") && slug != "." && slug != ".."
+}
+
+// preserveConceptLifecycle carries forward only lifecycle state that still
+// belongs to a rebuilt active or dormant Concept. Entity rows for removed
+// Concepts are deliberately pruned; malformed rows and collisions fail before
+// Rebuild writes either generated artifact.
+func preserveConceptLifecycle(next *IDMap, old IDMap) error {
+	activeBySlug := make(map[string]string, len(next.Concept))
+	for id, slug := range next.Concept {
+		if !annotation.ValidSourceID(id) || !validConceptSlug(slug) {
+			return fmt.Errorf("unsafe rebuilt concept mapping %q -> %q", id, slug)
+		}
+		if priorID, exists := activeBySlug[slug]; exists && priorID != id {
+			return fmt.Errorf("duplicate rebuilt concept slug %q", slug)
+		}
+		activeBySlug[slug] = id
+	}
+
+	retainedDormant := make(map[string]string, len(old.DormantConcept))
+	dormantBySlug := make(map[string]string, len(old.DormantConcept))
+	for id, slug := range old.DormantConcept {
+		if !annotation.ValidSourceID(id) || !validConceptSlug(slug) || id != strings.TrimSpace(id) {
+			return fmt.Errorf("unsafe dormant concept mapping %q -> %q", id, slug)
+		}
+		if activeSlug, exists := next.Concept[id]; exists {
+			return fmt.Errorf("concept ID %q is both active (%q) and dormant (%q)", id, activeSlug, slug)
+		}
+		if activeID, exists := activeBySlug[slug]; exists {
+			return fmt.Errorf("concept slug %q is both active (%q) and dormant (%q)", slug, activeID, id)
+		}
+		if priorID, exists := dormantBySlug[slug]; exists && priorID != id {
+			return fmt.Errorf("duplicate dormant concept slug %q", slug)
+		}
+		dormantBySlug[slug] = id
+		retainedDormant[id] = slug
+	}
+
+	owned := make(map[string]struct{}, len(next.Concept)+len(retainedDormant))
+	for id := range next.Concept {
+		owned[id] = struct{}{}
+	}
+	for id := range retainedDormant {
+		owned[id] = struct{}{}
+	}
+	entityOwners := make(map[string]string)
+	nextEntities := make(map[string]string, len(old.ConceptEntityID))
+	for id, entityID := range old.ConceptEntityID {
+		if !annotation.ValidSourceID(id) || id != strings.TrimSpace(id) || !annotation.ValidSourceID(entityID) || entityID != strings.TrimSpace(entityID) {
+			return fmt.Errorf("unsafe concept entity mapping %q -> %q", id, entityID)
+		}
+		if _, isOwned := owned[id]; !isOwned {
+			// A valid row for an ID no longer present in either rebuilt active
+			// or retained dormant state is unowned engine state and is pruned.
+			continue
+		}
+		if priorID, exists := entityOwners[entityID]; exists && priorID != id {
+			return fmt.Errorf("concept entity ID %q maps to multiple LWC IDs", entityID)
+		}
+		entityOwners[entityID] = id
+		nextEntities[id] = entityID
+	}
+
+	next.DormantConcept = retainedDormant
+	next.ConceptEntityID = nextEntities
 	return nil
 }
 
@@ -251,10 +347,12 @@ func parseMarkdownMatter(data []byte) (markdownMatter, error) {
 
 func readOldIDMap(ctx context.Context, store Store) (IDMap, error) {
 	old := IDMap{
-		Concept:    map[string]string{},
-		Source:     map[string]string{},
-		SourceMeta: map[string]SourceMeta{},
-		Redirects:  map[string][]string{},
+		Concept:         map[string]string{},
+		DormantConcept:  map[string]string{},
+		ConceptEntityID: map[string]string{},
+		Source:          map[string]string{},
+		SourceMeta:      map[string]SourceMeta{},
+		Redirects:       map[string][]string{},
 	}
 	data, err := store.ReadFile(ctx, IDMapPath)
 	if err != nil {
@@ -278,6 +376,12 @@ func readOldIDMap(ctx context.Context, store Store) (IDMap, error) {
 	}
 	if old.SourceMeta == nil {
 		old.SourceMeta = map[string]SourceMeta{}
+	}
+	if old.DormantConcept == nil {
+		old.DormantConcept = map[string]string{}
+	}
+	if old.ConceptEntityID == nil {
+		old.ConceptEntityID = map[string]string{}
 	}
 	if old.Redirects == nil {
 		old.Redirects = map[string][]string{}

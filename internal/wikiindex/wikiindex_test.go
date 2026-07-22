@@ -132,3 +132,116 @@ func TestRebuildPreservesRedirects(t *testing.T) {
 		t.Fatalf("redirects = %#v, want old-alpha", next.Redirects)
 	}
 }
+
+func TestRebuildPreservesDormantConceptsAndOwnedEntityMappings(t *testing.T) {
+	old := IDMap{
+		Concept:         map[string]string{"stable-alpha": "alpha"},
+		DormantConcept:  map[string]string{"stable-beta": "beta"},
+		ConceptEntityID: map[string]string{"stable-alpha": "entity-alpha", "stable-beta": "entity-beta", "orphan": "entity-orphan"},
+		Source:          map[string]string{},
+		Redirects:       map[string][]string{},
+	}
+	oldJSON, err := json.Marshal(old)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &fakeStore{
+		files: map[string][]MarkdownFile{
+			"wiki/":         {{Slug: "alpha", Path: "wiki/alpha.md", Data: []byte("---\nid: stable-alpha\n---\nAlpha")}},
+			"wiki/sources/": {},
+		},
+		reads: map[string][]byte{IDMapPath: oldJSON},
+	}
+
+	next, err := Rebuild(context.Background(), store)
+	if err != nil {
+		t.Fatalf("Rebuild() error = %v", err)
+	}
+	if next.DormantConcept["stable-beta"] != "beta" {
+		t.Fatalf("dormant concept = %#v, want stable-beta -> beta", next.DormantConcept)
+	}
+	if next.ConceptEntityID["stable-alpha"] != "entity-alpha" || next.ConceptEntityID["stable-beta"] != "entity-beta" {
+		t.Fatalf("owned entity mappings = %#v", next.ConceptEntityID)
+	}
+	if _, ok := next.ConceptEntityID["orphan"]; ok {
+		t.Fatalf("orphan entity mapping was retained: %#v", next.ConceptEntityID)
+	}
+}
+
+func TestRebuildFailsClosedOnLifecycleMappingCollisions(t *testing.T) {
+	tests := []struct {
+		name string
+		old  IDMap
+	}{
+		{
+			name: "active dormant slug",
+			old: IDMap{
+				DormantConcept:  map[string]string{"stable-beta": "alpha"},
+				ConceptEntityID: map[string]string{"stable-beta": "entity-beta"},
+			},
+		},
+		{
+			name: "active dormant id",
+			old: IDMap{
+				DormantConcept:  map[string]string{"stable-alpha": "beta"},
+				ConceptEntityID: map[string]string{"stable-alpha": "entity-alpha"},
+			},
+		},
+		{
+			name: "dormant slug collision",
+			old: IDMap{
+				DormantConcept:  map[string]string{"stable-a": "beta", "stable-b": "beta"},
+				ConceptEntityID: map[string]string{"stable-a": "entity-a", "stable-b": "entity-b"},
+			},
+		},
+		{
+			name: "retained entity collision",
+			old: IDMap{
+				DormantConcept:  map[string]string{"stable-a": "alpha", "stable-b": "beta"},
+				ConceptEntityID: map[string]string{"stable-a": "same", "stable-b": "same"},
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			oldJSON, err := json.Marshal(tc.old)
+			if err != nil {
+				t.Fatal(err)
+			}
+			store := &fakeStore{
+				files: map[string][]MarkdownFile{
+					"wiki/":         {{Slug: "alpha", Path: "wiki/alpha.md", Data: []byte("---\nid: stable-alpha\n---\nAlpha")}},
+					"wiki/sources/": {},
+				},
+				reads: map[string][]byte{IDMapPath: oldJSON},
+			}
+			if _, err := Rebuild(context.Background(), store); err == nil {
+				t.Fatal("Rebuild() error = nil, want fail-closed lifecycle mapping rejection")
+			}
+			if _, ok := store.writes[IDMapPath]; ok {
+				t.Fatal("Rebuild() wrote id_map after lifecycle validation failure")
+			}
+		})
+	}
+}
+
+func TestRebuildFailsClosedOnMalformedLifecycleMapping(t *testing.T) {
+	old := IDMap{
+		DormantConcept:  map[string]string{"../stable": "beta"},
+		ConceptEntityID: map[string]string{"../stable": "entity-beta"},
+	}
+	oldJSON, err := json.Marshal(old)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &fakeStore{
+		files: map[string][]MarkdownFile{"wiki/": {}, "wiki/sources/": {}},
+		reads: map[string][]byte{IDMapPath: oldJSON},
+	}
+	if _, err := Rebuild(context.Background(), store); err == nil {
+		t.Fatal("Rebuild() error = nil, want malformed lifecycle mapping rejection")
+	}
+	if _, ok := store.writes[IDMapPath]; ok {
+		t.Fatal("Rebuild() wrote id_map after malformed lifecycle validation failure")
+	}
+}

@@ -36,7 +36,7 @@ import (
 const (
 	defaultMetadataTokenURL = "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token"
 	defaultCloudRunJobURL   = config.DefaultPipelineJobURL
-	defaultWorkerCommands   = `[["run","--auto-approve"],["approve","--all"]]`
+	defaultWorkerCommands   = `[["run","--auto-approve"]]`
 )
 
 var (

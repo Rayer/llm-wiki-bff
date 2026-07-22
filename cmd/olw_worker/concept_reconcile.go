@@ -21,12 +21,35 @@ import (
 type conceptSnapshot struct {
 	ConceptID string
 	Slug      string
+	EntityID  string
+	Dormant   bool
+	Page      []byte
+	CacheRow  []byte
 }
 
 type reconciledConcept struct {
 	CurrentID string
 	StableID  string
 	Slug      string
+}
+
+func validateConceptEntityMap(ids wikiindex.IDMap) error {
+	seen := make(map[string]string, len(ids.ConceptEntityID))
+	for conceptID, entityID := range ids.ConceptEntityID {
+		if !annotation.ValidSourceID(conceptID) || !annotation.ValidSourceID(entityID) {
+			return fmt.Errorf("unsafe concept entity mapping %q -> %q", conceptID, entityID)
+		}
+		if _, active := ids.Concept[conceptID]; !active {
+			if _, dormant := ids.DormantConcept[conceptID]; !dormant {
+				return fmt.Errorf("concept entity mapping has unknown LWC ID %q", conceptID)
+			}
+		}
+		if old, exists := seen[entityID]; exists && old != conceptID {
+			return fmt.Errorf("Synto entity_id %q maps to multiple LWC IDs", entityID)
+		}
+		seen[entityID] = conceptID
+	}
+	return nil
 }
 
 func snapshotConcepts(vault string) ([]conceptSnapshot, error) {
@@ -41,18 +64,33 @@ func snapshotConcepts(vault string) ([]conceptSnapshot, error) {
 	if err != nil {
 		return nil, fmt.Errorf("decode prior concept map: %w", err)
 	}
-	if ids.Concept == nil {
-		return []conceptSnapshot{}, nil
+	if err := validateConceptEntityMap(ids); err != nil {
+		return nil, fmt.Errorf("validate prior concept map: %w", err)
 	}
-	conceptIDs := make([]string, 0, len(ids.Concept))
+	if ids.Concept == nil {
+		ids.Concept = map[string]string{}
+	}
+	if ids.DormantConcept == nil {
+		ids.DormantConcept = map[string]string{}
+	}
+	conceptIDs := make([]string, 0, len(ids.Concept)+len(ids.DormantConcept))
 	for conceptID := range ids.Concept {
+		conceptIDs = append(conceptIDs, conceptID)
+	}
+	for conceptID := range ids.DormantConcept {
+		if _, active := ids.Concept[conceptID]; active {
+			return nil, fmt.Errorf("concept ID %q is both active and dormant", conceptID)
+		}
 		conceptIDs = append(conceptIDs, conceptID)
 	}
 	sort.Strings(conceptIDs)
 	out := make([]conceptSnapshot, 0, len(conceptIDs))
 	seenSlug := make(map[string]string, len(conceptIDs))
 	for _, conceptID := range conceptIDs {
-		slug := strings.TrimSpace(ids.Concept[conceptID])
+		slug, dormant := ids.Concept[conceptID], false
+		if slug == "" {
+			slug, dormant = ids.DormantConcept[conceptID], true
+		}
 		if !annotation.ValidSourceID(conceptID) || !safeConceptSlug(slug) {
 			return nil, fmt.Errorf("unsafe prior concept mapping %q -> %q", conceptID, slug)
 		}
@@ -60,9 +98,51 @@ func snapshotConcepts(vault string) ([]conceptSnapshot, error) {
 			return nil, fmt.Errorf("duplicate prior concept slug %q", slug)
 		}
 		seenSlug[slug] = conceptID
-		out = append(out, conceptSnapshot{ConceptID: conceptID, Slug: slug})
+		pagePath := filepath.Join("wiki", slug+".md")
+		if dormant {
+			pagePath = filepath.Join("wiki", ".dormant", slug+".md")
+		}
+		page, err := readBoundedRegularFileWithin(vault, filepath.ToSlash(pagePath))
+		if errors.Is(err, os.ErrNotExist) {
+			page = nil
+		} else if err != nil {
+			return nil, fmt.Errorf("read prior concept page %q: %w", slug, err)
+		}
+		row, err := readConceptCacheRow(vault, slug, dormant)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, conceptSnapshot{ConceptID: conceptID, Slug: slug, EntityID: ids.ConceptEntityID[conceptID], Dormant: dormant, Page: page, CacheRow: row})
 	}
 	return out, nil
+}
+
+func readConceptCacheRow(vault, slug string, dormant bool) ([]byte, error) {
+	path := "cache/concepts.jsonl"
+	if dormant {
+		path = "cache/dormant_concepts.jsonl"
+	}
+	data, err := readBoundedRegularFileWithin(vault, path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read prior concept cache: %w", err)
+	}
+	for _, line := range bytes.Split(data, []byte{'\n'}) {
+		line = bytes.TrimSpace(line)
+		if len(line) == 0 {
+			continue
+		}
+		row, err := decodeStrictConceptCacheRow(line)
+		if err != nil {
+			return nil, fmt.Errorf("decode prior concept cache: %w", err)
+		}
+		if value, ok := row["slug"].(string); ok && value == slug {
+			return append([]byte(nil), line...), nil
+		}
+	}
+	return nil, nil
 }
 
 func safeConceptSlug(slug string) bool {
@@ -71,7 +151,12 @@ func safeConceptSlug(slug string) bool {
 }
 
 func reconcileConceptIDMap(data []byte, prior []conceptSnapshot) ([]byte, []reconciledConcept, error) {
+	return reconcileConceptIDMapWithEntities(data, prior, false)
+}
+
+func reconcileConceptIDMapWithEntities(data []byte, prior []conceptSnapshot, requireEntity bool) ([]byte, []reconciledConcept, error) {
 	oldBySlug := make(map[string]string, len(prior))
+	oldByEntity := make(map[string]string, len(prior))
 	reservedByID := make(map[string]string, len(prior))
 	for _, concept := range prior {
 		if !annotation.ValidSourceID(concept.ConceptID) || !safeConceptSlug(concept.Slug) {
@@ -85,11 +170,23 @@ func reconcileConceptIDMap(data []byte, prior []conceptSnapshot) ([]byte, []reco
 		}
 		oldBySlug[concept.Slug] = concept.ConceptID
 		reservedByID[concept.ConceptID] = concept.Slug
+		if concept.EntityID != "" {
+			if !annotation.ValidSourceID(concept.EntityID) {
+				return nil, nil, errors.New("unsafe prior concept entity mapping")
+			}
+			if old, exists := oldByEntity[concept.EntityID]; exists && old != concept.ConceptID {
+				return nil, nil, fmt.Errorf("entity_id %q maps to multiple LWC IDs", concept.EntityID)
+			}
+			oldByEntity[concept.EntityID] = concept.ConceptID
+		}
 	}
 
 	ids, err := wikiindex.DecodeIDMap(data)
 	if err != nil {
 		return nil, nil, fmt.Errorf("decode generated concept map: %w", err)
+	}
+	if err := validateConceptEntityMap(ids); err != nil {
+		return nil, nil, fmt.Errorf("validate generated concept map: %w", err)
 	}
 	if ids.Concept == nil {
 		ids.Concept = map[string]string{}
@@ -102,6 +199,12 @@ func reconcileConceptIDMap(data []byte, prior []conceptSnapshot) ([]byte, []reco
 	}
 	if ids.Redirects == nil {
 		ids.Redirects = map[string][]string{}
+	}
+	if ids.DormantConcept == nil {
+		ids.DormantConcept = map[string]string{}
+	}
+	if ids.ConceptEntityID == nil {
+		ids.ConceptEntityID = map[string]string{}
 	}
 
 	currentIDs := make([]string, 0, len(ids.Concept))
@@ -124,8 +227,21 @@ func reconcileConceptIDMap(data []byte, prior []conceptSnapshot) ([]byte, []reco
 		}
 		seenSlug[slug] = currentID
 
+		entityID := strings.TrimSpace(ids.ConceptEntityID[currentID])
+		if requireEntity && entityID == "" {
+			return nil, nil, fmt.Errorf("missing Synto entity_id for concept %q", slug)
+		}
+		if entityID != "" && !annotation.ValidSourceID(entityID) {
+			return nil, nil, fmt.Errorf("unsafe Synto entity_id %q", entityID)
+		}
 		stableID := currentID
-		if priorID, ok := oldBySlug[slug]; ok {
+		if priorID, ok := oldByEntity[entityID]; entityID != "" && ok {
+			stableID = priorID
+		} else if priorID, ok := oldBySlug[slug]; ok {
+			prior := priorByID(prior, priorID)
+			if requireEntity && prior.EntityID != "" && prior.EntityID != entityID {
+				return nil, nil, fmt.Errorf("Synto entity mapping changed for slug %q", slug)
+			}
 			stableID = priorID
 		}
 		if !annotation.ValidSourceID(stableID) {
@@ -135,7 +251,9 @@ func reconcileConceptIDMap(data []byte, prior []conceptSnapshot) ([]byte, []reco
 			return nil, nil, fmt.Errorf("concept ID collision %q for %q and %q", stableID, otherSlug, slug)
 		}
 		if reservedSlug, ok := reservedByID[stableID]; ok && reservedSlug != slug {
-			return nil, nil, fmt.Errorf("concept ID %q is reserved for %q", stableID, reservedSlug)
+			if oldByEntity[entityID] != stableID {
+				return nil, nil, fmt.Errorf("concept ID %q is reserved for %q", stableID, reservedSlug)
+			}
 		}
 		used[stableID] = slug
 		translated[currentID] = stableID
@@ -143,10 +261,31 @@ func reconcileConceptIDMap(data []byte, prior []conceptSnapshot) ([]byte, []reco
 	}
 
 	nextConcept := make(map[string]string, len(ids.Concept))
+	nextEntity := make(map[string]string, len(ids.ConceptEntityID))
+	priorEntityBySlug := make(map[string]string, len(prior))
+	for _, old := range prior {
+		if old.EntityID != "" {
+			priorEntityBySlug[old.Slug] = old.EntityID
+		}
+	}
 	for _, concept := range reconciled {
 		nextConcept[concept.StableID] = concept.Slug
+		entityID := ids.ConceptEntityID[concept.CurrentID]
+		if entityID == "" {
+			entityID = priorEntityBySlug[concept.Slug]
+		}
+		if entityID != "" {
+			if !annotation.ValidSourceID(entityID) {
+				return nil, nil, fmt.Errorf("unsafe Synto entity_id %q", entityID)
+			}
+			if priorID, exists := nextEntity[concept.StableID]; exists && priorID != entityID {
+				return nil, nil, fmt.Errorf("Synto entity_id collision for concept %q", concept.StableID)
+			}
+			nextEntity[concept.StableID] = entityID
+		}
 	}
 	ids.Concept = nextConcept
+	ids.ConceptEntityID = nextEntity
 
 	normalizedRedirects := make(map[string][]string, len(ids.Redirects))
 	redirectKeys := make([]string, 0, len(ids.Redirects))
@@ -186,19 +325,118 @@ func reconcileConceptIDMap(data []byte, prior []conceptSnapshot) ([]byte, []reco
 	return out, reconciled, nil
 }
 
+func priorByID(prior []conceptSnapshot, id string) conceptSnapshot {
+	for _, concept := range prior {
+		if concept.ConceptID == id {
+			return concept
+		}
+	}
+	return conceptSnapshot{}
+}
+
 type plannedWrite struct {
 	rel  string
 	data []byte
 }
 
-func reconcileWorkspaceConcepts(workspace string, prior []conceptSnapshot) error {
+func planConceptLifecycle(workspace string, data []byte, concepts []reconciledConcept, prior []conceptSnapshot, activeEntities map[string]bool) ([]byte, map[string]bool, []plannedWrite, []string, error) {
+	ids, err := wikiindex.DecodeIDMap(data)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	if ids.DormantConcept == nil {
+		ids.DormantConcept = map[string]string{}
+	}
+	priorBySlug := make(map[string]conceptSnapshot, len(prior))
+	for _, old := range prior {
+		priorBySlug[old.Slug] = old
+	}
+	currentBySlug := make(map[string]reconciledConcept, len(concepts))
+	dormant := make(map[string]bool)
+	for _, concept := range concepts {
+		currentBySlug[concept.Slug] = concept
+		entityID := ids.ConceptEntityID[concept.StableID]
+		if entityID == "" || !activeEntities[entityID] {
+			dormant[concept.StableID] = true
+		}
+	}
+	for _, old := range prior {
+		if _, present := currentBySlug[old.Slug]; !present {
+			dormant[old.ConceptID] = true
+			ids.DormantConcept[old.ConceptID] = old.Slug
+			if old.EntityID != "" {
+				ids.ConceptEntityID[old.ConceptID] = old.EntityID
+			}
+		}
+	}
+	for id, slug := range ids.Concept {
+		if dormant[id] {
+			delete(ids.Concept, id)
+			ids.DormantConcept[id] = slug
+		}
+	}
+	for id := range ids.DormantConcept {
+		if _, active := ids.Concept[id]; active {
+			delete(ids.DormantConcept, id)
+		}
+	}
+
+	var writes []plannedWrite
+	var removals []string
+	for id, slug := range ids.DormantConcept {
+		old := priorBySlug[slug]
+		page := old.Page
+		if len(page) == 0 {
+			page, err = readBoundedRegularFileWithin(workspace, filepath.ToSlash(filepath.Join("wiki", slug+".md")))
+			if err != nil {
+				return nil, nil, nil, nil, fmt.Errorf("read dormant concept %q: %w", slug, err)
+			}
+		}
+		writes = append(writes, plannedWrite{rel: filepath.ToSlash(filepath.Join("wiki", ".dormant", slug+".md")), data: page})
+		removals = append(removals, filepath.ToSlash(filepath.Join("wiki", slug+".md")))
+		_ = id
+	}
+	for _, old := range prior {
+		if old.Dormant {
+			if _, stillDormant := ids.DormantConcept[old.ConceptID]; !stillDormant {
+				removals = append(removals, filepath.ToSlash(filepath.Join("wiki", ".dormant", old.Slug+".md")))
+			}
+		}
+	}
+	updated, err := json.MarshalIndent(ids, "", "  ")
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	return updated, dormant, writes, removals, nil
+}
+
+func reconcileWorkspaceConcepts(workspace string, prior []conceptSnapshot, currentSources ...[]sourceSnapshot) error {
 	// Plan/validate every output first, then apply. Input validation errors
 	// must leave the live vault byte-identical (zero writes).
 	data, err := readBoundedRegularFileWithin(workspace, "cache/id_map.json")
 	if err != nil {
 		return fmt.Errorf("read generated concept map: %w", err)
 	}
-	reconciledMap, concepts, err := reconcileConceptIDMap(data, prior)
+	generated, err := wikiindex.DecodeIDMap(data)
+	if err != nil {
+		return fmt.Errorf("decode generated concept map: %w", err)
+	}
+	indexTruth, err := readSyntoIndexTruth(workspace)
+	if err != nil {
+		return err
+	}
+	if indexTruth.AmbiguousLineage {
+		return errors.New("Synto merge/split lineage requires an owner-approved identity mapping")
+	}
+	entityIDs, err := readSyntoEntityIDs(workspace, generated.Concept)
+	if err != nil {
+		return err
+	}
+	data, err = mergeSyntoEntityIDs(data, entityIDs)
+	if err != nil {
+		return err
+	}
+	reconciledMap, concepts, err := reconcileConceptIDMapWithEntities(data, prior, entityIDs != nil)
 	if err != nil {
 		return err
 	}
@@ -210,10 +448,29 @@ func reconcileWorkspaceConcepts(workspace string, prior []conceptSnapshot) error
 		}
 	}
 
-	writes := make([]plannedWrite, 0, len(concepts)+2)
+	dormant := map[string]bool{}
+	lifecycleWrites := []plannedWrite(nil)
+	removals := []string(nil)
+	if entityIDs != nil {
+		// An omitted source-truth argument is unavailable, not an instruction to
+		// trust stale INDEX activity. Production callers pass the materialized
+		// source slice, including an explicitly empty or tombstone-only slice.
+		activeEntities := map[string]bool{}
+		if len(currentSources) > 0 {
+			activeEntities = activeSyntoEntities(indexTruth.SourceConcepts, currentSources[0])
+		}
+		reconciledMap, dormant, lifecycleWrites, removals, err = planConceptLifecycle(workspace, reconciledMap, concepts, prior, activeEntities)
+		if err != nil {
+			return err
+		}
+	}
+	writes := make([]plannedWrite, 0, len(concepts)+len(lifecycleWrites)+3)
 	writes = append(writes, plannedWrite{rel: "cache/id_map.json", data: reconciledMap})
 
 	for _, concept := range concepts {
+		if dormant[concept.StableID] {
+			continue
+		}
 		rel := filepath.ToSlash(filepath.Join("wiki", concept.Slug+".md"))
 		page, err := readBoundedRegularFileWithin(workspace, rel)
 		if err != nil {
@@ -240,8 +497,17 @@ func reconcileWorkspaceConcepts(workspace string, prior []conceptSnapshot) error
 		return err
 	}
 	if cachePresent {
+		if entityIDs != nil {
+			var dormantData []byte
+			cacheData, dormantData, err = partitionConceptCacheRows(cacheData, dormant, concepts, prior)
+			if err != nil {
+				return err
+			}
+			writes = append(writes, plannedWrite{rel: "cache/dormant_concepts.jsonl", data: dormantData})
+		}
 		writes = append(writes, plannedWrite{rel: "cache/concepts.jsonl", data: cacheData})
 	}
+	writes = append(writes, lifecycleWrites...)
 
 	// Deterministic apply order: id_map, concept pages (slug-sorted already),
 	// other pages (walk order collected deterministically), then cache.
@@ -250,7 +516,79 @@ func reconcileWorkspaceConcepts(workspace string, prior []conceptSnapshot) error
 			return err
 		}
 	}
+	for _, rel := range removals {
+		if err := removeRegularFileWithin(workspace, rel); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
 	return nil
+}
+
+func activeSyntoEntities(edges []syntoSourceConcept, sources []sourceSnapshot) map[string]bool {
+	current := make(map[string]string, len(sources))
+	for _, source := range sources {
+		if source.Tombstone || source.RawPath == "" {
+			continue
+		}
+		hash := source.SyntoContentHash
+		if hash == "" {
+			hash = syntoSourceContentHash(source)
+		}
+		current[source.RawPath] = hash
+	}
+	active := make(map[string]bool)
+	for _, edge := range edges {
+		if current[edge.SourcePath] == edge.ContentHash {
+			active[edge.EntityID] = true
+		}
+	}
+	return active
+}
+
+func partitionConceptCacheRows(data []byte, dormant map[string]bool, concepts []reconciledConcept, prior []conceptSnapshot) ([]byte, []byte, error) {
+	bySlug := make(map[string]reconciledConcept, len(concepts))
+	for _, concept := range concepts {
+		bySlug[concept.Slug] = concept
+	}
+	priorBySlug := make(map[string]conceptSnapshot, len(prior))
+	for _, old := range prior {
+		priorBySlug[old.Slug] = old
+	}
+	var active, dormantRows bytes.Buffer
+	for _, line := range bytes.Split(data, []byte{'\n'}) {
+		line = bytes.TrimSpace(line)
+		if len(line) == 0 {
+			continue
+		}
+		row, err := decodeStrictConceptCacheRow(line)
+		if err != nil {
+			return nil, nil, err
+		}
+		slug, ok := row["slug"].(string)
+		if !ok || !safeConceptSlug(slug) {
+			return nil, nil, errors.New("concept cache row has unsafe slug")
+		}
+		if concept, isCurrent := bySlug[slug]; isCurrent && dormant[concept.StableID] {
+			if old := priorBySlug[slug]; len(old.CacheRow) > 0 {
+				line = old.CacheRow
+			}
+			dormantRows.Write(line)
+			dormantRows.WriteByte('\n')
+			continue
+		}
+		active.Write(line)
+		active.WriteByte('\n')
+	}
+	for _, old := range prior {
+		if !dormant[old.ConceptID] || len(old.CacheRow) == 0 {
+			continue
+		}
+		if !bytes.Contains(dormantRows.Bytes(), old.CacheRow) {
+			dormantRows.Write(old.CacheRow)
+			dormantRows.WriteByte('\n')
+		}
+	}
+	return active.Bytes(), dormantRows.Bytes(), nil
 }
 
 func rewriteConceptPageID(data []byte, currentID, stableID string) ([]byte, error) {
@@ -723,7 +1061,16 @@ func decodeStrictConceptCacheRow(line []byte) (map[string]any, error) {
 
 // decodeStrictJSONValue recursively rejects duplicate object keys while
 // streaming. Reuses the same EOF contract as generation/wikiindex decoders.
+const maxStrictJSONDepth = 64
+
 func decodeStrictJSONValue(dec *json.Decoder) (any, error) {
+	return decodeStrictJSONValueAtDepth(dec, 0)
+}
+
+func decodeStrictJSONValueAtDepth(dec *json.Decoder, depth int) (any, error) {
+	if depth > maxStrictJSONDepth {
+		return nil, errors.New("JSON nesting depth exceeds limit")
+	}
 	token, err := dec.Token()
 	if err != nil {
 		return nil, err
@@ -735,6 +1082,9 @@ func decodeStrictJSONValue(dec *json.Decoder) (any, error) {
 			obj := make(map[string]any)
 			seen := make(map[string]struct{})
 			for dec.More() {
+				if len(obj) >= generation.MaxFiles {
+					return nil, generation.ErrLogicalEntryLimit
+				}
 				keyToken, err := dec.Token()
 				if err != nil {
 					return nil, err
@@ -747,7 +1097,7 @@ func decodeStrictJSONValue(dec *json.Decoder) (any, error) {
 					return nil, errors.New("duplicate JSON object key")
 				}
 				seen[key] = struct{}{}
-				val, err := decodeStrictJSONValue(dec)
+				val, err := decodeStrictJSONValueAtDepth(dec, depth+1)
 				if err != nil {
 					return nil, err
 				}
@@ -763,7 +1113,7 @@ func decodeStrictJSONValue(dec *json.Decoder) (any, error) {
 				if len(arr) >= generation.MaxFiles {
 					return nil, generation.ErrLogicalEntryLimit
 				}
-				val, err := decodeStrictJSONValue(dec)
+				val, err := decodeStrictJSONValueAtDepth(dec, depth+1)
 				if err != nil {
 					return nil, err
 				}
@@ -782,6 +1132,10 @@ func decodeStrictJSONValue(dec *json.Decoder) (any, error) {
 }
 
 func readBoundedRegularFileWithin(root, rel string) ([]byte, error) {
+	return readBoundedRegularFileWithinLimit(root, rel, generation.MaxFileBytes)
+}
+
+func readBoundedRegularFileWithinLimit(root, rel string, limit int64) ([]byte, error) {
 	if err := safeRelativePath(rel); err != nil {
 		return nil, err
 	}
@@ -798,7 +1152,7 @@ func readBoundedRegularFileWithin(root, rel string) ([]byte, error) {
 	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
 		return nil, fmt.Errorf("%q is not a regular file", rel)
 	}
-	if info.Size() < 0 || info.Size() > generation.MaxFileBytes {
+	if limit < 0 || info.Size() < 0 || info.Size() > limit {
 		return nil, fmt.Errorf("%q exceeds generation size limit", rel)
 	}
 	file, err := r.Open(clean)
@@ -807,11 +1161,11 @@ func readBoundedRegularFileWithin(root, rel string) ([]byte, error) {
 	}
 	defer file.Close()
 	// Bound before allocation: never read more than MaxFileBytes+1.
-	data, err := io.ReadAll(io.LimitReader(file, generation.MaxFileBytes+1))
+	data, err := io.ReadAll(io.LimitReader(file, limit+1))
 	if err != nil {
 		return nil, err
 	}
-	if int64(len(data)) > generation.MaxFileBytes {
+	if int64(len(data)) > limit {
 		return nil, fmt.Errorf("%q exceeds generation size limit", rel)
 	}
 	return data, nil

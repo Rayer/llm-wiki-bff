@@ -97,7 +97,7 @@ func GenerationOwned(rel string) bool {
 		return safePath(rel)
 	}
 	switch rel {
-	case "wiki.toml", "cache/id_map.json", "cache/concepts.jsonl", "cache/raw_status.json", "cache/suggested_queries.json", ".olw/state.db":
+	case "wiki.toml", "synto.toml", "cache/id_map.json", "cache/concepts.jsonl", "cache/dormant_concepts.jsonl", "cache/raw_status.json", "cache/suggested_queries.json", ".olw/state.db", ".synto/state.db", ".synto/INDEX.json":
 		return true
 	default:
 		return false

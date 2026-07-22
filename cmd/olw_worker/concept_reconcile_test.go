@@ -401,12 +401,18 @@ func TestDefaultInPlacePathReconcilesConceptIDs(t *testing.T) {
 	defer func() { execOLW = old }()
 
 	vault := t.TempDir()
-	mustWriteFile(t, filepath.Join(vault, "cache", "id_map.json"), []byte(`{"concept":{"stable-a":"alpha"},"source":{},"source_meta":{},"redirects":{}}`))
+	mustWriteFile(t, filepath.Join(vault, "raw", "source.md"), []byte("x"))
+	mustWriteFile(t, filepath.Join(vault, "cache", "id_map.json"), []byte(`{"concept":{"stable-a":"alpha"},"source":{"stable-source":"source"},"source_meta":{"stable-source":{"source_file":"raw/source.md"}},"redirects":{}}`))
 	mustWriteFile(t, filepath.Join(vault, "wiki", "alpha.md"), []byte("---\nid: stable-a\ntitle: Alpha\n---\nprior body\n"))
 
-	execOLW = func(_ context.Context, work string, _ []string, _ []string, _, _ io.Writer) error {
+	execOLW = func(_ context.Context, work string, command []string, _ []string, _, _ io.Writer) error {
 		// OLW regenerates the same slug under a transient concept ID.
 		mustWriteFile(t, filepath.Join(work, "wiki", "alpha.md"), []byte("---\nid: transient-a\ntitle: Alpha Regenerated\n---\nregenerated [[concepts/transient-a-alpha|Alpha]]\n"))
+		mustWriteFile(t, filepath.Join(work, ".synto", "INDEX.json"), []byte(syntoIndexFixtureWithEntitiesHash([]string{"article:entity:alpha"}, []string{"entity"}, sha256Text("x"))))
+		writeValidSQLiteState(t, filepath.Join(work, ".synto", "state.db"))
+		if strings.Join(command, " ") == "pack export --target agents --out" {
+			return nil
+		}
 		return nil
 	}
 
@@ -696,20 +702,20 @@ func TestRewriteConceptCacheIDsRejectsDuplicateJSONKeys(t *testing.T) {
 	})
 }
 
-func TestDockerfilePinsExactOLWWheelHash(t *testing.T) {
-	// Issue 7: production install must pin the inspected 0.8.5 wheel digest.
+func TestDockerfilePinsExactSyntoWheelHash(t *testing.T) {
+	// Production install must pin the inspected Synto 0.7.0 wheel digest.
 	data, err := os.ReadFile("Dockerfile")
 	if err != nil {
 		t.Fatal(err)
 	}
 	text := string(data)
-	wantURL := "https://files.pythonhosted.org/packages/5c/5b/0d226bc92e3adeafeb8f0717a6968526bb5e7b4a09a313d888cacc422204/obsidian_llm_wiki-0.8.5-py3-none-any.whl"
-	wantHash := "sha256=a01375b9cc21107e3e1d33b0f3192ad18252406f47bee9ba6ecbd30e122eb337"
+	wantURL := "https://files.pythonhosted.org/packages/4a/e9/41c6b61338d98820780a43ed075cd77525674c38242110435330771d771b/synto-0.7.0-py3-none-any.whl"
+	wantHash := "sha256=4bc8dcf14b53f45fac32ce737ecf878f1a46d6d0b010c7decbe6c3b7b10afa77"
 	if !strings.Contains(text, wantURL) || !strings.Contains(text, wantHash) {
 		t.Fatalf("Dockerfile does not pin exact wheel URL+hash:\n%s", text)
 	}
-	if strings.Contains(text, `obsidian-llm-wiki==0.8.5"`) && !strings.Contains(text, wantURL) {
-		t.Fatal("Dockerfile still uses unpinned version-only install")
+	if strings.Contains(text, "obsidian_llm_wiki") || strings.Contains(text, "pip install synto") {
+		t.Fatal("Dockerfile retains an unpinned or OLW dependency")
 	}
 }
 
@@ -886,7 +892,8 @@ func TestRewriteConceptPageIDRejectsDuplicateStableAndCurrentIDs(t *testing.T) {
 }
 
 func TestDefaultPathNoPostprocessIgnoresMalformedPriorConceptMap(t *testing.T) {
-	// D: Postprocess=false must not snapshot/require cache/id_map.json.
+	// A generation without postprocess is no longer a supported production
+	// transaction; reject it before the child can touch the vault.
 	old := execOLW
 	defer func() { execOLW = old }()
 	vault := t.TempDir()
@@ -898,16 +905,16 @@ func TestDefaultPathNoPostprocessIgnoresMalformedPriorConceptMap(t *testing.T) {
 	}
 	cfg := workerConfig{VaultPath: vault, APIKey: "secret", Workspace: false, Postprocess: false, StopOnError: true}
 	if err := runWorkerBatch(context.Background(), cfg, `[["run","--auto-approve"]]`); err != nil {
-		t.Fatalf("no-postprocess run blocked by prior map: %v", err)
+		t.Fatalf("private no-postprocess run failed: %v", err)
 	}
 	if !ran {
-		t.Fatal("expected OLW to run")
+		t.Fatal("expected private no-postprocess Synto run")
 	}
-	// Missing map also must not block.
+	// Missing map is rejected the same way.
 	vault2 := t.TempDir()
 	ran = false
 	if err := runWorkerBatch(context.Background(), workerConfig{VaultPath: vault2, APIKey: "secret", Workspace: false, Postprocess: false}, `[["run"]]`); err != nil {
-		t.Fatalf("missing map blocked no-postprocess: %v", err)
+		t.Fatalf("missing-map no-postprocess run failed: %v", err)
 	}
 }
 
@@ -929,6 +936,10 @@ func TestExactSlugStabilityThroughWorkspaceAndCloudCompose(t *testing.T) {
 	mustWriteFile(t, filepath.Join(vault, "wiki", "sources", "source.md"), []byte("---\nid: s-stable\nsource_file: raw/source.md\n---\nsource [[concepts/c-stable-alpha|Alpha]]\n"))
 	mustWriteFile(t, filepath.Join(vault, "cache", "concepts.jsonl"), []byte(`{"slug":"alpha","frontmatter":{"id":"c-stable","sources":["s-stable"]},"sources":["s-stable"]}`+"\n"))
 	mustWriteFile(t, filepath.Join(vault, "wiki.toml"), []byte("name = \"t\"\n"))
+	mustWriteFile(t, filepath.Join(vault, "synto.toml"), []byte("[pipeline]\nauto_commit = false\nauto_maintain = false\nrelation_extraction = false\n"))
+	mustWriteFile(t, filepath.Join(vault, ".synto", "INDEX.json"), []byte(syntoIndexFixtureWithEntitiesHash([]string{"c-stable:entity-c:alpha"}, []string{"entity-c"}, sha256Text("raw body"))))
+	writeValidSQLiteState(t, filepath.Join(vault, ".synto", "state.db"))
+	writeValidSQLiteState(t, filepath.Join(vault, ".olw", "state.db"))
 
 	var gen int
 	execOLW = func(_ context.Context, work string, _ []string, _ []string, _, _ io.Writer) error {
@@ -937,6 +948,7 @@ func TestExactSlugStabilityThroughWorkspaceAndCloudCompose(t *testing.T) {
 		transientS := fmt.Sprintf("s-transient-%d", gen)
 		mustWriteFile(t, filepath.Join(work, "wiki", "alpha.md"), []byte("---\nid: "+transientC+"\nsources:\n  - "+transientS+"\n---\nbody [[concepts/"+transientC+"-alpha|Alpha]]\n"))
 		mustWriteFile(t, filepath.Join(work, "wiki", "sources", "source.md"), []byte("---\nid: "+transientS+"\nsource_file: raw/source.md\n---\nsource [[concepts/"+transientC+"-alpha|Alpha]]\n"))
+		mustWriteFile(t, filepath.Join(work, ".synto", "INDEX.json"), []byte(syntoIndexFixtureWithEntitiesHash([]string{transientC + ":entity-c:alpha"}, []string{"entity-c"}, sha256Text("raw body"))))
 		// Postprocess rebuilds id_map/concepts from these pages.
 		return nil
 	}
@@ -1004,6 +1016,7 @@ func TestExactSlugStabilityThroughWorkspaceAndCloudCompose(t *testing.T) {
 		writeCloudRequiredOutputs(t, work)
 		mustWriteFile(t, filepath.Join(work, "cache", "id_map.json"), []byte(`{"concept":{"`+transientC+`":"alpha"},"source":{"`+transientS+`":"source"},"source_meta":{"`+transientS+`":{"slug":"source","source_file":"raw/source.md"}},"redirects":{}}`))
 		mustWriteFile(t, filepath.Join(work, "cache", "concepts.jsonl"), []byte(`{"slug":"alpha","frontmatter":{"id":"`+transientC+`","sources":["`+transientS+`"]},"sources":["`+transientS+`"],"body":"[[concepts/`+transientC+`-alpha|Alpha]]"}`+"\n"))
+		mustWriteFile(t, filepath.Join(work, ".synto", "INDEX.json"), []byte(syntoIndexFixtureWithEntitiesHash([]string{transientC + ":entity-c:alpha"}, []string{"entity-c"}, sha256Text("raw body"))))
 		return nil
 	}
 	for i := 0; i < 2; i++ {
