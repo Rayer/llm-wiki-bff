@@ -124,7 +124,7 @@ type publishJournalRecord struct {
 
 const publishPhaseCommitted = "committed"
 
-const maxPublishEntries = 8
+const maxPublishEntries = 24
 
 func validatePublishJournal(journal publishJournalRecord) error {
 	if journal.Phase != "" && journal.Phase != "uncommitted" && journal.Phase != publishPhaseCommitted {
@@ -166,7 +166,7 @@ func validPublishDirectory(name, prefix string) bool {
 
 func validPublishDestination(destination string) bool {
 	switch destination {
-	case "wiki", "wiki.toml", "cache/id_map.json", "cache/concepts.jsonl", "cache/raw_status.json", "cache/suggested_queries.json", ".olw/state.db":
+	case "wiki", "wiki.toml", "synto.toml", "cache/id_map.json", "cache/concepts.jsonl", "cache/dormant_concepts.jsonl", "cache/raw_status.json", "cache/suggested_queries.json", ".olw/state.db", ".synto/state.db", ".synto/INDEX.json":
 		return true
 	}
 	const prefix = "cache/pipeline-"
@@ -234,7 +234,10 @@ func stageWorkspaceOutputs(workspace, vault, executionID string) (string, error)
 	if err := copyOneIfExists(workspaceRoot, stageRoot, "wiki.toml"); err != nil {
 		return fail(err)
 	}
-	for _, name := range []string{"cache/id_map.json", "cache/concepts.jsonl", "cache/raw_status.json", "cache/suggested_queries.json", ".olw/state.db"} {
+	if err := copyOneIfExists(workspaceRoot, stageRoot, "synto.toml"); err != nil {
+		return fail(err)
+	}
+	for _, name := range []string{"cache/id_map.json", "cache/concepts.jsonl", "cache/dormant_concepts.jsonl", "cache/raw_status.json", "cache/suggested_queries.json", ".olw/state.db", ".synto/state.db", ".synto/INDEX.json"} {
 		if err := copyOneIfExists(workspaceRoot, stageRoot, name); err != nil {
 			return fail(err)
 		}
@@ -363,14 +366,17 @@ func atomicRootWrite(root *os.Root, name string, data []byte, perm os.FileMode) 
 }
 
 func publishStagedOutputs(vault, stage string) (runErr error) {
+	if !validPublishDirectory(stage, ".lwc-worker-stage-") {
+		return fmt.Errorf("unsafe publish stage %q", stage)
+	}
+	if _, err := preflightGenerationOutputs(filepath.Join(vault, stage)); err != nil {
+		return fmt.Errorf("generation output validation failed: %w", err)
+	}
 	r, err := os.OpenRoot(vault)
 	if err != nil {
 		return err
 	}
 	defer r.Close()
-	if !validPublishDirectory(stage, ".lwc-worker-stage-") {
-		return fmt.Errorf("unsafe publish stage %q", stage)
-	}
 	stageRoot, err := r.OpenRoot(stage)
 	if err != nil {
 		return err
@@ -385,7 +391,7 @@ func publishStagedOutputs(vault, stage string) (runErr error) {
 		return err
 	}
 	journal := publishJournalRecord{Stage: stage, Backup: backup}
-	for _, destination := range []string{"wiki", "wiki.toml", "cache/id_map.json", "cache/concepts.jsonl", "cache/raw_status.json", "cache/suggested_queries.json", ".olw/state.db"} {
+	for _, destination := range []string{"wiki", "wiki.toml", "synto.toml", "cache/id_map.json", "cache/concepts.jsonl", "cache/dormant_concepts.jsonl", "cache/raw_status.json", "cache/suggested_queries.json", ".olw/state.db", ".synto/state.db", ".synto/INDEX.json"} {
 		journal.Entries = append(journal.Entries, publishEntry{Destination: destination, Stage: filepath.Join(stage, destination), Backup: filepath.Join(backup, destination)})
 	}
 	cacheEntries, err := r.OpenRoot(stage)

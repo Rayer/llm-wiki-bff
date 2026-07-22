@@ -289,6 +289,15 @@ func runCloudWorkerBatch(ctx context.Context, cfg workerConfig, commands [][]str
 		}
 		return errCloudMaterialization
 	}
+	// Capture concept IDs from the immediately prior committed/materialized
+	// workspace id_map before OLW regenerates transient concept identities.
+	priorConcepts, err := snapshotConcepts(workspace)
+	if err != nil {
+		if recordErr := writeCloudFailureReceipts(ctx, objects, prefix, workspace, cfg, snapshots); recordErr != nil {
+			return errors.Join(errCloudMaterialization, recordErr)
+		}
+		return errCloudMaterialization
+	}
 	if err := materializeSnapshots(workspace, snapshots); err != nil {
 		if recordErr := writeCloudFailureReceipts(ctx, objects, prefix, workspace, cfg, snapshots); recordErr != nil {
 			return errors.Join(errCloudMaterialization, recordErr)
@@ -306,6 +315,12 @@ func runCloudWorkerBatch(ctx context.Context, cfg workerConfig, commands [][]str
 		return primary
 	}
 	if err := reconcileWorkspaceSources(workspace, snapshots); err != nil {
+		if recordErr := writeCloudFailureReceipts(ctx, objects, prefix, workspace, cfg, snapshots); recordErr != nil {
+			return errors.Join(errCloudPipelinePublish, recordErr)
+		}
+		return errCloudPipelinePublish
+	}
+	if err := reconcileWorkspaceConcepts(workspace, priorConcepts, snapshots); err != nil {
 		if recordErr := writeCloudFailureReceipts(ctx, objects, prefix, workspace, cfg, snapshots); recordErr != nil {
 			return errors.Join(errCloudPipelinePublish, recordErr)
 		}
@@ -502,11 +517,13 @@ func snapshotCanonicalCloudSources(workspace string, data []byte) ([]sourceSnaps
 		rawSum := sha256.Sum256(raw)
 		rawSHA := fmt.Sprintf("%x", rawSum[:])
 		fingerprint := sourcestatus.Fingerprint(rawSHA, ann.SHA256)
-		snapshots = append(snapshots, sourceSnapshot{
+		snapshot := sourceSnapshot{
 			SourceID: sourceID, RawPath: receipt.RawPath, RawBytes: raw, RawSHA256: rawSHA,
 			AnnotationBody: ann.Body, AnnotationSHA: ann.SHA256, Fingerprint: fingerprint,
 			Dirty: !sourcestatus.ValidReceipt(receipt, receipt.RawPath) || receipt.LastIngestFingerprint != fingerprint,
-		})
+		}
+		snapshot.SyntoContentHash = syntoSourceContentHash(snapshot)
+		snapshots = append(snapshots, snapshot)
 	}
 	sort.Slice(snapshots, func(i, j int) bool { return snapshots[i].SourceID < snapshots[j].SourceID })
 	return snapshots, nil
@@ -520,19 +537,25 @@ func materializeLegacyCloudOutputs(ctx context.Context, objects objectStore, pre
 		{"wiki/", generation.GenerationOwned},
 		{"cache/", func(rel string) bool { return generation.GenerationOwned(rel) && rel != sourcestatus.Path }},
 		{".olw/", generation.GenerationOwned},
+		{".synto/", generation.GenerationOwned},
 	} {
 		if err := materializeCloudObjects(ctx, objects, prefix, workspace, entry.prefix, budget, entry.keep); err != nil {
 			return err
 		}
 	}
-	data, attrs, err := objects.Read(ctx, prefix+"wiki.toml", 0, generation.MaxFileBytes)
-	if isObjectNotFound(err) {
-		return nil
+	for _, config := range []string{"wiki.toml", "synto.toml"} {
+		data, attrs, err := objects.Read(ctx, prefix+config, 0, generation.MaxFileBytes)
+		if isObjectNotFound(err) {
+			continue
+		}
+		if err != nil || budget.reserve(attrs.Size) != nil || int64(len(data)) != attrs.Size {
+			return errors.New("cloud object read failed")
+		}
+		if err := writeCloudFile(workspace, config, data); err != nil {
+			return err
+		}
 	}
-	if err != nil || budget.reserve(attrs.Size) != nil || int64(len(data)) != attrs.Size {
-		return errors.New("cloud object read failed")
-	}
-	return writeCloudFile(workspace, "wiki.toml", data)
+	return nil
 }
 func writeCloudFile(root, rel string, b []byte) error {
 	if err := safeRelativePath(rel); err != nil {
@@ -548,7 +571,7 @@ func writeCloudFile(root, rel string, b []byte) error {
 func publishCloudGeneration(ctx context.Context, objects objectStore, prefix, workspace string, snapshots []sourceSnapshot) (generation.Manifest, int64, error) {
 	files, err := preflightGenerationOutputs(workspace)
 	if err != nil {
-		return generation.Manifest{}, 0, errors.New("generation output validation failed")
+		return generation.Manifest{}, 0, fmt.Errorf("generation output validation failed: %w", err)
 	}
 	oldData, oldAttrs, oldErr := objects.Read(ctx, prefix+generation.ManifestPath, 0, generation.MaxManifestBytes)
 	if oldErr != nil && !isObjectNotFound(oldErr) {
@@ -559,7 +582,7 @@ func publishCloudGeneration(ctx context.Context, objects objectStore, prefix, wo
 func publishCloudGenerationFromStart(ctx context.Context, objects objectStore, prefix, workspace string, snapshots []sourceSnapshot, oldData []byte, oldAttrs objectAttrs, oldExists bool) (generation.Manifest, int64, error) {
 	files, err := preflightGenerationOutputs(workspace)
 	if err != nil {
-		return generation.Manifest{}, 0, errors.New("generation output validation failed")
+		return generation.Manifest{}, 0, fmt.Errorf("generation output validation failed: %w", err)
 	}
 	return publishCloudGenerationWithFiles(ctx, objects, prefix, workspace, snapshots, files, oldData, oldAttrs, oldExists)
 }
@@ -753,10 +776,24 @@ func preflightGenerationOutputsWithLimits(root string, limits generationTraversa
 	if err != nil {
 		return nil, err
 	}
-	for _, required := range []string{"wiki.toml", "cache/id_map.json", "cache/concepts.jsonl", "cache/raw_status.json", "cache/suggested_queries.json", ".olw/state.db"} {
+	for _, required := range []string{"synto.toml", "cache/id_map.json", "cache/concepts.jsonl", "cache/dormant_concepts.jsonl", "cache/raw_status.json", "cache/suggested_queries.json", ".synto/state.db", ".synto/INDEX.json"} {
 		if !seen[required] {
 			return nil, errors.New("generation output is incomplete")
 		}
+	}
+	legacyConfig, legacyState := seen["wiki.toml"], seen[".olw/state.db"]
+	if legacyConfig != legacyState {
+		return nil, errors.New("migrated generation rollback artifacts are incomplete")
+	}
+	for _, state := range []string{".synto/state.db", ".olw/state.db"} {
+		if seen[state] {
+			if err := validateSQLiteArtifact(root, state); err != nil {
+				return nil, fmt.Errorf("invalid %s: %w", state, err)
+			}
+		}
+	}
+	if _, err := readSyntoIndexTruth(root); err != nil {
+		return nil, fmt.Errorf("invalid .synto/INDEX.json: %w", err)
 	}
 	sort.Slice(files, func(i, j int) bool { return files[i].path < files[j].path })
 	return files, nil

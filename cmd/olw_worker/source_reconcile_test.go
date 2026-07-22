@@ -230,6 +230,92 @@ func bytesReplaceOnce(data, old, replacement []byte) []byte {
 	return append(out, data[index+len(old):]...)
 }
 
+func TestSourceReconcileMalformedConceptsCacheLeavesAllBytesUnchanged(t *testing.T) {
+	// Adversarial: duplicate-key concepts cache must fail closed with zero writes
+	// (id_map, concepts cache, concept pages, Source pages).
+	workspace := t.TempDir()
+	idMap := []byte(`{
+  "source": {"s-transient": "source"},
+  "source_meta": {"s-transient": {"slug": "source", "source_file": "raw/a.md"}},
+  "redirects": {}
+}`)
+	malformedCache := []byte(
+		`{"slug":"alpha","slug":"evil","sources":["s-transient"],"frontmatter":{"sources":["s-transient"]}}` + "\n",
+	)
+	conceptPage := []byte("---\nid: c1\nsources:\n  - s-transient\n---\nbody\n")
+	sourcePage := []byte("---\nid: s-transient\nsource_file: raw/a.md\n---\nsource body\n")
+	mustWriteFile(t, filepath.Join(workspace, "cache", "id_map.json"), idMap)
+	mustWriteFile(t, filepath.Join(workspace, "cache", "concepts.jsonl"), malformedCache)
+	mustWriteFile(t, filepath.Join(workspace, "wiki", "alpha.md"), conceptPage)
+	mustWriteFile(t, filepath.Join(workspace, "wiki", "sources", "source.md"), sourcePage)
+
+	before := snapshotRelevantVaultBytes(t, workspace,
+		"cache/id_map.json", "cache/concepts.jsonl", "wiki/alpha.md", "wiki/sources/source.md",
+	)
+	err := reconcileWorkspaceSources(workspace, []sourceSnapshot{{SourceID: "s-stable", RawPath: "raw/a.md"}})
+	if err == nil || !strings.Contains(err.Error(), "duplicate") {
+		t.Fatalf("error=%v, want duplicate-key rejection", err)
+	}
+	assertVaultBytesUnchanged(t, workspace, before)
+}
+
+func TestSourceReconcileLateMalformedSourcePageLeavesAllBytesUnchanged(t *testing.T) {
+	// Adversarial late failure: Source page with duplicate frontmatter ids after
+	// id_map/concepts/concept pages would previously have been written.
+	workspace := t.TempDir()
+	idMap := []byte(`{
+  "source": {"s-transient": "source"},
+  "source_meta": {"s-transient": {"slug": "source", "source_file": "raw/a.md"}},
+  "redirects": {}
+}`)
+	cache := []byte(`{"slug":"alpha","sources":["s-transient"],"frontmatter":{"sources":["s-transient"]}}` + "\n")
+	conceptPage := []byte("---\nid: c1\nsources:\n  - s-transient\nsource: s-transient\n---\nbody\n")
+	// Duplicate top-level id fields — rewriteSourcePageID rejects after earlier stages.
+	sourcePage := []byte("---\nid: s-transient\nid: s-other\nsource_file: raw/a.md\n---\nsource body\n")
+	mustWriteFile(t, filepath.Join(workspace, "cache", "id_map.json"), idMap)
+	mustWriteFile(t, filepath.Join(workspace, "cache", "concepts.jsonl"), cache)
+	mustWriteFile(t, filepath.Join(workspace, "wiki", "alpha.md"), conceptPage)
+	mustWriteFile(t, filepath.Join(workspace, "wiki", "sources", "source.md"), sourcePage)
+
+	before := snapshotRelevantVaultBytes(t, workspace,
+		"cache/id_map.json", "cache/concepts.jsonl", "wiki/alpha.md", "wiki/sources/source.md",
+	)
+	err := reconcileWorkspaceSources(workspace, []sourceSnapshot{{SourceID: "s-stable", RawPath: "raw/a.md"}})
+	if err == nil || !strings.Contains(err.Error(), "duplicate") {
+		t.Fatalf("error=%v, want late duplicate source frontmatter rejection", err)
+	}
+	assertVaultBytesUnchanged(t, workspace, before)
+}
+
+func TestSourceReconcileLateMalformedAnnotationTrailerLeavesAllBytesUnchanged(t *testing.T) {
+	// Adversarial late failure: annotation trailer validation after Source ID rewrite.
+	workspace := t.TempDir()
+	idMap := []byte(`{
+  "source": {"s-transient": "source"},
+  "source_meta": {"s-transient": {"slug": "source", "source_file": "raw/a.md"}},
+  "redirects": {}
+}`)
+	cache := []byte(`{"slug":"alpha","sources":["s-transient"],"frontmatter":{"sources":["s-transient"]}}` + "\n")
+	conceptPage := []byte("---\nid: c1\nsources:\n  - s-transient\n---\nbody\n")
+	// Valid frontmatter/id but malformed terminal annotation trailer.
+	sourcePage := []byte("---\nid: s-transient\nsource_file: raw/a.md\n---\nbody\n\n---\n\n## Human annotations (system)\n<!-- lwc-ann-v1 source_id=s-transient ann_sha256=fake -->\nuser text continues\n")
+	mustWriteFile(t, filepath.Join(workspace, "cache", "id_map.json"), idMap)
+	mustWriteFile(t, filepath.Join(workspace, "cache", "concepts.jsonl"), cache)
+	mustWriteFile(t, filepath.Join(workspace, "wiki", "alpha.md"), conceptPage)
+	mustWriteFile(t, filepath.Join(workspace, "wiki", "sources", "source.md"), sourcePage)
+
+	before := snapshotRelevantVaultBytes(t, workspace,
+		"cache/id_map.json", "cache/concepts.jsonl", "wiki/alpha.md", "wiki/sources/source.md",
+	)
+	err := reconcileWorkspaceSources(workspace, []sourceSnapshot{
+		{SourceID: "s-stable", RawPath: "raw/a.md", AnnotationBody: "note", AnnotationSHA: annotation.Digest("note")},
+	})
+	if err == nil || !strings.Contains(err.Error(), "annotation trailer") {
+		t.Fatalf("error=%v, want late malformed annotation trailer rejection", err)
+	}
+	assertVaultBytesUnchanged(t, workspace, before)
+}
+
 func TestApplyStableSourceAnnotationsIsExactlyOnceAndIdempotent(t *testing.T) {
 	workspace := t.TempDir()
 	path := filepath.Join(workspace, "wiki", "sources", "slug.md")

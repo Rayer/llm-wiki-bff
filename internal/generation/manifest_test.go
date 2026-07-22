@@ -30,7 +30,7 @@ func TestDecodeRejectsUnsafeOrInvalidFileTables(t *testing.T) {
 }
 
 func TestGenerationOwnedAndCanonicalPaths(t *testing.T) {
-	for _, path := range []string{"wiki/a.md", "wiki/.drafts/a.md", "wiki.toml", "cache/id_map.json", "cache/concepts.jsonl", "cache/raw_status.json", "cache/suggested_queries.json", ".olw/state.db"} {
+	for _, path := range []string{"wiki/a.md", "wiki/.drafts/a.md", "wiki.toml", "synto.toml", "cache/id_map.json", "cache/concepts.jsonl", "cache/dormant_concepts.jsonl", "cache/raw_status.json", "cache/suggested_queries.json", ".olw/state.db", ".synto/state.db", ".synto/INDEX.json"} {
 		if !GenerationOwned(path) {
 			t.Errorf("GenerationOwned(%q) = false", path)
 		}

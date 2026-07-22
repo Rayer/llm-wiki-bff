@@ -250,18 +250,11 @@ func TestRunWorkerBatchCanInitializeVaultBeforeCommands(t *testing.T) {
 	}
 
 	cfg := workerConfig{VaultPath: vault, APIKey: "secret", InitVault: true, Postprocess: false, StopOnError: true}
-	if err := runWorkerBatch(context.Background(), cfg, `[["run","--auto-approve"]]`); err != nil {
-		t.Fatalf("runWorkerBatch() error = %v", err)
+	if err := runWorkerBatch(context.Background(), cfg, `[["run","--auto-approve"]]`); err == nil {
+		t.Fatal("--init was accepted despite the single-command contract")
 	}
-
-	want := [][]string{{"init", "."}, {"run", "--auto-approve"}}
-	if len(ran) != len(want) {
-		t.Fatalf("ran = %#v, want %#v", ran, want)
-	}
-	for i := range want {
-		if strings.Join(ran[i], "\x00") != strings.Join(want[i], "\x00") {
-			t.Fatalf("ran = %#v, want %#v", ran, want)
-		}
+	if len(ran) != 0 {
+		t.Fatalf("unsafe --init reached child: %#v", ran)
 	}
 }
 
@@ -299,12 +292,14 @@ func TestRunOLWBatchStopsOnFirstFailure(t *testing.T) {
 		return nil
 	}
 
-	err := runOLWBatch(context.Background(), t.TempDir(), [][]string{{"fail"}, {"second"}}, true, nil, nil, nil)
-	if !errors.Is(err, failErr) {
-		t.Fatalf("runOLWBatch() error = %v, want %v", err, failErr)
+	vault := t.TempDir()
+	mustWriteFile(t, filepath.Join(vault, "synto.toml"), []byte("[pipeline]\nauto_commit = false\nauto_maintain = false\nrelation_extraction = false\n"))
+	err := runOLWBatch(context.Background(), vault, [][]string{{"fail"}, {"second"}}, true, nil, nil, nil)
+	if err == nil {
+		t.Fatal("unsafe batch was accepted")
 	}
-	if len(ran) != 1 {
-		t.Fatalf("ran %d commands, want 1: %#v", len(ran), ran)
+	if len(ran) != 0 {
+		t.Fatalf("unsafe batch reached child: %#v", ran)
 	}
 }
 
@@ -321,12 +316,14 @@ func TestRunOLWBatchContinuesWhenStopOnErrorFalse(t *testing.T) {
 		return nil
 	}
 
-	err := runOLWBatch(context.Background(), t.TempDir(), [][]string{{"fail"}, {"second"}}, false, nil, nil, nil)
+	vault := t.TempDir()
+	mustWriteFile(t, filepath.Join(vault, "synto.toml"), []byte("[pipeline]\nauto_commit = false\nauto_maintain = false\nrelation_extraction = false\n"))
+	err := runOLWBatch(context.Background(), vault, [][]string{{"fail"}, {"second"}}, false, nil, nil, nil)
 	if err == nil {
-		t.Fatal("runOLWBatch() error = nil, want error")
+		t.Fatal("unsafe batch was accepted")
 	}
-	if len(ran) != 2 {
-		t.Fatalf("ran %d commands, want 2: %#v", len(ran), ran)
+	if len(ran) != 0 {
+		t.Fatalf("unsafe batch reached child: %#v", ran)
 	}
 }
 
@@ -350,13 +347,8 @@ func TestRunWorkerBatchWritesPipelineLogForExecution(t *testing.T) {
 		t.Fatalf("runWorkerBatch() error = %v", err)
 	}
 
-	data, err := os.ReadFile(filepath.Join(vault, "cache", "pipeline-olw-pipeline-abc123.log"))
-	if err != nil {
-		t.Fatalf("read pipeline log: %v", err)
-	}
-	text := string(data)
-	if !strings.Contains(text, "stdout line\n") || !strings.Contains(text, "stderr line\n") {
-		t.Fatalf("log = %q, want stdout and stderr", text)
+	if _, err := os.Stat(filepath.Join(vault, "cache", "pipeline-olw-pipeline-abc123.log")); !os.IsNotExist(err) {
+		t.Fatalf("no-postprocess private run published a pipeline log: %v", err)
 	}
 }
 
@@ -415,6 +407,53 @@ func TestRunPostprocessWritesSuggestedQueriesFromConcepts(t *testing.T) {
 	}
 	if artifact.UpdatedAt == "" {
 		t.Fatal("updated_at is empty")
+	}
+}
+
+func TestWorkerPostprocessDirectPreservesDormantConceptAndEntityMappings(t *testing.T) {
+	vault := t.TempDir()
+	mustWriteFile(t, filepath.Join(vault, "wiki", "alpha.md"), []byte("---\nid: stable-alpha\n---\nAlpha"))
+	mustWriteFile(t, filepath.Join(vault, "cache", "id_map.json"), []byte(`{"concept":{"stable-alpha":"alpha"},"dormant_concept":{"stable-beta":"beta"},"concept_entity_id":{"stable-alpha":"entity-alpha","stable-beta":"entity-beta","orphan":"entity-orphan"},"source":{},"redirects":{}}`))
+	mustWriteFile(t, filepath.Join(vault, "synto.toml"), []byte("[pipeline]\nauto_commit = false\nauto_maintain = false\nrelation_extraction = false\n"))
+	mustWriteFile(t, filepath.Join(vault, ".synto", "INDEX.json"), []byte(syntoIndexFixture("stable-alpha", "entity-alpha", "alpha", false)))
+	writeValidSQLiteState(t, filepath.Join(vault, ".synto", "state.db"))
+
+	if err := runPostprocessCommand(context.Background(), workerConfig{VaultPath: vault, ExecutionID: "direct-r1"}); err != nil {
+		t.Fatalf("runPostprocessCommand() error = %v", err)
+	}
+	ids := mustSnapshotIDMap(t, vault)
+	if ids.Concept["stable-alpha"] != "alpha" || ids.DormantConcept["stable-beta"] != "beta" {
+		t.Fatalf("postprocess lifecycle maps = %#v", ids)
+	}
+	if ids.ConceptEntityID["stable-alpha"] != "entity-alpha" || ids.ConceptEntityID["stable-beta"] != "entity-beta" {
+		t.Fatalf("postprocess entity maps = %#v", ids.ConceptEntityID)
+	}
+	if _, ok := ids.ConceptEntityID["orphan"]; ok {
+		t.Fatalf("postprocess retained orphan entity mapping: %#v", ids.ConceptEntityID)
+	}
+}
+
+func TestWorkerPostprocessWorkspacePreservesDormantConceptAndEntityMappings(t *testing.T) {
+	vault := t.TempDir()
+	mustWriteFile(t, filepath.Join(vault, "wiki", "alpha.md"), []byte("---\nid: stable-alpha\n---\nAlpha"))
+	mustWriteFile(t, filepath.Join(vault, "cache", "id_map.json"), []byte(`{"concept":{"stable-alpha":"alpha"},"dormant_concept":{"stable-beta":"beta"},"concept_entity_id":{"stable-alpha":"entity-alpha","stable-beta":"entity-beta","orphan":"entity-orphan"},"source":{},"redirects":{}}`))
+	mustWriteFile(t, filepath.Join(vault, "cache", "dormant_concepts.jsonl"), nil)
+	mustWriteFile(t, filepath.Join(vault, "synto.toml"), []byte("[pipeline]\n"))
+	mustWriteFile(t, filepath.Join(vault, ".synto", "INDEX.json"), []byte(syntoIndexFixture("stable-alpha", "entity-alpha", "alpha", true)))
+	writeValidSQLiteState(t, filepath.Join(vault, ".synto", "state.db"))
+
+	if err := runPostprocessCommand(context.Background(), workerConfig{VaultPath: vault, Workspace: true, WorkspaceDir: t.TempDir(), ExecutionID: "workspace-r1"}); err != nil {
+		t.Fatalf("runPostprocessCommand(workspace) error = %v", err)
+	}
+	ids := mustSnapshotIDMap(t, vault)
+	if ids.Concept["stable-alpha"] != "alpha" || ids.DormantConcept["stable-beta"] != "beta" {
+		t.Fatalf("workspace postprocess lifecycle maps = %#v", ids)
+	}
+	if ids.ConceptEntityID["stable-alpha"] != "entity-alpha" || ids.ConceptEntityID["stable-beta"] != "entity-beta" {
+		t.Fatalf("workspace postprocess entity maps = %#v", ids.ConceptEntityID)
+	}
+	if _, ok := ids.ConceptEntityID["orphan"]; ok {
+		t.Fatalf("workspace postprocess retained orphan entity mapping: %#v", ids.ConceptEntityID)
 	}
 }
 
@@ -550,7 +589,7 @@ func TestWorkspaceMaterializesAnnotatedSourceIdenticallyOnSequentialRuns(t *test
 	}
 	cfg := workerConfig{VaultPath: vault, APIKey: "secret", Workspace: true, WorkspaceDir: t.TempDir(), Postprocess: true}
 	for i := 0; i < 2; i++ {
-		if err := runWorkerBatch(context.Background(), cfg, `[["run","--auto-approve"],["approve","--all"]]`); err != nil {
+		if err := runWorkerBatch(context.Background(), cfg, `[["run","--auto-approve"]]`); err != nil {
 			t.Fatal(err)
 		}
 		// In production OLW regenerates id_map with its source mappings. The fake
@@ -558,7 +597,7 @@ func TestWorkspaceMaterializesAnnotatedSourceIdenticallyOnSequentialRuns(t *test
 		// the two independent workspace runs.
 		mustWriteFile(t, filepath.Join(vault, "cache", "id_map.json"), []byte(`{"source_meta":{"s1":{"source_file":"raw/source.md"}}}`))
 	}
-	if len(materialized) != 4 || materialized[0] != materialized[2] {
+	if len(materialized) != 2 || materialized[0] != materialized[1] {
 		t.Fatalf("materialized runs differ: %#v", materialized)
 	}
 	if strings.Count(materialized[0], "<!-- lwc-ann-v1 source_id=s1 ") != 1 {
@@ -597,7 +636,7 @@ func TestWorkspaceRequiresFirstCommandToBeRunBeforeLeaseOrExecution(t *testing.T
 			}
 
 			err := runWorkerBatch(context.Background(), workerConfig{VaultPath: vault, APIKey: "secret", ExecutionID: "invalid", Workspace: true, WorkspaceDir: t.TempDir(), Postprocess: true}, commands)
-			if err == nil || !strings.Contains(err.Error(), "requires the first olw command to be run") {
+			if err == nil || !strings.Contains(err.Error(), "worker input is invalid") {
 				t.Fatalf("error=%v", err)
 			}
 			if executed {
@@ -622,10 +661,10 @@ func TestWorkspaceAcceptsProductionCommandContract(t *testing.T) {
 		return nil
 	}
 
-	if err := runWorkerBatch(context.Background(), workerConfig{VaultPath: vault, APIKey: "secret", Workspace: true, WorkspaceDir: t.TempDir(), Postprocess: true}, `[["run","--auto-approve"],["approve","--all"]]`); err != nil {
+	if err := runWorkerBatch(context.Background(), workerConfig{VaultPath: vault, APIKey: "secret", Workspace: true, WorkspaceDir: t.TempDir(), Postprocess: true}, `[["run","--auto-approve"]]`); err != nil {
 		t.Fatal(err)
 	}
-	want := [][]string{{"run", "--auto-approve"}, {"approve", "--all"}}
+	want := [][]string{{"run", "--auto-approve"}}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("commands=%q, want %q", got, want)
 	}
@@ -685,8 +724,11 @@ func TestStagePublishMirrorsWikiAndExcludesUnownedFiles(t *testing.T) {
 	mustWriteFile(t, filepath.Join(workspace, "cache", "id_map.json"), []byte("id map"))
 	mustWriteFile(t, filepath.Join(workspace, "cache", "annotations", "s1.json"), []byte("must not copy"))
 	mustWriteFile(t, filepath.Join(workspace, "cache", "unknown.json"), []byte("must not copy"))
-	mustWriteFile(t, filepath.Join(workspace, ".olw", "state.db"), []byte("state"))
+	writeValidSQLiteState(t, filepath.Join(workspace, ".olw", "state.db"))
 	mustWriteFile(t, filepath.Join(workspace, ".olw", "pipeline.lock"), []byte("must not copy"))
+	writeFreshSyntoRequiredOutputs(t, workspace)
+	mustWriteFile(t, filepath.Join(workspace, "wiki.toml"), []byte("legacy"))
+	writeValidSQLiteState(t, filepath.Join(workspace, ".olw", "state.db"))
 	if err := syncWorkspaceOutputs(workspace, vault, ""); err != nil {
 		t.Fatal(err)
 	}
@@ -695,11 +737,14 @@ func TestStagePublishMirrorsWikiAndExcludesUnownedFiles(t *testing.T) {
 			t.Fatalf("unexpected synced file %s: %v", absent, err)
 		}
 	}
-	for path, want := range map[string]string{"raw/source.md": "stored raw", "cache/annotations/s1.json": "keep annotation", "cache/unknown.json": "keep unknown", ".olw/other.db": "keep other", "wiki/current.md": "current", ".olw/state.db": "state"} {
+	for path, want := range map[string]string{"raw/source.md": "stored raw", "cache/annotations/s1.json": "keep annotation", "cache/unknown.json": "keep unknown", ".olw/other.db": "keep other", "wiki/current.md": "current"} {
 		data, err := os.ReadFile(filepath.Join(vault, path))
 		if err != nil || string(data) != want {
 			t.Fatalf("%s=%q err=%v, want %q", path, data, err, want)
 		}
+	}
+	if _, err := os.Stat(filepath.Join(vault, ".olw", "state.db")); err != nil {
+		t.Fatalf("legacy SQLite state missing: %v", err)
 	}
 }
 
@@ -708,6 +753,7 @@ func TestPublishRollbackPreservesPriorGenerationOnRenameError(t *testing.T) {
 	mustWriteFile(t, filepath.Join(vault, "wiki", "page.md"), []byte("old"))
 	workspace := t.TempDir()
 	mustWriteFile(t, filepath.Join(workspace, "wiki", "page.md"), []byte("new"))
+	writeFreshSyntoRequiredOutputs(t, workspace)
 	stage, err := stageWorkspaceOutputs(workspace, vault, "")
 	if err != nil {
 		t.Fatal(err)
@@ -818,6 +864,7 @@ func TestCommittedCleanupFailurePreservesNewGeneration(t *testing.T) {
 	workspace := t.TempDir()
 	mustWriteFile(t, filepath.Join(vault, "wiki", "page.md"), []byte("old"))
 	mustWriteFile(t, filepath.Join(workspace, "wiki", "page.md"), []byte("new"))
+	writeFreshSyntoRequiredOutputs(t, workspace)
 	stage, err := stageWorkspaceOutputs(workspace, vault, "")
 	if err != nil {
 		t.Fatal(err)
@@ -856,6 +903,7 @@ func TestPublishRejectsDestinationSymlink(t *testing.T) {
 	}
 	workspace := t.TempDir()
 	mustWriteFile(t, filepath.Join(workspace, "wiki", "page.md"), []byte("new"))
+	writeFreshSyntoRequiredOutputs(t, workspace)
 	if err := syncWorkspaceOutputs(workspace, vault, ""); err == nil || !strings.Contains(err.Error(), "destination symlink") {
 		t.Fatalf("error=%v", err)
 	}
@@ -1131,12 +1179,12 @@ func TestNoWorkspaceRunsAgainstOriginalVault(t *testing.T) {
 	if err := runWorkerBatch(context.Background(), workerConfig{VaultPath: vault, APIKey: "secret", Workspace: false, Postprocess: false}, `[["run"]]`); err != nil {
 		t.Fatal(err)
 	}
-	want, err := filepath.EvalSymlinks(vault)
+	tmpRoot, err := filepath.EvalSymlinks("/tmp")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got != want {
-		t.Fatalf("OLW vault=%q, want %q", got, want)
+	if got == vault || !strings.HasPrefix(got, tmpRoot+string(filepath.Separator)) {
+		t.Fatalf("Synto vault=%q, want a private workspace under %q", got, tmpRoot)
 	}
 }
 
@@ -1244,6 +1292,9 @@ func workspaceVault(t *testing.T, raw string) string {
 	vault := t.TempDir()
 	mustWriteFile(t, filepath.Join(vault, "raw", "source.md"), []byte(raw))
 	mustWriteFile(t, filepath.Join(vault, "cache", "id_map.json"), []byte(`{"source_meta":{"s1":{"source_file":"raw/source.md"}}}`))
+	mustWriteFile(t, filepath.Join(vault, "synto.toml"), []byte("[pipeline]\nauto_commit = false\nauto_maintain = false\nrelation_extraction = false\n"))
+	mustWriteFile(t, filepath.Join(vault, ".synto", "INDEX.json"), []byte(syntoIndexFixture("22af645d1859", "entity", "new", false)))
+	writeValidSQLiteState(t, filepath.Join(vault, ".synto", "state.db"))
 	return vault
 }
 

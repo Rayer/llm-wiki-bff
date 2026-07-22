@@ -87,7 +87,7 @@ func newRootCommand() *cobra.Command {
 
 	rootCmd := &cobra.Command{
 		Use:           "worker",
-		Short:         "Run OLW commands against a local vault",
+		Short:         "Run the pinned Synto pipeline against a local vault",
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}
@@ -99,13 +99,13 @@ func newRootCommand() *cobra.Command {
 	rootCmd.PersistentFlags().StringVar(&cfg.ProjectID, "project-id", "", "project id")
 	rootCmd.PersistentFlags().StringVar(&cfg.ExecutionID, "execution-id", "", "pipeline execution id")
 	rootCmd.PersistentFlags().StringVar(&cfg.APIKey, "api-key", "", "LLM API key")
-	rootCmd.PersistentFlags().BoolVar(&cfg.StopOnError, "stop-on-error", true, "stop on first failed OLW command")
+	rootCmd.PersistentFlags().BoolVar(&cfg.StopOnError, "stop-on-error", true, "stop on first failed Synto command")
 	rootCmd.PersistentFlags().BoolVar(&cfg.Workspace, "workspace", false, "run against a private copied workspace")
 	rootCmd.PersistentFlags().StringVar(&cfg.WorkspaceDir, "workspace-dir", "", "parent directory for private workspaces")
 
 	runCmd := &cobra.Command{
 		Use:   "run <json array of arrays>",
-		Short: "Execute a batch of OLW commands",
+		Short: "Execute the accepted Synto run command",
 		Args:  fixedArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			runCfg := cfg
@@ -116,7 +116,7 @@ func newRootCommand() *cobra.Command {
 			return runWorkerBatch(cmd.Context(), runCfg, args[0])
 		},
 	}
-	runCmd.Flags().BoolVar(&cfg.InitVault, "init", false, "run 'olw init .' before the command batch")
+	runCmd.Flags().BoolVar(&cfg.InitVault, "init", false, "deprecated; rejected because initialization is not part of the worker contract")
 	runCmd.Flags().BoolVar(&cfg.Postprocess, "postprocess", true, "run postprocess after successful batch")
 	runCmd.Flags().BoolVar(&noPostprocess, "no-postprocess", false, "skip postprocess after batch")
 
@@ -191,10 +191,10 @@ func runWorkerBatch(ctx context.Context, cfg workerConfig, rawCommands string) e
 	if err != nil {
 		return err
 	}
-	if cfg.Workspace {
-		return runWorkerBatchWorkspace(ctx, cfg, commands, vault)
-	}
-	return runWorkerBatchAtVault(ctx, cfg, commands, vault)
+	// Generation always runs in the existing private-workspace transaction,
+	// including local invocations. This keeps direct mode from letting Synto
+	// migrate or mutate the mounted/live vault before validation and publish.
+	return runWorkerBatchWorkspace(ctx, cfg, commands, vault)
 }
 
 func configFromEnvironment(cfg workerConfig) workerConfig {
@@ -239,14 +239,14 @@ func runWorkerBatchAtVault(ctx context.Context, cfg workerConfig, commands [][]s
 	if err := cleanStaleLock(vault, 5*time.Minute); err != nil {
 		return err
 	}
-	if err := ensureWikiTOML(vault, cfg); err != nil {
-		return err
-	}
 	olwEnv, err := prepareOLWEnvironment(cfg)
 	if err != nil {
 		return err
 	}
 	defer cleanupOLWEnvironment(olwEnv)
+	if err := ensureSyntoVault(ctx, vault, cfg, olwEnv); err != nil {
+		return err
+	}
 
 	stdout, stderr, closeLog, err := pipelineLogWriters(vault, cfg, commands, cfg.SuppressOutput)
 	if err != nil {
@@ -260,6 +260,14 @@ func runWorkerBatchAtVault(ctx context.Context, cfg workerConfig, commands [][]s
 		return runErr
 	}
 	if cfg.Postprocess {
+		if err := ensureSyntoIndex(ctx, vault, olwEnv); err != nil {
+			return err
+		}
+	}
+	if err := validateSyntoPipelineSafety(filepath.Join(vault, "synto.toml")); err != nil {
+		return err
+	}
+	if cfg.Postprocess {
 		if err := runPostprocess(ctx, vault); err != nil {
 			return err
 		}
@@ -267,14 +275,19 @@ func runWorkerBatchAtVault(ctx context.Context, cfg workerConfig, commands [][]s
 	return nil
 }
 
-// runWorkerBatchWorkspace keeps the mounted vault immutable while OLW runs.
+// runWorkerBatchWorkspace keeps the mounted vault immutable while Synto runs.
 // Receipts are written only after every durable output has been copied back.
 func runWorkerBatchWorkspace(ctx context.Context, cfg workerConfig, commands [][]string, vault string) (runErr error) {
 	if !cfg.Postprocess {
-		return errors.New("workspace mode requires postprocess before recording ingestion receipts")
+		workspace, err := createWorkspace(cfg.WorkspaceDir, vault)
+		if err != nil {
+			return err
+		}
+		defer os.RemoveAll(workspace)
+		return runWorkerBatchAtVault(ctx, cfg, commands, workspace)
 	}
 	if !startsWithFullOLWRun(commands) {
-		return errors.New("workspace mode requires the first olw command to be run before recording ingestion receipts")
+		return errors.New("workspace mode requires the Synto run command before recording ingestion receipts")
 	}
 	lease, err := acquireVaultLease(vault, cfg.ExecutionID)
 	if err != nil {
@@ -289,6 +302,10 @@ func runWorkerBatchWorkspace(ctx context.Context, cfg workerConfig, commands [][
 		return err
 	}
 	snapshots, err := snapshotSources(vault)
+	if err != nil {
+		return err
+	}
+	priorConcepts, err := snapshotConcepts(vault)
 	if err != nil {
 		return err
 	}
@@ -321,6 +338,13 @@ func runWorkerBatchWorkspace(ctx context.Context, cfg workerConfig, commands [][
 		}
 		return err
 	}
+	if err := reconcileWorkspaceConcepts(workspace, priorConcepts, snapshots); err != nil {
+		recordErr := recordFailure(vault, snapshots, err)
+		if recordErr != nil {
+			return errors.Join(err, recordErr)
+		}
+		return err
+	}
 	if err := syncWorkspaceOutputs(workspace, vault, cfg.ExecutionID); err != nil {
 		recordErr := recordFailure(vault, snapshots, err)
 		if recordErr != nil {
@@ -340,30 +364,27 @@ func runPostprocessCommand(ctx context.Context, cfg workerConfig) (runErr error)
 	if err != nil {
 		return err
 	}
-	if cfg.Workspace {
-		lease, err := acquireVaultLease(vault, cfg.ExecutionID)
-		if err != nil {
-			return err
-		}
-		defer func() {
-			if err := lease.Release(); err != nil && runErr == nil {
-				runErr = err
-			}
-		}()
-		if err := recoverInterruptedPublish(vault); err != nil {
-			return err
-		}
-		workspace, err := createWorkspace(cfg.WorkspaceDir, vault)
-		if err != nil {
-			return err
-		}
-		defer os.RemoveAll(workspace)
-		if err := runPostprocess(ctx, workspace); err != nil {
-			return err
-		}
-		return syncWorkspaceOutputs(workspace, vault, cfg.ExecutionID)
+	lease, err := acquireVaultLease(vault, cfg.ExecutionID)
+	if err != nil {
+		return err
 	}
-	return runPostprocess(ctx, vault)
+	defer func() {
+		if err := lease.Release(); err != nil && runErr == nil {
+			runErr = err
+		}
+	}()
+	if err := recoverInterruptedPublish(vault); err != nil {
+		return err
+	}
+	workspace, err := createWorkspace(cfg.WorkspaceDir, vault)
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(workspace)
+	if err := runPostprocess(ctx, workspace); err != nil {
+		return err
+	}
+	return syncWorkspaceOutputs(workspace, vault, cfg.ExecutionID)
 }
 
 func parseCommandBatch(raw string) ([][]string, error) {
@@ -437,7 +458,7 @@ func parseCommandBatch(raw string) ([][]string, error) {
 }
 
 func startsWithFullOLWRun(commands [][]string) bool {
-	return len(commands) > 0 && len(commands[0]) > 0 && commands[0][0] == "run"
+	return len(commands) == 1 && len(commands[0]) >= 1 && commands[0][0] == "run"
 }
 
 func resolveVaultPath(cfg workerConfig) (string, error) {
@@ -485,18 +506,21 @@ ingest_parallel = false
 }
 
 func prepareOLWEnvironment(cfg workerConfig) ([]string, error) {
-	configHome, err := os.MkdirTemp("", "olw-config-*")
+	configHome, err := os.MkdirTemp("", "synto-config-*")
 	if err != nil {
-		return nil, fmt.Errorf("create isolated OLW config dir: %w", err)
+		return nil, fmt.Errorf("create isolated Synto config dir: %w", err)
 	}
 	env := []string{"XDG_CONFIG_HOME=" + configHome}
 	if strings.TrimSpace(cfg.APIKey) != "" {
-		env = append(env, "LLM_API_KEY="+cfg.APIKey, "DEEPSEEK_API_KEY="+cfg.APIKey)
+		env = append(env, "SYNTO_API_KEY="+cfg.APIKey, "DEEPSEEK_API_KEY="+cfg.APIKey)
 	}
 	return env, nil
 }
 
 func runOLWBatch(ctx context.Context, vault string, commands [][]string, stopOnError bool, env []string, stdout, stderr io.Writer) error {
+	if err := validateSyntoCommandBatch(commands); err != nil {
+		return err
+	}
 	if stdout == nil {
 		stdout = os.Stdout
 	}
@@ -505,13 +529,16 @@ func runOLWBatch(ctx context.Context, vault string, commands [][]string, stopOnE
 	}
 	var batchErr error
 	for i, command := range commands {
-		log.Printf("[%d/%d] olw command", i+1, len(commands))
+		log.Printf("[%d/%d] synto command", i+1, len(commands))
+		if err := validateSyntoPipelineSafety(filepath.Join(vault, "synto.toml")); err != nil {
+			return err
+		}
 		if err := execOLW(ctx, vault, command, env, stdout, stderr); err != nil {
-			wrapped := fmt.Errorf("olw command failed: %w", err)
+			wrapped := fmt.Errorf("synto command failed: %w", err)
 			if stopOnError {
 				return wrapped
 			}
-			log.Printf("olw command failed (continuing)")
+			log.Printf("synto command failed (continuing)")
 			batchErr = errors.Join(batchErr, wrapped)
 		}
 	}
@@ -519,12 +546,30 @@ func runOLWBatch(ctx context.Context, vault string, commands [][]string, stopOnE
 }
 
 func execOLWCommand(ctx context.Context, vault string, command []string, env []string, stdout, stderr io.Writer) error {
-	cmd := exec.CommandContext(ctx, "olw", command...)
+	cmd := exec.CommandContext(ctx, "synto", command...)
 	cmd.Dir = vault
-	cmd.Env = append(os.Environ(), env...)
+	cmd.Env = allowlistedSyntoEnvironment(env)
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 	return cmd.Run()
+}
+
+func allowlistedSyntoEnvironment(extra []string) []string {
+	env := make([]string, 0, len(extra)+1)
+	if path := os.Getenv("PATH"); path != "" {
+		env = append(env, "PATH="+path)
+	}
+	for _, item := range extra {
+		key, _, ok := strings.Cut(item, "=")
+		if !ok {
+			continue
+		}
+		switch key {
+		case "XDG_CONFIG_HOME", "SYNTO_API_KEY", "DEEPSEEK_API_KEY":
+			env = append(env, item)
+		}
+	}
+	return env
 }
 
 func pipelineLogWriters(vault string, cfg workerConfig, commands [][]string, suppressOutput bool) (io.Writer, io.Writer, func() error, error) {
@@ -747,6 +792,9 @@ func validateWorkerInput(cfg workerConfig, commands [][]string) error {
 	if len(commands) == 0 || len(commands) > maxWorkerCommands {
 		return errors.New("oversize command batch")
 	}
+	if err := validateSyntoCommandBatch(commands); err != nil {
+		return err
+	}
 	for _, command := range commands {
 		if len(command) == 0 || len(command) > maxWorkerArgs {
 			return errors.New("oversize command")
@@ -767,6 +815,23 @@ func validateWorkerInput(cfg workerConfig, commands [][]string) error {
 		}
 	}
 	return nil
+}
+
+// validateSyntoCommandBatch is intentionally stricter than JSON/argument
+// validation. The Cloud contract is one unattended full Synto run; allowing a
+// second command or a force-like flag would bypass Synto's manual-edit guard
+// or expose mutation-capable maintenance/curation commands.
+func validateSyntoCommandBatch(commands [][]string) error {
+	if len(commands) != 1 || len(commands[0]) < 1 || commands[0][0] != "run" {
+		return errors.New("only one Synto run command is allowed")
+	}
+	if len(commands[0]) == 1 {
+		return nil
+	}
+	if len(commands[0]) == 2 && commands[0][1] == "--auto-approve" {
+		return nil
+	}
+	return errors.New("unsafe Synto command or flag")
 }
 
 func validateWorkerConfigBounds(cfg workerConfig) error {
@@ -831,6 +896,9 @@ func runPostprocess(ctx context.Context, vault string) error {
 	if _, err := wikiindex.Rebuild(ctx, store); err != nil {
 		return fmt.Errorf("postprocess: %w", err)
 	}
+	if err := ensureDormantConceptCache(vault); err != nil {
+		return fmt.Errorf("postprocess dormant concepts: %w", err)
+	}
 	if err := writeRawStatus(ctx, vault); err != nil {
 		return fmt.Errorf("postprocess raw status: %w", err)
 	}
@@ -838,6 +906,16 @@ func runPostprocess(ctx context.Context, vault string) error {
 		return fmt.Errorf("postprocess suggested queries: %w", err)
 	}
 	return nil
+}
+
+func ensureDormantConceptCache(vault string) error {
+	path := "cache/dormant_concepts.jsonl"
+	if _, err := readBoundedRegularFileWithin(vault, path); err == nil {
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return writeFileAtomicWithin(vault, path, nil)
 }
 
 func writeSuggestedQueries(ctx context.Context, vault string) error {
@@ -978,15 +1056,16 @@ func requireExistingDir(path string) error {
 }
 
 type sourceSnapshot struct {
-	SourceID       string
-	RawPath        string
-	RawBytes       []byte
-	RawSHA256      string
-	AnnotationBody string
-	AnnotationSHA  string
-	Fingerprint    string
-	Dirty          bool
-	Tombstone      bool
+	SourceID         string
+	RawPath          string
+	RawBytes         []byte
+	RawSHA256        string
+	SyntoContentHash string
+	AnnotationBody   string
+	AnnotationSHA    string
+	Fingerprint      string
+	Dirty            bool
+	Tombstone        bool
 }
 
 func canonicalExistingDir(dir string) (string, error) {
@@ -1044,11 +1123,13 @@ func snapshotSources(vault string) ([]sourceSnapshot, error) {
 		rawSHA := fmt.Sprintf("%x", rawSum[:])
 		fingerprint := sourcestatus.Fingerprint(rawSHA, ann.SHA256)
 		receipt := status.Sources[sourceID]
-		snapshots = append(snapshots, sourceSnapshot{
+		snapshot := sourceSnapshot{
 			SourceID: sourceID, RawPath: rawPath, RawBytes: raw, RawSHA256: rawSHA,
 			AnnotationBody: ann.Body, AnnotationSHA: ann.SHA256, Fingerprint: fingerprint,
 			Dirty: !sourcestatus.ValidReceipt(receipt, rawPath) || receipt.LastIngestFingerprint != fingerprint,
-		})
+		}
+		snapshot.SyntoContentHash = syntoSourceContentHash(snapshot)
+		snapshots = append(snapshots, snapshot)
 	}
 	sort.Slice(snapshots, func(i, j int) bool { return snapshots[i].SourceID < snapshots[j].SourceID })
 	return snapshots, nil
@@ -1098,7 +1179,7 @@ func createWorkspace(parent, vault string) (string, error) {
 		return "", err
 	}
 	defer workspaceRoot.Close()
-	for _, dir := range []string{"raw", "wiki", "cache", ".olw"} {
+	for _, dir := range []string{"raw", "wiki", "cache", ".olw", ".synto"} {
 		if err := copyTreeRoot(vaultRoot, workspaceRoot, dir, dir, nil); err != nil && !errors.Is(err, os.ErrNotExist) {
 			_ = os.RemoveAll(workspace)
 			return "", fmt.Errorf("copy %s into workspace: %w", dir, err)
@@ -1108,6 +1189,10 @@ func createWorkspace(parent, vault string) (string, error) {
 		_ = os.RemoveAll(workspace)
 		return "", fmt.Errorf("copy wiki.toml into workspace: %w", err)
 	}
+	if err := copyOneIfExists(vaultRoot, workspaceRoot, "synto.toml"); err != nil {
+		_ = os.RemoveAll(workspace)
+		return "", fmt.Errorf("copy synto.toml into workspace: %w", err)
+	}
 	return workspace, nil
 }
 
@@ -1116,14 +1201,10 @@ func materializeSnapshots(workspace string, snapshots []sourceSnapshot) error {
 		if snapshot.Tombstone {
 			continue
 		}
-		data := append([]byte(nil), snapshot.RawBytes...)
 		// Every non-empty annotation is materialized for every fresh workspace.
 		// Receipts only determine BFF dirty state; they must never change the OLW
 		// byte stream for otherwise identical source inputs.
-		if strings.TrimSpace(snapshot.AnnotationBody) != "" {
-			trailer := "\n\n---\n\n## Human annotations (system)\n<!-- lwc-ann-v1 source_id=" + snapshot.SourceID + " ann_sha256=" + snapshot.AnnotationSHA + " -->\n" + annotation.Normalize(snapshot.AnnotationBody) + "\n"
-			data = append(data, []byte(trailer)...)
-		}
+		data := materializedSourceBytes(snapshot)
 		if err := writeFileAtomicWithin(workspace, snapshot.RawPath, data); err != nil {
 			return fmt.Errorf("materialize %q: %w", snapshot.RawPath, err)
 		}
@@ -1247,6 +1328,22 @@ func writeFileAtomicWithin(root, rel string, data []byte) error {
 		return err
 	}
 	return r.Rename(tmpName, clean)
+}
+
+func removeRegularFileWithin(root, rel string) error {
+	r, err := os.OpenRoot(root)
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+	info, err := r.Lstat(rel)
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("refusing to remove non-regular path %q", rel)
+	}
+	return r.Remove(rel)
 }
 
 func safeRelativePath(rel string) error {

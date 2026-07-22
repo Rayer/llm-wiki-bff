@@ -482,7 +482,11 @@ func TestCloudRejectsUnsafeCommandContractBeforeLeaseStorageOrChild(t *testing.T
 				return nil
 			}
 			err := runCloudWorkerBatch(context.Background(), cfg, tc.commands, store)
-			if err == nil || err.Error() != "cloud worker configuration is invalid" {
+			wantErr := "cloud worker input is invalid"
+			if tc.name == "no postprocess" {
+				wantErr = "cloud worker configuration is invalid"
+			}
+			if err == nil || err.Error() != wantErr {
 				t.Fatalf("error=%v", err)
 			}
 			if store.calls != 0 || called {
@@ -654,6 +658,39 @@ func TestCloudMaterializationReadsManifestDirectlyAndNeverListsGenerations(t *te
 	}
 }
 
+func TestCloudMaterializationPreservesValidatedSyntoIndexAndState(t *testing.T) {
+	workspace := t.TempDir()
+	writeCloudRequiredOutputs(t, workspace)
+	m := newMemoryObjects()
+	prefix := "users/user/projects/project/"
+	if _, _, err := publishCloudGeneration(context.Background(), m, prefix, workspace, nil); err != nil {
+		t.Fatal(err)
+	}
+	originalIndex, err := os.ReadFile(filepath.Join(workspace, ".synto", "INDEX.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalState, err := os.ReadFile(filepath.Join(workspace, ".synto", "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	materialized := t.TempDir()
+	if _, _, _, err := materializeCloudWorkspace(context.Background(), m, prefix, materialized); err != nil {
+		t.Fatal(err)
+	}
+	gotIndex, err := os.ReadFile(filepath.Join(materialized, ".synto", "INDEX.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotState, err := os.ReadFile(filepath.Join(materialized, ".synto", "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(gotIndex, originalIndex) || !bytes.Equal(gotState, originalState) {
+		t.Fatalf("materialized Synto artifacts changed: index=%v state=%v", bytes.Equal(gotIndex, originalIndex), bytes.Equal(gotState, originalState))
+	}
+}
+
 func TestCloudMaterializationRejectsPresentEmptyManifestBeforeChild(t *testing.T) {
 	m := newMemoryObjects()
 	prefix := "users/user-secret/projects/project-secret/"
@@ -770,7 +807,7 @@ func TestPublishCloudGenerationUsesImmutableFilesAndManifestCAS(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got.Files) != 7 {
+	if len(got.Files) != 11 {
 		t.Fatalf("files=%d", len(got.Files))
 	}
 	if _, _, err := publishCloudGeneration(context.Background(), m, "p/", root, nil); err != nil {
@@ -880,6 +917,104 @@ func TestCloudPreflightRejectsDirectoryAndTraversalByteBudgets(t *testing.T) {
 	}
 }
 
+func TestCloudPreflightAndPublicationAcceptFreshSyntoOutputWithoutLegacyState(t *testing.T) {
+	workspace := t.TempDir()
+	writeFreshSyntoRequiredOutputs(t, workspace)
+	if _, err := preflightGenerationOutputs(workspace); err != nil {
+		t.Fatalf("fresh Synto preflight: %v", err)
+	}
+	vault := t.TempDir()
+	if err := syncWorkspaceOutputs(workspace, vault, ""); err != nil {
+		t.Fatalf("fresh Synto publication: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(vault, ".olw", "state.db")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("fresh publication fabricated OLW state: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(vault, ".synto", "state.db")); err != nil {
+		t.Fatalf("fresh publication lost Synto state: %v", err)
+	}
+}
+
+func TestCloudPreflightRequiresBothMigratedRollbackArtifacts(t *testing.T) {
+	workspace := t.TempDir()
+	writeFreshSyntoRequiredOutputs(t, workspace)
+	mustWriteFile(t, filepath.Join(workspace, "wiki.toml"), []byte("legacy"))
+	if _, err := preflightGenerationOutputs(workspace); err == nil {
+		t.Fatal("migrated output without .olw/state.db accepted")
+	}
+}
+
+func TestSyntoPublicationFailsClosedOnMissingMalformedOrUnsafeState(t *testing.T) {
+	validState := func(t *testing.T, root string) {
+		t.Helper()
+		writeFreshSyntoRequiredOutputs(t, root)
+	}
+	t.Run("missing state preserves current", func(t *testing.T) {
+		vault := t.TempDir()
+		mustWriteFile(t, filepath.Join(vault, "wiki", "current.md"), []byte("old"))
+		workspace := t.TempDir()
+		validState(t, workspace)
+		if err := os.Remove(filepath.Join(workspace, ".synto", "state.db")); err != nil {
+			t.Fatal(err)
+		}
+		stage, err := stageWorkspaceOutputs(workspace, vault, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := publishStagedOutputs(vault, stage); err == nil {
+			t.Fatal("missing Synto state was published")
+		}
+		data, readErr := os.ReadFile(filepath.Join(vault, "wiki", "current.md"))
+		if readErr != nil || string(data) != "old" {
+			t.Fatalf("current generation changed: %q err=%v", data, readErr)
+		}
+	})
+	tests := map[string][]byte{
+		"arbitrary bytes":   []byte("not sqlite"),
+		"truncated header":  []byte("SQLite format 3\x00"),
+		"invalid page size": func() []byte { b := make([]byte, 100); copy(b, []byte("SQLite format 3\x00")); return b }(),
+	}
+	for name, data := range tests {
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			validState(t, root)
+			mustWriteFile(t, filepath.Join(root, ".synto", "state.db"), data)
+			if _, err := preflightGenerationOutputs(root); err == nil {
+				t.Fatal("malformed SQLite state accepted")
+			}
+			objects := newMemoryObjects()
+			if _, _, err := publishCloudGeneration(context.Background(), objects, "p/", root, nil); err == nil {
+				t.Fatal("malformed SQLite state published")
+			}
+			if got, _ := objects.List(context.Background(), "p/"+generation.Prefix, generation.MaxFiles); len(got) != 0 {
+				t.Fatalf("malformed state caused generation writes: %+v", got)
+			}
+		})
+	}
+	t.Run("state symlink and special file", func(t *testing.T) {
+		for _, kind := range []string{"symlink", "directory"} {
+			t.Run(kind, func(t *testing.T) {
+				root := t.TempDir()
+				validState(t, root)
+				state := filepath.Join(root, ".synto", "state.db")
+				if err := os.Remove(state); err != nil {
+					t.Fatal(err)
+				}
+				if kind == "symlink" {
+					if err := os.Symlink(filepath.Join(t.TempDir(), "outside"), state); err != nil {
+						t.Fatal(err)
+					}
+				} else if err := os.Mkdir(state, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := preflightGenerationOutputs(root); err == nil {
+					t.Fatal("unsafe state path accepted")
+				}
+			})
+		}
+	})
+}
+
 func TestCloudPreCommitFailuresKeepOldManifestAndRecordSanitizedFailure(t *testing.T) {
 	old := execOLW
 	defer func() { execOLW = old }()
@@ -900,7 +1035,7 @@ func TestCloudPreCommitFailuresKeepOldManifestAndRecordSanitizedFailure(t *testi
 		writeCloudRequiredOutputs(t, vault)
 		return nil
 	}
-	err := runCloudWorkerBatch(context.Background(), cloudCfg(), [][]string{{"run", "--dangerous-arg"}}, fail)
+	err := runCloudWorkerBatch(context.Background(), cloudCfg(), [][]string{{"run", "--auto-approve"}}, fail)
 	if err == nil || strings.Contains(err.Error(), "user-secret") || strings.Contains(err.Error(), "provider") {
 		t.Fatalf("error=%q is not generic", err)
 	}
@@ -932,7 +1067,7 @@ func TestCloudPostCommitReceiptFailureDoesNotRollbackManifest(t *testing.T) {
 		writeCloudRequiredOutputs(t, vault)
 		return nil
 	}
-	err := runCloudWorkerBatch(context.Background(), cloudCfg(), [][]string{{"run", "--secret-arg"}}, fail)
+	err := runCloudWorkerBatch(context.Background(), cloudCfg(), [][]string{{"run", "--auto-approve"}}, fail)
 	if err == nil || !strings.Contains(err.Error(), "receipt") || strings.Contains(err.Error(), "private") {
 		t.Fatalf("error=%q, want generic post-commit receipt error", err)
 	}
@@ -1361,7 +1496,6 @@ func TestCloudStatusOnlyReservationRejectsTransientReuseBeforePublish(t *testing
 	writeCloudObject(t, m, prefix+"raw/new.md", []byte("new raw"))
 	writeCloudObject(t, m, prefix+sourcestatus.Path, mustJSON(t, sourcestatus.Artifact{Version: 1, Sources: map[string]sourcestatus.Receipt{"stable-old": prior}}))
 	writeCloudObject(t, m, prefix+"cache/id_map.json", []byte(`{"source":{"stable-old":"new"},"source_meta":{"stable-old":{"slug":"new","source_file":"raw/new.md"}}}`))
-	writeCloudObject(t, m, prefix+"wiki.toml", []byte("name = \"test\"\n"))
 
 	execOLW = func(_ context.Context, vault string, _ []string, _ []string, _, _ io.Writer) error {
 		writeCloudRequiredOutputs(t, vault)
@@ -1577,10 +1711,13 @@ func writeCloudRequiredOutputs(t *testing.T, root string) {
 	t.Helper()
 	for path, data := range map[string]string{
 		"wiki.toml":                    "name = \"test\"\n",
+		"synto.toml":                   "[pipeline]\nauto_commit = false\nauto_maintain = false\nrelation_extraction = false\n",
 		"cache/id_map.json":            `{"source_meta":{"s1":{"source_file":"raw/source.md"}}}`,
 		"cache/concepts.jsonl":         "",
+		"cache/dormant_concepts.jsonl": "",
 		"cache/raw_status.json":        "{}",
 		"cache/suggested_queries.json": "{}",
+		".synto/INDEX.json":            syntoIndexFixtureWithEntities([]string{"149603e6c035:entity-old:old", "22af645d1859:entity:new"}, nil),
 	} {
 		mustWriteFile(t, filepath.Join(root, filepath.FromSlash(path)), []byte(data))
 	}
@@ -1594,6 +1731,41 @@ func writeCloudRequiredOutputs(t *testing.T, root string) {
 	}
 	defer db.Close()
 	if _, err := db.Exec(`create table raw_notes (path text primary key, content_hash text not null, status text not null default 'new', ingested_at text, error text);`); err != nil {
+		t.Fatal(err)
+	}
+	writeValidSQLiteState(t, filepath.Join(root, ".synto", "state.db"))
+}
+
+func writeFreshSyntoRequiredOutputs(t *testing.T, root string) {
+	t.Helper()
+	for path, data := range map[string]string{
+		"synto.toml":                   "[pipeline]\nauto_commit = false\nauto_maintain = false\nrelation_extraction = false\n",
+		"cache/id_map.json":            `{"concept":{},"source":{},"redirects":{}}`,
+		"cache/concepts.jsonl":         "",
+		"cache/dormant_concepts.jsonl": "",
+		"cache/raw_status.json":        "{}",
+		"cache/suggested_queries.json": "{}",
+		".synto/INDEX.json":            syntoIndexFixture("article", "entity", "alpha", false),
+	} {
+		mustWriteFile(t, filepath.Join(root, filepath.FromSlash(path)), []byte(data))
+	}
+	writeValidSQLiteState(t, filepath.Join(root, ".synto", "state.db"))
+}
+
+func writeValidSQLiteState(t *testing.T, path string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`create table if not exists raw_notes (path text primary key, content_hash text not null, status text not null default 'new', ingested_at text, error text);`); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
 }
