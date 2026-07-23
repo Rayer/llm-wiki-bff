@@ -233,7 +233,7 @@ func TestWorkerPromotionWorkflowsContract(t *testing.T) {
 		t.Fatal("production update must clear mounts before volumes atomically")
 	}
 	readback := workflowSection(t, release, "      - name: Render normalized deployment evidence after strict read-back", "      - name: Upload normalized deployment evidence")
-	for _, want := range []string{"scripts/render_worker_deployment_evidence.py render-evidence", "--bucket \"$BUCKET\"", "--rollback-contract \"$ROLLBACK_CONTRACT\"", "--metadata \"$METADATA\"", "--output \"$EVIDENCE\"", "--failure-output \"$EVIDENCE_FAILURE\""} {
+	for _, want := range []string{"EXPECTED_RUNTIME_SERVICE_ACCOUNT: lwc-worker@llm-wiki-cloud.iam.gserviceaccount.com", "scripts/render_worker_deployment_evidence.py render-evidence", "--bucket \"$BUCKET\"", "--expected-runtime-service-account \"$EXPECTED_RUNTIME_SERVICE_ACCOUNT\"", "--rollback-contract \"$ROLLBACK_CONTRACT\"", "--metadata \"$METADATA\"", "--output \"$EVIDENCE\"", "--failure-output \"$EVIDENCE_FAILURE\""} {
 		if !strings.Contains(readback, want) {
 			t.Fatalf("production read-back evidence step missing %q", want)
 		}

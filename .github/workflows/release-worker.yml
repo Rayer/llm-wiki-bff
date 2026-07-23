@@ -208,6 +208,7 @@ jobs:
       - name: Render normalized deployment evidence after strict read-back
         env:
           BUCKET: llm-wiki-data
+          EXPECTED_RUNTIME_SERVICE_ACCOUNT: lwc-worker@llm-wiki-cloud.iam.gserviceaccount.com
         run: |
           set -euo pipefail
           python3 scripts/render_worker_deployment_evidence.py render-evidence \
@@ -216,6 +217,7 @@ jobs:
             --job-name "$JOB_NAME" \
             --ar-repo "$AR_REPO" \
             --bucket "$BUCKET" \
+            --expected-runtime-service-account "$EXPECTED_RUNTIME_SERVICE_ACCOUNT" \
             --rollback-contract "$ROLLBACK_CONTRACT" \
             --metadata "$METADATA" \
             --output "$EVIDENCE" \

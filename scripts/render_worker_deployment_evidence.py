@@ -18,6 +18,7 @@ EXPECTED_ENVIRONMENT = "production"
 EXPECTED_ACTION = "promote"
 EXPECTED_SCHEMA_VERSION = 1
 EXPECTED_ARGS = ["run", "[[\"run\",\"--auto-approve\"]]"]
+EXPECTED_RUNTIME_SERVICE_ACCOUNT = "lwc-worker@llm-wiki-cloud.iam.gserviceaccount.com"
 LEGACY_ENV_NAMES = {"DATA_DIR", "WORKSPACE", "VAULT_PATH", "WORKSPACE_DIR"}
 ALLOWLISTED_ENV_NAMES = LEGACY_ENV_NAMES | {"BUCKET"}
 SECRET_WORDS = ("secret", "token", "password", "apikey", "privatekey", "valuefrom")
@@ -54,7 +55,7 @@ REASON_CODES = {
     "provider_handle_mismatch": CLASSIFICATION_FAILED,
     "generation_mismatch": CLASSIFICATION_FAILED,
     "image_mismatch": CLASSIFICATION_FAILED,
-    "runtime_mismatch": CLASSIFICATION_FAILED,
+    "runtime_service_account_mismatch": CLASSIFICATION_FAILED,
     "config_mismatch": CLASSIFICATION_FAILED,
     "evidence_output_exists": CLASSIFICATION_UNKNOWN,
 }
@@ -553,9 +554,11 @@ def _render_evidence(args):
         reject("observed Job name does not match the requested provider handle", "provider_handle_mismatch")
     if container["image"] != expected_image:
         reject("observed Job image does not match the promoted immutable image", "image_mismatch")
+    if args.expected_runtime_service_account != EXPECTED_RUNTIME_SERVICE_ACCOUNT:
+        reject("expected runtime service account argument is invalid")
     service_account = spec.get("serviceAccountName")
-    if not isinstance(service_account, str) or not service_account:
-        reject("observed runtime service account is missing or invalid", "runtime_mismatch")
+    if service_account != args.expected_runtime_service_account:
+        reject("observed runtime service account does not match the expected account", "runtime_service_account_mismatch")
     try:
         config = allowlisted_config(
             container,
@@ -684,6 +687,7 @@ def build_parser():
     add_provider_args(render)
     render.add_argument("--ar-repo", required=True)
     render.add_argument("--bucket", required=True)
+    render.add_argument("--expected-runtime-service-account", required=True)
     render.add_argument("--rollback-contract", required=True)
     render.add_argument("--metadata", required=True)
     render.add_argument("--output", required=True)

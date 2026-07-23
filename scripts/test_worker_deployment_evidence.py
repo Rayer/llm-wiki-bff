@@ -149,6 +149,8 @@ class WorkerDeploymentEvidenceTest(unittest.TestCase):
                 "asia-east1-docker.pkg.dev/llm-wiki-cloud/cloud-run-images",
                 "--bucket",
                 "llm-wiki-data",
+                "--expected-runtime-service-account",
+                "lwc-worker@llm-wiki-cloud.iam.gserviceaccount.com",
                 "--rollback-contract",
                 str(self.root / "rollback.json"),
                 "--metadata",
@@ -351,6 +353,28 @@ class WorkerDeploymentEvidenceTest(unittest.TestCase):
         self.assertEqual(document["status"], "UNHEALTHY")
         self.assertEqual(document["config"]["result"], "failed")
         self.assertEqual(document["provider_verification"]["reason_code"], "image_mismatch")
+        self.assertIsNotNone(document["provider_verification"]["checked_at"])
+
+    def test_runtime_service_account_mismatch_falls_back_to_unhealthy_with_safe_reason(self):
+        prepared, _ = self.prepare_rollback()
+        self.assertEqual(prepared.returncode, 0, prepared.stderr)
+        observed = json.loads(OBSERVED_FIXTURE.read_text())
+        observed["spec"]["template"]["spec"]["template"]["spec"]["serviceAccountName"] = "unexpected@llm-wiki-cloud.iam.gserviceaccount.com"
+        observed_path = self.root / "runtime-service-account-mismatch.json"
+        observed_path.write_text(json.dumps(observed))
+
+        rendered, evidence = self.render(self.metadata(), observed_path)
+        self.assertNotEqual(rendered.returncode, 0)
+        self.assertFalse(evidence.exists())
+        marker = json.loads((self.root / "deployment-evidence-failure.json").read_text())
+        self.assertEqual(marker["reason_code"], "runtime_service_account_mismatch")
+        self.assertEqual(marker["classification"], "failed")
+        partial, evidence = self.render_partial()
+        self.assertEqual(partial.returncode, 0, partial.stderr)
+        document = json.loads(evidence.read_text())
+        self.assertEqual(document["status"], "UNHEALTHY")
+        self.assertEqual(document["config"]["result"], "failed")
+        self.assertEqual(document["provider_verification"]["reason_code"], "runtime_service_account_mismatch")
         self.assertIsNotNone(document["provider_verification"]["checked_at"])
 
     def test_no_failure_marker_keeps_update_failure_unknown(self):
