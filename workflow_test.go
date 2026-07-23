@@ -32,35 +32,26 @@ func TestDevWorkflowValidatesAndPassesBuildIdentity(t *testing.T) {
 	assertWorkflowUsesCentralizedVersioncheck(t, contents)
 }
 
-func TestDeployWorkflowPushesDevelopAndMain(t *testing.T) {
+func TestCIWorkflowPushesAndPRsMainAndDevelop(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/ci.yml")
+	for _, want := range []string{
+		"  push:\n    branches: [main, develop]",
+		"  pull_request:\n    branches: [main, develop]",
+	} {
+		if !strings.Contains(contents, want) {
+			t.Errorf("CI workflow is missing trigger contract %q", want)
+		}
+	}
+}
+
+func TestBFFDevWorkflowPushesMainOnlyAndSupportsManualDispatch(t *testing.T) {
 	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
-	const pushBranchesStart = "  push:\n    branches:\n"
-	start := strings.Index(contents, pushBranchesStart)
-	if start == -1 {
-		t.Fatal("deploy workflow is missing a push branches trigger")
-	}
-	pushBranches := contents[start+len(pushBranchesStart):]
-	if end := strings.Index(pushBranches, "  workflow_dispatch:"); end != -1 {
-		pushBranches = pushBranches[:end]
-	}
-	var branches []string
-	for _, line := range strings.Split(pushBranches, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		if !strings.HasPrefix(line, "- ") {
-			t.Fatalf("deploy workflow push branch line must use YAML list syntax; got %q", line)
-		}
-		branches = append(branches, strings.TrimSpace(strings.TrimPrefix(line, "- ")))
-	}
-	want := []string{"develop/1.0", "main"}
-	if len(branches) != len(want) {
-		t.Fatalf("deploy workflow push branches = %q, want %q", branches, want)
-	}
-	for i, branch := range want {
-		if branches[i] != branch {
-			t.Fatalf("deploy workflow push branch %d = %q, want %q", i, branches[i], branch)
+	for _, want := range []string{
+		"  push:\n    branches: [main]",
+		"  workflow_dispatch:",
+	} {
+		if !strings.Contains(contents, want) {
+			t.Errorf("BFF dev workflow is missing trigger contract %q", want)
 		}
 	}
 }
@@ -116,8 +107,10 @@ func TestReleaseWorkflowRequiresMainBuildProvenance(t *testing.T) {
 			t.Errorf("release workflow is missing main provenance contract %q", want)
 		}
 	}
-	if strings.Contains(contents, "develop/1.0") {
-		t.Fatal("release workflow must not accept develop/1.0 provenance")
+	for _, forbidden := range []string{"ref: develop", `origin/develop`, `.head_branch == "develop"`} {
+		if strings.Contains(contents, forbidden) {
+			t.Fatalf("release workflow must not accept develop provenance %q", forbidden)
+		}
 	}
 }
 

@@ -21,8 +21,14 @@ func TestDeployWorkerWorkflowContract(t *testing.T) {
 	}
 	workflow := string(data)
 	for _, want := range []string{
-		"branches: [develop/1.0, main]",
+		"push:\n    branches: [main]",
 		"workflow_dispatch:",
+	} {
+		if !strings.Contains(workflow, want) {
+			t.Fatalf("worker dev workflow is missing trigger contract %q", want)
+		}
+	}
+	for _, want := range []string{
 		"group: deploy-olw-pipeline-dev",
 		"cancel-in-progress: true",
 		"actions/setup-go@v5",
@@ -55,6 +61,13 @@ func TestDeployWorkerWorkflowContract(t *testing.T) {
 	}
 	if strings.Count(workflow, "git rev-parse \"origin/${SOURCE_BRANCH}\"") != 2 {
 		t.Fatal("workflow must recheck the selected source branch before and after the job update")
+	}
+	if !strings.Contains(workflow, `case "${GITHUB_REF_NAME}" in
+            develop|main) SOURCE_BRANCH="${GITHUB_REF_NAME}" ;;`) {
+		t.Fatal("worker workflow must allow only develop and main runtime sources")
+	}
+	if strings.Contains(workflow, "feature|develop|main)") || strings.Contains(workflow, "*) SOURCE_BRANCH") {
+		t.Fatal("worker workflow must fail closed for arbitrary source refs")
 	}
 	if !strings.Contains(workflow, "newer serialized workflow must supersede") {
 		t.Fatal("workflow must explain that a newer serialized workflow supersedes an out-of-order deployment")
@@ -123,7 +136,7 @@ func TestWorkerPromotionWorkflowsContract(t *testing.T) {
 	for _, want := range []string{
 		"SOURCE_BRANCH=",
 		"case \"${GITHUB_REF_NAME}\" in",
-		"develop/1.0|main)",
+		"develop|main)",
 		"GITHUB_SHA",
 		"worker-image-digest-${GITHUB_SHA}",
 		"sha256:[0-9a-f]{64}",
@@ -138,7 +151,7 @@ func TestWorkerPromotionWorkflowsContract(t *testing.T) {
 	if strings.Count(deploy, "actions/upload-artifact@v4") != 1 || strings.Count(deploy, "worker-image-digest-${GITHUB_SHA}.txt") != 1 || strings.Count(deploy, "path: worker-image-digest-${{ github.sha }}.txt") != 1 {
 		t.Fatal("dev workflow must persist and upload exactly one full-SHA digest artifact")
 	}
-	if strings.Contains(deploy, "origin/develop/1.0") {
+	if strings.Contains(deploy, "origin/develop") {
 		t.Fatal("dev workflow must not hardcode develop ordering for main runs")
 	}
 

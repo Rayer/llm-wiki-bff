@@ -2,9 +2,7 @@ name: Deploy BFF to Cloud Run (dev)
 
 on:
   push:
-    branches:
-      - develop/1.0
-      - main
+    branches: [main]
   workflow_dispatch:
 
 env:
