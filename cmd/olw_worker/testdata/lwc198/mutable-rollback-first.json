@@ -1,0 +1,25 @@
+{
+  "apiVersion": "run.googleapis.com/v1",
+  "kind": "Job",
+  "metadata": {"name": "olw-pipeline"},
+  "spec": {
+    "template": {
+      "spec": {
+        "template": {
+          "spec": {
+            "containers": [{
+              "image": "asia-east1-docker.pkg.dev/llm-wiki-cloud/cloud-run-images/olw-pipeline:latest",
+              "env": [
+                {"name": "BUCKET", "value": "llm-wiki-data-first"},
+                {"name": "DATA_DIR", "value": "/first"}
+              ],
+              "args": ["run", "[[\"run\",\"--auto-approve\"]]"],
+              "volumeMounts": [{"name": "first", "mountPath": "/first"}]
+            }],
+            "volumes": [{"name": "first", "csi": {"driver": "gcsfuse.run.googleapis.com"}}]
+          }
+        }
+      }
+    }
+  }
+}

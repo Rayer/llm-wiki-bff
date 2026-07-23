@@ -254,12 +254,13 @@ def prepare_rollback(args):
             reject("prior production image tag is invalid")
         resolved = provider_digest(args.project, args.region, image)
         after = provider_job(args.project, args.region, args.job_name)
-        _, _, after_container, _, _ = job_spec(after)
+        _, _, after_container, after_volumes, after_mounts = job_spec(after)
         if after_container["image"] != image:
             reject("prior production image reference moved during rollback resolution")
         resolved_again = provider_digest(args.project, args.region, image)
         if resolved != resolved_again:
             reject("both prior image resolutions differ")
+        container, volumes, mounts = after_container, after_volumes, after_mounts
         rollback_image = image_prefix + "@" + resolved
     else:
         reject("prior production image has the wrong repository or is not a supported reference")

@@ -39,7 +39,11 @@ class WorkerDeploymentEvidenceTest(unittest.TestCase):
                     print("fake provider failure", file=sys.stderr)
                     raise SystemExit(9)
                 if args[:3] == ["run", "jobs", "describe"]:
-                    fixture = os.environ["FAKE_JOB_FIXTURE"]
+                    fixtures = os.environ.get("FAKE_JOB_FIXTURES", os.environ["FAKE_JOB_FIXTURE"]).split(",")
+                    state = Path(os.environ["FAKE_JOB_STATE"])
+                    index = int(state.read_text()) if state.exists() else 0
+                    state.write_text(str(index + 1))
+                    fixture = fixtures[min(index, len(fixtures) - 1)]
                     print(Path(fixture).read_text(), end="")
                     raise SystemExit(0)
                 if args[:4] == ["artifacts", "docker", "images", "describe"]:
@@ -59,6 +63,7 @@ class WorkerDeploymentEvidenceTest(unittest.TestCase):
             **os.environ,
             "PATH": f"{self.fake_bin}:{os.environ['PATH']}",
             "FAKE_DIGEST_STATE": str(self.root / "digest-state"),
+            "FAKE_JOB_STATE": str(self.root / "job-state"),
             "FAKE_DIGESTS": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         }
 
@@ -92,9 +97,11 @@ class WorkerDeploymentEvidenceTest(unittest.TestCase):
             },
         }
 
-    def prepare_rollback(self, fixture=ROLLBACK_FIXTURE, digests=None):
+    def prepare_rollback(self, fixture=ROLLBACK_FIXTURE, digests=None, fixtures=None):
         output = self.root / "rollback.json"
         env = {**self.env, "FAKE_JOB_FIXTURE": str(fixture)}
+        if fixtures is not None:
+            env["FAKE_JOB_FIXTURES"] = ",".join(str(path) for path in fixtures)
         if digests is not None:
             env["FAKE_DIGESTS"] = ",".join(digests)
         result = subprocess.run(
@@ -235,6 +242,23 @@ class WorkerDeploymentEvidenceTest(unittest.TestCase):
         result, output = self.prepare_rollback()
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse(output.exists())
+
+    def test_mutable_rollback_uses_second_validated_job_snapshot(self):
+        first = ROOT / "cmd/olw_worker/testdata/lwc198/mutable-rollback-first.json"
+        second = ROOT / "cmd/olw_worker/testdata/lwc198/mutable-rollback-second.json"
+        result, output = self.prepare_rollback(fixtures=[first, second])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rollback = json.loads(output.read_text())
+        self.assertEqual(rollback["config"]["env"], [
+            {"name": "BUCKET", "value": "llm-wiki-data-second"},
+            {"name": "DATA_DIR", "value": "/second"},
+        ])
+        self.assertEqual(rollback["config"]["volumes"], [
+            {"name": "second", "csi": {"driver": "gcsfuse.run.googleapis.com"}},
+        ])
+        self.assertEqual(rollback["config"]["volume_mounts"], [
+            {"name": "second", "mountPath": "/second"},
+        ])
 
 
 if __name__ == "__main__":
