@@ -74,6 +74,8 @@ class BFFDeploymentEvidenceTest(unittest.TestCase):
             body = args[args.index("-o") + 1]
             Path(headers).write_text(os.environ.get("FAKE_HEADERS", "HTTP/2 200\nCache-Control: no-store\nContent-Type: application/json\n"))
             Path(body).write_text(os.environ["FAKE_VERSION_JSON"])
+            if os.environ.get("FAKE_CURL_HTTP_ERROR") == "1" and "--fail-with-body" in args:
+                raise SystemExit(22)
         ''').lstrip())
         curl.chmod(curl.stat().st_mode | stat.S_IXUSR)
         self.before = self.root / "before.json"
@@ -111,14 +113,14 @@ class BFFDeploymentEvidenceTest(unittest.TestCase):
         result = self.invoke("prepare-rollback", "--artifact-name", ARTIFACT, "--output", str(output))
         return result, output
 
-    def render(self, metadata=None):
+    def render(self, metadata=None, service_fixtures=None):
         metadata = self.metadata() if metadata is None else metadata
         metadata_path = self.root / "metadata.json"
         metadata_path.write_text(json.dumps(metadata))
         output = self.root / "deployment-evidence.json"
         failure = self.root / "failure.json"
         self.env["FAKE_SERVICE_STATE"] = str(self.root / "post-state")
-        self.env["FAKE_SERVICE_FIXTURES"] = f"{self.after},{self.after}"
+        self.env["FAKE_SERVICE_FIXTURES"] = service_fixtures or f"{self.after},{self.after}"
         self.env["FAKE_REVISION_FIXTURE"] = str(self.revision_path)
         if not getattr(self, "custom_revision", False):
             self.revision_path.write_text(json.dumps(fixture("bff-revision-after.json")))
@@ -145,7 +147,7 @@ class BFFDeploymentEvidenceTest(unittest.TestCase):
         self.assertEqual(document["observed_service"]["ready_revision"], "llm-wiki-bff-00002-new")
         self.assertEqual(document["observed_service"]["image_reference"], IMAGE)
         self.assertEqual(document["observed_service"]["image_digest"], DIGEST)
-        self.assertEqual(document["observed_service"]["traffic"], [{"revision_name": "llm-wiki-bff-00002-new", "percent": 100}])
+        self.assertEqual(document["observed_service"]["traffic"], [{"revision_name": "llm-wiki-bff-00002-new", "percent": 100, "latest_revision": True}])
         self.assertEqual(document["config"]["allowlisted"]["legacy_preserved"], [{"name": "PROJECT_ID", "value": "demo"}, {"name": "USER_ID", "value": "test-user"}])
         self.assertEqual(document["health"]["identity"]["commit"], "c" * 40)
         self.assertNotIn("secret-value", output.read_text())
@@ -278,6 +280,60 @@ class BFFDeploymentEvidenceTest(unittest.TestCase):
                 self.assertEqual(partial.returncode, 0, partial.stderr)
                 self.assertEqual(json.loads(output.read_text())["status"], "UNHEALTHY")
 
+    def test_observed_revision_image_shapes_are_failed_with_safe_reasons(self):
+        cases = {
+            "malformed image reference": (lambda r: r["spec"]["containers"][0].update(image="not-an-immutable-image"), "image_mismatch"),
+            "malformed container": (lambda r: r["spec"].update(containers=[None]), "provider_shape_unsupported"),
+            "malformed full image digest": (lambda r: r["status"].update(imageDigest={"image": IMAGE}), "image_mismatch"),
+        }
+        for name, (mutate, reason_code) in cases.items():
+            with self.subTest(name=name):
+                prepared, rollback = self.prepare()
+                self.assertEqual(prepared.returncode, 0, prepared.stderr)
+                observed_revision = fixture("bff-revision-after.json")
+                mutate(observed_revision)
+                result, output, failure = self.render_documents(fixture("bff-service-after.json"), observed_revision)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(output.exists())
+                marker = json.loads(failure.read_text())
+                self.assertEqual(marker, {"classification": "failed", "reason_code": reason_code, "checked_at": marker["checked_at"]})
+                partial = self.invoke("render-partial", "--rollback-contract", str(rollback), "--metadata", str(self.root / "metadata.json"), "--output", str(output), "--failure-output", str(failure))
+                self.assertEqual(partial.returncode, 0, partial.stderr)
+                document = json.loads(output.read_text())
+                self.assertEqual(document["status"], "UNHEALTHY")
+                self.assertEqual(document["provider_verification"]["reason_code"], reason_code)
+
+    def test_malformed_service_shapes_emit_failed_marker_and_unhealthy_fallback(self):
+        cases = {
+            "metadata None": lambda s: s.update(metadata=None),
+            "metadata list": lambda s: s.update(metadata=[]),
+            "metadata annotations malformed": lambda s: s["metadata"].update(annotations=[]),
+            "spec None": lambda s: s.update(spec=None),
+            "spec list": lambda s: s.update(spec=[]),
+            "template None": lambda s: s["spec"].update(template=None),
+            "template list": lambda s: s["spec"].update(template=[]),
+            "template metadata None": lambda s: s["spec"]["template"].update(metadata=None),
+            "template metadata list": lambda s: s["spec"]["template"].update(metadata=[]),
+            "template annotations malformed": lambda s: s["spec"]["template"]["metadata"].update(annotations=[]),
+        }
+        for name, mutate in cases.items():
+            with self.subTest(name=name):
+                prepared, rollback = self.prepare()
+                self.assertEqual(prepared.returncode, 0, prepared.stderr)
+                observed_service = fixture("bff-service-after.json")
+                mutate(observed_service)
+                result, output, failure = self.render_documents(observed_service, fixture("bff-revision-after.json"))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(output.exists())
+                marker = json.loads(failure.read_text())
+                self.assertEqual(marker["classification"], "failed")
+                self.assertEqual(marker["reason_code"], "provider_shape_unsupported")
+                partial = self.invoke("render-partial", "--rollback-contract", str(rollback), "--metadata", str(self.root / "metadata.json"), "--output", str(output), "--failure-output", str(failure))
+                self.assertEqual(partial.returncode, 0, partial.stderr)
+                document = json.loads(output.read_text())
+                self.assertEqual(document["status"], "UNHEALTHY")
+                self.assertEqual(document["provider_verification"]["reason_code"], "provider_shape_unsupported")
+
     def test_identity_sha_cache_header_and_status_gates_fail(self):
         for label, body, headers in [
             ("wrong sha", self.env["FAKE_VERSION_JSON"].replace('"commit": "' + "c" * 40, '"commit": "' + "d" * 40), None),
@@ -295,6 +351,60 @@ class BFFDeploymentEvidenceTest(unittest.TestCase):
                     self.env["FAKE_HEADERS"] = headers
                 result, output, failure = self.render()
                 self.assertNotEqual(result.returncode, 0)
+                partial = self.invoke("render-partial", "--rollback-contract", str(rollback), "--metadata", str(self.root / "metadata.json"), "--output", str(output), "--failure-output", str(failure))
+                self.assertEqual(partial.returncode, 0, partial.stderr)
+                self.assertEqual(json.loads(output.read_text())["status"], "UNHEALTHY")
+
+    def test_identity_transport_failure_is_unknown_but_http_status_is_failed(self):
+        prepared, rollback = self.prepare()
+        self.assertEqual(prepared.returncode, 0, prepared.stderr)
+        self.env["FAKE_HEADERS"] = "HTTP/2 503\nCache-Control: no-store\n"
+        self.env["FAKE_CURL_HTTP_ERROR"] = "1"
+        result, output, failure = self.render()
+        self.assertNotEqual(result.returncode, 0)
+        marker = json.loads(failure.read_text())
+        self.assertEqual(marker["classification"], "failed")
+        self.assertEqual(marker["reason_code"], "identity_status_mismatch")
+        self.assertNotIn("--fail-with-body", Path(self.env["FAKE_LOG"]).read_text())
+        partial = self.invoke("render-partial", "--rollback-contract", str(rollback), "--metadata", str(self.root / "metadata.json"), "--output", str(output), "--failure-output", str(failure))
+        self.assertEqual(partial.returncode, 0, partial.stderr)
+        self.assertEqual(json.loads(output.read_text())["status"], "UNHEALTHY")
+
+        prepared, rollback = self.prepare()
+        self.assertEqual(prepared.returncode, 0, prepared.stderr)
+        self.env.pop("FAKE_CURL_HTTP_ERROR")
+        self.env["FAKE_CURL_FAILURE"] = "1"
+        result, output, failure = self.render()
+        self.assertNotEqual(result.returncode, 0)
+        marker = json.loads(failure.read_text())
+        self.assertEqual(marker["classification"], "unknown")
+        self.assertEqual(marker["reason_code"], "identity_unavailable")
+        partial = self.invoke("render-partial", "--rollback-contract", str(rollback), "--metadata", str(self.root / "metadata.json"), "--output", str(output), "--failure-output", str(failure))
+        self.assertEqual(partial.returncode, 0, partial.stderr)
+        document = json.loads(output.read_text())
+        self.assertEqual(document["status"], "PARTIAL")
+        self.assertIsNone(document["provider_verification"]["reason_code"])
+
+    def test_strict_post_readback_requires_latest_revision_true(self):
+        for value in (False, None):
+            with self.subTest(value=value):
+                prepared, rollback = self.prepare()
+                self.assertEqual(prepared.returncode, 0, prepared.stderr)
+                good = self.root / "good-after.json"
+                bad = self.root / "bad-after.json"
+                good.write_text(json.dumps(fixture("bff-service-after.json")))
+                observed_service = fixture("bff-service-after.json")
+                if value is None:
+                    del observed_service["status"]["traffic"][0]["latestRevision"]
+                else:
+                    observed_service["status"]["traffic"][0]["latestRevision"] = value
+                bad.write_text(json.dumps(observed_service))
+                result, output, failure = self.render(service_fixtures=f"{good},{bad}")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(output.exists())
+                marker = json.loads(failure.read_text())
+                self.assertEqual(marker["classification"], "failed")
+                self.assertEqual(marker["reason_code"], "traffic_mismatch")
                 partial = self.invoke("render-partial", "--rollback-contract", str(rollback), "--metadata", str(self.root / "metadata.json"), "--output", str(output), "--failure-output", str(failure))
                 self.assertEqual(partial.returncode, 0, partial.stderr)
                 self.assertEqual(json.loads(output.read_text())["status"], "UNHEALTHY")

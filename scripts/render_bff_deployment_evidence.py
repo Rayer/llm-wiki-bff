@@ -124,15 +124,25 @@ def handle(args):
 
 
 def annotations(service):
+    if not isinstance(service, dict):
+        reject("service shape is unsupported", "provider_shape_unsupported")
     metadata = service.get("metadata")
     if not isinstance(metadata, dict) or not isinstance(metadata.get("name"), str):
         reject("service metadata shape is unsupported", "provider_shape_unsupported")
-    if not isinstance(metadata.get("annotations", {}), dict):
+    service_annotations = metadata.get("annotations", {})
+    if not isinstance(service_annotations, dict):
         reject("service annotations shape is unsupported", "provider_shape_unsupported")
-    template = service.get("spec", {}).get("template", {})
-    if not isinstance(template, dict) or not isinstance(template.get("metadata", {}).get("annotations", {}), dict):
+    spec = service.get("spec")
+    if not isinstance(spec, dict):
+        reject("service spec shape is unsupported", "provider_shape_unsupported")
+    template = spec.get("template")
+    if not isinstance(template, dict):
         reject("service template annotations are missing", "provider_shape_unsupported")
-    return metadata, metadata["annotations"], template["metadata"]["annotations"], template.get("spec")
+    template_metadata = template.get("metadata")
+    template_annotations = template_metadata.get("annotations", {}) if isinstance(template_metadata, dict) else None
+    if not isinstance(template_metadata, dict) or not isinstance(template_annotations, dict):
+        reject("service template annotations are missing", "provider_shape_unsupported")
+    return metadata, service_annotations, template_annotations, template.get("spec")
 
 
 def service_parts(service, args):
@@ -160,7 +170,11 @@ def normalized_traffic(traffic):
     result = []
     for entry in traffic:
         if isinstance(entry, dict) and "revision_name" in entry:
+            has_latest_revision = "latest_revision" in entry
+            latest_revision = entry.get("latest_revision")
             entry = {"revisionName": entry.get("revision_name"), "percent": entry.get("percent"), **({"tag": entry["tag"]} if "tag" in entry else {})}
+            if has_latest_revision:
+                entry["latestRevision"] = latest_revision
         if not isinstance(entry, dict) or set(entry) - {"latestRevision", "revisionName", "percent", "tag"}:
             reject("traffic snapshot shape is unsupported", "provider_shape_unsupported")
         if "latestRevision" in entry and not isinstance(entry["latestRevision"], bool):
@@ -170,6 +184,8 @@ def normalized_traffic(traffic):
         if not isinstance(revision, str) or not revision or isinstance(percent, bool) or not isinstance(percent, int) or percent < 0 or percent > 100:
             reject("traffic snapshot value is invalid", "provider_shape_unsupported")
         clean = {"revision_name": revision, "percent": percent}
+        if "latestRevision" in entry:
+            clean["latest_revision"] = entry["latestRevision"]
         if "tag" in entry:
             if not isinstance(entry["tag"], str):
                 reject("traffic tag is invalid", "provider_shape_unsupported")
@@ -304,8 +320,8 @@ def revision_parts(document, expected_name, expected_image=None):
     digest = status.get("imageDigest")
     if not isinstance(image, str) or not isinstance(digest, str):
         reject("revision image digest is not immutable", "image_mismatch")
-    immutable_image(image)
-    immutable_image(digest)
+    immutable_image(image, "image_mismatch")
+    immutable_image(digest, "image_mismatch")
     if image != digest:
         reject("revision image is not the expected immutable reference", "image_mismatch")
     if expected_image is not None and image != expected_image:
@@ -327,9 +343,9 @@ def binding(policy, role, member):
     reject("required IAM binding is missing", "iam_binding_missing")
 
 
-def immutable_image(image):
+def immutable_image(image, reason_code="rollback_unavailable"):
     if not isinstance(image, str) or not image.startswith(AR_REPO + "/llm-wiki-bff@") or not DIGEST_RE.fullmatch(image.rsplit("@", 1)[-1]):
-        reject("rollback image is not immutable", "rollback_unavailable")
+        reject("rollback image is not immutable", reason_code)
     return image
 
 
@@ -398,7 +414,7 @@ def identity(args, url, commit, revision):
         temporary_paths.append(handle.name)
     headers_path, body_path = temporary_paths
     try:
-        command = ["curl", "--silent", "--show-error", "--fail-with-body", "--max-time", "20", "-D", headers_path, "-o", body_path, url.rstrip("/") + "/api/v1/public/version"]
+        command = ["curl", "--silent", "--show-error", "--max-time", "20", "-D", headers_path, "-o", body_path, url.rstrip("/") + "/api/v1/public/version"]
         try:
             result = subprocess.run(command, check=False, capture_output=True, text=True)
         except OSError:
@@ -463,7 +479,7 @@ def render_strict(args):
     traffic = normalized_traffic(second_parts[-1]["traffic"])
     if second_parts[-1]["latestReadyRevisionName"] != ready:
         reject("new ready revision changed during read-back", "revision_mismatch")
-    if len(traffic) != 1 or traffic[0]["revision_name"] != ready or traffic[0]["percent"] != 100:
+    if len(traffic) != 1 or traffic[0]["revision_name"] != ready or traffic[0]["percent"] != 100 or traffic[0].get("latest_revision") is not True:
         reject("effective traffic is not 100 percent on the new revision", "traffic_mismatch")
     if second_parts[4]["image"] != expected_image or normalized_config(second_parts, legacy_preserved) != config:
         reject("service template changed during read-back", "config_mismatch")
