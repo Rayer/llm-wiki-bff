@@ -137,8 +137,31 @@ def canonical_handle(project, region, job_name):
     return f"projects/{project}/locations/{region}/jobs/{job_name}"
 
 
-def allowlisted_config(container, volumes, mounts, expected_bucket=None, require_bucket=False, require_cloud_shape=False):
-    env = container["env"]
+def normalized_volume(volume):
+    if not isinstance(volume, dict) or not isinstance(volume.get("name"), str):
+        reject("Cloud Run volume entry is invalid")
+    normalized = {"name": volume["name"]}
+    csi = volume.get("csi")
+    if csi is not None:
+        if not isinstance(csi, dict) or not isinstance(csi.get("driver"), str):
+            reject("Cloud Run volume CSI entry is invalid")
+        normalized["csi"] = {"driver": csi["driver"]}
+    return normalized
+
+
+def normalized_volume_mount(mount):
+    if not isinstance(mount, dict):
+        reject("Cloud Run volume mount entry is invalid")
+    if not isinstance(mount.get("name"), str) or not isinstance(mount.get("mountPath"), str):
+        reject("Cloud Run volume mount entry is invalid")
+    return {"name": mount["name"], "mountPath": mount["mountPath"]}
+
+
+def normalized_config(env, args, volumes, mounts, expected_bucket=None, require_bucket=False, require_cloud_shape=False):
+    if not isinstance(env, list) or not isinstance(volumes, list) or not isinstance(mounts, list):
+        reject("Cloud Run config collections are invalid")
+    if not isinstance(args, list) or not all(isinstance(item, str) for item in args):
+        reject("Cloud Run container args are missing or invalid")
     allowlisted = []
     for entry in env:
         if not isinstance(entry, dict) or not isinstance(entry.get("name"), str):
@@ -159,17 +182,45 @@ def allowlisted_config(container, volumes, mounts, expected_bucket=None, require
         reject("production BUCKET is missing")
     if expected_bucket is not None and bucket != expected_bucket:
         reject("production BUCKET is incorrect")
-    if require_cloud_shape and container["args"] != EXPECTED_ARGS:
+    if require_cloud_shape and args != EXPECTED_ARGS:
         reject("production args do not match the cloud worker contract")
     if require_cloud_shape and (volumes or mounts):
         reject("production job retains volumes or volume mounts")
     return {
         "env": allowlisted,
         "bucket": bucket,
-        "args": list(container["args"]),
-        "volumes": volumes,
-        "volume_mounts": mounts,
+        "args": list(args),
+        "volumes": [normalized_volume(volume) for volume in volumes],
+        "volume_mounts": [normalized_volume_mount(mount) for mount in mounts],
     }
+
+
+def allowlisted_config(container, volumes, mounts, expected_bucket=None, require_bucket=False, require_cloud_shape=False):
+    return normalized_config(
+        container["env"],
+        container["args"],
+        volumes,
+        mounts,
+        expected_bucket=expected_bucket,
+        require_bucket=require_bucket,
+        require_cloud_shape=require_cloud_shape,
+    )
+
+
+def normalized_rollback_config(config):
+    if not isinstance(config, dict):
+        reject("rollback config is missing or invalid")
+    if not isinstance(config.get("env"), list) or not isinstance(config.get("volumes"), list) or not isinstance(config.get("volume_mounts"), list):
+        reject("rollback config is missing or invalid")
+    normalized = normalized_config(
+        config.get("env"),
+        config.get("args"),
+        config.get("volumes"),
+        config.get("volume_mounts"),
+    )
+    if not isinstance(config.get("bucket"), str) or config["bucket"] != normalized["bucket"]:
+        reject("rollback config bucket is invalid")
+    return normalized
 
 
 def normalized_hash(value):
@@ -340,7 +391,29 @@ def validate_metadata(metadata, args):
         reject("originating workflow name is missing")
     positive_int(originating.get("run_id"), "originating workflow run ID")
     positive_int(originating.get("run_attempt"), "originating workflow run attempt")
-    return commit_sha, image["reference"], artifact_name
+    return (
+        commit_sha,
+        image["reference"],
+        artifact_name,
+        {
+            "dev_provenance": {
+                "workflow": provenance["workflow"],
+                "event": provenance["event"],
+                "head_branch": provenance["head_branch"],
+                "head_sha": provenance["head_sha"],
+                "conclusion": provenance["conclusion"],
+                "run_id": provenance["run_id"],
+                "run_url": provenance["run_url"],
+            },
+            "image": {"digest": image["digest"], "reference": image["reference"]},
+            "originating_workflow": {
+                "repository": originating["repository"],
+                "workflow": originating["workflow"],
+                "run_id": originating["run_id"],
+                "run_attempt": originating["run_attempt"],
+            },
+        },
+    )
 
 
 def validate_rollback(rollback, args):
@@ -352,17 +425,14 @@ def validate_rollback(rollback, args):
     if not isinstance(artifact_name, str) or not ARTIFACT_RE.fullmatch(artifact_name):
         reject("rollback artifact name is missing or invalid")
     image = immutable_image(rollback.get("image_reference"), args.ar_repo)
-    config = rollback.get("config")
-    if not isinstance(config, dict) or not isinstance(config.get("args"), list):
-        reject("rollback config is missing or invalid")
-    return artifact_name, image, config
+    return artifact_name, image, normalized_rollback_config(rollback.get("config"))
 
 
 def render_evidence(args):
     remove_output(args.output)
     metadata = read_json(args.metadata)
     rollback = read_json(args.rollback_contract)
-    commit_sha, expected_image, metadata_artifact_name = validate_metadata(metadata, args)
+    commit_sha, expected_image, metadata_artifact_name, normalized_metadata = validate_metadata(metadata, args)
     artifact_name, rollback_image, rollback_config = validate_rollback(rollback, args)
     if artifact_name != metadata_artifact_name:
         reject("rollback artifact name does not match evidence metadata")
@@ -396,8 +466,8 @@ def render_evidence(args):
         "environment": metadata["environment"],
         "action": metadata["action"],
         "source": {"commit_sha": commit_sha, "ref": metadata["source"]["ref"]},
-        "dev_provenance": metadata["dev_provenance"],
-        "image": metadata["image"],
+        "dev_provenance": normalized_metadata["dev_provenance"],
+        "image": normalized_metadata["image"],
         "provider": {
             "current_handle": provider_handle,
             "rollback_handle": rollback["provider_handle"],
@@ -414,7 +484,7 @@ def render_evidence(args):
             "checked_at": checked_at,
             "checks": ["provider_handle", "generation", "image", "runtime_service_account", "allowlisted_config"],
         },
-        "originating_workflow": metadata["originating_workflow"],
+        "originating_workflow": normalized_metadata["originating_workflow"],
         "rollback": {"image_reference": rollback_image, "config": rollback_config},
     }
     validate_no_secret_like_fields(evidence)

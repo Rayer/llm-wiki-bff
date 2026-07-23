@@ -260,6 +260,69 @@ class WorkerDeploymentEvidenceTest(unittest.TestCase):
             {"name": "second", "mountPath": "/second"},
         ])
 
+    def test_render_reconstructs_nested_v1_objects_from_allowlisted_fields(self):
+        sentinel = "benign-unknown-field-must-not-leak"
+        provider = json.loads(ROLLBACK_FIXTURE.read_text())
+        provider_container = provider["spec"]["template"]["spec"]["template"]["spec"]["containers"][0]
+        provider_container["env"][0]["benign"] = sentinel
+        provider["spec"]["template"]["spec"]["template"]["spec"]["volumes"][0]["benign"] = sentinel
+        provider["spec"]["template"]["spec"]["template"]["spec"]["volumes"][0]["csi"]["benign"] = sentinel
+        provider_container["volumeMounts"][0]["benign"] = sentinel
+        provider_path = self.root / "provider-with-unknown-fields.json"
+        provider_path.write_text(json.dumps(provider))
+
+        prepared, rollback = self.prepare_rollback(fixture=provider_path)
+        self.assertEqual(prepared.returncode, 0, prepared.stderr)
+        rollback_document = json.loads(rollback.read_text())
+        rollback_document["config"]["benign"] = sentinel
+        rollback_document["config"]["env"][0]["benign"] = sentinel
+        rollback_document["config"]["volumes"][0]["benign"] = sentinel
+        rollback_document["config"]["volumes"][0]["csi"]["benign"] = sentinel
+        rollback_document["config"]["volume_mounts"][0]["benign"] = sentinel
+        rollback.write_text(json.dumps(rollback_document))
+
+        metadata = self.metadata()
+        metadata["source"]["benign"] = sentinel
+        metadata["dev_provenance"]["benign"] = sentinel
+        metadata["image"]["benign"] = sentinel
+        metadata["originating_workflow"]["benign"] = sentinel
+
+        observed = json.loads(OBSERVED_FIXTURE.read_text())
+        observed["spec"]["template"]["spec"]["template"]["spec"]["containers"][0]["env"][0]["benign"] = sentinel
+        observed_path = self.root / "observed-with-unknown-fields.json"
+        observed_path.write_text(json.dumps(observed))
+        rendered, evidence = self.render(metadata, observed_path)
+
+        self.assertEqual(rendered.returncode, 0, rendered.stderr)
+        evidence_text = evidence.read_text()
+        self.assertNotIn(sentinel, evidence_text)
+        document = json.loads(evidence_text)
+        clean_metadata = self.metadata()
+        self.assertEqual(document["source"], clean_metadata["source"])
+        self.assertEqual(document["dev_provenance"], clean_metadata["dev_provenance"])
+        self.assertEqual(document["image"], clean_metadata["image"])
+        self.assertEqual(document["originating_workflow"], clean_metadata["originating_workflow"])
+        self.assertEqual(document["config"]["allowlisted"], {
+            "env": [{"name": "BUCKET", "value": "llm-wiki-data"}],
+            "bucket": "llm-wiki-data",
+            "args": ["run", "[[\"run\",\"--auto-approve\"]]"],
+            "volumes": [],
+            "volume_mounts": [],
+        })
+        self.assertEqual(document["rollback"]["config"], {
+            "env": [
+                {"name": "BUCKET", "value": "llm-wiki-data"},
+                {"name": "DATA_DIR", "value": "/data"},
+                {"name": "WORKSPACE", "value": "prod"},
+                {"name": "VAULT_PATH", "value": "/vault"},
+                {"name": "WORKSPACE_DIR", "value": "/workspace"},
+            ],
+            "bucket": "llm-wiki-data",
+            "args": ["run", "[[\"run\",\"--auto-approve\"]]"],
+            "volumes": [{"name": "gcs", "csi": {"driver": "gcsfuse.run.googleapis.com"}}],
+            "volume_mounts": [{"name": "gcs", "mountPath": "/data"}],
+        })
+
 
 if __name__ == "__main__":
     unittest.main()
