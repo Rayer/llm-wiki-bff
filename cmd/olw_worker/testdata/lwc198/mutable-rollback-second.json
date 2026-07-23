@@ -16,7 +16,16 @@
               "args": ["run", "[[\"run\",\"--auto-approve\"]]"],
               "volumeMounts": [{"name": "second", "mountPath": "/second"}]
             }],
-            "volumes": [{"name": "second", "csi": {"driver": "gcsfuse.run.googleapis.com"}}]
+            "volumes": [{
+              "name": "second",
+              "csi": {
+                "driver": "gcsfuse.run.googleapis.com",
+                "volumeAttributes": {
+                  "bucketName": "rollback-bucket",
+                  "gcsfuseVersion": "v2"
+                }
+              }
+            }]
           }
         }
       }

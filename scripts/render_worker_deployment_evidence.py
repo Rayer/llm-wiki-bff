@@ -140,19 +140,38 @@ def canonical_handle(project, region, job_name):
 def normalized_volume(volume):
     if not isinstance(volume, dict) or not isinstance(volume.get("name"), str):
         reject("Cloud Run volume entry is invalid")
-    normalized = {"name": volume["name"]}
-    csi = volume.get("csi")
-    if csi is not None:
-        if not isinstance(csi, dict) or not isinstance(csi.get("driver"), str):
-            reject("Cloud Run volume CSI entry is invalid")
-        normalized["csi"] = {"driver": csi["driver"]}
+    if not volume["name"]:
+        reject("Cloud Run volume name is invalid")
+    if set(volume) != {"name", "csi"}:
+        reject("unsupported Cloud Run volume shape")
+    csi = volume["csi"]
+    if not isinstance(csi, dict) or set(csi) - {"driver", "volumeAttributes"}:
+        reject("unsupported Cloud Run volume CSI shape")
+    if not isinstance(csi.get("driver"), str) or not csi["driver"]:
+        reject("Cloud Run volume CSI driver is invalid")
+    volume_attributes = csi.get("volumeAttributes", {})
+    if not isinstance(volume_attributes, dict) or any(
+        not isinstance(key, str) or not isinstance(value, str)
+        for key, value in volume_attributes.items()
+    ):
+        reject("Cloud Run volume CSI volumeAttributes must be a string map")
+    normalized = {
+        "name": volume["name"],
+        "csi": {
+            "driver": csi["driver"],
+            "volumeAttributes": dict(volume_attributes),
+        },
+    }
+    validate_no_secret_like_fields(normalized)
     return normalized
 
 
 def normalized_volume_mount(mount):
     if not isinstance(mount, dict):
         reject("Cloud Run volume mount entry is invalid")
-    if not isinstance(mount.get("name"), str) or not isinstance(mount.get("mountPath"), str):
+    if set(mount) != {"name", "mountPath"}:
+        reject("unsupported Cloud Run volume mount shape")
+    if not isinstance(mount.get("name"), str) or not mount["name"] or not isinstance(mount.get("mountPath"), str) or not mount["mountPath"]:
         reject("Cloud Run volume mount entry is invalid")
     return {"name": mount["name"], "mountPath": mount["mountPath"]}
 
@@ -491,6 +510,45 @@ def render_evidence(args):
     write_json(args.output, evidence)
 
 
+def render_partial(args):
+    if Path(args.output).exists():
+        reject("refusing to overwrite existing deployment evidence")
+    metadata = read_json(args.metadata)
+    rollback = read_json(args.rollback_contract)
+    commit_sha, _, metadata_artifact_name, normalized_metadata = validate_metadata(metadata, args)
+    artifact_name, rollback_image, rollback_config = validate_rollback(rollback, args)
+    if artifact_name != metadata_artifact_name:
+        reject("rollback artifact name does not match evidence metadata")
+    provider_handle = canonical_handle(args.project, args.region, args.job_name)
+    evidence = {
+        "schema_version": EXPECTED_SCHEMA_VERSION,
+        "status": "PARTIAL",
+        "project": metadata["project"],
+        "component": metadata["component"],
+        "environment": metadata["environment"],
+        "action": metadata["action"],
+        "source": {"commit_sha": commit_sha, "ref": metadata["source"]["ref"]},
+        "dev_provenance": normalized_metadata["dev_provenance"],
+        "image": normalized_metadata["image"],
+        "provider": {
+            "current_handle": provider_handle,
+            "rollback_handle": rollback["provider_handle"],
+            "rollback_artifact_name": artifact_name,
+        },
+        "config": {"result": "unknown", "fingerprint": None, "allowlisted": None},
+        "provider_verification": {"result": "unknown", "checked_at": None, "checks": []},
+        "originating_workflow": normalized_metadata["originating_workflow"],
+        "rollback": {"image_reference": rollback_image, "config": rollback_config},
+        "next_action": "independent provider read-back required before retry or rollback",
+    }
+    validate_no_secret_like_fields(evidence)
+    write_json(args.output, evidence)
+
+
+def validate_metadata_only(args):
+    validate_metadata(read_json(args.metadata), args)
+
+
 def add_provider_args(parser):
     parser.add_argument("--project", required=True)
     parser.add_argument("--region", required=True)
@@ -512,6 +570,16 @@ def build_parser():
     render.add_argument("--rollback-contract", required=True)
     render.add_argument("--metadata", required=True)
     render.add_argument("--output", required=True)
+    partial = subparsers.add_parser("render-partial")
+    add_provider_args(partial)
+    partial.add_argument("--ar-repo", required=True)
+    partial.add_argument("--rollback-contract", required=True)
+    partial.add_argument("--metadata", required=True)
+    partial.add_argument("--output", required=True)
+    validate = subparsers.add_parser("validate-metadata")
+    validate.add_argument("--project", required=True)
+    validate.add_argument("--ar-repo", required=True)
+    validate.add_argument("--metadata", required=True)
     return parser
 
 
@@ -520,8 +588,12 @@ def main(argv=None):
     try:
         if args.mode == "prepare-rollback":
             prepare_rollback(args)
-        else:
+        elif args.mode == "render-evidence":
             render_evidence(args)
+        elif args.mode == "render-partial":
+            render_partial(args)
+        else:
+            validate_metadata_only(args)
     except EvidenceError as error:
         print(f"deployment evidence rejected: {error}", file=sys.stderr)
         return 1

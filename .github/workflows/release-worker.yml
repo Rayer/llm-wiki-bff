@@ -28,6 +28,11 @@ jobs:
       contents: read
       actions: read
       id-token: write
+    env:
+      EVIDENCE_DIR: ${{ runner.temp }}/worker-deployment-evidence
+      ROLLBACK_CONTRACT: ${{ runner.temp }}/worker-deployment-evidence/rollback-contract.json
+      METADATA: ${{ runner.temp }}/worker-deployment-evidence/metadata.json
+      EVIDENCE: ${{ runner.temp }}/worker-deployment-evidence/deployment-evidence.json
 
     steps:
       - name: Checkout main
@@ -120,10 +125,9 @@ jobs:
         id: rollback
         env:
           COMMIT_SHA: ${{ steps.commit.outputs.commit_sha }}
-          ROLLBACK_DIR: ${{ runner.temp }}/worker-production-rollback
         run: |
           set -euo pipefail
-          mkdir -p "$ROLLBACK_DIR"
+          mkdir -p "$EVIDENCE_DIR"
           EVIDENCE_ARTIFACT_NAME="worker-deployment-evidence-${COMMIT_SHA}"
           python3 scripts/render_worker_deployment_evidence.py prepare-rollback \
             --project "${PROJECT_ID}" \
@@ -131,31 +135,13 @@ jobs:
             --job-name "${JOB_NAME}" \
             --ar-repo "${AR_REPO}" \
             --artifact-name "$EVIDENCE_ARTIFACT_NAME" \
-            --output "$ROLLBACK_DIR/rollback-contract.json"
+            --output "$ROLLBACK_CONTRACT"
           echo "artifact_name=$EVIDENCE_ARTIFACT_NAME" >> "$GITHUB_OUTPUT"
 
-      - name: Update production worker
+      - name: Prepare validated deployment metadata before mutation
         env:
-          IMMUTABLE_IMAGE: ${{ steps.image.outputs.image }}
-          BUCKET: llm-wiki-data
-        run: |
-          set -euo pipefail
-          gcloud run jobs update "${JOB_NAME}" \
-            --image "$IMMUTABLE_IMAGE" \
-            --update-env-vars "BUCKET=${BUCKET}" \
-            --remove-env-vars "DATA_DIR,WORKSPACE,VAULT_PATH,WORKSPACE_DIR" \
-            --args "^@^run@[[\"run\",\"--auto-approve\"]]" \
-            --clear-volume-mounts \
-            --clear-volumes \
-            --region "${REGION}" \
-            --quiet
-
-      - name: Render normalized deployment evidence after strict read-back
-        id: evidence
-        env:
-          IMMUTABLE_IMAGE: ${{ steps.image.outputs.image }}
-          BUCKET: llm-wiki-data
           COMMIT_SHA: ${{ steps.commit.outputs.commit_sha }}
+          IMMUTABLE_IMAGE: ${{ steps.image.outputs.image }}
           DEV_RUN_ID: ${{ steps.dev_run.outputs.run_id }}
           DEV_RUN_URL: ${{ steps.dev_run.outputs.run_url }}
           DEV_RUN_EVENT: ${{ steps.dev_run.outputs.run_event }}
@@ -163,17 +149,12 @@ jobs:
           DEV_RUN_HEAD_SHA: ${{ steps.dev_run.outputs.run_head_sha }}
           DEV_RUN_CONCLUSION: ${{ steps.dev_run.outputs.run_conclusion }}
           EVIDENCE_ARTIFACT_NAME: ${{ steps.rollback.outputs.artifact_name }}
-          ROLLBACK_CONTRACT: ${{ runner.temp }}/worker-production-rollback/rollback-contract.json
-          EVIDENCE_DIR: ${{ runner.temp }}/worker-deployment-evidence
           GITHUB_REPOSITORY: ${{ github.repository }}
           GITHUB_WORKFLOW: ${{ github.workflow }}
           GITHUB_RUN_ID: ${{ github.run_id }}
           GITHUB_RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
           set -euo pipefail
-          mkdir -p "$EVIDENCE_DIR"
-          METADATA="$EVIDENCE_DIR/metadata.json"
-          EVIDENCE="$EVIDENCE_DIR/deployment-evidence.json"
           jq -n \
             --arg project "$PROJECT_ID" \
             --arg component "olw-worker" \
@@ -198,6 +179,32 @@ jobs:
             --argjson workflow_run_attempt "$GITHUB_RUN_ATTEMPT" \
             '{schema_version: $schema_version, project: $project, component: $component, environment: $environment, action: $action, rollback_artifact_name: $rollback_artifact_name, source: {commit_sha: $commit_sha, ref: $source_ref}, dev_provenance: {workflow: $dev_workflow, event: $dev_event, head_branch: $dev_head_branch, head_sha: $dev_head_sha, conclusion: $dev_conclusion, run_id: $dev_run_id, run_url: $dev_run_url}, image: {digest: $digest, reference: $image}, originating_workflow: {repository: $repository, workflow: $workflow, run_id: $workflow_run_id, run_attempt: $workflow_run_attempt}}' \
             > "$METADATA"
+          python3 scripts/render_worker_deployment_evidence.py validate-metadata \
+            --project "$PROJECT_ID" \
+            --ar-repo "$AR_REPO" \
+            --metadata "$METADATA"
+
+      - name: Update production worker
+        env:
+          IMMUTABLE_IMAGE: ${{ steps.image.outputs.image }}
+          BUCKET: llm-wiki-data
+        run: |
+          set -euo pipefail
+          gcloud run jobs update "${JOB_NAME}" \
+            --image "$IMMUTABLE_IMAGE" \
+            --update-env-vars "BUCKET=${BUCKET}" \
+            --remove-env-vars "DATA_DIR,WORKSPACE,VAULT_PATH,WORKSPACE_DIR" \
+            --args "^@^run@[[\"run\",\"--auto-approve\"]]" \
+            --clear-volume-mounts \
+            --clear-volumes \
+            --region "${REGION}" \
+            --quiet
+
+      - name: Render normalized deployment evidence after strict read-back
+        env:
+          BUCKET: llm-wiki-data
+        run: |
+          set -euo pipefail
           python3 scripts/render_worker_deployment_evidence.py render-evidence \
             --project "$PROJECT_ID" \
             --region "$REGION" \
@@ -207,14 +214,33 @@ jobs:
             --rollback-contract "$ROLLBACK_CONTRACT" \
             --metadata "$METADATA" \
             --output "$EVIDENCE"
-          echo "evidence_file=$EVIDENCE" >> "$GITHUB_OUTPUT"
+
+      - name: Finalize partial evidence when provider verification is unknown
+        if: always()
+        run: |
+          set -euo pipefail
+          if [[ -e "$EVIDENCE" ]]; then
+            echo "verified evidence already exists; preserving it"
+          elif [[ -f "$ROLLBACK_CONTRACT" && -f "$METADATA" ]]; then
+            python3 scripts/render_worker_deployment_evidence.py render-partial \
+              --project "$PROJECT_ID" \
+              --region "$REGION" \
+              --job-name "$JOB_NAME" \
+              --ar-repo "$AR_REPO" \
+              --rollback-contract "$ROLLBACK_CONTRACT" \
+              --metadata "$METADATA" \
+              --output "$EVIDENCE"
+          else
+            echo "rollback or validated metadata is unavailable; no evidence fabricated"
+          fi
 
       - name: Upload normalized deployment evidence
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.rollback.outputs.artifact_name }}
-          path: ${{ steps.evidence.outputs.evidence_file }}
-          if-no-files-found: error
+          path: ${{ env.EVIDENCE }}
+          if-no-files-found: ignore
           retention-days: 90
 
       - name: Tag promoted production image

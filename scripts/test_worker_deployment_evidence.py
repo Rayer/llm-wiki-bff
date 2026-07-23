@@ -162,6 +162,38 @@ class WorkerDeploymentEvidenceTest(unittest.TestCase):
         )
         return result, output
 
+    def render_partial(self, metadata=None, output=None):
+        metadata = self.metadata() if metadata is None else metadata
+        metadata_path = self.root / "metadata.json"
+        metadata_path.write_text(json.dumps(metadata))
+        output = self.root / "deployment-evidence.json" if output is None else output
+        env = {**self.env, "FAKE_JOB_FIXTURE": str(OBSERVED_FIXTURE)}
+        result = subprocess.run(
+            [
+                "python3",
+                str(SCRIPT),
+                "render-partial",
+                "--project",
+                "llm-wiki-cloud",
+                "--region",
+                "asia-east1",
+                "--job-name",
+                "olw-pipeline",
+                "--ar-repo",
+                "asia-east1-docker.pkg.dev/llm-wiki-cloud/cloud-run-images",
+                "--rollback-contract",
+                str(self.root / "rollback.json"),
+                "--metadata",
+                str(metadata_path),
+                "--output",
+                str(output),
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        return result, output
+
     def test_success_normalizes_evidence_after_provider_readback(self):
         prepared, rollback = self.prepare_rollback()
         self.assertEqual(prepared.returncode, 0, prepared.stderr)
@@ -243,6 +275,49 @@ class WorkerDeploymentEvidenceTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse(output.exists())
 
+    def test_partial_fallback_preserves_frozen_rollback_and_unknown_semantics(self):
+        prepared, rollback = self.prepare_rollback()
+        self.assertEqual(prepared.returncode, 0, prepared.stderr)
+        frozen = json.loads(rollback.read_text())
+
+        rendered, evidence = self.render(self.metadata(), fixture=MALFORMED_FIXTURE)
+        self.assertNotEqual(rendered.returncode, 0)
+        self.assertFalse(evidence.exists())
+
+        partial, evidence = self.render_partial()
+        self.assertEqual(partial.returncode, 0, partial.stderr)
+        document = json.loads(evidence.read_text())
+        self.assertEqual(document["status"], "PARTIAL")
+        self.assertEqual(document["provider_verification"], {
+            "result": "unknown",
+            "checked_at": None,
+            "checks": [],
+        })
+        self.assertEqual(document["config"], {
+            "result": "unknown",
+            "fingerprint": None,
+            "allowlisted": None,
+        })
+        self.assertEqual(document["rollback"], {
+            "image_reference": frozen["image_reference"],
+            "config": frozen["config"],
+        })
+        self.assertNotIn("observed_job", document)
+        self.assertIn("independent provider read-back", document["next_action"])
+        self.assertIn("retry", document["next_action"])
+        self.assertIn("rollback", document["next_action"])
+
+    def test_partial_fallback_never_overwrites_existing_success_evidence(self):
+        prepared, _ = self.prepare_rollback()
+        self.assertEqual(prepared.returncode, 0, prepared.stderr)
+        rendered, evidence = self.render(self.metadata())
+        self.assertEqual(rendered.returncode, 0, rendered.stderr)
+        before = evidence.read_text()
+
+        partial, _ = self.render_partial(output=evidence)
+        self.assertNotEqual(partial.returncode, 0)
+        self.assertEqual(evidence.read_text(), before)
+
     def test_mutable_rollback_uses_second_validated_job_snapshot(self):
         first = ROOT / "cmd/olw_worker/testdata/lwc198/mutable-rollback-first.json"
         second = ROOT / "cmd/olw_worker/testdata/lwc198/mutable-rollback-second.json"
@@ -254,7 +329,16 @@ class WorkerDeploymentEvidenceTest(unittest.TestCase):
             {"name": "DATA_DIR", "value": "/second"},
         ])
         self.assertEqual(rollback["config"]["volumes"], [
-            {"name": "second", "csi": {"driver": "gcsfuse.run.googleapis.com"}},
+            {
+                "name": "second",
+                "csi": {
+                    "driver": "gcsfuse.run.googleapis.com",
+                    "volumeAttributes": {
+                        "bucketName": "rollback-bucket",
+                        "gcsfuseVersion": "v2",
+                    },
+                },
+            },
         ])
         self.assertEqual(rollback["config"]["volume_mounts"], [
             {"name": "second", "mountPath": "/second"},
@@ -265,9 +349,6 @@ class WorkerDeploymentEvidenceTest(unittest.TestCase):
         provider = json.loads(ROLLBACK_FIXTURE.read_text())
         provider_container = provider["spec"]["template"]["spec"]["template"]["spec"]["containers"][0]
         provider_container["env"][0]["benign"] = sentinel
-        provider["spec"]["template"]["spec"]["template"]["spec"]["volumes"][0]["benign"] = sentinel
-        provider["spec"]["template"]["spec"]["template"]["spec"]["volumes"][0]["csi"]["benign"] = sentinel
-        provider_container["volumeMounts"][0]["benign"] = sentinel
         provider_path = self.root / "provider-with-unknown-fields.json"
         provider_path.write_text(json.dumps(provider))
 
@@ -276,9 +357,6 @@ class WorkerDeploymentEvidenceTest(unittest.TestCase):
         rollback_document = json.loads(rollback.read_text())
         rollback_document["config"]["benign"] = sentinel
         rollback_document["config"]["env"][0]["benign"] = sentinel
-        rollback_document["config"]["volumes"][0]["benign"] = sentinel
-        rollback_document["config"]["volumes"][0]["csi"]["benign"] = sentinel
-        rollback_document["config"]["volume_mounts"][0]["benign"] = sentinel
         rollback.write_text(json.dumps(rollback_document))
 
         metadata = self.metadata()
@@ -319,9 +397,36 @@ class WorkerDeploymentEvidenceTest(unittest.TestCase):
             ],
             "bucket": "llm-wiki-data",
             "args": ["run", "[[\"run\",\"--auto-approve\"]]"],
-            "volumes": [{"name": "gcs", "csi": {"driver": "gcsfuse.run.googleapis.com"}}],
+            "volumes": [{
+                "name": "gcs",
+                "csi": {"driver": "gcsfuse.run.googleapis.com", "volumeAttributes": {}},
+            }],
             "volume_mounts": [{"name": "gcs", "mountPath": "/data"}],
         })
+
+    def test_unsupported_volume_and_mount_shapes_fail_closed_before_rollback_write(self):
+        for name, mutate in {
+            "unsupported volume provider": lambda d: d["spec"]["template"]["spec"]["template"]["spec"]["volumes"][0].update(
+                persistentDisk={"diskName": "worker-disk"}
+            ),
+            "unsupported CSI field": lambda d: d["spec"]["template"]["spec"]["template"]["spec"]["volumes"][0]["csi"].update(
+                nodeStageSecretRef={"name": "not-allowed"}
+            ),
+            "unsupported mount field": lambda d: d["spec"]["template"]["spec"]["template"]["spec"]["containers"][0]["volumeMounts"][0].update(
+                readOnly=True
+            ),
+            "secret-like volume attribute": lambda d: d["spec"]["template"]["spec"]["template"]["spec"]["volumes"][0]["csi"].update(
+                volumeAttributes={"accessToken": "redacted"}
+            ),
+        }.items():
+            with self.subTest(name=name):
+                provider = json.loads(ROLLBACK_FIXTURE.read_text())
+                mutate(provider)
+                fixture = self.root / (name.replace(" ", "-") + ".json")
+                fixture.write_text(json.dumps(provider))
+                result, output = self.prepare_rollback(fixture=fixture)
+                self.assertNotEqual(result.returncode, 0, result.stderr)
+                self.assertFalse(output.exists())
 
 
 if __name__ == "__main__":
