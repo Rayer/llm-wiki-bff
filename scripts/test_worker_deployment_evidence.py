@@ -132,7 +132,7 @@ class WorkerDeploymentEvidenceTest(unittest.TestCase):
         metadata_path = self.root / "metadata.json"
         metadata_path.write_text(json.dumps(metadata))
         output = self.root / "deployment-evidence.json"
-        output.write_text("stale output")
+        failure = self.root / "deployment-evidence-failure.json"
         env = {**self.env, "FAKE_JOB_FIXTURE": str(fixture)}
         result = subprocess.run(
             [
@@ -155,6 +155,8 @@ class WorkerDeploymentEvidenceTest(unittest.TestCase):
                 str(metadata_path),
                 "--output",
                 str(output),
+                "--failure-output",
+                str(failure),
             ],
             env=env,
             capture_output=True,
@@ -167,6 +169,7 @@ class WorkerDeploymentEvidenceTest(unittest.TestCase):
         metadata_path = self.root / "metadata.json"
         metadata_path.write_text(json.dumps(metadata))
         output = self.root / "deployment-evidence.json" if output is None else output
+        failure = self.root / "deployment-evidence-failure.json"
         env = {**self.env, "FAKE_JOB_FIXTURE": str(OBSERVED_FIXTURE)}
         result = subprocess.run(
             [
@@ -187,6 +190,8 @@ class WorkerDeploymentEvidenceTest(unittest.TestCase):
                 str(metadata_path),
                 "--output",
                 str(output),
+                "--failure-output",
+                str(failure),
             ],
             env=env,
             capture_output=True,
@@ -287,14 +292,12 @@ class WorkerDeploymentEvidenceTest(unittest.TestCase):
         partial, evidence = self.render_partial()
         self.assertEqual(partial.returncode, 0, partial.stderr)
         document = json.loads(evidence.read_text())
-        self.assertEqual(document["status"], "PARTIAL")
-        self.assertEqual(document["provider_verification"], {
-            "result": "unknown",
-            "checked_at": None,
-            "checks": [],
-        })
+        self.assertEqual(document["status"], "UNHEALTHY")
+        self.assertEqual(document["provider_verification"]["result"], "failed")
+        self.assertEqual(document["provider_verification"]["reason_code"], "observed_shape_unsupported")
+        self.assertIsNotNone(document["provider_verification"]["checked_at"])
         self.assertEqual(document["config"], {
-            "result": "unknown",
+            "result": "failed",
             "fingerprint": None,
             "allowlisted": None,
         })
@@ -307,6 +310,59 @@ class WorkerDeploymentEvidenceTest(unittest.TestCase):
         self.assertIn("retry", document["next_action"])
         self.assertIn("rollback", document["next_action"])
 
+    def test_provider_unavailable_falls_back_to_unknown_without_provider_data(self):
+        prepared, _ = self.prepare_rollback()
+        self.assertEqual(prepared.returncode, 0, prepared.stderr)
+        self.env["FAKE_PROVIDER_FAILURE"] = "1"
+
+        rendered, evidence = self.render(self.metadata())
+        self.assertNotEqual(rendered.returncode, 0)
+        self.assertFalse(evidence.exists())
+        self.assertNotIn("fake provider failure", rendered.stderr)
+        marker = json.loads((self.root / "deployment-evidence-failure.json").read_text())
+        self.assertEqual(marker["classification"], "unknown")
+        self.assertEqual(marker["reason_code"], "provider_command_failed")
+        self.assertNotIn("fake provider failure", (self.root / "deployment-evidence-failure.json").read_text())
+
+        partial, evidence = self.render_partial()
+        self.assertEqual(partial.returncode, 0, partial.stderr)
+        document = json.loads(evidence.read_text())
+        self.assertEqual(document["status"], "PARTIAL")
+        self.assertEqual(document["provider_verification"], {
+            "result": "unknown",
+            "checked_at": None,
+            "checks": [],
+        })
+
+    def test_image_mismatch_falls_back_to_unhealthy_with_safe_reason(self):
+        prepared, _ = self.prepare_rollback()
+        self.assertEqual(prepared.returncode, 0, prepared.stderr)
+        observed = json.loads(OBSERVED_FIXTURE.read_text())
+        observed["spec"]["template"]["spec"]["template"]["spec"]["containers"][0]["image"] = IMAGE.replace("b" * 64, "d" * 64)
+        observed_path = self.root / "image-mismatch.json"
+        observed_path.write_text(json.dumps(observed))
+
+        rendered, evidence = self.render(self.metadata(), observed_path)
+        self.assertNotEqual(rendered.returncode, 0)
+        self.assertFalse(evidence.exists())
+        partial, evidence = self.render_partial()
+        self.assertEqual(partial.returncode, 0, partial.stderr)
+        document = json.loads(evidence.read_text())
+        self.assertEqual(document["status"], "UNHEALTHY")
+        self.assertEqual(document["config"]["result"], "failed")
+        self.assertEqual(document["provider_verification"]["reason_code"], "image_mismatch")
+        self.assertIsNotNone(document["provider_verification"]["checked_at"])
+
+    def test_no_failure_marker_keeps_update_failure_unknown(self):
+        prepared, _ = self.prepare_rollback()
+        self.assertEqual(prepared.returncode, 0, prepared.stderr)
+        partial, evidence = self.render_partial()
+        self.assertEqual(partial.returncode, 0, partial.stderr)
+        document = json.loads(evidence.read_text())
+        self.assertEqual(document["status"], "PARTIAL")
+        self.assertEqual(document["provider_verification"]["result"], "unknown")
+        self.assertIsNone(document["provider_verification"]["checked_at"])
+
     def test_partial_fallback_never_overwrites_existing_success_evidence(self):
         prepared, _ = self.prepare_rollback()
         self.assertEqual(prepared.returncode, 0, prepared.stderr)
@@ -314,6 +370,9 @@ class WorkerDeploymentEvidenceTest(unittest.TestCase):
         self.assertEqual(rendered.returncode, 0, rendered.stderr)
         before = evidence.read_text()
 
+        strict_again, _ = self.render(self.metadata())
+        self.assertNotEqual(strict_again.returncode, 0)
+        self.assertEqual(evidence.read_text(), before)
         partial, _ = self.render_partial(output=evidence)
         self.assertNotEqual(partial.returncode, 0)
         self.assertEqual(evidence.read_text(), before)
@@ -418,6 +477,21 @@ class WorkerDeploymentEvidenceTest(unittest.TestCase):
             "secret-like volume attribute": lambda d: d["spec"]["template"]["spec"]["template"]["spec"]["volumes"][0]["csi"].update(
                 volumeAttributes={"accessToken": "redacted"}
             ),
+            "keyFile volume attribute": lambda d: d["spec"]["template"]["spec"]["template"]["spec"]["volumes"][0]["csi"].update(
+                volumeAttributes={"keyFile": "/var/run/key"}
+            ),
+            "encryptionKey volume attribute": lambda d: d["spec"]["template"]["spec"]["template"]["spec"]["volumes"][0]["csi"].update(
+                volumeAttributes={"encryptionKey": "encrypted"}
+            ),
+            "accessKey volume attribute": lambda d: d["spec"]["template"]["spec"]["template"]["spec"]["volumes"][0]["csi"].update(
+                volumeAttributes={"accessKey": "redacted"}
+            ),
+            "credential volume attribute": lambda d: d["spec"]["template"]["spec"]["template"]["spec"]["volumes"][0]["csi"].update(
+                volumeAttributes={"credential": "redacted"}
+            ),
+            "secret-like volume attribute value": lambda d: d["spec"]["template"]["spec"]["template"]["spec"]["volumes"][0]["csi"].update(
+                volumeAttributes={"mountPath": "/var/lib/secret/data"}
+            ),
         }.items():
             with self.subTest(name=name):
                 provider = json.loads(ROLLBACK_FIXTURE.read_text())
@@ -427,6 +501,22 @@ class WorkerDeploymentEvidenceTest(unittest.TestCase):
                 result, output = self.prepare_rollback(fixture=fixture)
                 self.assertNotEqual(result.returncode, 0, result.stderr)
                 self.assertFalse(output.exists())
+
+    def test_valid_volume_attributes_are_preserved(self):
+        provider = json.loads(ROLLBACK_FIXTURE.read_text())
+        provider["spec"]["template"]["spec"]["template"]["spec"]["volumes"][0]["csi"]["volumeAttributes"] = {
+            "bucketName": "rollback-bucket",
+            "mountOptions": "implicit-dirs,uid=1000",
+        }
+        fixture = self.root / "valid-volume-attributes.json"
+        fixture.write_text(json.dumps(provider))
+
+        result, output = self.prepare_rollback(fixture=fixture)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            json.loads(output.read_text())["config"]["volumes"][0]["csi"]["volumeAttributes"],
+            provider["spec"]["template"]["spec"]["template"]["spec"]["volumes"][0]["csi"]["volumeAttributes"],
+        )
 
 
 if __name__ == "__main__":

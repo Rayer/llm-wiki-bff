@@ -205,6 +205,7 @@ func TestWorkerPromotionWorkflowsContract(t *testing.T) {
 		"ROLLBACK_CONTRACT=\"$EVIDENCE_DIR/rollback-contract.json\"",
 		"METADATA=\"$EVIDENCE_DIR/metadata.json\"",
 		"EVIDENCE=\"$EVIDENCE_DIR/deployment-evidence.json\"",
+		"EVIDENCE_FAILURE=\"$EVIDENCE_DIR/deployment-evidence-failure.json\"",
 		">> \"$GITHUB_ENV\"",
 	} {
 		if !strings.Contains(initializer, want) {
@@ -232,7 +233,7 @@ func TestWorkerPromotionWorkflowsContract(t *testing.T) {
 		t.Fatal("production update must clear mounts before volumes atomically")
 	}
 	readback := workflowSection(t, release, "      - name: Render normalized deployment evidence after strict read-back", "      - name: Upload normalized deployment evidence")
-	for _, want := range []string{"scripts/render_worker_deployment_evidence.py render-evidence", "--bucket \"$BUCKET\"", "--rollback-contract \"$ROLLBACK_CONTRACT\"", "--metadata \"$METADATA\"", "--output \"$EVIDENCE\""} {
+	for _, want := range []string{"scripts/render_worker_deployment_evidence.py render-evidence", "--bucket \"$BUCKET\"", "--rollback-contract \"$ROLLBACK_CONTRACT\"", "--metadata \"$METADATA\"", "--output \"$EVIDENCE\"", "--failure-output \"$EVIDENCE_FAILURE\""} {
 		if !strings.Contains(readback, want) {
 			t.Fatalf("production read-back evidence step missing %q", want)
 		}
@@ -244,7 +245,7 @@ func TestWorkerPromotionWorkflowsContract(t *testing.T) {
 	if !strings.Contains(finalizer, "if: always()") || !strings.Contains(finalizer, "scripts/render_worker_deployment_evidence.py render-partial") {
 		t.Fatal("release workflow must finalize truthful partial evidence after any failure")
 	}
-	if !strings.Contains(finalizer, "-f \"$ROLLBACK_CONTRACT\" && -f \"$METADATA\"") || !strings.Contains(finalizer, "[[ -e \"$EVIDENCE\" ]]") {
+	if !strings.Contains(finalizer, "-f \"$ROLLBACK_CONTRACT\" && -f \"$METADATA\"") || !strings.Contains(finalizer, "[[ -e \"$EVIDENCE\" ]]") || !strings.Contains(finalizer, "--failure-output \"$EVIDENCE_FAILURE\"") {
 		t.Fatal("partial finalizer must require frozen inputs and preserve existing evidence")
 	}
 	upload := workflowSection(t, release, "      - name: Upload normalized deployment evidence", "      - name: Tag promoted production image")
@@ -278,6 +279,7 @@ func TestWorkerReleaseEmitsOneNormalizedEvidenceArtifactAfterReadback(t *testing
 		"--rollback-contract",
 		"--metadata",
 		"--output \"$EVIDENCE\"",
+		"--failure-output \"$EVIDENCE_FAILURE\"",
 		"render-partial",
 		"name: ${{ steps.rollback.outputs.artifact_name }}",
 	} {

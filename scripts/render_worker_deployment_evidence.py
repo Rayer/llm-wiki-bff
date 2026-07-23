@@ -21,18 +21,59 @@ EXPECTED_ARGS = ["run", "[[\"run\",\"--auto-approve\"]]"]
 LEGACY_ENV_NAMES = {"DATA_DIR", "WORKSPACE", "VAULT_PATH", "WORKSPACE_DIR"}
 ALLOWLISTED_ENV_NAMES = LEGACY_ENV_NAMES | {"BUCKET"}
 SECRET_WORDS = ("secret", "token", "password", "apikey", "privatekey", "valuefrom")
+CSI_SECRET_KEY_NAMES = {
+    "key",
+    "keyfile",
+    "credential",
+    "credentials",
+    "auth",
+    "accesskey",
+    "secretkey",
+    "privatekey",
+    "apikey",
+    "valuefrom",
+}
+CSI_SECRET_VALUE_RE = re.compile(
+    r"(?i)(secret|token|password|credential|auth|api[\s_-]*key|"
+    r"access[\s_-]*key|secret[\s_-]*key|private[\s_-]*key|keyfile|valuefrom)"
+)
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 TAG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 ARTIFACT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
+CLASSIFICATION_UNKNOWN = "unknown"
+CLASSIFICATION_FAILED = "failed"
+REASON_CODES = {
+    "input_invalid": CLASSIFICATION_UNKNOWN,
+    "provider_command_unavailable": CLASSIFICATION_UNKNOWN,
+    "provider_command_failed": CLASSIFICATION_UNKNOWN,
+    "provider_readback_unparseable": CLASSIFICATION_UNKNOWN,
+    "observed_shape_unsupported": CLASSIFICATION_FAILED,
+    "provider_handle_mismatch": CLASSIFICATION_FAILED,
+    "generation_mismatch": CLASSIFICATION_FAILED,
+    "image_mismatch": CLASSIFICATION_FAILED,
+    "runtime_mismatch": CLASSIFICATION_FAILED,
+    "config_mismatch": CLASSIFICATION_FAILED,
+    "evidence_output_exists": CLASSIFICATION_UNKNOWN,
+}
+
+
 class EvidenceError(Exception):
-    pass
+    def __init__(self, message, reason_code="input_invalid", classification=None):
+        if reason_code not in REASON_CODES:
+            raise ValueError("unallowlisted evidence reason code")
+        expected = REASON_CODES[reason_code]
+        if classification is not None and classification != expected:
+            raise ValueError("evidence reason code classification mismatch")
+        super().__init__(message)
+        self.reason_code = reason_code
+        self.classification = expected
 
 
-def reject(message):
-    raise EvidenceError(message)
+def reject(message, reason_code="input_invalid", classification=None):
+    raise EvidenceError(message, reason_code=reason_code, classification=classification)
 
 
 def read_json(path):
@@ -50,9 +91,9 @@ def run_provider(args):
     try:
         result = subprocess.run(args, check=False, capture_output=True, text=True)
     except OSError as error:
-        reject(f"provider command unavailable: {args[0]} ({error.__class__.__name__})")
+        reject("provider command unavailable", "provider_command_unavailable")
     if result.returncode != 0:
-        reject(f"provider command failed: {' '.join(args[:4])}")
+        reject("provider command failed", "provider_command_failed")
     return result.stdout
 
 
@@ -75,9 +116,9 @@ def provider_job(project, region, job_name):
     try:
         value = json.loads(output)
     except json.JSONDecodeError:
-        reject("provider job read-back was not JSON")
+        reject("provider job read-back was not JSON", "provider_readback_unparseable")
     if not isinstance(value, dict):
-        reject("provider job read-back must be an object")
+        reject("provider job read-back has an unsupported shape", "observed_shape_unsupported")
     return value
 
 
@@ -98,30 +139,30 @@ def provider_digest(project, region, image):
     )
     value = output.strip()
     if not DIGEST_RE.fullmatch(value):
-        reject("provider rollback image resolution was not an immutable digest")
+        reject("provider rollback image resolution was not an immutable digest", "provider_readback_unparseable")
     return value
 
 
 def job_spec(document):
     metadata = document.get("metadata")
     if not isinstance(metadata, dict) or not isinstance(metadata.get("name"), str):
-        reject("provider job metadata name is missing or invalid")
+        reject("provider job metadata name is missing or invalid", "observed_shape_unsupported")
     try:
         spec = document["spec"]["template"]["spec"]["template"]["spec"]
     except (KeyError, TypeError):
-        reject("missing Cloud Run job template spec")
+        reject("missing Cloud Run job template spec", "observed_shape_unsupported")
     if not isinstance(spec, dict):
-        reject("Cloud Run job template spec is not an object")
+        reject("Cloud Run job template spec is not an object", "observed_shape_unsupported")
     containers = spec.get("containers")
     if not isinstance(containers, list) or len(containers) != 1 or not isinstance(containers[0], dict):
-        reject("expected exactly one Cloud Run container")
+        reject("expected exactly one Cloud Run container", "observed_shape_unsupported")
     container = containers[0]
     if not isinstance(container.get("image"), str):
-        reject("Cloud Run container image is missing or invalid")
+        reject("Cloud Run container image is missing or invalid", "observed_shape_unsupported")
     if not isinstance(container.get("env"), list):
-        reject("Cloud Run container env is missing or invalid")
+        reject("Cloud Run container env is missing or invalid", "observed_shape_unsupported")
     if not isinstance(container.get("args"), list) or not all(isinstance(item, str) for item in container["args"]):
-        reject("Cloud Run container args are missing or invalid")
+        reject("Cloud Run container args are missing or invalid", "observed_shape_unsupported")
     volumes = spec.get("volumes", [])
     mounts = container.get("volumeMounts", [])
     if volumes is None:
@@ -129,7 +170,7 @@ def job_spec(document):
     if mounts is None:
         mounts = []
     if not isinstance(volumes, list) or not isinstance(mounts, list):
-        reject("Cloud Run volumes or volume mounts are invalid")
+        reject("Cloud Run volumes or volume mounts are invalid", "observed_shape_unsupported")
     return document, spec, container, volumes, mounts
 
 
@@ -139,22 +180,34 @@ def canonical_handle(project, region, job_name):
 
 def normalized_volume(volume):
     if not isinstance(volume, dict) or not isinstance(volume.get("name"), str):
-        reject("Cloud Run volume entry is invalid")
+        reject("Cloud Run volume entry is invalid", "observed_shape_unsupported")
     if not volume["name"]:
-        reject("Cloud Run volume name is invalid")
+        reject("Cloud Run volume name is invalid", "observed_shape_unsupported")
     if set(volume) != {"name", "csi"}:
-        reject("unsupported Cloud Run volume shape")
+        reject("unsupported Cloud Run volume shape", "observed_shape_unsupported")
     csi = volume["csi"]
     if not isinstance(csi, dict) or set(csi) - {"driver", "volumeAttributes"}:
-        reject("unsupported Cloud Run volume CSI shape")
+        reject("unsupported Cloud Run volume CSI shape", "observed_shape_unsupported")
     if not isinstance(csi.get("driver"), str) or not csi["driver"]:
-        reject("Cloud Run volume CSI driver is invalid")
+        reject("Cloud Run volume CSI driver is invalid", "observed_shape_unsupported")
     volume_attributes = csi.get("volumeAttributes", {})
     if not isinstance(volume_attributes, dict) or any(
         not isinstance(key, str) or not isinstance(value, str)
         for key, value in volume_attributes.items()
     ):
-        reject("Cloud Run volume CSI volumeAttributes must be a string map")
+        reject("Cloud Run volume CSI volumeAttributes must be a string map", "observed_shape_unsupported")
+    for key, value in volume_attributes.items():
+        normalized_key = re.sub(r"[^a-z0-9]", "", key.lower())
+        if (
+            normalized_key in CSI_SECRET_KEY_NAMES
+            or normalized_key.endswith("key")
+            or "credential" in normalized_key
+            or "auth" in normalized_key
+            or any(word in normalized_key for word in SECRET_WORDS)
+        ):
+            reject("secret-like CSI volume attribute is not permitted", "config_mismatch")
+        if CSI_SECRET_VALUE_RE.search(value):
+            reject("secret-like CSI volume attribute is not permitted", "config_mismatch")
     normalized = {
         "name": volume["name"],
         "csi": {
@@ -168,11 +221,11 @@ def normalized_volume(volume):
 
 def normalized_volume_mount(mount):
     if not isinstance(mount, dict):
-        reject("Cloud Run volume mount entry is invalid")
+        reject("Cloud Run volume mount entry is invalid", "observed_shape_unsupported")
     if set(mount) != {"name", "mountPath"}:
-        reject("unsupported Cloud Run volume mount shape")
+        reject("unsupported Cloud Run volume mount shape", "observed_shape_unsupported")
     if not isinstance(mount.get("name"), str) or not mount["name"] or not isinstance(mount.get("mountPath"), str) or not mount["mountPath"]:
-        reject("Cloud Run volume mount entry is invalid")
+        reject("Cloud Run volume mount entry is invalid", "observed_shape_unsupported")
     return {"name": mount["name"], "mountPath": mount["mountPath"]}
 
 
@@ -289,6 +342,38 @@ def write_json(path, value):
         except FileNotFoundError:
             pass
         raise
+
+
+def failure_marker(error):
+    return {
+        "classification": error.classification,
+        "reason_code": error.reason_code,
+        "checked_at": datetime.now(timezone.utc).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+
+
+def read_failure_marker(path):
+    if not path or not Path(path).is_file():
+        return None
+    try:
+        with Path(path).open(encoding="utf-8") as handle:
+            marker = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(marker, dict):
+        return None
+    reason_code = marker.get("reason_code")
+    classification = marker.get("classification")
+    checked_at = marker.get("checked_at")
+    if (
+        classification != CLASSIFICATION_FAILED
+        or reason_code not in REASON_CODES
+        or REASON_CODES[reason_code] != CLASSIFICATION_FAILED
+        or not isinstance(checked_at, str)
+        or not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", checked_at)
+    ):
+        return None
+    return {"reason_code": reason_code, "checked_at": checked_at}
 
 
 def remove_output(path):
@@ -447,8 +532,9 @@ def validate_rollback(rollback, args):
     return artifact_name, image, normalized_rollback_config(rollback.get("config"))
 
 
-def render_evidence(args):
-    remove_output(args.output)
+def _render_evidence(args):
+    if Path(args.output).exists():
+        reject("deployment evidence already exists", "evidence_output_exists")
     metadata = read_json(args.metadata)
     rollback = read_json(args.rollback_contract)
     commit_sha, expected_image, metadata_artifact_name, normalized_metadata = validate_metadata(metadata, args)
@@ -459,22 +545,30 @@ def render_evidence(args):
     document = provider_job(args.project, args.region, args.job_name)
     _, spec, container, volumes, mounts = job_spec(document)
     observed_metadata = document.get("metadata", {})
-    generation = positive_int(observed_metadata.get("generation"), "observed Job generation")
+    try:
+        generation = positive_int(observed_metadata.get("generation"), "observed Job generation")
+    except EvidenceError:
+        reject("observed Job generation failed verification", "generation_mismatch")
     if observed_metadata.get("name") != args.job_name:
-        reject("observed Job name does not match the requested provider handle")
+        reject("observed Job name does not match the requested provider handle", "provider_handle_mismatch")
     if container["image"] != expected_image:
-        reject("observed Job image does not match the promoted immutable image")
+        reject("observed Job image does not match the promoted immutable image", "image_mismatch")
     service_account = spec.get("serviceAccountName")
     if not isinstance(service_account, str) or not service_account:
-        reject("observed runtime service account is missing or invalid")
-    config = allowlisted_config(
-        container,
-        volumes,
-        mounts,
-        expected_bucket=args.bucket,
-        require_bucket=True,
-        require_cloud_shape=True,
-    )
+        reject("observed runtime service account is missing or invalid", "runtime_mismatch")
+    try:
+        config = allowlisted_config(
+            container,
+            volumes,
+            mounts,
+            expected_bucket=args.bucket,
+            require_bucket=True,
+            require_cloud_shape=True,
+        )
+    except EvidenceError as error:
+        if error.reason_code == "observed_shape_unsupported":
+            raise
+        reject("observed Cloud Run config failed verification", "config_mismatch")
     config_fingerprint = normalized_hash(config)
     checked_at = datetime.now(timezone.utc).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
     provider_handle = canonical_handle(args.project, args.region, args.job_name)
@@ -510,6 +604,15 @@ def render_evidence(args):
     write_json(args.output, evidence)
 
 
+def render_evidence(args):
+    remove_output(args.failure_output)
+    try:
+        _render_evidence(args)
+    except EvidenceError as error:
+        write_json(args.failure_output, failure_marker(error))
+        raise
+
+
 def render_partial(args):
     if Path(args.output).exists():
         reject("refusing to overwrite existing deployment evidence")
@@ -519,10 +622,24 @@ def render_partial(args):
     artifact_name, rollback_image, rollback_config = validate_rollback(rollback, args)
     if artifact_name != metadata_artifact_name:
         reject("rollback artifact name does not match evidence metadata")
+    failure = read_failure_marker(args.failure_output)
     provider_handle = canonical_handle(args.project, args.region, args.job_name)
+    if failure is None:
+        status = "PARTIAL"
+        config_result = "unknown"
+        provider_verification = {"result": "unknown", "checked_at": None, "checks": []}
+    else:
+        status = "UNHEALTHY"
+        config_result = "failed"
+        provider_verification = {
+            "result": "failed",
+            "reason_code": failure["reason_code"],
+            "checked_at": failure["checked_at"],
+            "checks": [],
+        }
     evidence = {
         "schema_version": EXPECTED_SCHEMA_VERSION,
-        "status": "PARTIAL",
+        "status": status,
         "project": metadata["project"],
         "component": metadata["component"],
         "environment": metadata["environment"],
@@ -535,8 +652,8 @@ def render_partial(args):
             "rollback_handle": rollback["provider_handle"],
             "rollback_artifact_name": artifact_name,
         },
-        "config": {"result": "unknown", "fingerprint": None, "allowlisted": None},
-        "provider_verification": {"result": "unknown", "checked_at": None, "checks": []},
+        "config": {"result": config_result, "fingerprint": None, "allowlisted": None},
+        "provider_verification": provider_verification,
         "originating_workflow": normalized_metadata["originating_workflow"],
         "rollback": {"image_reference": rollback_image, "config": rollback_config},
         "next_action": "independent provider read-back required before retry or rollback",
@@ -570,12 +687,14 @@ def build_parser():
     render.add_argument("--rollback-contract", required=True)
     render.add_argument("--metadata", required=True)
     render.add_argument("--output", required=True)
+    render.add_argument("--failure-output", required=True)
     partial = subparsers.add_parser("render-partial")
     add_provider_args(partial)
     partial.add_argument("--ar-repo", required=True)
     partial.add_argument("--rollback-contract", required=True)
     partial.add_argument("--metadata", required=True)
     partial.add_argument("--output", required=True)
+    partial.add_argument("--failure-output")
     validate = subparsers.add_parser("validate-metadata")
     validate.add_argument("--project", required=True)
     validate.add_argument("--ar-repo", required=True)
@@ -595,7 +714,7 @@ def main(argv=None):
         else:
             validate_metadata_only(args)
     except EvidenceError as error:
-        print(f"deployment evidence rejected: {error}", file=sys.stderr)
+        print(f"deployment evidence rejected: {error.reason_code}", file=sys.stderr)
         return 1
     return 0
 

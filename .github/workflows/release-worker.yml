@@ -42,8 +42,9 @@ jobs:
           ROLLBACK_CONTRACT="$EVIDENCE_DIR/rollback-contract.json"
           METADATA="$EVIDENCE_DIR/metadata.json"
           EVIDENCE="$EVIDENCE_DIR/deployment-evidence.json"
-          printf 'EVIDENCE_DIR=%s\nROLLBACK_CONTRACT=%s\nMETADATA=%s\nEVIDENCE=%s\n' \
-            "$EVIDENCE_DIR" "$ROLLBACK_CONTRACT" "$METADATA" "$EVIDENCE" >> "$GITHUB_ENV"
+          EVIDENCE_FAILURE="$EVIDENCE_DIR/deployment-evidence-failure.json"
+          printf 'EVIDENCE_DIR=%s\nROLLBACK_CONTRACT=%s\nMETADATA=%s\nEVIDENCE=%s\nEVIDENCE_FAILURE=%s\n' \
+            "$EVIDENCE_DIR" "$ROLLBACK_CONTRACT" "$METADATA" "$EVIDENCE" "$EVIDENCE_FAILURE" >> "$GITHUB_ENV"
 
       - name: Validate promotion commit
         id: commit
@@ -217,7 +218,8 @@ jobs:
             --bucket "$BUCKET" \
             --rollback-contract "$ROLLBACK_CONTRACT" \
             --metadata "$METADATA" \
-            --output "$EVIDENCE"
+            --output "$EVIDENCE" \
+            --failure-output "$EVIDENCE_FAILURE"
 
       - name: Finalize partial evidence when provider verification is unknown
         if: always()
@@ -233,7 +235,8 @@ jobs:
               --ar-repo "$AR_REPO" \
               --rollback-contract "$ROLLBACK_CONTRACT" \
               --metadata "$METADATA" \
-              --output "$EVIDENCE"
+              --output "$EVIDENCE" \
+              --failure-output "$EVIDENCE_FAILURE"
           else
             echo "rollback or validated metadata is unavailable; no evidence fabricated"
           fi
