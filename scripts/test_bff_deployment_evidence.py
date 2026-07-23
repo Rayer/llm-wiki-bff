@@ -258,6 +258,81 @@ class BFFDeploymentEvidenceTest(unittest.TestCase):
         self.assertEqual(document["rollback"], frozen)
         self.assertEqual(document["provider_verification"]["result"], "failed")
 
+    def test_partial_preserves_unknown_marker_and_ignores_forged_classification(self):
+        prepared, rollback = self.prepare()
+        self.assertEqual(prepared.returncode, 0, prepared.stderr)
+        (self.root / "metadata.json").write_text(json.dumps(self.metadata()))
+        marker_path = self.root / "failure.json"
+        marker_path.write_text(json.dumps({"classification": "unknown", "reason_code": "identity_unavailable", "checked_at": "2026-07-24T00:00:00Z"}))
+        output = self.root / "deployment-evidence.json"
+        partial = self.invoke("render-partial", "--rollback-contract", str(rollback), "--metadata", str(self.root / "metadata.json"), "--output", str(output), "--failure-output", str(marker_path))
+        self.assertEqual(partial.returncode, 0, partial.stderr)
+        document = json.loads(output.read_text())
+        self.assertEqual(document["status"], "PARTIAL")
+        self.assertEqual(document["reason"], "identity_unavailable")
+        self.assertEqual(document["provider_verification"], {"result": "unknown", "reason_code": "identity_unavailable", "checked_at": "2026-07-24T00:00:00Z", "checks": []})
+
+        for forged in (
+            {"classification": "failed", "reason_code": "identity_unavailable", "checked_at": "2026-07-24T00:00:00Z"},
+            {"classification": "unknown", "reason_code": "image_mismatch", "checked_at": "2026-07-24T00:00:00Z"},
+        ):
+            with self.subTest(forged=forged):
+                output.unlink()
+                marker_path.write_text(json.dumps(forged))
+                partial = self.invoke("render-partial", "--rollback-contract", str(rollback), "--metadata", str(self.root / "metadata.json"), "--output", str(output), "--failure-output", str(marker_path))
+                self.assertEqual(partial.returncode, 0, partial.stderr)
+                document = json.loads(output.read_text())
+                self.assertEqual(document["status"], "PARTIAL")
+                self.assertEqual(document["reason"], "deployment_outcome_unknown")
+                self.assertEqual(document["provider_verification"], {"result": "unknown", "reason_code": None, "checked_at": None, "checks": []})
+
+    def test_render_modes_require_failure_output(self):
+        cases = {
+            "render-evidence": ("--expected-runtime-service-account", SA, "--rollback-contract", str(self.root / "rollback.json"), "--metadata", str(self.root / "metadata.json"), "--output", str(self.root / "deployment-evidence.json")),
+            "render-partial": ("--rollback-contract", str(self.root / "rollback.json"), "--metadata", str(self.root / "metadata.json"), "--output", str(self.root / "deployment-evidence.json")),
+        }
+        for mode, extra in cases.items():
+            with self.subTest(mode=mode):
+                result = self.invoke(mode, *extra)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("required", result.stderr)
+
+    def test_saved_canonical_traffic_unknown_keys_are_rejected(self):
+        prepared, rollback = self.prepare()
+        self.assertEqual(prepared.returncode, 0, prepared.stderr)
+        (self.root / "metadata.json").write_text(json.dumps(self.metadata()))
+        saved = json.loads(rollback.read_text())
+        saved["traffic"][0]["unexpected"] = "must-not-be-discarded"
+        rollback.write_text(json.dumps(saved))
+        result = self.invoke("render-partial", "--rollback-contract", str(rollback), "--metadata", str(self.root / "metadata.json"), "--output", str(self.root / "deployment-evidence.json"), "--failure-output", str(self.root / "failure.json"))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("provider_shape_unsupported", result.stderr)
+
+    def test_provider_traffic_is_compared_in_canonical_order(self):
+        first = fixture("bff-service-before.json")
+        second = fixture("bff-service-before.json")
+        traffic = [
+            {"revisionName": "b", "percent": 30, "latestRevision": False, "tag": "z"},
+            {"revisionName": "a", "percent": 20, "latestRevision": True, "tag": "z"},
+            {"revisionName": "a", "percent": 50, "latestRevision": False, "tag": "a"},
+        ]
+        first["status"]["traffic"] = traffic
+        second["status"]["traffic"] = list(reversed(traffic))
+        first_path = self.root / "traffic-first.json"
+        second_path = self.root / "traffic-second.json"
+        first_path.write_text(json.dumps(first))
+        second_path.write_text(json.dumps(second))
+        self.env["FAKE_SERVICE_FIXTURES"] = f"{first_path},{second_path}"
+        self.env["FAKE_SERVICE_STATE"] = str(self.root / "traffic-state")
+        output = self.root / "traffic-rollback.json"
+        result = self.invoke("prepare-rollback", "--artifact-name", ARTIFACT, "--output", str(output))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(output.read_text())["traffic"], [
+            {"revision_name": "a", "percent": 50, "tag": "a", "latest_revision": False},
+            {"revision_name": "a", "percent": 20, "tag": "z", "latest_revision": True},
+            {"revision_name": "b", "percent": 30, "tag": "z", "latest_revision": False},
+        ])
+
     def test_provider_and_identity_mismatches_are_classified_failed(self):
         cases = {
             "image": lambda s, r: (s["spec"]["template"]["spec"]["containers"][0].update(image=PRIOR_IMAGE), r["spec"]["containers"][0].update(image=PRIOR_IMAGE), r["status"].update(imageDigest=PRIOR_DIGEST)),
@@ -383,7 +458,8 @@ class BFFDeploymentEvidenceTest(unittest.TestCase):
         self.assertEqual(partial.returncode, 0, partial.stderr)
         document = json.loads(output.read_text())
         self.assertEqual(document["status"], "PARTIAL")
-        self.assertIsNone(document["provider_verification"]["reason_code"])
+        self.assertEqual(document["provider_verification"]["reason_code"], "identity_unavailable")
+        self.assertEqual(document["provider_verification"]["checked_at"], marker["checked_at"])
 
     def test_strict_post_readback_requires_latest_revision_true(self):
         for value in (False, None):

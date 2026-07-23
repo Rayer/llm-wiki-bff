@@ -105,6 +105,7 @@ func TestDeployWorkflowUsesImmutableCloudBuildResultDigest(t *testing.T) {
 func TestReleaseWorkflowRequiresMainBuildProvenance(t *testing.T) {
 	contents := readWorkflow(t, ".github/workflows/release-bff.yml")
 	for _, want := range []string{
+		"if: github.ref == 'refs/heads/main'",
 		"concurrency:",
 		"group: promote-bff-production",
 		"cancel-in-progress: false",
@@ -119,8 +120,8 @@ func TestReleaseWorkflowRequiresMainBuildProvenance(t *testing.T) {
 		"# v2",
 		"actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
 		"# v4.6.2",
-		"git fetch origin main --force --no-tags",
-		`git merge-base --is-ancestor "$COMMIT_SHA" origin/main`,
+		`git cat-file -e "$COMMIT_SHA^{commit}"`,
+		`git merge-base --is-ancestor "$COMMIT_SHA" HEAD`,
 		"commit_sha is not an ancestor of main",
 		`.head_branch == "main"`,
 		".html_url",
@@ -142,6 +143,20 @@ func TestReleaseWorkflowRequiresMainBuildProvenance(t *testing.T) {
 	}
 	if strings.Contains(contents, "develop/1.0") {
 		t.Fatal("release workflow must not accept develop/1.0 provenance")
+	}
+	if strings.Contains(contents, "git fetch") {
+		t.Fatal("release workflow must validate promotion ancestry from the full local checkout")
+	}
+	checkoutStart := strings.Index(contents, "      - name: Checkout main")
+	checkoutEnd := strings.Index(contents, "      - name: Initialize deployment evidence paths")
+	if checkoutStart < 0 || checkoutEnd < 0 || checkoutStart >= checkoutEnd {
+		t.Fatal("release workflow checkout section is missing")
+	}
+	checkout := contents[checkoutStart:checkoutEnd]
+	for _, forbidden := range []string{"token:", "GH_TOKEN", "github.token", "http.extraheader", "git config"} {
+		if strings.Contains(checkout, forbidden) {
+			t.Fatalf("release checkout must not inject credentials or tokens: found %q", forbidden)
+		}
 	}
 }
 

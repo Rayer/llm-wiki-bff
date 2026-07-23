@@ -166,33 +166,48 @@ def service_parts(service, args):
     return metadata, service_annotations, template_annotations, spec, container, service_account, status
 
 
+CANONICAL_TRAFFIC_KEYS = {"revision_name", "percent", "latest_revision", "tag"}
+PROVIDER_TRAFFIC_KEYS = {"revisionName", "percent", "latestRevision", "tag"}
+
+
 def normalized_traffic(traffic):
     result = []
     for entry in traffic:
-        if isinstance(entry, dict) and "revision_name" in entry:
-            has_latest_revision = "latest_revision" in entry
-            latest_revision = entry.get("latest_revision")
-            entry = {"revisionName": entry.get("revision_name"), "percent": entry.get("percent"), **({"tag": entry["tag"]} if "tag" in entry else {})}
-            if has_latest_revision:
-                entry["latestRevision"] = latest_revision
-        if not isinstance(entry, dict) or set(entry) - {"latestRevision", "revisionName", "percent", "tag"}:
+        if not isinstance(entry, dict):
             reject("traffic snapshot shape is unsupported", "provider_shape_unsupported")
-        if "latestRevision" in entry and not isinstance(entry["latestRevision"], bool):
+        if "revision_name" in entry:
+            if set(entry) - CANONICAL_TRAFFIC_KEYS:
+                reject("traffic snapshot shape is unsupported", "provider_shape_unsupported")
+            revision = entry.get("revision_name")
+            percent = entry.get("percent")
+            latest_revision = entry.get("latest_revision")
+            has_latest_revision = "latest_revision" in entry
+            tag = entry.get("tag")
+            has_tag = "tag" in entry
+        else:
+            if set(entry) - PROVIDER_TRAFFIC_KEYS:
+                reject("traffic snapshot shape is unsupported", "provider_shape_unsupported")
+            revision = entry.get("revisionName")
+            percent = entry.get("percent")
+            latest_revision = entry.get("latestRevision")
+            has_latest_revision = "latestRevision" in entry
+            tag = entry.get("tag")
+            has_tag = "tag" in entry
+        if has_latest_revision and not isinstance(latest_revision, bool):
             reject("traffic latestRevision value is invalid", "provider_shape_unsupported")
-        revision = entry.get("revisionName")
-        percent = entry.get("percent")
         if not isinstance(revision, str) or not revision or isinstance(percent, bool) or not isinstance(percent, int) or percent < 0 or percent > 100:
             reject("traffic snapshot value is invalid", "provider_shape_unsupported")
         clean = {"revision_name": revision, "percent": percent}
-        if "latestRevision" in entry:
-            clean["latest_revision"] = entry["latestRevision"]
-        if "tag" in entry:
-            if not isinstance(entry["tag"], str):
+        if has_latest_revision:
+            clean["latest_revision"] = latest_revision
+        if has_tag:
+            if not isinstance(tag, str):
                 reject("traffic tag is invalid", "provider_shape_unsupported")
-            clean["tag"] = entry["tag"]
+            clean["tag"] = tag
         result.append(clean)
     if not result or sum(item["percent"] for item in result) != 100:
         reject("traffic snapshot is not coherent", "rollback_race")
+    result.sort(key=lambda item: (item["revision_name"], item.get("tag", ""), item.get("latest_revision", False), item["percent"]))
     return result
 
 
@@ -519,7 +534,7 @@ def read_failure(path):
         marker = json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
-    if not isinstance(marker, dict) or marker.get("classification") not in {CLASS_UNKNOWN, CLASS_FAILED} or marker.get("reason_code") not in REASONS or not isinstance(marker.get("checked_at"), str):
+    if not isinstance(marker, dict) or marker.get("reason_code") not in REASONS or marker.get("classification") != REASONS[marker["reason_code"]] or not isinstance(marker.get("checked_at"), str):
         return None
     return marker
 
@@ -537,9 +552,9 @@ def partial(args):
     status = "UNHEALTHY" if failed else "PARTIAL"
     result = "failed" if failed else "unknown"
     reason = marker["reason_code"] if marker else "deployment_outcome_unknown"
-    checked = marker["checked_at"] if failed else None
+    checked = marker["checked_at"] if marker else None
     return {
-        "schema_version": EXPECTED_SCHEMA, "project": metadata["project"], "component": metadata["component"], "environment": metadata["environment"], "action": metadata["action"], "source": metadata["source"], "dev_provenance": metadata["dev_provenance"], "image": metadata["image"], "provider": {"current_handle": handle(args), "rollback_handle": rollback["provider_handle"], "rollback_artifact_name": artifact}, "observed_service": None, "config": {"result": result, "fingerprint": None, "allowlisted": None}, "provider_verification": {"result": result, "reason_code": reason if failed else None, "checked_at": checked, "checks": []}, "originating_workflow": metadata["originating_workflow"], "rollback": rollback, "health": {"result": result, "checked_at": checked, "identity": None}, "status": status, "reason": reason, "next_action": "independent provider read-back required before retry or rollback; do not tag the image",
+        "schema_version": EXPECTED_SCHEMA, "project": metadata["project"], "component": metadata["component"], "environment": metadata["environment"], "action": metadata["action"], "source": metadata["source"], "dev_provenance": metadata["dev_provenance"], "image": metadata["image"], "provider": {"current_handle": handle(args), "rollback_handle": rollback["provider_handle"], "rollback_artifact_name": artifact}, "observed_service": None, "config": {"result": result, "fingerprint": None, "allowlisted": None}, "provider_verification": {"result": result, "reason_code": reason if marker else None, "checked_at": checked, "checks": []}, "originating_workflow": metadata["originating_workflow"], "rollback": rollback, "health": {"result": result, "checked_at": checked, "identity": None}, "status": status, "reason": reason, "next_action": "independent provider read-back required before retry or rollback; do not tag the image",
     }
 
 
@@ -587,7 +602,7 @@ def parser():
             child.add_argument("--rollback-contract", required=True)
             child.add_argument("--metadata", required=True)
             child.add_argument("--output", required=True)
-            child.add_argument("--failure-output")
+            child.add_argument("--failure-output", required=True)
             if mode == "render-evidence":
                 child.add_argument("--expected-runtime-service-account", required=True)
                 child.add_argument("--service-url")

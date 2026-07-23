@@ -28,6 +28,7 @@ concurrency:
 jobs:
   promote:
     name: Promote immutable BFF image
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     environment: production
@@ -65,12 +66,11 @@ jobs:
             echo "commit_sha must be a 40-character lowercase commit SHA"
             exit 1
           fi
-          git fetch origin main --force --no-tags
           if ! git cat-file -e "$COMMIT_SHA^{commit}"; then
             echo "commit_sha does not identify a commit"
             exit 1
           fi
-          if ! git merge-base --is-ancestor "$COMMIT_SHA" origin/main; then
+          if ! git merge-base --is-ancestor "$COMMIT_SHA" HEAD; then
             echo "commit_sha is not an ancestor of main"
             exit 1
           fi
