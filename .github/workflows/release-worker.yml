@@ -20,6 +20,7 @@ concurrency:
 
 jobs:
   promote:
+    if: github.ref == 'refs/heads/main'
     name: Promote immutable worker image
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -30,10 +31,11 @@ jobs:
       id-token: write
     steps:
       - name: Checkout main
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: main
+          ref: ${{ github.sha }}
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Initialize deployment evidence paths
         run: |
@@ -56,13 +58,16 @@ jobs:
             echo "commit_sha must be a 40-character lowercase commit SHA"
             exit 1
           fi
-          git fetch origin main --force --no-tags
+          if [[ "$(git rev-parse HEAD)" != "${GITHUB_SHA}" ]]; then
+            echo "checkout HEAD does not match the workflow commit"
+            exit 1
+          fi
           if ! git cat-file -e "$COMMIT_SHA^{commit}"; then
             echo "commit_sha does not identify a commit"
             exit 1
           fi
-          if ! git merge-base --is-ancestor "$COMMIT_SHA" origin/main; then
-            echo "commit_sha is not an ancestor of main"
+          if ! git merge-base --is-ancestor "$COMMIT_SHA" HEAD; then
+            echo "commit_sha is not an ancestor of the checked-out main commit"
             exit 1
           fi
           echo "commit_sha=$COMMIT_SHA" >> "$GITHUB_OUTPUT"
@@ -115,14 +120,14 @@ jobs:
           echo "image=${AR_REPO}/olw-pipeline@${DIGEST}" >> "$GITHUB_OUTPUT"
 
       - name: Authenticate to Google Cloud
-        uses: google-github-actions/auth@v3
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093
         with:
           project_id: ${{ env.PROJECT_ID }}
           workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
           service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
 
       - name: Set up Cloud SDK
-        uses: google-github-actions/setup-gcloud@v2
+        uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f
         with:
           project_id: ${{ env.PROJECT_ID }}
 
@@ -133,15 +138,17 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$EVIDENCE_DIR"
+          ROLLBACK_ARTIFACT_NAME="worker-rollback-contract-${COMMIT_SHA}"
           EVIDENCE_ARTIFACT_NAME="worker-deployment-evidence-${COMMIT_SHA}"
           python3 scripts/render_worker_deployment_evidence.py prepare-rollback \
             --project "${PROJECT_ID}" \
             --region "${REGION}" \
             --job-name "${JOB_NAME}" \
             --ar-repo "${AR_REPO}" \
-            --artifact-name "$EVIDENCE_ARTIFACT_NAME" \
+            --artifact-name "$ROLLBACK_ARTIFACT_NAME" \
             --output "$ROLLBACK_CONTRACT"
-          echo "artifact_name=$EVIDENCE_ARTIFACT_NAME" >> "$GITHUB_OUTPUT"
+          echo "rollback_artifact_name=$ROLLBACK_ARTIFACT_NAME" >> "$GITHUB_OUTPUT"
+          echo "evidence_artifact_name=$EVIDENCE_ARTIFACT_NAME" >> "$GITHUB_OUTPUT"
 
       - name: Prepare validated deployment metadata before mutation
         env:
@@ -153,7 +160,7 @@ jobs:
           DEV_RUN_HEAD_BRANCH: ${{ steps.dev_run.outputs.run_head_branch }}
           DEV_RUN_HEAD_SHA: ${{ steps.dev_run.outputs.run_head_sha }}
           DEV_RUN_CONCLUSION: ${{ steps.dev_run.outputs.run_conclusion }}
-          EVIDENCE_ARTIFACT_NAME: ${{ steps.rollback.outputs.artifact_name }}
+          ROLLBACK_ARTIFACT_NAME: ${{ steps.rollback.outputs.rollback_artifact_name }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           GITHUB_WORKFLOW: ${{ github.workflow }}
           GITHUB_RUN_ID: ${{ github.run_id }}
@@ -177,7 +184,7 @@ jobs:
             --arg dev_run_url "$DEV_RUN_URL" \
             --arg image "$IMMUTABLE_IMAGE" \
             --arg digest "${IMMUTABLE_IMAGE##*@}" \
-            --arg rollback_artifact_name "$EVIDENCE_ARTIFACT_NAME" \
+            --arg rollback_artifact_name "$ROLLBACK_ARTIFACT_NAME" \
             --arg repository "$GITHUB_REPOSITORY" \
             --arg workflow "$GITHUB_WORKFLOW" \
             --argjson workflow_run_id "$GITHUB_RUN_ID" \
@@ -188,6 +195,14 @@ jobs:
             --project "$PROJECT_ID" \
             --ar-repo "$AR_REPO" \
             --metadata "$METADATA"
+
+      - name: Upload validated rollback contract
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ${{ steps.rollback.outputs.rollback_artifact_name }}
+          path: ${{ env.ROLLBACK_CONTRACT }}
+          if-no-files-found: error
+          retention-days: 90
 
       - name: Update production worker
         env:
@@ -245,9 +260,9 @@ jobs:
 
       - name: Upload normalized deployment evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: ${{ steps.rollback.outputs.artifact_name }}
+          name: ${{ steps.rollback.outputs.evidence_artifact_name }}
           path: ${{ env.EVIDENCE }}
           if-no-files-found: ignore
           retention-days: 90

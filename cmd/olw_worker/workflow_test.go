@@ -141,6 +141,9 @@ func TestWorkerPromotionWorkflowsContract(t *testing.T) {
 	if strings.Contains(deploy, "origin/develop/1.0") {
 		t.Fatal("dev workflow must not hardcode develop ordering for main runs")
 	}
+	if strings.Contains(release, "git fetch") {
+		t.Fatal("manual promotion must validate source ancestry locally without a post-checkout fetch")
+	}
 
 	for _, want := range []string{
 		"commit_sha:",
@@ -148,9 +151,15 @@ func TestWorkerPromotionWorkflowsContract(t *testing.T) {
 		"contents: read",
 		"actions: read",
 		"id-token: write",
-		"ref: main",
+		"if: github.ref == 'refs/heads/main'",
+		"uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
+		"ref: ${{ github.sha }}",
 		"fetch-depth: 0",
+		"persist-credentials: false",
+		"uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093",
+		"uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f",
 		"git merge-base --is-ancestor",
+		"git merge-base --is-ancestor \"$COMMIT_SHA\" HEAD",
 		"event=push&status=completed&head_sha=${COMMIT_SHA}",
 		".head_branch == \"main\"",
 		"worker-image-digest-$COMMIT_SHA",
@@ -184,9 +193,11 @@ func TestWorkerPromotionWorkflowsContract(t *testing.T) {
 	}
 	for _, want := range []string{
 		"id: rollback",
+		"ROLLBACK_ARTIFACT_NAME=\"worker-rollback-contract-${COMMIT_SHA}\"",
 		"EVIDENCE_ARTIFACT_NAME=\"worker-deployment-evidence-${COMMIT_SHA}\"",
-		"--artifact-name \"$EVIDENCE_ARTIFACT_NAME\"",
-		"echo \"artifact_name=$EVIDENCE_ARTIFACT_NAME\" >> \"$GITHUB_OUTPUT\"",
+		"--artifact-name \"$ROLLBACK_ARTIFACT_NAME\"",
+		"echo \"rollback_artifact_name=$ROLLBACK_ARTIFACT_NAME\" >> \"$GITHUB_OUTPUT\"",
+		"echo \"evidence_artifact_name=$EVIDENCE_ARTIFACT_NAME\" >> \"$GITHUB_OUTPUT\"",
 		"--output \"$ROLLBACK_CONTRACT\"",
 	} {
 		if !strings.Contains(rollback, want) {
@@ -215,14 +226,15 @@ func TestWorkerPromotionWorkflowsContract(t *testing.T) {
 	if strings.Index(release, "Initialize deployment evidence paths") > strings.Index(release, "Validate promotion commit") {
 		t.Fatal("evidence paths must be initialized before promotion validation")
 	}
-	if strings.Count(release, "EVIDENCE_ARTIFACT_NAME=\"worker-deployment-evidence-${COMMIT_SHA}\"") != 1 {
-		t.Fatal("release workflow must create exactly one frozen evidence artifact identity")
+	if strings.Count(release, "ROLLBACK_ARTIFACT_NAME=\"worker-rollback-contract-${COMMIT_SHA}\"") != 1 || strings.Count(release, "EVIDENCE_ARTIFACT_NAME=\"worker-deployment-evidence-${COMMIT_SHA}\"") != 1 {
+		t.Fatal("release workflow must create exactly one frozen rollback and evidence artifact identity")
 	}
 	metadata := workflowSection(t, release, "      - name: Prepare validated deployment metadata before mutation", "      - name: Update production worker")
 	for _, want := range []string{
 		"> \"$METADATA\"",
 		"scripts/render_worker_deployment_evidence.py validate-metadata",
 		"--metadata \"$METADATA\"",
+		"ROLLBACK_ARTIFACT_NAME: ${{ steps.rollback.outputs.rollback_artifact_name }}",
 	} {
 		if !strings.Contains(metadata, want) {
 			t.Fatalf("pre-mutation metadata step missing %q", want)
@@ -252,11 +264,36 @@ func TestWorkerPromotionWorkflowsContract(t *testing.T) {
 	if !strings.Contains(upload, "if: always()") || !strings.Contains(upload, "path: ${{ env.EVIDENCE }}") || !strings.Contains(upload, "if-no-files-found: ignore") {
 		t.Fatal("normalized evidence upload must run always against the canonical path")
 	}
-	if !strings.Contains(upload, "name: ${{ steps.rollback.outputs.artifact_name }}") {
-		t.Fatal("normalized evidence upload must use the frozen rollback artifact identity")
+	if !strings.Contains(upload, "name: ${{ steps.rollback.outputs.evidence_artifact_name }}") {
+		t.Fatal("normalized evidence upload must use the distinct evidence artifact identity")
 	}
 	if strings.Count(upload, "path: ${{ env.EVIDENCE }}") != 1 {
 		t.Fatal("normalized evidence upload must retain exactly one canonical artifact path")
+	}
+	preUpload := workflowSection(t, release, "      - name: Upload validated rollback contract", "      - name: Update production worker")
+	if !strings.Contains(preUpload, "uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02") ||
+		!strings.Contains(preUpload, "name: ${{ steps.rollback.outputs.rollback_artifact_name }}") ||
+		!strings.Contains(preUpload, "path: ${{ env.ROLLBACK_CONTRACT }}") ||
+		!strings.Contains(preUpload, "if-no-files-found: error") ||
+		!strings.Contains(preUpload, "retention-days: 90") {
+		t.Fatal("rollback contract must be durably uploaded before mutation")
+	}
+	if strings.Contains(preUpload, "if: always()") || strings.Contains(preUpload, "continue-on-error") {
+		t.Fatal("rollback contract upload must fail closed before mutation")
+	}
+	if strings.Count(release, "uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02") != 2 {
+		t.Fatal("release workflow must have exactly two pinned artifact uploads")
+	}
+	freezeAt := strings.Index(release, "      - name: Freeze production rollback contract")
+	preUploadAt := strings.Index(release, "      - name: Upload validated rollback contract")
+	mutationAt := strings.Index(release, "      - name: Update production worker")
+	renderAt := strings.Index(release, "      - name: Render normalized deployment evidence after strict read-back")
+	evidenceUploadAt := strings.Index(release, "      - name: Upload normalized deployment evidence")
+	if !(freezeAt < preUploadAt && preUploadAt < mutationAt && mutationAt < renderAt && renderAt < evidenceUploadAt) {
+		t.Fatal("deployment contract must order freeze, durable rollback upload, mutation, evidence render, and evidence upload")
+	}
+	if strings.Contains(release[mutationAt:evidenceUploadAt], "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02") {
+		t.Fatal("mutation must not occur before durable rollback upload")
 	}
 	if !strings.Contains(release, "group: promote-olw-pipeline-production") || !strings.Contains(release, "cancel-in-progress: false") {
 		t.Fatal("production promotions must be serialized without cancellation")
@@ -281,14 +318,14 @@ func TestWorkerReleaseEmitsOneNormalizedEvidenceArtifactAfterReadback(t *testing
 		"--output \"$EVIDENCE\"",
 		"--failure-output \"$EVIDENCE_FAILURE\"",
 		"render-partial",
-		"name: ${{ steps.rollback.outputs.artifact_name }}",
+		"name: ${{ steps.rollback.outputs.evidence_artifact_name }}",
 	} {
 		if !strings.Contains(evidenceSection, want) {
 			t.Fatalf("release workflow missing normalized evidence contract %q", want)
 		}
 	}
-	if strings.Count(evidenceSection, "actions/upload-artifact@v4") != 1 {
-		t.Fatalf("release workflow must upload exactly one post-read-back artifact")
+	if strings.Count(evidenceSection, "uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02") != 1 {
+		t.Fatalf("release workflow must upload exactly one pinned post-read-back artifact")
 	}
 	if strings.Count(evidenceSection, "path: ${{ env.EVIDENCE }}") != 1 {
 		t.Fatalf("release workflow must upload exactly one canonical evidence path")

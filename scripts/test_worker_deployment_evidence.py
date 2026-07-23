@@ -16,7 +16,7 @@ ROLLBACK_FIXTURE = ROOT / "cmd/olw_worker/testdata/lwc179/legacy-prod.json"
 OBSERVED_FIXTURE = ROOT / "cmd/olw_worker/testdata/lwc198/observed-prod.json"
 MALFORMED_FIXTURE = ROOT / "cmd/olw_worker/testdata/lwc179/malformed-image.json"
 IMAGE = "asia-east1-docker.pkg.dev/llm-wiki-cloud/cloud-run-images/olw-pipeline@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-ARTIFACT_NAME = "worker-deployment-evidence-" + "c" * 40
+ROLLBACK_ARTIFACT_NAME = "worker-rollback-contract-" + "c" * 40
 
 
 class WorkerDeploymentEvidenceTest(unittest.TestCase):
@@ -77,7 +77,7 @@ class WorkerDeploymentEvidenceTest(unittest.TestCase):
             "component": "olw-worker",
             "environment": "production",
             "action": "promote",
-            "rollback_artifact_name": ARTIFACT_NAME,
+            "rollback_artifact_name": ROLLBACK_ARTIFACT_NAME,
             "source": {"commit_sha": "c" * 40, "ref": "refs/heads/main"},
             "dev_provenance": {
                 "workflow": "deploy-worker.yml",
@@ -118,7 +118,7 @@ class WorkerDeploymentEvidenceTest(unittest.TestCase):
                 "--ar-repo",
                 "asia-east1-docker.pkg.dev/llm-wiki-cloud/cloud-run-images",
                 "--artifact-name",
-                ARTIFACT_NAME,
+                ROLLBACK_ARTIFACT_NAME,
                 "--output",
                 str(output),
             ],
@@ -216,7 +216,7 @@ class WorkerDeploymentEvidenceTest(unittest.TestCase):
         self.assertEqual(document["observed_job"]["generation"], 42)
         self.assertEqual(document["observed_job"]["image_reference"], IMAGE)
         self.assertEqual(document["observed_job"]["runtime_service_account"], "lwc-worker@llm-wiki-cloud.iam.gserviceaccount.com")
-        self.assertEqual(document["provider"]["rollback_artifact_name"], ARTIFACT_NAME)
+        self.assertEqual(document["provider"]["rollback_artifact_name"], ROLLBACK_ARTIFACT_NAME)
         self.assertEqual(document["config"]["result"], "verified")
         self.assertRegex(document["config"]["fingerprint"], r"^sha256:[0-9a-f]{64}$")
         self.assertEqual(document["provider_verification"]["result"], "verified")
