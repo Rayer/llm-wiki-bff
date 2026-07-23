@@ -1,0 +1,744 @@
+#!/usr/bin/env python3
+"""Validate the worker provider read-back and render one canonical evidence file."""
+
+import argparse
+from datetime import datetime, timezone
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import tempfile
+
+
+EXPECTED_COMPONENT = "olw-worker"
+EXPECTED_ENVIRONMENT = "production"
+EXPECTED_ACTION = "promote"
+EXPECTED_SCHEMA_VERSION = 1
+EXPECTED_ARGS = ["run", "[[\"run\",\"--auto-approve\"]]"]
+EXPECTED_RUNTIME_SERVICE_ACCOUNT = "lwc-worker@llm-wiki-cloud.iam.gserviceaccount.com"
+LEGACY_ENV_NAMES = {"DATA_DIR", "WORKSPACE", "VAULT_PATH", "WORKSPACE_DIR"}
+ALLOWLISTED_ENV_NAMES = LEGACY_ENV_NAMES | {"BUCKET"}
+SECRET_WORDS = ("secret", "token", "password", "apikey", "privatekey", "valuefrom")
+CSI_SECRET_KEY_NAMES = {
+    "key",
+    "keyfile",
+    "credential",
+    "credentials",
+    "auth",
+    "accesskey",
+    "secretkey",
+    "privatekey",
+    "apikey",
+    "valuefrom",
+}
+CSI_SECRET_VALUE_RE = re.compile(
+    r"(?i)(secret|token|password|credential|auth|api[\s_-]*key|"
+    r"access[\s_-]*key|secret[\s_-]*key|private[\s_-]*key|keyfile|valuefrom)"
+)
+SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+TAG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+ARTIFACT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+CLASSIFICATION_UNKNOWN = "unknown"
+CLASSIFICATION_FAILED = "failed"
+REASON_CODES = {
+    "input_invalid": CLASSIFICATION_UNKNOWN,
+    "provider_command_unavailable": CLASSIFICATION_UNKNOWN,
+    "provider_command_failed": CLASSIFICATION_UNKNOWN,
+    "provider_readback_unparseable": CLASSIFICATION_UNKNOWN,
+    "observed_shape_unsupported": CLASSIFICATION_FAILED,
+    "provider_handle_mismatch": CLASSIFICATION_FAILED,
+    "generation_mismatch": CLASSIFICATION_FAILED,
+    "image_mismatch": CLASSIFICATION_FAILED,
+    "runtime_service_account_mismatch": CLASSIFICATION_FAILED,
+    "config_mismatch": CLASSIFICATION_FAILED,
+    "evidence_output_exists": CLASSIFICATION_UNKNOWN,
+}
+
+
+class EvidenceError(Exception):
+    def __init__(self, message, reason_code="input_invalid", classification=None):
+        if reason_code not in REASON_CODES:
+            raise ValueError("unallowlisted evidence reason code")
+        expected = REASON_CODES[reason_code]
+        if classification is not None and classification != expected:
+            raise ValueError("evidence reason code classification mismatch")
+        super().__init__(message)
+        self.reason_code = reason_code
+        self.classification = expected
+
+
+def reject(message, reason_code="input_invalid", classification=None):
+    raise EvidenceError(message, reason_code=reason_code, classification=classification)
+
+
+def read_json(path):
+    try:
+        with Path(path).open(encoding="utf-8") as handle:
+            value = json.load(handle)
+    except (OSError, json.JSONDecodeError) as error:
+        reject(f"cannot read JSON input {Path(path).name}: {error.__class__.__name__}")
+    if not isinstance(value, dict):
+        reject(f"JSON input {Path(path).name} must be an object")
+    return value
+
+
+def run_provider(args):
+    try:
+        result = subprocess.run(args, check=False, capture_output=True, text=True)
+    except OSError as error:
+        reject("provider command unavailable", "provider_command_unavailable")
+    if result.returncode != 0:
+        reject("provider command failed", "provider_command_failed")
+    return result.stdout
+
+
+def provider_job(project, region, job_name):
+    output = run_provider(
+        [
+            "gcloud",
+            "run",
+            "jobs",
+            "describe",
+            job_name,
+            "--project",
+            project,
+            "--region",
+            region,
+            "--format=json",
+            "--quiet",
+        ]
+    )
+    try:
+        value = json.loads(output)
+    except json.JSONDecodeError:
+        reject("provider job read-back was not JSON", "provider_readback_unparseable")
+    if not isinstance(value, dict):
+        reject("provider job read-back has an unsupported shape", "observed_shape_unsupported")
+    return value
+
+
+def provider_digest(project, region, image):
+    output = run_provider(
+        [
+            "gcloud",
+            "artifacts",
+            "docker",
+            "images",
+            "describe",
+            image,
+            "--project",
+            project,
+            "--format=value(image_summary.digest)",
+            "--quiet",
+        ]
+    )
+    value = output.strip()
+    if not DIGEST_RE.fullmatch(value):
+        reject("provider rollback image resolution was not an immutable digest", "provider_readback_unparseable")
+    return value
+
+
+def job_spec(document):
+    metadata = document.get("metadata")
+    if not isinstance(metadata, dict) or not isinstance(metadata.get("name"), str):
+        reject("provider job metadata name is missing or invalid", "observed_shape_unsupported")
+    try:
+        spec = document["spec"]["template"]["spec"]["template"]["spec"]
+    except (KeyError, TypeError):
+        reject("missing Cloud Run job template spec", "observed_shape_unsupported")
+    if not isinstance(spec, dict):
+        reject("Cloud Run job template spec is not an object", "observed_shape_unsupported")
+    containers = spec.get("containers")
+    if not isinstance(containers, list) or len(containers) != 1 or not isinstance(containers[0], dict):
+        reject("expected exactly one Cloud Run container", "observed_shape_unsupported")
+    container = containers[0]
+    if not isinstance(container.get("image"), str):
+        reject("Cloud Run container image is missing or invalid", "observed_shape_unsupported")
+    if not isinstance(container.get("env"), list):
+        reject("Cloud Run container env is missing or invalid", "observed_shape_unsupported")
+    if not isinstance(container.get("args"), list) or not all(isinstance(item, str) for item in container["args"]):
+        reject("Cloud Run container args are missing or invalid", "observed_shape_unsupported")
+    volumes = spec.get("volumes", [])
+    mounts = container.get("volumeMounts", [])
+    if volumes is None:
+        volumes = []
+    if mounts is None:
+        mounts = []
+    if not isinstance(volumes, list) or not isinstance(mounts, list):
+        reject("Cloud Run volumes or volume mounts are invalid", "observed_shape_unsupported")
+    return document, spec, container, volumes, mounts
+
+
+def canonical_handle(project, region, job_name):
+    return f"projects/{project}/locations/{region}/jobs/{job_name}"
+
+
+def normalized_volume(volume):
+    if not isinstance(volume, dict) or not isinstance(volume.get("name"), str):
+        reject("Cloud Run volume entry is invalid", "observed_shape_unsupported")
+    if not volume["name"]:
+        reject("Cloud Run volume name is invalid", "observed_shape_unsupported")
+    if set(volume) != {"name", "csi"}:
+        reject("unsupported Cloud Run volume shape", "observed_shape_unsupported")
+    csi = volume["csi"]
+    if not isinstance(csi, dict) or set(csi) - {"driver", "volumeAttributes"}:
+        reject("unsupported Cloud Run volume CSI shape", "observed_shape_unsupported")
+    if not isinstance(csi.get("driver"), str) or not csi["driver"]:
+        reject("Cloud Run volume CSI driver is invalid", "observed_shape_unsupported")
+    volume_attributes = csi.get("volumeAttributes", {})
+    if not isinstance(volume_attributes, dict) or any(
+        not isinstance(key, str) or not isinstance(value, str)
+        for key, value in volume_attributes.items()
+    ):
+        reject("Cloud Run volume CSI volumeAttributes must be a string map", "observed_shape_unsupported")
+    for key, value in volume_attributes.items():
+        normalized_key = re.sub(r"[^a-z0-9]", "", key.lower())
+        if (
+            normalized_key in CSI_SECRET_KEY_NAMES
+            or normalized_key.endswith("key")
+            or "credential" in normalized_key
+            or "auth" in normalized_key
+            or any(word in normalized_key for word in SECRET_WORDS)
+        ):
+            reject("secret-like CSI volume attribute is not permitted", "config_mismatch")
+        if CSI_SECRET_VALUE_RE.search(value):
+            reject("secret-like CSI volume attribute is not permitted", "config_mismatch")
+    normalized = {
+        "name": volume["name"],
+        "csi": {
+            "driver": csi["driver"],
+            "volumeAttributes": dict(volume_attributes),
+        },
+    }
+    validate_no_secret_like_fields(normalized)
+    return normalized
+
+
+def normalized_volume_mount(mount):
+    if not isinstance(mount, dict):
+        reject("Cloud Run volume mount entry is invalid", "observed_shape_unsupported")
+    if set(mount) != {"name", "mountPath"}:
+        reject("unsupported Cloud Run volume mount shape", "observed_shape_unsupported")
+    if not isinstance(mount.get("name"), str) or not mount["name"] or not isinstance(mount.get("mountPath"), str) or not mount["mountPath"]:
+        reject("Cloud Run volume mount entry is invalid", "observed_shape_unsupported")
+    return {"name": mount["name"], "mountPath": mount["mountPath"]}
+
+
+def normalized_config(env, args, volumes, mounts, expected_bucket=None, require_bucket=False, require_cloud_shape=False):
+    if not isinstance(env, list) or not isinstance(volumes, list) or not isinstance(mounts, list):
+        reject("Cloud Run config collections are invalid")
+    if not isinstance(args, list) or not all(isinstance(item, str) for item in args):
+        reject("Cloud Run container args are missing or invalid")
+    allowlisted = []
+    for entry in env:
+        if not isinstance(entry, dict) or not isinstance(entry.get("name"), str):
+            reject("Cloud Run env entry is invalid")
+        if entry["name"] in LEGACY_ENV_NAMES:
+            if require_cloud_shape:
+                reject("production job retains forbidden legacy env")
+        if entry["name"] not in ALLOWLISTED_ENV_NAMES:
+            continue
+        if "valueFrom" in entry or not isinstance(entry.get("value"), str):
+            reject("allowlisted env must be a name/value pair")
+        allowlisted.append({"name": entry["name"], "value": entry["value"]})
+    buckets = [entry["value"] for entry in allowlisted if entry["name"] == "BUCKET"]
+    if len(buckets) > 1:
+        reject("Cloud Run job contains duplicate BUCKET env entries")
+    bucket = buckets[0] if buckets else ""
+    if require_bucket and not bucket:
+        reject("production BUCKET is missing")
+    if expected_bucket is not None and bucket != expected_bucket:
+        reject("production BUCKET is incorrect")
+    if require_cloud_shape and args != EXPECTED_ARGS:
+        reject("production args do not match the cloud worker contract")
+    if require_cloud_shape and (volumes or mounts):
+        reject("production job retains volumes or volume mounts")
+    return {
+        "env": allowlisted,
+        "bucket": bucket,
+        "args": list(args),
+        "volumes": [normalized_volume(volume) for volume in volumes],
+        "volume_mounts": [normalized_volume_mount(mount) for mount in mounts],
+    }
+
+
+def allowlisted_config(container, volumes, mounts, expected_bucket=None, require_bucket=False, require_cloud_shape=False):
+    return normalized_config(
+        container["env"],
+        container["args"],
+        volumes,
+        mounts,
+        expected_bucket=expected_bucket,
+        require_bucket=require_bucket,
+        require_cloud_shape=require_cloud_shape,
+    )
+
+
+def normalized_rollback_config(config):
+    if not isinstance(config, dict):
+        reject("rollback config is missing or invalid")
+    if not isinstance(config.get("env"), list) or not isinstance(config.get("volumes"), list) or not isinstance(config.get("volume_mounts"), list):
+        reject("rollback config is missing or invalid")
+    normalized = normalized_config(
+        config.get("env"),
+        config.get("args"),
+        config.get("volumes"),
+        config.get("volume_mounts"),
+    )
+    if not isinstance(config.get("bucket"), str) or config["bucket"] != normalized["bucket"]:
+        reject("rollback config bucket is invalid")
+    return normalized
+
+
+def normalized_hash(value):
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def secret_like(value, path=""):
+    if isinstance(value, dict):
+        for key, child in value.items():
+            normalized = re.sub(r"[^a-z0-9]", "", str(key).lower())
+            if any(word in normalized for word in SECRET_WORDS):
+                return path + str(key)
+            found = secret_like(child, path + str(key) + ".")
+            if found:
+                return found
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            found = secret_like(child, path + str(index) + ".")
+            if found:
+                return found
+    elif isinstance(value, str) and re.search(r"(?i)(secret|token|password|api[_-]?key|valuefrom)", value):
+        return path.rstrip(".")
+    return ""
+
+
+def validate_no_secret_like_fields(value):
+    found = secret_like(value)
+    if found:
+        reject(f"secret-like field is not permitted: {found}")
+
+
+def validate_normalized_evidence(evidence):
+    if not isinstance(evidence, dict):
+        reject("normalized evidence must be an object")
+    if type(evidence.get("job_executed")) is not bool or evidence["job_executed"] is not False:
+        reject("normalized evidence job_executed must be exactly false")
+
+
+def write_json(path, value):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True) + "\n"
+    descriptor, temporary = tempfile.mkstemp(prefix=".deployment-evidence-", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fchmod(handle.fileno(), 0o600)
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def failure_marker(error):
+    return {
+        "classification": error.classification,
+        "reason_code": error.reason_code,
+        "checked_at": datetime.now(timezone.utc).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+
+
+def read_failure_marker(path):
+    if not path or not Path(path).is_file():
+        return None
+    try:
+        with Path(path).open(encoding="utf-8") as handle:
+            marker = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(marker, dict):
+        return None
+    reason_code = marker.get("reason_code")
+    classification = marker.get("classification")
+    checked_at = marker.get("checked_at")
+    if (
+        classification != CLASSIFICATION_FAILED
+        or reason_code not in REASON_CODES
+        or REASON_CODES[reason_code] != CLASSIFICATION_FAILED
+        or not isinstance(checked_at, str)
+        or not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", checked_at)
+    ):
+        return None
+    return {"reason_code": reason_code, "checked_at": checked_at}
+
+
+def remove_output(path):
+    try:
+        Path(path).unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        reject(f"cannot prepare output {Path(path).name}: {error.__class__.__name__}")
+
+
+def immutable_image(image, image_prefix):
+    expected_prefix = image_prefix + "/olw-pipeline"
+    if not isinstance(image, str) or not image.startswith(expected_prefix + "@"):
+        reject("rollback image must use the worker Artifact Registry repository")
+    digest = image[len(expected_prefix) + 1 :]
+    if not DIGEST_RE.fullmatch(digest):
+        reject("rollback image must be immutable")
+    return image
+
+
+def prepare_rollback(args):
+    remove_output(args.output)
+    document = provider_job(args.project, args.region, args.job_name)
+    _, _, container, volumes, mounts = job_spec(document)
+    image = container["image"]
+    image_prefix = args.ar_repo + "/olw-pipeline"
+    if image.startswith(image_prefix + "@"):
+        rollback_image = immutable_image(image, args.ar_repo)
+    elif image.startswith(image_prefix + ":"):
+        tag = image[len(image_prefix) + 1 :]
+        if not TAG_RE.fullmatch(tag):
+            reject("prior production image tag is invalid")
+        resolved = provider_digest(args.project, args.region, image)
+        after = provider_job(args.project, args.region, args.job_name)
+        _, _, after_container, after_volumes, after_mounts = job_spec(after)
+        if after_container["image"] != image:
+            reject("prior production image reference moved during rollback resolution")
+        resolved_again = provider_digest(args.project, args.region, image)
+        if resolved != resolved_again:
+            reject("both prior image resolutions differ")
+        container, volumes, mounts = after_container, after_volumes, after_mounts
+        rollback_image = image_prefix + "@" + resolved
+    else:
+        reject("prior production image has the wrong repository or is not a supported reference")
+    config = allowlisted_config(container, volumes, mounts)
+    rollback = {
+        "provider_handle": canonical_handle(args.project, args.region, args.job_name),
+        "artifact_name": args.artifact_name,
+        "image_reference": rollback_image,
+        "config": config,
+    }
+    validate_no_secret_like_fields(rollback)
+    write_json(args.output, rollback)
+
+
+def positive_int(value, label):
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        reject(f"{label} is missing or invalid")
+    return value
+
+
+def metadata_value(metadata, key):
+    value = metadata.get(key)
+    if not isinstance(value, dict):
+        reject(f"{key} metadata is missing or invalid")
+    return value
+
+
+def validate_metadata(metadata, args):
+    validate_no_secret_like_fields(metadata)
+    if metadata.get("schema_version") != EXPECTED_SCHEMA_VERSION:
+        reject("unsupported evidence schema version")
+    if metadata.get("project") != args.project:
+        reject("evidence project is invalid")
+    if metadata.get("component") != EXPECTED_COMPONENT:
+        reject("unsupported evidence component")
+    if metadata.get("environment") != EXPECTED_ENVIRONMENT:
+        reject("unsupported evidence environment")
+    if metadata.get("action") != EXPECTED_ACTION:
+        reject("unsupported evidence action")
+    artifact_name = metadata.get("rollback_artifact_name")
+    if not isinstance(artifact_name, str) or not ARTIFACT_RE.fullmatch(artifact_name):
+        reject("rollback artifact name is missing or invalid")
+
+    source = metadata_value(metadata, "source")
+    commit_sha = source.get("commit_sha")
+    if not isinstance(commit_sha, str) or not SHA_RE.fullmatch(commit_sha):
+        reject("source commit SHA is missing or invalid")
+    if source.get("ref") != "refs/heads/main":
+        reject("source ref is invalid")
+
+    provenance = metadata_value(metadata, "dev_provenance")
+    if provenance.get("workflow") != "deploy-worker.yml" or provenance.get("event") != "push":
+        reject("dev provenance workflow or event is invalid")
+    if provenance.get("head_branch") != "main" or provenance.get("head_sha") != commit_sha:
+        reject("dev provenance does not match the source commit")
+    if provenance.get("conclusion") != "success":
+        reject("dev provenance run was not successful")
+    positive_int(provenance.get("run_id"), "dev provenance run ID")
+    if not isinstance(provenance.get("run_url"), str) or not provenance["run_url"].startswith("https://"):
+        reject("dev provenance run URL is missing or invalid")
+
+    image = metadata_value(metadata, "image")
+    digest = image.get("digest")
+    expected_image = args.ar_repo + "/olw-pipeline@" + str(digest)
+    if not isinstance(digest, str) or not DIGEST_RE.fullmatch(digest):
+        reject("promoted image digest is missing or invalid")
+    if image.get("reference") != expected_image:
+        reject("promoted image reference is invalid")
+
+    if "provider_verification" in metadata:
+        reject("provider verification metadata must be generated by the renderer")
+
+    originating = metadata_value(metadata, "originating_workflow")
+    if not isinstance(originating.get("repository"), str) or not originating["repository"]:
+        reject("originating workflow repository is missing")
+    if not isinstance(originating.get("workflow"), str) or not originating["workflow"]:
+        reject("originating workflow name is missing")
+    positive_int(originating.get("run_id"), "originating workflow run ID")
+    positive_int(originating.get("run_attempt"), "originating workflow run attempt")
+    return (
+        commit_sha,
+        image["reference"],
+        artifact_name,
+        {
+            "dev_provenance": {
+                "workflow": provenance["workflow"],
+                "event": provenance["event"],
+                "head_branch": provenance["head_branch"],
+                "head_sha": provenance["head_sha"],
+                "conclusion": provenance["conclusion"],
+                "run_id": provenance["run_id"],
+                "run_url": provenance["run_url"],
+            },
+            "image": {"digest": image["digest"], "reference": image["reference"]},
+            "originating_workflow": {
+                "repository": originating["repository"],
+                "workflow": originating["workflow"],
+                "run_id": originating["run_id"],
+                "run_attempt": originating["run_attempt"],
+            },
+        },
+    )
+
+
+def validate_rollback(rollback, args):
+    validate_no_secret_like_fields(rollback)
+    expected_handle = canonical_handle(args.project, args.region, args.job_name)
+    if rollback.get("provider_handle") != expected_handle:
+        reject("rollback provider handle is invalid")
+    artifact_name = rollback.get("artifact_name")
+    if not isinstance(artifact_name, str) or not ARTIFACT_RE.fullmatch(artifact_name):
+        reject("rollback artifact name is missing or invalid")
+    image = immutable_image(rollback.get("image_reference"), args.ar_repo)
+    return artifact_name, image, normalized_rollback_config(rollback.get("config"))
+
+
+def _render_evidence(args):
+    if Path(args.output).exists():
+        reject("deployment evidence already exists", "evidence_output_exists")
+    metadata = read_json(args.metadata)
+    rollback = read_json(args.rollback_contract)
+    commit_sha, expected_image, metadata_artifact_name, normalized_metadata = validate_metadata(metadata, args)
+    artifact_name, rollback_image, rollback_config = validate_rollback(rollback, args)
+    if artifact_name != metadata_artifact_name:
+        reject("rollback artifact name does not match evidence metadata")
+
+    document = provider_job(args.project, args.region, args.job_name)
+    _, spec, container, volumes, mounts = job_spec(document)
+    observed_metadata = document.get("metadata", {})
+    try:
+        generation = positive_int(observed_metadata.get("generation"), "observed Job generation")
+    except EvidenceError:
+        reject("observed Job generation failed verification", "generation_mismatch")
+    if observed_metadata.get("name") != args.job_name:
+        reject("observed Job name does not match the requested provider handle", "provider_handle_mismatch")
+    if container["image"] != expected_image:
+        reject("observed Job image does not match the promoted immutable image", "image_mismatch")
+    if args.expected_runtime_service_account != EXPECTED_RUNTIME_SERVICE_ACCOUNT:
+        reject("expected runtime service account argument is invalid")
+    service_account = spec.get("serviceAccountName")
+    if service_account != args.expected_runtime_service_account:
+        reject("observed runtime service account does not match the expected account", "runtime_service_account_mismatch")
+    try:
+        config = allowlisted_config(
+            container,
+            volumes,
+            mounts,
+            expected_bucket=args.bucket,
+            require_bucket=True,
+            require_cloud_shape=True,
+        )
+    except EvidenceError as error:
+        if error.reason_code == "observed_shape_unsupported":
+            raise
+        reject("observed Cloud Run config failed verification", "config_mismatch")
+    config_fingerprint = normalized_hash(config)
+    checked_at = datetime.now(timezone.utc).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+    provider_handle = canonical_handle(args.project, args.region, args.job_name)
+    evidence = {
+        "schema_version": EXPECTED_SCHEMA_VERSION,
+        # Deployment evidence does not assert Job execution or data success.
+        "job_executed": False,
+        "project": metadata["project"],
+        "component": metadata["component"],
+        "environment": metadata["environment"],
+        "action": metadata["action"],
+        "source": {"commit_sha": commit_sha, "ref": metadata["source"]["ref"]},
+        "dev_provenance": normalized_metadata["dev_provenance"],
+        "image": normalized_metadata["image"],
+        "provider": {
+            "current_handle": provider_handle,
+            "rollback_handle": rollback["provider_handle"],
+            "rollback_artifact_name": artifact_name,
+        },
+        "observed_job": {
+            "generation": generation,
+            "image_reference": container["image"],
+            "runtime_service_account": service_account,
+        },
+        "config": {"result": "verified", "fingerprint": config_fingerprint, "allowlisted": config},
+        "provider_verification": {
+            "result": "verified",
+            "checked_at": checked_at,
+            "checks": ["provider_handle", "generation", "image", "runtime_service_account", "allowlisted_config"],
+        },
+        "originating_workflow": normalized_metadata["originating_workflow"],
+        "rollback": {"image_reference": rollback_image, "config": rollback_config},
+    }
+    validate_normalized_evidence(evidence)
+    validate_no_secret_like_fields(evidence)
+    write_json(args.output, evidence)
+
+
+def render_evidence(args):
+    remove_output(args.failure_output)
+    try:
+        _render_evidence(args)
+    except EvidenceError as error:
+        write_json(args.failure_output, failure_marker(error))
+        raise
+
+
+def render_partial(args):
+    if Path(args.output).exists():
+        reject("refusing to overwrite existing deployment evidence")
+    metadata = read_json(args.metadata)
+    rollback = read_json(args.rollback_contract)
+    commit_sha, _, metadata_artifact_name, normalized_metadata = validate_metadata(metadata, args)
+    artifact_name, rollback_image, rollback_config = validate_rollback(rollback, args)
+    if artifact_name != metadata_artifact_name:
+        reject("rollback artifact name does not match evidence metadata")
+    failure = read_failure_marker(args.failure_output)
+    provider_handle = canonical_handle(args.project, args.region, args.job_name)
+    if failure is None:
+        status = "PARTIAL"
+        config_result = "unknown"
+        provider_verification = {"result": "unknown", "checked_at": None, "checks": []}
+    else:
+        status = "UNHEALTHY"
+        config_result = "failed"
+        provider_verification = {
+            "result": "failed",
+            "reason_code": failure["reason_code"],
+            "checked_at": failure["checked_at"],
+            "checks": [],
+        }
+    evidence = {
+        "schema_version": EXPECTED_SCHEMA_VERSION,
+        "status": status,
+        # Deployment evidence does not assert Job execution or data success.
+        "job_executed": False,
+        "project": metadata["project"],
+        "component": metadata["component"],
+        "environment": metadata["environment"],
+        "action": metadata["action"],
+        "source": {"commit_sha": commit_sha, "ref": metadata["source"]["ref"]},
+        "dev_provenance": normalized_metadata["dev_provenance"],
+        "image": normalized_metadata["image"],
+        "provider": {
+            "current_handle": provider_handle,
+            "rollback_handle": rollback["provider_handle"],
+            "rollback_artifact_name": artifact_name,
+        },
+        "config": {"result": config_result, "fingerprint": None, "allowlisted": None},
+        "provider_verification": provider_verification,
+        "originating_workflow": normalized_metadata["originating_workflow"],
+        "rollback": {"image_reference": rollback_image, "config": rollback_config},
+        "next_action": "independent provider read-back required before retry or rollback",
+    }
+    validate_normalized_evidence(evidence)
+    validate_no_secret_like_fields(evidence)
+    write_json(args.output, evidence)
+
+
+def validate_metadata_only(args):
+    validate_metadata(read_json(args.metadata), args)
+
+
+def add_provider_args(parser):
+    parser.add_argument("--project", required=True)
+    parser.add_argument("--region", required=True)
+    parser.add_argument("--job-name", required=True)
+
+
+def build_parser():
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="mode", required=True)
+    prepare = subparsers.add_parser("prepare-rollback")
+    add_provider_args(prepare)
+    prepare.add_argument("--ar-repo", required=True)
+    prepare.add_argument("--artifact-name", required=True)
+    prepare.add_argument("--output", required=True)
+    render = subparsers.add_parser("render-evidence")
+    add_provider_args(render)
+    render.add_argument("--ar-repo", required=True)
+    render.add_argument("--bucket", required=True)
+    render.add_argument("--expected-runtime-service-account", required=True)
+    render.add_argument("--rollback-contract", required=True)
+    render.add_argument("--metadata", required=True)
+    render.add_argument("--output", required=True)
+    render.add_argument("--failure-output", required=True)
+    partial = subparsers.add_parser("render-partial")
+    add_provider_args(partial)
+    partial.add_argument("--ar-repo", required=True)
+    partial.add_argument("--rollback-contract", required=True)
+    partial.add_argument("--metadata", required=True)
+    partial.add_argument("--output", required=True)
+    partial.add_argument("--failure-output")
+    evidence = subparsers.add_parser("validate-evidence")
+    evidence.add_argument("--evidence", required=True)
+    validate = subparsers.add_parser("validate-metadata")
+    validate.add_argument("--project", required=True)
+    validate.add_argument("--ar-repo", required=True)
+    validate.add_argument("--metadata", required=True)
+    return parser
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    try:
+        if args.mode == "prepare-rollback":
+            prepare_rollback(args)
+        elif args.mode == "render-evidence":
+            render_evidence(args)
+        elif args.mode == "render-partial":
+            render_partial(args)
+        elif args.mode == "validate-evidence":
+            validate_normalized_evidence(read_json(args.evidence))
+        else:
+            validate_metadata_only(args)
+    except EvidenceError as error:
+        print(f"deployment evidence rejected: {error.reason_code}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
