@@ -117,18 +117,22 @@ jobs:
           project_id: ${{ env.PROJECT_ID }}
 
       - name: Freeze production rollback contract
+        id: rollback
         env:
+          COMMIT_SHA: ${{ steps.commit.outputs.commit_sha }}
           ROLLBACK_DIR: ${{ runner.temp }}/worker-production-rollback
         run: |
           set -euo pipefail
           mkdir -p "$ROLLBACK_DIR"
+          EVIDENCE_ARTIFACT_NAME="worker-deployment-evidence-${COMMIT_SHA}"
           python3 scripts/render_worker_deployment_evidence.py prepare-rollback \
             --project "${PROJECT_ID}" \
             --region "${REGION}" \
             --job-name "${JOB_NAME}" \
             --ar-repo "${AR_REPO}" \
-            --artifact-name "production-job-contract.json" \
+            --artifact-name "$EVIDENCE_ARTIFACT_NAME" \
             --output "$ROLLBACK_DIR/rollback-contract.json"
+          echo "artifact_name=$EVIDENCE_ARTIFACT_NAME" >> "$GITHUB_OUTPUT"
 
       - name: Update production worker
         env:
@@ -158,6 +162,7 @@ jobs:
           DEV_RUN_HEAD_BRANCH: ${{ steps.dev_run.outputs.run_head_branch }}
           DEV_RUN_HEAD_SHA: ${{ steps.dev_run.outputs.run_head_sha }}
           DEV_RUN_CONCLUSION: ${{ steps.dev_run.outputs.run_conclusion }}
+          EVIDENCE_ARTIFACT_NAME: ${{ steps.rollback.outputs.artifact_name }}
           ROLLBACK_CONTRACT: ${{ runner.temp }}/worker-production-rollback/rollback-contract.json
           EVIDENCE_DIR: ${{ runner.temp }}/worker-deployment-evidence
           GITHUB_REPOSITORY: ${{ github.repository }}
@@ -167,7 +172,6 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$EVIDENCE_DIR"
-          CHECKED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           METADATA="$EVIDENCE_DIR/metadata.json"
           EVIDENCE="$EVIDENCE_DIR/deployment-evidence.json"
           jq -n \
@@ -187,13 +191,12 @@ jobs:
             --arg dev_run_url "$DEV_RUN_URL" \
             --arg image "$IMMUTABLE_IMAGE" \
             --arg digest "${IMMUTABLE_IMAGE##*@}" \
-            --arg verification_result "verified" \
-            --arg checked_at "$CHECKED_AT" \
+            --arg rollback_artifact_name "$EVIDENCE_ARTIFACT_NAME" \
             --arg repository "$GITHUB_REPOSITORY" \
             --arg workflow "$GITHUB_WORKFLOW" \
             --argjson workflow_run_id "$GITHUB_RUN_ID" \
             --argjson workflow_run_attempt "$GITHUB_RUN_ATTEMPT" \
-            '{schema_version: $schema_version, project: $project, component: $component, environment: $environment, action: $action, source: {commit_sha: $commit_sha, ref: $source_ref}, dev_provenance: {workflow: $dev_workflow, event: $dev_event, head_branch: $dev_head_branch, head_sha: $dev_head_sha, conclusion: $dev_conclusion, run_id: $dev_run_id, run_url: $dev_run_url}, image: {digest: $digest, reference: $image}, provider_verification: {result: $verification_result, checked_at: $checked_at}, originating_workflow: {repository: $repository, workflow: $workflow, run_id: $workflow_run_id, run_attempt: $workflow_run_attempt}}' \
+            '{schema_version: $schema_version, project: $project, component: $component, environment: $environment, action: $action, rollback_artifact_name: $rollback_artifact_name, source: {commit_sha: $commit_sha, ref: $source_ref}, dev_provenance: {workflow: $dev_workflow, event: $dev_event, head_branch: $dev_head_branch, head_sha: $dev_head_sha, conclusion: $dev_conclusion, run_id: $dev_run_id, run_url: $dev_run_url}, image: {digest: $digest, reference: $image}, originating_workflow: {repository: $repository, workflow: $workflow, run_id: $workflow_run_id, run_attempt: $workflow_run_attempt}}' \
             > "$METADATA"
           python3 scripts/render_worker_deployment_evidence.py render-evidence \
             --project "$PROJECT_ID" \
@@ -209,7 +212,7 @@ jobs:
       - name: Upload normalized deployment evidence
         uses: actions/upload-artifact@v4
         with:
-          name: worker-deployment-evidence-${{ steps.commit.outputs.commit_sha }}
+          name: ${{ steps.rollback.outputs.artifact_name }}
           path: ${{ steps.evidence.outputs.evidence_file }}
           if-no-files-found: error
           retention-days: 90

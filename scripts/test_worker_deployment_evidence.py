@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import json
+from datetime import datetime, timedelta, timezone
 import os
 from pathlib import Path
 import stat
@@ -15,6 +16,7 @@ ROLLBACK_FIXTURE = ROOT / "cmd/olw_worker/testdata/lwc179/legacy-prod.json"
 OBSERVED_FIXTURE = ROOT / "cmd/olw_worker/testdata/lwc198/observed-prod.json"
 MALFORMED_FIXTURE = ROOT / "cmd/olw_worker/testdata/lwc179/malformed-image.json"
 IMAGE = "asia-east1-docker.pkg.dev/llm-wiki-cloud/cloud-run-images/olw-pipeline@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+ARTIFACT_NAME = "worker-deployment-evidence-" + "c" * 40
 
 
 class WorkerDeploymentEvidenceTest(unittest.TestCase):
@@ -70,6 +72,7 @@ class WorkerDeploymentEvidenceTest(unittest.TestCase):
             "component": "olw-worker",
             "environment": "production",
             "action": "promote",
+            "rollback_artifact_name": ARTIFACT_NAME,
             "source": {"commit_sha": "c" * 40, "ref": "refs/heads/main"},
             "dev_provenance": {
                 "workflow": "deploy-worker.yml",
@@ -81,7 +84,6 @@ class WorkerDeploymentEvidenceTest(unittest.TestCase):
                 "run_url": "https://github.com/Rayer/llm-wiki-bff/actions/runs/123",
             },
             "image": {"digest": "sha256:" + "b" * 64, "reference": IMAGE},
-            "provider_verification": {"result": "verified", "checked_at": "2026-07-23T01:02:03Z"},
             "originating_workflow": {
                 "repository": "Rayer/llm-wiki-bff",
                 "workflow": "Promote OLW worker to Cloud Run (production)",
@@ -109,7 +111,7 @@ class WorkerDeploymentEvidenceTest(unittest.TestCase):
                 "--ar-repo",
                 "asia-east1-docker.pkg.dev/llm-wiki-cloud/cloud-run-images",
                 "--artifact-name",
-                "production-job-contract.json",
+                ARTIFACT_NAME,
                 "--output",
                 str(output),
             ],
@@ -168,10 +170,13 @@ class WorkerDeploymentEvidenceTest(unittest.TestCase):
         self.assertEqual(document["observed_job"]["generation"], 42)
         self.assertEqual(document["observed_job"]["image_reference"], IMAGE)
         self.assertEqual(document["observed_job"]["runtime_service_account"], "lwc-worker@llm-wiki-cloud.iam.gserviceaccount.com")
-        self.assertEqual(document["provider"]["rollback_artifact_name"], "production-job-contract.json")
+        self.assertEqual(document["provider"]["rollback_artifact_name"], ARTIFACT_NAME)
         self.assertEqual(document["config"]["result"], "verified")
         self.assertRegex(document["config"]["fingerprint"], r"^sha256:[0-9a-f]{64}$")
         self.assertEqual(document["provider_verification"]["result"], "verified")
+        checked_at = document["provider_verification"]["checked_at"]
+        checked = datetime.strptime(checked_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        self.assertLessEqual(datetime.now(timezone.utc) - checked, timedelta(seconds=5))
         self.assertEqual(document["originating_workflow"]["run_attempt"], 2)
         self.assertNotIn("DEEPSEEK", evidence.read_text())
 
@@ -186,6 +191,9 @@ class WorkerDeploymentEvidenceTest(unittest.TestCase):
             "unsupported component": lambda m: m.update(component="other-worker"),
             "unsupported environment": lambda m: m.update(environment="staging"),
             "unsupported action": lambda m: m.update(action="rollback"),
+            "caller-supplied verification timestamp": lambda m: m.update(
+                provider_verification={"result": "verified", "checked_at": "1970-01-01T00:00:00Z"}
+            ),
             "secret-like field": lambda m: m.update(credentials={"t" + "oken": "redacted"}),
         }
         for name, mutate in cases.items():
