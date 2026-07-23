@@ -11,6 +11,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -134,6 +135,73 @@ func (s *noFullProjectListStore) Read(ctx context.Context, name string, generati
 }
 
 type contextAwareDeleteStore struct{ objectStore }
+
+type rejectCanceledWritesStore struct{ objectStore }
+
+func (s *rejectCanceledWritesStore) Write(ctx context.Context, name string, data []byte, meta map[string]string, condition objectConditions) (objectAttrs, error) {
+	if err := ctx.Err(); err != nil {
+		return objectAttrs{}, err
+	}
+	return s.objectStore.Write(ctx, name, data, meta, condition)
+}
+
+type manifestCASConflictStore struct {
+	objectStore
+	manifest string
+}
+
+func (s *manifestCASConflictStore) Write(ctx context.Context, name string, data []byte, meta map[string]string, condition objectConditions) (objectAttrs, error) {
+	if name == s.manifest && condition.GenerationMatch > 0 {
+		return objectAttrs{}, errObjectGenerationConflict
+	}
+	return s.objectStore.Write(ctx, name, data, meta, condition)
+}
+
+type materializationReadErrorStore struct {
+	objectStore
+	name string
+}
+
+func (s *materializationReadErrorStore) Read(ctx context.Context, name string, generationID, limit int64) ([]byte, objectAttrs, error) {
+	if name == s.name {
+		return nil, objectAttrs{}, errors.New("arbitrary provider state validation secret")
+	}
+	return s.objectStore.Read(ctx, name, generationID, limit)
+}
+
+type postcommitDiagnosticContextStore struct {
+	objectStore
+	sawDiagnosticDeadline bool
+}
+
+func (s *postcommitDiagnosticContextStore) Write(ctx context.Context, name string, data []byte, meta map[string]string, condition objectConditions) (objectAttrs, error) {
+	if strings.HasSuffix(name, ".failure.json") {
+		_, s.sawDiagnosticDeadline = ctx.Deadline()
+		if !s.sawDiagnosticDeadline {
+			return objectAttrs{}, errors.New("diagnostic context was not bounded")
+		}
+	}
+	if strings.HasSuffix(name, sourcestatus.Path) {
+		return objectAttrs{}, errors.New("receipt write failed")
+	}
+	return s.objectStore.Write(ctx, name, data, meta, condition)
+}
+
+type failureRecordingDeadlineStore struct {
+	objectStore
+	deadlines map[string]time.Time
+}
+
+func (s *failureRecordingDeadlineStore) Write(ctx context.Context, name string, data []byte, meta map[string]string, condition objectConditions) (objectAttrs, error) {
+	if strings.HasSuffix(name, ".log") || strings.HasSuffix(name, sourcestatus.Path) || strings.HasSuffix(name, ".failure.json") {
+		deadline, ok := ctx.Deadline()
+		if !ok {
+			return objectAttrs{}, errors.New("failure recording context was not bounded")
+		}
+		s.deadlines[name] = deadline
+	}
+	return s.objectStore.Write(ctx, name, data, meta, condition)
+}
 
 func (s *contextAwareDeleteStore) Delete(ctx context.Context, name string, generation int64) error {
 	if err := ctx.Err(); err != nil {
@@ -460,6 +528,314 @@ func TestCloudManifestCommitTimeoutReadbackControlsReceipts(t *testing.T) {
 	})
 }
 
+func TestCloudCanceledAndExpiredFailuresStillRecordAllArtifacts(t *testing.T) {
+	old := execOLW
+	t.Cleanup(func() { execOLW = old })
+	t.Run("cancelled", func(t *testing.T) {
+		m := newMemoryObjects()
+		prefix := "users/user/projects/cancelled/"
+		seedCloudSource(t, m, prefix, "raw", "", priorCloudReceipt())
+		store := &rejectCanceledWritesStore{objectStore: m}
+		ctx, cancel := context.WithCancel(context.Background())
+		execOLW = func(_ context.Context, _ string, _ []string, _ []string, _, _ io.Writer) error {
+			cancel()
+			return context.Canceled
+		}
+		err := runCloudWorkerBatch(ctx, cloudCfgFor("user", "cancelled", "execution-secret"), [][]string{{"run"}}, store)
+		if err == nil {
+			t.Fatal("cancelled execution unexpectedly succeeded")
+		}
+		assertCloudFailure(t, m, prefix, "provider", "secret")
+		if _, _, readErr := m.Read(context.Background(), prefix+"cache/pipeline-execution-secret.failure.json", 0, generation.MaxFileBytes); readErr != nil {
+			t.Fatalf("cancelled diagnostic missing: %v", readErr)
+		}
+	})
+
+	t.Run("expired", func(t *testing.T) {
+		m := newMemoryObjects()
+		prefix := "users/user/projects/expired/"
+		seedCloudSource(t, m, prefix, "raw", "", priorCloudReceipt())
+		store := &rejectCanceledWritesStore{objectStore: m}
+		ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+		defer cancel()
+		execOLW = func(_ context.Context, _ string, _ []string, _ []string, _, _ io.Writer) error {
+			time.Sleep(40 * time.Millisecond)
+			return context.DeadlineExceeded
+		}
+		err := runCloudWorkerBatch(ctx, cloudCfgFor("user", "expired", "execution-secret"), [][]string{{"run"}}, store)
+		if err == nil {
+			t.Fatal("expired execution unexpectedly succeeded")
+		}
+		assertCloudFailure(t, m, prefix, "provider", "secret")
+		if _, _, readErr := m.Read(context.Background(), prefix+"cache/pipeline-execution-secret.failure.json", 0, generation.MaxFileBytes); readErr != nil {
+			t.Fatalf("expired diagnostic missing: %v", readErr)
+		}
+	})
+}
+
+func TestCloudWorkspaceCreationFailureRecordsDiagnosticWithoutPublication(t *testing.T) {
+	old := cloudMkdirTemp
+	t.Cleanup(func() { cloudMkdirTemp = old })
+	cloudMkdirTemp = func(string, string) (string, error) {
+		return "", errors.New("workspace provider secret")
+	}
+	m := newMemoryObjects()
+	prefix := "users/user/projects/project/"
+	seedCloudSource(t, m, prefix, "raw", "", priorCloudReceipt())
+	err := runCloudWorkerBatch(context.Background(), cloudCfgFor("user", "project", "execution"), [][]string{{"run"}}, m)
+	if err == nil || err.Error() != "pipeline workspace unavailable" {
+		t.Fatalf("error=%v, want sanitized workspace failure", err)
+	}
+	logData, _, err := m.Read(context.Background(), prefix+"cache/pipeline-execution.log", 0, generation.MaxFileBytes)
+	if err != nil || string(logData) != "pipeline failed\n" {
+		t.Fatalf("fixed failure log=%q err=%v", logData, err)
+	}
+	diagnosticData, _, err := m.Read(context.Background(), prefix+"cache/pipeline-execution.failure.json", 0, generation.MaxFileBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var diagnostic failureDiagnostic
+	if err := json.Unmarshal(diagnosticData, &diagnostic); err != nil {
+		t.Fatal(err)
+	}
+	if diagnostic.Stage != failureStageInputMaterialization || diagnostic.ErrorClass != failureClassIO {
+		t.Fatalf("diagnostic=%+v", diagnostic)
+	}
+	if _, _, err := m.Read(context.Background(), prefix+generation.ManifestPath, 0, generation.MaxManifestBytes); !errors.Is(err, cloudstorage.ErrObjectNotExist) {
+		t.Fatalf("manifest read error=%v, want no publication", err)
+	}
+	if got, _ := m.List(context.Background(), prefix+generation.Prefix, generation.MaxFiles); len(got) != 0 {
+		t.Fatalf("generation objects=%+v, want none", got)
+	}
+}
+
+func TestCloudMigrationPostconditionFailureIsTyped(t *testing.T) {
+	old := execOLW
+	t.Cleanup(func() { execOLW = old })
+	m := newMemoryObjects()
+	prefix := "users/user/projects/project/"
+	seedCloudSource(t, m, prefix, "raw", "", priorCloudReceipt())
+	writeCloudLegacyState(t, m, prefix)
+	execOLW = func(_ context.Context, vault string, command []string, _ []string, _, _ io.Writer) error {
+		if strings.HasPrefix(strings.Join(command, " "), "migrate-olw ") {
+			mustWriteFile(t, filepath.Join(vault, "raw", "source.md"), []byte("changed"))
+		}
+		return nil
+	}
+	if err := runCloudWorkerBatch(context.Background(), cloudCfgFor("user", "project", "execution-secret"), [][]string{{"run"}}, m); err == nil {
+		t.Fatal("migration postcondition failure unexpectedly succeeded")
+	}
+	diagnosticData, _, err := m.Read(context.Background(), prefix+"cache/pipeline-execution-secret.failure.json", 0, generation.MaxFileBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var diagnostic failureDiagnostic
+	if err := json.Unmarshal(diagnosticData, &diagnostic); err != nil {
+		t.Fatal(err)
+	}
+	if diagnostic.Stage != failureStageSyntoMigration || diagnostic.ErrorClass != failureClassStateInvalid {
+		t.Fatalf("diagnostic=%+v", diagnostic)
+	}
+}
+
+func TestCloudMigrationNormalizationFailureIsTyped(t *testing.T) {
+	old := execOLW
+	t.Cleanup(func() { execOLW = old })
+	m := newMemoryObjects()
+	prefix := "users/user/projects/project/"
+	seedCloudSource(t, m, prefix, "raw", "", priorCloudReceipt())
+	writeCloudLegacyState(t, m, prefix)
+	execOLW = func(_ context.Context, vault string, command []string, _ []string, _, _ io.Writer) error {
+		if strings.HasPrefix(strings.Join(command, " "), "migrate-olw ") {
+			mustWriteFile(t, filepath.Join(vault, "synto.toml"), []byte("pipeline = \"not-a-table\"\n"))
+			writeValidSQLiteState(t, filepath.Join(vault, ".synto", "state.db"))
+		}
+		return nil
+	}
+	if err := runCloudWorkerBatch(context.Background(), cloudCfgFor("user", "project", "execution-secret"), [][]string{{"run"}}, m); err == nil {
+		t.Fatal("migration normalization failure unexpectedly succeeded")
+	}
+	diagnosticData, _, err := m.Read(context.Background(), prefix+"cache/pipeline-execution-secret.failure.json", 0, generation.MaxFileBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var diagnostic failureDiagnostic
+	if err := json.Unmarshal(diagnosticData, &diagnostic); err != nil {
+		t.Fatal(err)
+	}
+	if diagnostic.Stage != failureStageSyntoConfigNormalization || diagnostic.ErrorClass != failureClassValidation {
+		t.Fatalf("diagnostic=%+v", diagnostic)
+	}
+}
+
+func TestFailureDiagnosticCreateOnlyReplayRequiresCanonicalIdentity(t *testing.T) {
+	m := newMemoryObjects()
+	prefix := "users/user/projects/project/"
+	cfg := cloudCfgFor("user", "project", "execution")
+	failure := newWorkerFailure(context.Background(), failureStageSyntoRun, failureClassChildExit, failureChildRun, errors.New("child"))
+	canonical, err := marshalFailureDiagnostic(failure)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Write(context.Background(), prefix+"cache/pipeline-execution.failure.json", canonical, nil, objectConditions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeCloudFailureDiagnostic(context.Background(), m, prefix, cfg, failure); err != nil {
+		t.Fatalf("identical canonical replay failed: %v", err)
+	}
+
+	for _, existing := range [][]byte{
+		[]byte(`{"version":1,"status":"failed","stage":"synto_run","error_class":"child_exit","child_command":"run","exit_code":23}`),
+		[]byte(`{"version":1,"status":"failed","stage":"synto_run","error_class":"child_exit","child_command":"run","unknown":"x"}`),
+		[]byte(`{"version":1,"status":"failed","stage":"synto_run","error_class":"child_exit","child_command":"run"} trailing`),
+	} {
+		m2 := newMemoryObjects()
+		if _, err := m2.Write(context.Background(), prefix+"cache/pipeline-execution.failure.json", existing, nil, objectConditions{}); err != nil {
+			t.Fatal(err)
+		}
+		if err := writeCloudFailureDiagnostic(context.Background(), m2, prefix, cfg, failure); err == nil {
+			t.Fatalf("existing non-identical bytes accepted: %q", existing)
+		}
+		got, _, err := m2.Read(context.Background(), prefix+"cache/pipeline-execution.failure.json", 0, generation.MaxFileBytes)
+		if err != nil || !bytes.Equal(got, existing) {
+			t.Fatalf("existing bytes changed: got=%q err=%v", got, err)
+		}
+	}
+}
+
+func TestWorkerFailureContextClassificationUsesAuthoritativeContext(t *testing.T) {
+	deadlineCtx, deadlineCancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer deadlineCancel()
+	if got := diagnosticForError(newWorkerFailure(deadlineCtx, failureStageSyntoRun, failureClassUnknown, failureChildRun, fmt.Errorf("wrapped: %w", context.Canceled))); got.ErrorClass != failureClassTimeout {
+		t.Fatalf("deadline context with canceled cause classified as %q", got.ErrorClass)
+	}
+	cancelCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if got := diagnosticForError(newWorkerFailure(cancelCtx, failureStageSyntoRun, failureClassUnknown, failureChildRun, fmt.Errorf("wrapped: %w", context.DeadlineExceeded))); got.ErrorClass != failureClassCancelled {
+		t.Fatalf("cancelled context with deadline cause classified as %q", got.ErrorClass)
+	}
+}
+
+func TestCloudManifestGenerationConflictKeepsTypedPublicationClass(t *testing.T) {
+	old := execOLW
+	t.Cleanup(func() { execOLW = old })
+	m := newMemoryObjects()
+	prefix := "users/user/projects/project/"
+	seedCloudSource(t, m, prefix, "raw", "", priorCloudReceipt())
+	seedCloudManifest(t, m, prefix, "old")
+	store := &manifestCASConflictStore{objectStore: m, manifest: prefix + generation.ManifestPath}
+	execOLW = func(_ context.Context, vault string, _ []string, _ []string, _, _ io.Writer) error {
+		mustWriteFile(t, filepath.Join(vault, "wiki", "new.md"), []byte("new"))
+		writeCloudRequiredOutputs(t, vault)
+		return nil
+	}
+	if err := runCloudWorkerBatch(context.Background(), cloudCfgFor("user", "project", "execution"), [][]string{{"run"}}, store); err == nil {
+		t.Fatal("generation CAS conflict unexpectedly succeeded")
+	}
+	data, _, err := m.Read(context.Background(), prefix+"cache/pipeline-execution.failure.json", 0, generation.MaxFileBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var diagnostic failureDiagnostic
+	if err := json.Unmarshal(data, &diagnostic); err != nil {
+		t.Fatal(err)
+	}
+	if diagnostic.Stage != failureStageGenerationPublish || diagnostic.ErrorClass != failureClassPublishConflict {
+		t.Fatalf("diagnostic=%+v", diagnostic)
+	}
+}
+
+func TestCloudMaterializationArbitraryErrorFallsBackToUnknown(t *testing.T) {
+	m := newMemoryObjects()
+	prefix := "users/user/projects/project/"
+	seedCloudSource(t, m, prefix, "raw", "", priorCloudReceipt())
+	store := &materializationReadErrorStore{objectStore: m, name: prefix + "raw/source.md"}
+	if err := runCloudWorkerBatch(context.Background(), cloudCfgFor("user", "project", "execution"), [][]string{{"run"}}, store); err == nil {
+		t.Fatal("arbitrary materialization error unexpectedly succeeded")
+	}
+	data, _, err := m.Read(context.Background(), prefix+"cache/pipeline-execution.failure.json", 0, generation.MaxFileBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var diagnostic failureDiagnostic
+	if err := json.Unmarshal(data, &diagnostic); err != nil {
+		t.Fatal(err)
+	}
+	if diagnostic.Stage != failureStageInputMaterialization || diagnostic.ErrorClass != failureClassUnknown {
+		t.Fatalf("diagnostic=%+v", diagnostic)
+	}
+}
+
+func TestCloudReconciliationArbitraryErrorsFallBackToUnknown(t *testing.T) {
+	oldExec := execOLW
+	oldSources := cloudReconcileSources
+	oldConcepts := cloudReconcileConcepts
+	t.Cleanup(func() {
+		execOLW = oldExec
+		cloudReconcileSources = oldSources
+		cloudReconcileConcepts = oldConcepts
+	})
+	for _, tc := range []struct {
+		name  string
+		stage failureStage
+		set   func()
+	}{
+		{name: "source", stage: failureStageSourceReconciliation, set: func() {
+			cloudReconcileSources = func(string, []sourceSnapshot) error { return errors.New("arbitrary source state secret") }
+		}},
+		{name: "concept", stage: failureStageConceptReconciliation, set: func() {
+			cloudReconcileConcepts = func(string, []conceptSnapshot, ...[]sourceSnapshot) error {
+				return errors.New("arbitrary concept validation secret")
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newMemoryObjects()
+			prefix := "users/user/projects/" + tc.name + "/"
+			seedCloudSource(t, m, prefix, "raw", "", priorCloudReceipt())
+			execOLW = func(_ context.Context, vault string, _ []string, _ []string, _, _ io.Writer) error {
+				writeCloudRequiredOutputs(t, vault)
+				return nil
+			}
+			cloudReconcileSources = oldSources
+			cloudReconcileConcepts = oldConcepts
+			tc.set()
+			if err := runCloudWorkerBatch(context.Background(), cloudCfgFor("user", tc.name, "execution-secret"), [][]string{{"run"}}, m); err == nil {
+				t.Fatal("arbitrary reconciliation error unexpectedly succeeded")
+			}
+			data, _, err := m.Read(context.Background(), prefix+"cache/pipeline-execution-secret.failure.json", 0, generation.MaxFileBytes)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var diagnostic failureDiagnostic
+			if err := json.Unmarshal(data, &diagnostic); err != nil {
+				t.Fatal(err)
+			}
+			if diagnostic.Stage != tc.stage || diagnostic.ErrorClass != failureClassUnknown {
+				t.Fatalf("diagnostic=%+v", diagnostic)
+			}
+		})
+	}
+}
+
+func TestWorkerFailureDiagnosticHandlesTypedNilAndInvalidExitCode(t *testing.T) {
+	var typedNil *workerFailure
+	if got := diagnosticForError(typedNil); got.Stage != failureStageUnknown || got.ErrorClass != failureClassUnknown {
+		t.Fatalf("typed nil diagnostic=%+v", got)
+	}
+	for _, code := range []int{-1, 256, 999999} {
+		code := code
+		err := &workerFailure{cause: errors.New("child"), Stage: failureStageSyntoRun, Class: failureClassChildExit, Child: failureChildRun, ExitCode: &code}
+		if got := diagnosticForError(err); got.ExitCode != nil {
+			t.Fatalf("invalid exit code %d retained: %+v", code, got)
+		}
+	}
+	var nilCause *workerFailure = &workerFailure{}
+	if got := nilCause.Error(); got == "" {
+		t.Fatal("nil-cause worker failure returned empty error")
+	}
+}
+
 func TestCloudRejectsUnsafeCommandContractBeforeLeaseStorageOrChild(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
@@ -620,6 +996,127 @@ func TestCloudDiagnosticSinkDiscardsArbitraryChildOutput(t *testing.T) {
 		if strings.Contains(string(logData), forbidden) {
 			t.Fatalf("cloud pipeline log retained child diagnostic %q: %q", forbidden, logData)
 		}
+	}
+}
+
+func TestCloudRunFailureWritesStrictBoundedDiagnosticAndFixedReceipts(t *testing.T) {
+	m := newMemoryObjects()
+	prefix := "users/user-secret/projects/project-secret/"
+	seedCloudSource(t, m, prefix, "raw-start", "", priorCloudReceipt())
+	child := exec.Command("sh", "-c", "exit 23")
+	childErr := child.Run()
+	malicious := "api-key=secret bearer token https://provider.invalid /tmp/private tenant-secret project-secret execution-secret --arg source text"
+	old := execOLW
+	t.Cleanup(func() { execOLW = old })
+	execOLW = func(_ context.Context, _ string, _ []string, _ []string, stdout, stderr io.Writer) error {
+		for _, part := range []string{malicious[:len(malicious)/2], malicious[len(malicious)/2:], strings.Repeat("oversized-provider-output ", maxPipelineLog+1024)} {
+			_, _ = io.WriteString(stdout, part)
+			_, _ = io.WriteString(stderr, part)
+		}
+		return childErr
+	}
+
+	err := runCloudWorkerBatch(context.Background(), cloudCfg(), [][]string{{"run"}}, m)
+	if err == nil || err.Error() != "pipeline execution failed" {
+		t.Fatalf("error=%v, want fixed execution failure", err)
+	}
+	data, _, err := m.Read(context.Background(), prefix+"cache/pipeline-execution-secret.failure.json", 0, generation.MaxFileBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(data) > 4<<10 {
+		t.Fatalf("diagnostic size=%d, want <= 4096", len(data))
+	}
+	var diagnostic failureDiagnostic
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&diagnostic); err != nil {
+		t.Fatalf("strict diagnostic decode: %v; data=%q", err, data)
+	}
+	if diagnostic.Version != 1 || diagnostic.Status != "failed" || diagnostic.Stage != failureStageSyntoRun || diagnostic.ErrorClass != failureClassChildExit || diagnostic.Child != failureChildRun || diagnostic.ExitCode == nil || *diagnostic.ExitCode != 23 {
+		t.Fatalf("diagnostic=%+v", diagnostic)
+	}
+	for _, forbidden := range []string{"api-key", "bearer", "provider.invalid", "/tmp/private", "tenant-secret", "project-secret", "execution-secret", "--arg", "source text", "oversized-provider-output"} {
+		if strings.Contains(string(data), forbidden) {
+			t.Fatalf("diagnostic retained %q: %q", forbidden, data)
+		}
+	}
+	logData, _, err := m.Read(context.Background(), prefix+"cache/pipeline-execution-secret.log", 0, generation.MaxFileBytes)
+	if err != nil || string(logData) != "pipeline failed\n" {
+		t.Fatalf("fixed pipeline log=%q err=%v", logData, err)
+	}
+	if receipt := cloudStatus(t, m, prefix).Sources["s1"]; receipt.Error != "pipeline failed" {
+		t.Fatalf("source receipt=%+v", receipt)
+	}
+}
+
+func TestCloudSuccessWritesNoFailureDiagnostic(t *testing.T) {
+	m := newMemoryObjects()
+	prefix := "users/user/projects/project/"
+	seedCloudSource(t, m, prefix, "raw-start", "", priorCloudReceipt())
+	old := execOLW
+	t.Cleanup(func() { execOLW = old })
+	execOLW = func(_ context.Context, vault string, _ []string, _ []string, _, _ io.Writer) error {
+		writeCloudRequiredOutputs(t, vault)
+		return nil
+	}
+	if err := runCloudWorkerBatch(context.Background(), cloudCfgFor("user", "project", "execution"), [][]string{{"run"}}, m); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := m.Read(context.Background(), prefix+"cache/pipeline-execution.failure.json", 0, generation.MaxFileBytes); !errors.Is(err, cloudstorage.ErrObjectNotExist) {
+		t.Fatalf("success failure diagnostic read error=%v, want object absent", err)
+	}
+}
+
+func TestFailureDiagnosticUnknownErrorIsFiniteAndMessageFree(t *testing.T) {
+	raw := "tenant-secret https://provider.invalid /tmp/private bearer token=secret project-secret execution-secret --api-key source text"
+	data, err := marshalFailureDiagnostic(errors.New(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var diagnostic failureDiagnostic
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&diagnostic); err != nil {
+		t.Fatal(err)
+	}
+	if diagnostic.Stage != failureStageUnknown || diagnostic.ErrorClass != failureClassUnknown || diagnostic.Child != "" || diagnostic.ExitCode != nil {
+		t.Fatalf("diagnostic=%+v", diagnostic)
+	}
+	for _, forbidden := range []string{"tenant-secret", "provider.invalid", "/tmp/private", "bearer", "secret", "project-secret", "execution-secret", "api-key", "source text"} {
+		if strings.Contains(string(data), forbidden) {
+			t.Fatalf("diagnostic retained %q: %q", forbidden, data)
+		}
+	}
+}
+
+func TestCloudDiagnosticWriteFailureRecordsFixedCategoryBeforePublication(t *testing.T) {
+	m := newMemoryObjects()
+	prefix := "users/user/projects/project/"
+	seedCloudSource(t, m, prefix, "raw-start", "", priorCloudReceipt())
+	store := &failureStore{objectStore: m, failWrite: func(name string, _ int) error {
+		if strings.HasSuffix(name, ".failure.json") {
+			return errors.New("diagnostic provider secret")
+		}
+		return nil
+	}}
+	child := exec.Command("sh", "-c", "exit 31")
+	childErr := child.Run()
+	old := execOLW
+	t.Cleanup(func() { execOLW = old })
+	execOLW = func(context.Context, string, []string, []string, io.Writer, io.Writer) error { return childErr }
+	err := runCloudWorkerBatch(context.Background(), cloudCfgFor("user", "project", "execution"), [][]string{{"run"}}, store)
+	if err == nil || !errors.Is(err, errCloudFailureRecording) || !strings.Contains(err.Error(), "pipeline execution failed") {
+		t.Fatalf("error=%v, want execution and fixed recording categories", err)
+	}
+	if strings.Contains(err.Error(), "provider") || strings.Contains(err.Error(), "secret") {
+		t.Fatalf("error leaked diagnostic write cause: %v", err)
+	}
+	if _, _, err := m.Read(context.Background(), prefix+generation.ManifestPath, 0, generation.MaxManifestBytes); !errors.Is(err, cloudstorage.ErrObjectNotExist) {
+		t.Fatalf("manifest read error=%v, want no publication", err)
+	}
+	if _, _, err := m.Read(context.Background(), prefix+"cache/pipeline-execution.failure.json", 0, generation.MaxFileBytes); !errors.Is(err, cloudstorage.ErrObjectNotExist) {
+		t.Fatalf("diagnostic read error=%v, want no partial artifact", err)
 	}
 }
 
@@ -1075,6 +1572,124 @@ func TestCloudPostCommitReceiptFailureDoesNotRollbackManifest(t *testing.T) {
 	if readErr != nil || bytes.Equal(got, oldManifest) {
 		t.Fatalf("manifest not committed: %q err=%v", got, readErr)
 	}
+	if !errors.Is(err, errCloudCommittedReceipt) {
+		t.Fatalf("error=%v, want explicit committed receipt failure", err)
+	}
+	diagnosticData, _, diagnosticErr := m.Read(context.Background(), prefix+"cache/pipeline-execution-secret.failure.json", 0, generation.MaxFileBytes)
+	if diagnosticErr != nil {
+		t.Fatal(diagnosticErr)
+	}
+	var diagnostic failureDiagnostic
+	if err := json.Unmarshal(diagnosticData, &diagnostic); err != nil {
+		t.Fatal(err)
+	}
+	if diagnostic.Stage != failureStageReceiptRecording || diagnostic.ErrorClass != failureClassRecordingFailure || diagnostic.Child != "" {
+		t.Fatalf("diagnostic=%+v", diagnostic)
+	}
+}
+
+func TestCloudPostCommitReceiptDiagnosticFailurePreservesCommittedCategory(t *testing.T) {
+	old := execOLW
+	t.Cleanup(func() { execOLW = old })
+	m := newMemoryObjects()
+	prefix := "users/user-secret/projects/project-secret/"
+	seedCloudSource(t, m, prefix, "raw-start", "", priorCloudReceipt())
+	store := &failureStore{objectStore: m, failWrite: func(name string, _ int) error {
+		if name == prefix+sourcestatus.Path || strings.HasSuffix(name, ".failure.json") {
+			return errors.New("receipt recording unavailable")
+		}
+		return nil
+	}}
+	execOLW = func(_ context.Context, vault string, _ []string, _ []string, _, _ io.Writer) error {
+		mustWriteFile(t, filepath.Join(vault, "wiki", "new.md"), []byte("new"))
+		writeCloudRequiredOutputs(t, vault)
+		return nil
+	}
+
+	err := runCloudWorkerBatch(context.Background(), cloudCfg(), [][]string{{"run"}}, store)
+	if !errors.Is(err, errCloudCommittedReceipt) || !errors.Is(err, errCloudFailureRecording) {
+		t.Fatalf("error=%v, want committed receipt and failure-recording categories", err)
+	}
+	if _, _, readErr := m.Read(context.Background(), prefix+generation.ManifestPath, 0, generation.MaxManifestBytes); readErr != nil {
+		t.Fatalf("committed manifest lost: %v", readErr)
+	}
+}
+
+func TestCloudPostCommitDiagnosticUsesBoundedDetachedContext(t *testing.T) {
+	old := execOLW
+	t.Cleanup(func() { execOLW = old })
+	m := newMemoryObjects()
+	prefix := "users/user/projects/project/"
+	seedCloudSource(t, m, prefix, "raw-start", "", priorCloudReceipt())
+	store := &postcommitDiagnosticContextStore{objectStore: m}
+	execOLW = func(_ context.Context, vault string, _ []string, _ []string, _, _ io.Writer) error {
+		mustWriteFile(t, filepath.Join(vault, "wiki", "new.md"), []byte("new"))
+		writeCloudRequiredOutputs(t, vault)
+		return nil
+	}
+	if err := runCloudWorkerBatch(context.Background(), cloudCfg(), [][]string{{"run"}}, store); !errors.Is(err, errCloudCommittedReceipt) {
+		t.Fatalf("error=%v, want committed receipt failure", err)
+	}
+	if !store.sawDiagnosticDeadline {
+		t.Fatal("postcommit diagnostic did not receive bounded context")
+	}
+}
+
+func TestCloudFailureRecordingArtifactsShareOneDeadline(t *testing.T) {
+	m := newMemoryObjects()
+	store := &failureRecordingDeadlineStore{objectStore: m, deadlines: make(map[string]time.Time)}
+	cfg := cloudCfgFor("user", "project", "execution")
+	failure := newWorkerFailure(context.Background(), failureStageSyntoRun, failureClassChildExit, failureChildRun, errors.New("child"))
+
+	if err := writeCloudFailureReceipts(context.Background(), store, "users/user/projects/project/", "", cfg, []sourceSnapshot{{SourceID: "source"}}, failure); err != nil {
+		t.Fatal(err)
+	}
+	if len(store.deadlines) != 3 {
+		t.Fatalf("recorded deadlines=%v, want fixed event, source receipt, and diagnostic", store.deadlines)
+	}
+	var want time.Time
+	for name, got := range store.deadlines {
+		if want.IsZero() {
+			want = got
+		} else if !got.Equal(want) {
+			t.Fatalf("artifact %q deadline=%v, want shared deadline %v; all=%v", name, got, want, store.deadlines)
+		}
+	}
+}
+
+func TestCloudPostprocessFailureUsesPostprocessDiagnosticStage(t *testing.T) {
+	old := execOLW
+	t.Cleanup(func() { execOLW = old })
+	m := newMemoryObjects()
+	prefix := "users/user-secret/projects/project-secret/"
+	seedCloudSource(t, m, prefix, "raw-start", "", priorCloudReceipt())
+	execOLW = func(_ context.Context, vault string, _ []string, _ []string, _, _ io.Writer) error {
+		writeCloudRequiredOutputs(t, vault)
+		path := filepath.Join(vault, "cache", "raw_status.json")
+		if err := os.Remove(path); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(path, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return nil
+	}
+
+	err := runCloudWorkerBatch(context.Background(), cloudCfg(), [][]string{{"run"}}, m)
+	if err == nil || !errors.Is(err, errCloudPipelineExecution) {
+		t.Fatalf("error=%v, want fixed pipeline execution failure", err)
+	}
+	data, _, readErr := m.Read(context.Background(), prefix+"cache/pipeline-execution-secret.failure.json", 0, generation.MaxFileBytes)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	var diagnostic failureDiagnostic
+	if err := json.Unmarshal(data, &diagnostic); err != nil {
+		t.Fatal(err)
+	}
+	if diagnostic.Stage != failureStage("postprocess") || diagnostic.ErrorClass != failureClassIO {
+		t.Fatalf("diagnostic=%+v", diagnostic)
+	}
 }
 
 func TestCloudSuccessUsesExactStartAndConcurrentChangesStayDirty(t *testing.T) {
@@ -1320,6 +1935,17 @@ func TestCloudLeaseReleaseConflictsPreserveExactState(t *testing.T) {
 		if got := cloudStatus(t, m, prefix).Sources["s1"]; got.LastIngestFingerprint != priorCloudReceipt().LastIngestFingerprint {
 			t.Fatalf("false success receipt: %+v", got)
 		}
+		data, _, readErr := m.Read(context.Background(), prefix+"cache/pipeline-execution-secret.failure.json", 0, generation.MaxFileBytes)
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		var diagnostic failureDiagnostic
+		if err := json.Unmarshal(data, &diagnostic); err != nil {
+			t.Fatal(err)
+		}
+		if diagnostic.Stage != failureStageSyntoRun {
+			t.Fatalf("primary diagnostic overwritten by cleanup: %+v", diagnostic)
+		}
 		lease, _, err := m.Read(context.Background(), prefix+generation.LeasePath, 0, generation.MaxFileBytes)
 		if err != nil || string(lease) != `{"execution":"other"}` {
 			t.Fatalf("failed conditional release changed replacement lease=%q err=%v", lease, err)
@@ -1353,7 +1979,50 @@ func TestCloudLeaseReleaseConflictsPreserveExactState(t *testing.T) {
 		if err != nil || string(lease) != `{"execution":"other"}` {
 			t.Fatalf("failed conditional release changed replacement lease=%q err=%v", lease, err)
 		}
+		data, _, err := m.Read(context.Background(), prefix+"cache/pipeline-execution-secret.failure.json", 0, generation.MaxFileBytes)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var diagnostic failureDiagnostic
+		if err := json.Unmarshal(data, &diagnostic); err != nil {
+			t.Fatal(err)
+		}
+		if diagnostic.Stage != failureStageLeaseCleanup || diagnostic.ErrorClass != failureClassIO || diagnostic.Child != "" {
+			t.Fatalf("cleanup diagnostic=%+v", diagnostic)
+		}
 	})
+}
+
+func TestCloudLeaseCleanupDiagnosticFailurePreservesCommittedCleanupCategory(t *testing.T) {
+	old := execOLW
+	t.Cleanup(func() { execOLW = old })
+	m := newMemoryObjects()
+	prefix := "users/user-secret/projects/project-secret/"
+	seedCloudSource(t, m, prefix, "raw", "", priorCloudReceipt())
+	base := &deleteFailureStore{objectStore: m, fail: true, replace: func(ctx context.Context, name string) {
+		if _, err := m.Write(ctx, name, []byte(`{"execution":"other"}`), nil, objectConditions{}); err != nil {
+			t.Fatal(err)
+		}
+	}}
+	store := &failureStore{objectStore: base, failWrite: func(name string, _ int) error {
+		if strings.HasSuffix(name, ".failure.json") {
+			return errors.New("cleanup diagnostic unavailable")
+		}
+		return nil
+	}}
+	execOLW = func(_ context.Context, vault string, _ []string, _ []string, _, _ io.Writer) error {
+		mustWriteFile(t, filepath.Join(vault, "wiki", "new.md"), []byte("new"))
+		writeCloudRequiredOutputs(t, vault)
+		return nil
+	}
+
+	err := runCloudWorkerBatch(context.Background(), cloudCfg(), [][]string{{"run"}}, store)
+	if !errors.Is(err, errCloudCommittedCleanup) || !errors.Is(err, errCloudFailureRecording) {
+		t.Fatalf("error=%v, want committed cleanup and failure-recording categories", err)
+	}
+	if _, _, readErr := m.Read(context.Background(), prefix+generation.ManifestPath, 0, generation.MaxManifestBytes); readErr != nil {
+		t.Fatalf("committed manifest lost: %v", readErr)
+	}
 }
 
 func TestCloudSuccessExactStartRawAndAnnotationPairs(t *testing.T) {
@@ -1707,6 +2376,11 @@ func (s *failureStore) Write(ctx context.Context, name string, data []byte, meta
 func cloudCfg() workerConfig {
 	return workerConfig{Bucket: "bucket", UserID: "user-secret", ProjectID: "project-secret", ExecutionID: "execution-secret", APIKey: "api-secret", WorkspaceDir: os.TempDir(), Postprocess: true, StopOnError: true, SuppressOutput: true}
 }
+func cloudCfgFor(user, project, execution string) workerConfig {
+	cfg := cloudCfg()
+	cfg.UserID, cfg.ProjectID, cfg.ExecutionID = user, project, execution
+	return cfg
+}
 func writeCloudRequiredOutputs(t *testing.T, root string) {
 	t.Helper()
 	for path, data := range map[string]string{
@@ -1802,6 +2476,18 @@ func seedCloudSource(t *testing.T, m *memoryObjects, prefix, raw, ann string, re
 		b, _ := json.Marshal(sourcestatus.Artifact{Version: 1, Sources: map[string]sourcestatus.Receipt{"s1": receipt}})
 		writeCloudObject(t, m, prefix+sourcestatus.Path, b)
 	}
+}
+
+func writeCloudLegacyState(t *testing.T, m *memoryObjects, prefix string) {
+	t.Helper()
+	statePath := filepath.Join(t.TempDir(), "state.db")
+	writeValidSQLiteState(t, statePath)
+	state, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeCloudObject(t, m, prefix+"wiki.toml", []byte("legacy config\n"))
+	writeCloudObject(t, m, prefix+".olw/state.db", state)
 }
 func priorCloudReceipt() sourcestatus.Receipt {
 	return sourcestatus.Receipt{RawPath: "raw/source.md", LastIngestedRawSHA256: sha256Text("old"), LastIngestedAnnSHA256: annotation.Digest("old"), LastIngestFingerprint: sourcestatus.Fingerprint(sha256Text("old"), annotation.Digest("old")), LastSuccessAt: time.Now().UTC().Format(time.RFC3339)}

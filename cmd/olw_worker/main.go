@@ -237,39 +237,39 @@ func configFromEnvironment(cfg workerConfig) workerConfig {
 
 func runWorkerBatchAtVault(ctx context.Context, cfg workerConfig, commands [][]string, vault string) error {
 	if err := cleanStaleLock(vault, 5*time.Minute); err != nil {
-		return err
+		return preserveWorkerFailure(err, failureStageLeaseCleanup, failureClassStateInvalid)
 	}
 	olwEnv, err := prepareOLWEnvironment(cfg)
 	if err != nil {
-		return err
+		return preserveWorkerFailure(err, failureStageSyntoConfigValidation, failureClassIO)
 	}
 	defer cleanupOLWEnvironment(olwEnv)
 	if err := ensureSyntoVault(ctx, vault, cfg, olwEnv); err != nil {
-		return err
+		return preserveWorkerFailure(err, failureStageSyntoConfigValidation, failureClassUnknown)
 	}
 
 	stdout, stderr, closeLog, err := pipelineLogWriters(vault, cfg, commands, cfg.SuppressOutput)
 	if err != nil {
-		return err
+		return preserveWorkerFailure(err, failureStageReceiptRecording, failureClassIO)
 	}
 	runErr := runOLWBatch(ctx, vault, commands, cfg.StopOnError, olwEnv, stdout, stderr)
 	if err := closeLog(); err != nil {
-		return fmt.Errorf("close pipeline log: %w", err)
+		return preserveWorkerFailure(fmt.Errorf("close pipeline log: %w", err), failureStageReceiptRecording, failureClassIO)
 	}
 	if runErr != nil {
-		return runErr
+		return preserveWorkerFailure(runErr, failureStageSyntoRun, failureClassUnknown)
 	}
 	if cfg.Postprocess {
 		if err := ensureSyntoIndex(ctx, vault, olwEnv); err != nil {
-			return err
+			return preserveWorkerFailure(err, failureStageSyntoIndexExport, failureClassStateInvalid)
 		}
 	}
 	if err := validateSyntoPipelineSafety(filepath.Join(vault, "synto.toml")); err != nil {
-		return err
+		return preserveWorkerFailure(err, failureStageSyntoConfigValidation, failureClassValidation)
 	}
 	if cfg.Postprocess {
 		if err := runPostprocess(ctx, vault); err != nil {
-			return err
+			return preserveWorkerFailure(err, failureStagePostprocess, failureClassIO)
 		}
 	}
 	return nil
@@ -519,7 +519,7 @@ func prepareOLWEnvironment(cfg workerConfig) ([]string, error) {
 
 func runOLWBatch(ctx context.Context, vault string, commands [][]string, stopOnError bool, env []string, stdout, stderr io.Writer) error {
 	if err := validateSyntoCommandBatch(commands); err != nil {
-		return err
+		return newWorkerFailure(ctx, failureStageSyntoConfigValidation, failureClassValidation, "", err)
 	}
 	if stdout == nil {
 		stdout = os.Stdout
@@ -531,10 +531,10 @@ func runOLWBatch(ctx context.Context, vault string, commands [][]string, stopOnE
 	for i, command := range commands {
 		log.Printf("[%d/%d] synto command", i+1, len(commands))
 		if err := validateSyntoPipelineSafety(filepath.Join(vault, "synto.toml")); err != nil {
-			return err
+			return newWorkerFailure(ctx, failureStageSyntoConfigValidation, failureClassValidation, "", err)
 		}
 		if err := execOLW(ctx, vault, command, env, stdout, stderr); err != nil {
-			wrapped := fmt.Errorf("synto command failed: %w", err)
+			wrapped := fmt.Errorf("synto command failed: %w", newWorkerFailure(ctx, failureStageSyntoRun, failureClassChildExit, failureChildRun, err))
 			if stopOnError {
 				return wrapped
 			}

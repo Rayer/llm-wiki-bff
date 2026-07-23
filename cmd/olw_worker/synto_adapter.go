@@ -30,133 +30,144 @@ import (
 // alter the source or generated page byte streams.
 func ensureSyntoVault(ctx context.Context, vault string, cfg workerConfig, env []string) error {
 	if err := validateSyntoVaultLayout(vault); err != nil {
-		return err
+		return newWorkerFailure(ctx, failureStageSyntoConfigValidation, failureClassStateInvalid, "", err)
 	}
 	syntoConfig := filepath.Join(vault, "synto.toml")
 	configInfo, configErr := os.Lstat(syntoConfig)
 	if configErr == nil {
 		if !configInfo.Mode().IsRegular() {
-			return errors.New("synto.toml is not a regular file")
+			return newWorkerFailure(ctx, failureStageSyntoConfigValidation, failureClassStateInvalid, "", errors.New("synto.toml is not a regular file"))
 		}
 		syntoState, stateErr := os.Lstat(filepath.Join(vault, ".synto", "state.db"))
 		if stateErr != nil && !errors.Is(stateErr, os.ErrNotExist) {
-			return fmt.Errorf("stat .synto/state.db: %w", stateErr)
+			return newWorkerFailure(ctx, failureStageSyntoConfigValidation, failureClassIO, "", fmt.Errorf("stat .synto/state.db: %w", stateErr))
 		}
 		if errors.Is(stateErr, os.ErrNotExist) {
 			if _, err := os.Lstat(filepath.Join(vault, ".synto")); err == nil {
-				return errors.New("Synto directory exists without .synto/state.db")
+				return newWorkerFailure(ctx, failureStageSyntoConfigValidation, failureClassStateInvalid, "", errors.New("Synto directory exists without .synto/state.db"))
 			} else if !errors.Is(err, os.ErrNotExist) {
-				return fmt.Errorf("stat .synto: %w", err)
+				return newWorkerFailure(ctx, failureStageSyntoConfigValidation, failureClassIO, "", fmt.Errorf("stat .synto: %w", err))
 			}
 			_, legacyConfigErr := os.Lstat(filepath.Join(vault, "wiki.toml"))
 			_, legacyStateErr := os.Lstat(filepath.Join(vault, ".olw", "state.db"))
 			if legacyConfigErr == nil || legacyStateErr == nil {
-				return errors.New("incoherent migrated state: legacy artifacts exist without .synto/state.db")
+				return newWorkerFailure(ctx, failureStageSyntoConfigValidation, failureClassStateInvalid, "", errors.New("incoherent migrated state: legacy artifacts exist without .synto/state.db"))
 			}
 			if !errors.Is(legacyConfigErr, os.ErrNotExist) {
-				return fmt.Errorf("stat wiki.toml: %w", legacyConfigErr)
+				return newWorkerFailure(ctx, failureStageSyntoConfigValidation, failureClassIO, "", fmt.Errorf("stat wiki.toml: %w", legacyConfigErr))
 			}
 			if !errors.Is(legacyStateErr, os.ErrNotExist) {
-				return fmt.Errorf("stat .olw/state.db: %w", legacyStateErr)
+				return newWorkerFailure(ctx, failureStageSyntoConfigValidation, failureClassIO, "", fmt.Errorf("stat .olw/state.db: %w", legacyStateErr))
 			}
 			if err := validateOLWWithoutState(vault); err != nil {
-				return err
+				return newWorkerFailure(ctx, failureStageSyntoConfigValidation, failureClassStateInvalid, "", err)
 			}
 		} else if !syntoState.Mode().IsRegular() {
-			return errors.New(".synto/state.db is not a regular file")
+			return newWorkerFailure(ctx, failureStageSyntoConfigValidation, failureClassStateInvalid, "", errors.New(".synto/state.db is not a regular file"))
 		} else if err := validateSQLiteArtifact(vault, ".synto/state.db"); err != nil {
-			return fmt.Errorf("invalid .synto/state.db: %w", err)
+			return newWorkerFailure(ctx, failureStageSyntoConfigValidation, failureClassStateInvalid, "", fmt.Errorf("invalid .synto/state.db: %w", err))
 		}
 		if _, err := os.Lstat(filepath.Join(vault, ".olw", "state.db")); err == nil {
 			if err := validateSQLiteArtifact(vault, ".olw/state.db"); err != nil {
-				return fmt.Errorf("invalid .olw/state.db: %w", err)
+				return newWorkerFailure(ctx, failureStageSyntoConfigValidation, failureClassStateInvalid, "", fmt.Errorf("invalid .olw/state.db: %w", err))
 			}
 		} else if !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("stat .olw/state.db: %w", err)
+			return newWorkerFailure(ctx, failureStageSyntoConfigValidation, failureClassIO, "", fmt.Errorf("stat .olw/state.db: %w", err))
 		}
 		if _, err := os.Lstat(filepath.Join(vault, ".olw", "state.db")); errors.Is(err, os.ErrNotExist) {
 			if err := validateOLWWithoutState(vault); err != nil {
-				return err
+				return newWorkerFailure(ctx, failureStageSyntoConfigValidation, failureClassStateInvalid, "", err)
 			}
 		}
 		// Existing Synto configuration is user/migration-owned. The worker may
 		// create a safe default, but must not rewrite an existing config while
 		// preparing a fresh or migrated generation.
-		return validateSyntoPipelineSafety(syntoConfig)
+		if err := validateSyntoPipelineSafety(syntoConfig); err != nil {
+			return newWorkerFailure(ctx, failureStageSyntoConfigValidation, failureClassValidation, "", err)
+		}
+		return nil
 	} else if !errors.Is(configErr, os.ErrNotExist) {
-		return fmt.Errorf("stat synto.toml: %w", configErr)
+		return newWorkerFailure(ctx, failureStageSyntoConfigValidation, failureClassIO, "", fmt.Errorf("stat synto.toml: %w", configErr))
 	}
 
 	if _, err := os.Lstat(filepath.Join(vault, ".synto")); err == nil {
-		return errors.New("Synto state exists without synto.toml")
+		return newWorkerFailure(ctx, failureStageSyntoConfigValidation, failureClassStateInvalid, "", errors.New("Synto state exists without synto.toml"))
 	} else if !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("stat .synto: %w", err)
+		return newWorkerFailure(ctx, failureStageSyntoConfigValidation, failureClassIO, "", fmt.Errorf("stat .synto: %w", err))
 	}
 
 	legacyConfigInfo, legacyConfigErr := os.Lstat(filepath.Join(vault, "wiki.toml"))
 	if legacyConfigErr != nil && !errors.Is(legacyConfigErr, os.ErrNotExist) {
-		return fmt.Errorf("stat wiki.toml: %w", legacyConfigErr)
+		return newWorkerFailure(ctx, failureStageSyntoConfigValidation, failureClassIO, "", fmt.Errorf("stat wiki.toml: %w", legacyConfigErr))
 	}
 	legacyState, legacyStateErr := os.Lstat(filepath.Join(vault, ".olw", "state.db"))
 	if legacyStateErr != nil && !errors.Is(legacyStateErr, os.ErrNotExist) {
-		return fmt.Errorf("stat .olw/state.db: %w", legacyStateErr)
+		return newWorkerFailure(ctx, failureStageSyntoConfigValidation, failureClassIO, "", fmt.Errorf("stat .olw/state.db: %w", legacyStateErr))
 	}
 	legacyConfigPresent := legacyConfigErr == nil
 	legacyStatePresent := legacyStateErr == nil
 	if !legacyStatePresent {
 		if err := validateOLWWithoutState(vault); err != nil {
-			return err
+			return newWorkerFailure(ctx, failureStageSyntoConfigValidation, failureClassStateInvalid, "", err)
 		}
 	}
 	if legacyConfigPresent != legacyStatePresent {
-		return errors.New("incoherent legacy migration state: wiki.toml and .olw/state.db must appear together")
+		return newWorkerFailure(ctx, failureStageSyntoConfigValidation, failureClassStateInvalid, "", errors.New("incoherent legacy migration state: wiki.toml and .olw/state.db must appear together"))
 	}
 	if legacyStatePresent {
 		if !legacyState.Mode().IsRegular() || !legacyConfigInfo.Mode().IsRegular() {
-			return errors.New("legacy migration artifacts are not regular files")
+			return newWorkerFailure(ctx, failureStageSyntoMigration, failureClassStateInvalid, "", errors.New("legacy migration artifacts are not regular files"))
 		}
 		if err := validateSQLiteArtifact(vault, ".olw/state.db"); err != nil {
-			return fmt.Errorf("invalid .olw/state.db: %w", err)
+			return newWorkerFailure(ctx, failureStageSyntoMigration, failureClassStateInvalid, "", fmt.Errorf("invalid .olw/state.db: %w", err))
 		}
 		before, err := snapshotMigrationInputs(vault)
 		if err != nil {
-			return err
+			return newWorkerFailure(ctx, failureStageSyntoMigration, failureClassStateInvalid, "", err)
 		}
 		if err := execOLW(ctx, vault, []string{"migrate-olw", "--vault", vault}, env, io.Discard, io.Discard); err != nil {
-			return fmt.Errorf("Synto OLW migration failed: %w", err)
+			return fmt.Errorf("Synto OLW migration failed: %w", newWorkerFailure(ctx, failureStageSyntoMigration, failureClassChildExit, failureChildMigrateOLW, err))
 		}
 		after, err := snapshotMigrationInputs(vault)
 		if err != nil {
-			return err
+			return newWorkerFailure(ctx, failureStageSyntoMigration, failureClassStateInvalid, "", err)
 		}
 		if !equalMigrationInputs(before, after) {
-			return errors.New("Synto migration modified raw or wiki inputs")
+			return newWorkerFailure(ctx, failureStageSyntoMigration, failureClassStateInvalid, "", errors.New("Synto migration modified raw or wiki inputs"))
 		}
 		if info, err := os.Lstat(syntoConfig); err != nil {
-			return fmt.Errorf("Synto migration did not produce synto.toml: %w", err)
+			return newWorkerFailure(ctx, failureStageSyntoMigration, failureClassStateInvalid, "", fmt.Errorf("Synto migration did not produce synto.toml: %w", err))
 		} else if !info.Mode().IsRegular() {
-			return errors.New("Synto migration produced a non-regular synto.toml")
+			return newWorkerFailure(ctx, failureStageSyntoMigration, failureClassStateInvalid, "", errors.New("Synto migration produced a non-regular synto.toml"))
 		}
 		if info, err := os.Lstat(filepath.Join(vault, ".synto")); err != nil {
-			return fmt.Errorf("Synto migration did not produce .synto state: %w", err)
+			return newWorkerFailure(ctx, failureStageSyntoMigration, failureClassStateInvalid, "", fmt.Errorf("Synto migration did not produce .synto state: %w", err))
 		} else if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-			return errors.New("Synto migration produced an unsafe .synto directory")
+			return newWorkerFailure(ctx, failureStageSyntoMigration, failureClassStateInvalid, "", errors.New("Synto migration produced an unsafe .synto directory"))
 		}
 		if info, err := os.Lstat(filepath.Join(vault, ".synto", "state.db")); err != nil {
-			return fmt.Errorf("Synto migration did not produce .synto/state.db: %w", err)
+			return newWorkerFailure(ctx, failureStageSyntoMigration, failureClassStateInvalid, "", fmt.Errorf("Synto migration did not produce .synto/state.db: %w", err))
 		} else if !info.Mode().IsRegular() {
-			return errors.New("Synto migration produced a non-regular .synto/state.db")
+			return newWorkerFailure(ctx, failureStageSyntoMigration, failureClassStateInvalid, "", errors.New("Synto migration produced a non-regular .synto/state.db"))
 		}
 		if err := validateSQLiteArtifact(vault, ".synto/state.db"); err != nil {
-			return fmt.Errorf("invalid migrated .synto/state.db: %w", err)
+			return newWorkerFailure(ctx, failureStageSyntoMigration, failureClassStateInvalid, "", fmt.Errorf("invalid migrated .synto/state.db: %w", err))
 		}
 		if err := normalizeMigratedSyntoConfig(vault); err != nil {
-			return fmt.Errorf("normalize migrated synto.toml: %w", err)
+			class := failureClassValidation
+			var pathErr *os.PathError
+			if errors.As(err, &pathErr) {
+				class = failureClassIO
+			}
+			return fmt.Errorf("normalize migrated synto.toml: %w", newWorkerFailure(ctx, failureStageSyntoConfigNormalization, class, "", err))
 		}
-		return validateSyntoPipelineSafety(syntoConfig)
+		if err := validateSyntoPipelineSafety(syntoConfig); err != nil {
+			return newWorkerFailure(ctx, failureStageSyntoConfigValidation, failureClassValidation, "", err)
+		}
+		return nil
 	}
 	if legacyConfigPresent {
-		return errors.New("legacy wiki.toml exists without .olw/state.db")
+		return newWorkerFailure(ctx, failureStageSyntoMigration, failureClassStateInvalid, "", errors.New("legacy wiki.toml exists without .olw/state.db"))
 	}
 
 	const config = `[providers.default]
@@ -185,12 +196,15 @@ max_concepts_per_source = 8
 ingest_parallel = false
 `
 	if strings.TrimSpace(cfg.APIKey) == "" {
-		return errors.New("missing API key: set --api-key or LLM_API_KEY to create synto.toml")
+		return newWorkerFailure(ctx, failureStageSyntoConfigValidation, failureClassValidation, "", errors.New("missing API key: set --api-key or LLM_API_KEY to create synto.toml"))
 	}
 	if err := writeFileAtomicWithin(vault, "synto.toml", []byte(config)); err != nil {
-		return fmt.Errorf("write synto.toml: %w", err)
+		return newWorkerFailure(ctx, failureStageSyntoConfigValidation, failureClassIO, "", fmt.Errorf("write synto.toml: %w", err))
 	}
-	return validateSyntoPipelineSafety(syntoConfig)
+	if err := validateSyntoPipelineSafety(syntoConfig); err != nil {
+		return newWorkerFailure(ctx, failureStageSyntoConfigValidation, failureClassValidation, "", err)
+	}
+	return nil
 }
 
 // validateSyntoVaultLayout rejects symlinked control/state paths before any
@@ -806,7 +820,7 @@ func readSyntoIndexTruth(workspace string) (syntoIndexTruth, error) {
 func ensureSyntoIndex(ctx context.Context, vault string, env []string) error {
 	exportDir, err := os.MkdirTemp("", "lwc-synto-index-")
 	if err != nil {
-		return fmt.Errorf("create Synto INDEX export directory: %w", err)
+		return newWorkerFailure(ctx, failureStageSyntoIndexExport, failureClassIO, "", fmt.Errorf("create Synto INDEX export directory: %w", err))
 	}
 	defer os.RemoveAll(exportDir)
 	command := []string{"pack", "export", "--target", "agents", "--out", exportDir}
@@ -822,23 +836,23 @@ func ensureSyntoIndex(ctx context.Context, vault string, env []string) error {
 		}
 	}
 	if err := execOLW(ctx, vault, command, env, io.Discard, io.Discard); err != nil {
-		return fmt.Errorf("Synto offline INDEX export failed: %w", err)
+		return fmt.Errorf("Synto offline INDEX export failed: %w", newWorkerFailure(ctx, failureStageSyntoIndexExport, failureClassChildExit, failureChildPackExport, err))
 	}
 	data, err := readBoundedRegularFileWithin(exportDir, "index/INDEX.json")
 	if err != nil {
 		// Existing unit fixtures predate the production export gate and replace
 		// the executor with a no-op. Keep those fixtures focused on reconciliation;
 		// the real executor remains fail-closed when the documented export is absent.
-		return fmt.Errorf("Synto offline INDEX export missing index/INDEX.json: %w", err)
+		return newWorkerFailure(ctx, failureStageSyntoIndexExport, failureClassStateInvalid, "", fmt.Errorf("Synto offline INDEX export missing index/INDEX.json: %w", err))
 	}
 	if _, err := decodeSyntoIndex(data); err != nil {
-		return fmt.Errorf("Synto offline INDEX export is invalid: %w", err)
+		return newWorkerFailure(ctx, failureStageSyntoIndexExport, failureClassStateInvalid, "", fmt.Errorf("Synto offline INDEX export is invalid: %w", err))
 	}
 	if err := writeFileAtomicWithin(vault, ".synto/INDEX.json", data); err != nil {
-		return fmt.Errorf("install authoritative .synto/INDEX.json: %w", err)
+		return newWorkerFailure(ctx, failureStageSyntoIndexExport, failureClassIO, "", fmt.Errorf("install authoritative .synto/INDEX.json: %w", err))
 	}
 	if _, err := readSyntoIndexTruth(vault); err != nil {
-		return fmt.Errorf("validate installed .synto/INDEX.json: %w", err)
+		return newWorkerFailure(ctx, failureStageSyntoIndexExport, failureClassStateInvalid, "", fmt.Errorf("validate installed .synto/INDEX.json: %w", err))
 	}
 	return nil
 }
