@@ -21,8 +21,14 @@ func TestDeployWorkerWorkflowContract(t *testing.T) {
 	}
 	workflow := string(data)
 	for _, want := range []string{
-		"branches: [develop, main]",
+		"push:\n    branches: [main]",
 		"workflow_dispatch:",
+	} {
+		if !strings.Contains(workflow, want) {
+			t.Fatalf("worker dev workflow is missing trigger contract %q", want)
+		}
+	}
+	for _, want := range []string{
 		"group: deploy-olw-pipeline-dev",
 		"cancel-in-progress: true",
 		"actions/setup-go@v5",
@@ -55,6 +61,13 @@ func TestDeployWorkerWorkflowContract(t *testing.T) {
 	}
 	if strings.Count(workflow, "git rev-parse \"origin/${SOURCE_BRANCH}\"") != 2 {
 		t.Fatal("workflow must recheck the selected source branch before and after the job update")
+	}
+	if !strings.Contains(workflow, `case "${GITHUB_REF_NAME}" in
+            develop|main) SOURCE_BRANCH="${GITHUB_REF_NAME}" ;;`) {
+		t.Fatal("worker workflow must allow only develop and main runtime sources")
+	}
+	if strings.Contains(workflow, "feature|develop|main)") || strings.Contains(workflow, "*) SOURCE_BRANCH") {
+		t.Fatal("worker workflow must fail closed for arbitrary source refs")
 	}
 	if !strings.Contains(workflow, "newer serialized workflow must supersede") {
 		t.Fatal("workflow must explain that a newer serialized workflow supersedes an out-of-order deployment")

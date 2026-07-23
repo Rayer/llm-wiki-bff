@@ -23,8 +23,8 @@ its `BUCKET` value, and that both `volumes` and `volumeMounts` are empty.
 
 ## GitHub Actions
 
-- `CI` runs vet and tests on `main`, `develop`, and pull requests targeting either branch. It has no legacy k3s deployment step.
-- `Deploy BFF to Cloud Run (dev)` runs from `develop` and `main`, vets and tests the commit, builds one image tagged with the full commit SHA, and deploys that exact image only to `llm-wiki-bff-dev` with the dev bucket, named database, pipeline job, CORS origins, and `DEV_JWT=false`.
+- `CI` integrates changes on `main` and `develop` and pull requests targeting either branch. It has no legacy k3s deployment step.
+- Development feature releases are manually dispatched from canonical `develop` for the BFF and worker. Each release vets and tests the commit, builds one image tagged with the full commit SHA, and deploys that exact image to the development resources. Pushes to `main` still run the dev build/deploy workflows to create exact-main development provenance.
 - `Promote BFF to Cloud Run (production)` is manually dispatched with a full commit SHA. Configure required reviewers on the `production` GitHub environment to enforce the release gate; the workflow requires that SHA to be an ancestor of `main`, verifies a successful exact-SHA `main` dev run, downloads its SHA-named digest artifact, and deploys that digest without rebuilding or resolving an environment tag. After each successful deployment, the workflow adds a unique immutable `:dev-${GITHUB_SHA}` or `:prod-<validated commit SHA>` tag to the exact deployed digest for observability only; these tags are never build or promotion inputs.
 
 The commit-SHA image tag identifies the immutable dev build, and the validated `repository@sha256:...` digest identifies the immutable image promoted to production. The `:dev-${GITHUB_SHA}` and `:prod-<validated commit SHA>` tags are unique immutable deployment records; the digest remains the source of truth.
