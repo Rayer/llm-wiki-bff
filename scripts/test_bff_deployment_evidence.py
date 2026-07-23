@@ -1,0 +1,288 @@
+#!/usr/bin/env python3
+import json
+import os
+from pathlib import Path
+import stat
+import subprocess
+import tempfile
+import textwrap
+import unittest
+
+
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPT = ROOT / "scripts" / "render_bff_deployment_evidence.py"
+DIGEST = "sha256:" + "b" * 64
+PRIOR_DIGEST = "sha256:" + "a" * 64
+AR_REPO = "asia-east1-docker.pkg.dev/llm-wiki-cloud/cloud-run-images"
+IMAGE = f"{AR_REPO}/llm-wiki-bff@{DIGEST}"
+PRIOR_IMAGE = f"{AR_REPO}/llm-wiki-bff@{PRIOR_DIGEST}"
+SA = "lwc-bff-prod@llm-wiki-cloud.iam.gserviceaccount.com"
+JOB = "olw-pipeline"
+SERVICE = "llm-wiki-bff"
+ARTIFACT = "bff-deployment-evidence-" + "c" * 40
+
+
+def env_entries():
+    return [
+        {"name": "GCP_PROJECT", "value": "llm-wiki-cloud"},
+        {"name": "BUCKET", "value": "llm-wiki-data"},
+        {"name": "FIRESTORE_DATABASE_ID", "value": "llm-wiki-cloud-prod"},
+        {"name": "PIPELINE_JOB_URL", "value": "https://run.googleapis.com/v2/projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline:run"},
+        {"name": "ALLOWED_ORIGINS", "value": "https://wiki.rayer.idv.tw,https://llm-wiki-frontend.vercel.app"},
+        {"name": "DEV_JWT", "value": "false"},
+        {"name": "JWT_SECRET", "valueSource": {"secretKeyRef": {"secret": "jwt-secret-prod", "version": "latest"}}},
+        {"name": "DEEPSEEK_API_KEY", "valueSource": {"secretKeyRef": {"secret": "deepseek-apikey", "version": "latest"}}},
+    ]
+
+
+def service(revision, image, traffic):
+    return {
+        "metadata": {"name": SERVICE, "annotations": {"run.googleapis.com/ingress": "all"}},
+        "spec": {"template": {"metadata": {"annotations": {
+            "run.googleapis.com/vpc-access-egress": "private-ranges-only",
+            "run.googleapis.com/network-interfaces": '[{"network":"default","subnetwork":"default"}]',
+        }}, "spec": {"serviceAccountName": SA, "containers": [{"image": image, "env": env_entries()}]}}},
+        "status": {"url": "https://llm-wiki-bff-abc-asia-east1.a.run.app", "latestReadyRevisionName": revision, "traffic": traffic},
+    }
+
+
+def revision(name, image, digest=DIGEST):
+    return {"metadata": {"name": name}, "spec": {"serviceAccountName": SA, "containers": [{"image": image, "env": env_entries()}]}, "status": {"imageDigest": digest}}
+
+
+class BFFDeploymentEvidenceTest(unittest.TestCase):
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.root = Path(self.tempdir.name)
+        self.bin = self.root / "bin"
+        self.bin.mkdir()
+        gcloud = self.bin / "gcloud"
+        gcloud.write_text(textwrap.dedent(r'''
+            #!/usr/bin/env python3
+            import json, os, sys
+            from pathlib import Path
+            args = sys.argv[1:]
+            log = Path(os.environ["FAKE_LOG"])
+            log.write_text(log.read_text() + "gcloud " + " ".join(args) + "\n" if log.exists() else "gcloud " + " ".join(args) + "\n")
+            if os.environ.get("FAKE_PROVIDER_FAILURE") == "1":
+                raise SystemExit(9)
+            if args[:3] == ["run", "services", "describe"]:
+                paths = os.environ["FAKE_SERVICE_FIXTURES"].split(",")
+                state = Path(os.environ["FAKE_SERVICE_STATE"])
+                i = int(state.read_text()) if state.exists() else 0
+                state.write_text(str(i + 1))
+                print(Path(paths[min(i, len(paths) - 1)]).read_text(), end="")
+            elif args[:3] == ["run", "revisions", "describe"]:
+                print(Path(os.environ["FAKE_REVISION_FIXTURE"]).read_text(), end="")
+            elif args[:3] == ["run", "services", "get-iam-policy"]:
+                print(Path(os.environ["FAKE_SERVICE_IAM"]).read_text(), end="")
+            elif args[:3] == ["run", "jobs", "get-iam-policy"]:
+                print(Path(os.environ["FAKE_JOB_IAM"]).read_text(), end="")
+            else:
+                raise SystemExit(2)
+        ''').lstrip())
+        gcloud.chmod(gcloud.stat().st_mode | stat.S_IXUSR)
+        curl = self.bin / "curl"
+        curl.write_text(textwrap.dedent(r'''
+            #!/usr/bin/env python3
+            import json, os, sys
+            from pathlib import Path
+            args = sys.argv[1:]
+            Path(os.environ["FAKE_LOG"]).write_text(Path(os.environ["FAKE_LOG"]).read_text() + "curl " + " ".join(args) + "\n")
+            if os.environ.get("FAKE_CURL_FAILURE") == "1":
+                raise SystemExit(7)
+            headers = args[args.index("-D") + 1]
+            body = args[args.index("-o") + 1]
+            Path(headers).write_text(os.environ.get("FAKE_HEADERS", "HTTP/2 200\nCache-Control: no-store\nContent-Type: application/json\n"))
+            Path(body).write_text(os.environ["FAKE_VERSION_JSON"])
+        ''').lstrip())
+        curl.chmod(curl.stat().st_mode | stat.S_IXUSR)
+        self.before = self.root / "before.json"
+        self.after = self.root / "after.json"
+        self.prior_revision_path = self.root / "prior-revision.json"
+        self.revision_path = self.root / "revision.json"
+        self.service_iam = self.root / "service-iam.json"
+        self.job_iam = self.root / "job-iam.json"
+        self.before.write_text(json.dumps(service("llm-wiki-bff-00001-old", PRIOR_IMAGE, [{"revisionName": "llm-wiki-bff-00001-old", "percent": 100}])))
+        self.after.write_text(json.dumps(service("llm-wiki-bff-00002-new", IMAGE, [{"revisionName": "llm-wiki-bff-00002-new", "percent": 100}])))
+        self.prior_revision_path.write_text(json.dumps(revision("llm-wiki-bff-00001-old", PRIOR_IMAGE, PRIOR_DIGEST)))
+        self.revision_path.write_text(json.dumps(revision("llm-wiki-bff-00002-new", IMAGE)))
+        self.service_iam.write_text(json.dumps({"bindings": [{"role": "roles/run.invoker", "members": ["allUsers"]}]}))
+        self.job_iam.write_text(json.dumps({"bindings": [{"role": "roles/run.jobsExecutorWithOverrides", "members": [f"serviceAccount:{SA}"]}]}))
+        self.env = {**os.environ, "PATH": f"{self.bin}:{os.environ['PATH']}", "FAKE_LOG": str(self.root / "provider.log"), "FAKE_SERVICE_STATE": str(self.root / "service-state"), "FAKE_SERVICE_FIXTURES": f"{self.before},{self.before}", "FAKE_REVISION_FIXTURE": str(self.prior_revision_path), "FAKE_SERVICE_IAM": str(self.service_iam), "FAKE_JOB_IAM": str(self.job_iam), "FAKE_VERSION_JSON": json.dumps({"product_version": "1.2.3", "commit": "c" * 40, "branch": "main", "tag": "", "image_tag": "c" * 40, "service": SERVICE, "revision": "llm-wiki-bff-00002-new"})}
+
+    def tearDown(self):
+        self.tempdir.cleanup()
+
+    def invoke(self, mode, *extra):
+        return subprocess.run(["python3", str(SCRIPT), mode, "--project", "llm-wiki-cloud", "--region", "asia-east1", "--service-name", SERVICE, "--pipeline-job-name", JOB, "--ar-repo", AR_REPO, *extra], env=self.env, capture_output=True, text=True)
+
+    def metadata(self):
+        return {"schema_version": 1, "project": "llm-wiki-cloud", "component": "lwc-bff", "environment": "production", "action": "promote", "rollback_artifact_name": ARTIFACT, "source": {"commit_sha": "c" * 40, "ref": "refs/heads/main"}, "dev_provenance": {"workflow": "deploy-bff.yml", "event": "push", "head_branch": "main", "head_sha": "c" * 40, "conclusion": "success", "run_id": 123, "run_url": "https://github.com/Rayer/llm-wiki-bff/actions/runs/123"}, "image": {"digest": DIGEST, "reference": IMAGE}, "originating_workflow": {"repository": "Rayer/llm-wiki-bff", "workflow": "Promote BFF to Cloud Run (production)", "run_id": 456, "run_attempt": 2}}
+
+    def prepare(self):
+        output = self.root / "rollback.json"
+        self.custom_revision = False
+        for path in (self.root / "deployment-evidence.json", self.root / "failure.json"):
+            path.unlink(missing_ok=True)
+        self.after.write_text(json.dumps(service("llm-wiki-bff-00002-new", IMAGE, [{"revisionName": "llm-wiki-bff-00002-new", "percent": 100}])))
+        self.revision_path.write_text(self.prior_revision_path.read_text())
+        self.env["FAKE_SERVICE_FIXTURES"] = f"{self.before},{self.before}"
+        self.env["FAKE_REVISION_FIXTURE"] = str(self.prior_revision_path)
+        result = self.invoke("prepare-rollback", "--artifact-name", ARTIFACT, "--output", str(output))
+        return result, output
+
+    def render(self, metadata=None):
+        metadata = self.metadata() if metadata is None else metadata
+        metadata_path = self.root / "metadata.json"
+        metadata_path.write_text(json.dumps(metadata))
+        output = self.root / "deployment-evidence.json"
+        failure = self.root / "failure.json"
+        self.env["FAKE_SERVICE_STATE"] = str(self.root / "post-state")
+        self.env["FAKE_SERVICE_FIXTURES"] = f"{self.after},{self.after}"
+        self.env["FAKE_REVISION_FIXTURE"] = str(self.revision_path)
+        if not getattr(self, "custom_revision", False):
+            self.revision_path.write_text(json.dumps(revision("llm-wiki-bff-00002-new", IMAGE)))
+        result = self.invoke("render-evidence", "--expected-runtime-service-account", SA, "--rollback-contract", str(self.root / "rollback.json"), "--metadata", str(metadata_path), "--output", str(output), "--failure-output", str(failure))
+        return result, output, failure
+
+    def render_documents(self, observed_service, observed_revision=None):
+        self.after.write_text(json.dumps(observed_service))
+        if observed_revision is not None:
+            self.revision_path.write_text(json.dumps(observed_revision))
+            self.custom_revision = True
+        return self.render()
+
+    def test_success_is_deterministic_and_has_no_secret_values(self):
+        prepared, rollback = self.prepare()
+        self.assertEqual(prepared.returncode, 0, prepared.stderr)
+        self.assertEqual(json.loads(rollback.read_text())["ready_revision"], "llm-wiki-bff-00001-old")
+        rendered, output, _ = self.render()
+        self.assertEqual(rendered.returncode, 0, rendered.stderr)
+        document = json.loads(output.read_text())
+        self.assertEqual(document["status"], "HEALTHY")
+        self.assertEqual(document["source"]["commit_sha"], "c" * 40)
+        self.assertEqual(document["image"], {"digest": DIGEST, "reference": IMAGE})
+        self.assertEqual(document["observed_service"]["ready_revision"], "llm-wiki-bff-00002-new")
+        self.assertEqual(document["health"]["identity"]["commit"], "c" * 40)
+        self.assertNotIn("secret-value", output.read_text())
+        self.assertIn('"secret_references"', output.read_text())
+        again = self.root / "again.json"
+        output.replace(again)
+        self.env["FAKE_SERVICE_STATE"] = str(self.root / "post-state-again")
+        result = self.invoke("render-evidence", "--expected-runtime-service-account", SA, "--rollback-contract", str(rollback), "--metadata", str(self.root / "metadata.json"), "--output", str(output), "--failure-output", str(self.root / "failure-again.json"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        second = json.loads(output.read_text())
+        first_document = json.loads(again.read_text())
+        first_document["health"]["checked_at"] = second["health"]["checked_at"]
+        first_document["provider_verification"]["checked_at"] = second["provider_verification"]["checked_at"]
+        self.assertEqual(output.read_text(), json.dumps(first_document, sort_keys=True, separators=(",", ":")) + "\n")
+
+    def test_invalid_metadata_and_provider_contracts_fail_closed(self):
+        prepared, _ = self.prepare()
+        self.assertEqual(prepared.returncode, 0, prepared.stderr)
+        cases = {
+            "malformed SHA": lambda m: m["source"].update(commit_sha="bad"),
+            "duplicate digest": lambda m: m["image"].update(digest="sha256:" + "a" * 64),
+            "provenance mismatch": lambda m: m["dev_provenance"].update(head_sha="d" * 40),
+        }
+        for name, mutate in cases.items():
+            with self.subTest(name=name):
+                metadata = self.metadata()
+                mutate(metadata)
+                result, output, _ = self.render(metadata)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(output.exists())
+
+        self.env["FAKE_JOB_IAM"] = str(self.root / "missing-iam.json")
+        Path(self.env["FAKE_JOB_IAM"]).write_text(json.dumps({"bindings": []}))
+        result, _, _ = self.render()
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_provider_unavailable_is_partial_and_mismatch_is_unhealthy_with_rollback(self):
+        prepared, rollback = self.prepare()
+        self.assertEqual(prepared.returncode, 0, prepared.stderr)
+        frozen = json.loads(rollback.read_text())
+        self.env["FAKE_PROVIDER_FAILURE"] = "1"
+        result, output, failure = self.render()
+        self.assertNotEqual(result.returncode, 0)
+        partial = self.invoke("render-partial", "--rollback-contract", str(rollback), "--metadata", str(self.root / "metadata.json"), "--output", str(output), "--failure-output", str(failure))
+        self.assertEqual(partial.returncode, 0, partial.stderr)
+        document = json.loads(output.read_text())
+        self.assertEqual(document["status"], "PARTIAL")
+        self.assertEqual(document["rollback"], frozen)
+
+        self.env.pop("FAKE_PROVIDER_FAILURE")
+        self.env["FAKE_JOB_IAM"] = str(self.job_iam)
+        self.env["FAKE_VERSION_JSON"] = self.env["FAKE_VERSION_JSON"].replace('"commit": "' + "c" * 40, '"commit": "' + "d" * 40)
+        output.unlink()
+        result, output, failure = self.render()
+        self.assertNotEqual(result.returncode, 0)
+        unhealthy = self.invoke("render-partial", "--rollback-contract", str(rollback), "--metadata", str(self.root / "metadata.json"), "--output", str(output), "--failure-output", str(failure))
+        self.assertEqual(unhealthy.returncode, 0, unhealthy.stderr)
+        document = json.loads(output.read_text())
+        self.assertEqual(document["status"], "UNHEALTHY")
+        self.assertEqual(document["rollback"], frozen)
+        self.assertEqual(document["provider_verification"]["result"], "failed")
+
+    def test_provider_and_identity_mismatches_are_classified_failed(self):
+        cases = {
+            "image": lambda s, r: (s["spec"]["template"]["spec"]["containers"][0].update(image=PRIOR_IMAGE), r["spec"]["containers"][0].update(image=PRIOR_IMAGE), r["status"].update(imageDigest=PRIOR_DIGEST)),
+            "service account": lambda s, r: s["spec"].update(serviceAccountName="wrong@llm-wiki-cloud.iam.gserviceaccount.com"),
+            "network": lambda s, r: s["spec"]["template"]["metadata"]["annotations"].update({"run.googleapis.com/vpc-access-egress": "all-traffic"}),
+            "traffic": lambda s, r: s["status"].update(traffic=[{"revisionName": "llm-wiki-bff-00002-new", "percent": 50}, {"revisionName": "llm-wiki-bff-00001-old", "percent": 50}]),
+            "missing secret": lambda s, r: s["spec"]["template"]["spec"]["containers"][0]["env"].pop(),
+        }
+        for name, mutate in cases.items():
+            with self.subTest(name=name):
+                prepared, rollback = self.prepare()
+                self.assertEqual(prepared.returncode, 0, prepared.stderr)
+                observed = json.loads(self.after.read_text())
+                observed_revision = json.loads(self.revision_path.read_text())
+                mutate(observed, observed_revision)
+                result, output, failure = self.render_documents(observed, observed_revision)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(output.exists())
+                partial = self.invoke("render-partial", "--rollback-contract", str(rollback), "--metadata", str(self.root / "metadata.json"), "--output", str(output), "--failure-output", str(failure))
+                self.assertEqual(partial.returncode, 0, partial.stderr)
+                self.assertEqual(json.loads(output.read_text())["status"], "UNHEALTHY")
+
+    def test_identity_sha_cache_header_and_status_gates_fail(self):
+        for label, body, headers in [
+            ("wrong sha", self.env["FAKE_VERSION_JSON"].replace('"commit": "' + "c" * 40, '"commit": "' + "d" * 40), None),
+            ("wrong cache", None, "HTTP/2 200\nCache-Control: public\n"),
+            ("wrong status", None, "HTTP/2 503\nCache-Control: no-store\n"),
+        ]:
+            with self.subTest(label=label):
+                prepared, rollback = self.prepare()
+                self.assertEqual(prepared.returncode, 0, prepared.stderr)
+                self.env.pop("FAKE_HEADERS", None)
+                self.env["FAKE_VERSION_JSON"] = body or self.env["FAKE_VERSION_JSON"]
+                if headers is None:
+                    self.env.pop("FAKE_HEADERS", None)
+                else:
+                    self.env["FAKE_HEADERS"] = headers
+                result, output, failure = self.render()
+                self.assertNotEqual(result.returncode, 0)
+                partial = self.invoke("render-partial", "--rollback-contract", str(rollback), "--metadata", str(self.root / "metadata.json"), "--output", str(output), "--failure-output", str(failure))
+                self.assertEqual(partial.returncode, 0, partial.stderr)
+                self.assertEqual(json.loads(output.read_text())["status"], "UNHEALTHY")
+
+    def test_rollback_race_and_http_identity_gates_fail(self):
+        self.env["FAKE_SERVICE_FIXTURES"] = f"{self.before},{self.after}"
+        output = self.root / "race-rollback.json"
+        result = self.invoke("prepare-rollback", "--artifact-name", ARTIFACT, "--output", str(output))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(output.exists())
+        prepared, _ = self.prepare()
+        self.assertEqual(prepared.returncode, 0, prepared.stderr)
+        self.env["FAKE_HEADERS"] = "HTTP/2 503\nCache-Control: no-store\n"
+        result, output, failure = self.render()
+        self.assertNotEqual(result.returncode, 0)
+        partial = self.invoke("render-partial", "--rollback-contract", str(self.root / "rollback.json"), "--metadata", str(self.root / "metadata.json"), "--output", str(output), "--failure-output", str(failure))
+        self.assertEqual(partial.returncode, 0)
+        self.assertEqual(json.loads(output.read_text())["status"], "UNHEALTHY")
+
+
+if __name__ == "__main__":
+    unittest.main()

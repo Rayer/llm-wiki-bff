@@ -105,12 +105,27 @@ func TestDeployWorkflowUsesImmutableCloudBuildResultDigest(t *testing.T) {
 func TestReleaseWorkflowRequiresMainBuildProvenance(t *testing.T) {
 	contents := readWorkflow(t, ".github/workflows/release-bff.yml")
 	for _, want := range []string{
+		"concurrency:",
+		"group: promote-bff-production",
+		"cancel-in-progress: false",
 		"- name: Checkout main",
 		"ref: main",
 		"git fetch origin main --force --no-tags",
 		`git merge-base --is-ancestor "$COMMIT_SHA" origin/main`,
 		"commit_sha is not an ancestor of main",
 		`.head_branch == "main"`,
+		".html_url",
+		"run_event=",
+		"run_head_branch=",
+		"run_head_sha=",
+		"run_conclusion=",
+		"roles/run.jobsExecutorWithOverrides",
+		"get-iam-policy",
+		"scripts/render_bff_deployment_evidence.py prepare-rollback",
+		"scripts/render_bff_deployment_evidence.py render-evidence",
+		"scripts/render_bff_deployment_evidence.py render-partial",
+		"/api/v1/public/version",
+		"actions/upload-artifact@v4",
 	} {
 		if !strings.Contains(contents, want) {
 			t.Errorf("release workflow is missing main provenance contract %q", want)
@@ -118,6 +133,33 @@ func TestReleaseWorkflowRequiresMainBuildProvenance(t *testing.T) {
 	}
 	if strings.Contains(contents, "develop/1.0") {
 		t.Fatal("release workflow must not accept develop/1.0 provenance")
+	}
+}
+
+func TestReleaseWorkflowAuthenticatesOnlyAfterReadOnlyGatesAndHasOneProviderMutation(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/release-bff.yml")
+	auth := strings.Index(contents, "- name: Authenticate to Google Cloud")
+	provenance := strings.Index(contents, "- name: Locate successful main dev deployment")
+	image := strings.Index(contents, "- name: Download exact dev image digest")
+	preflight := strings.Index(contents, "- name: Verify production pipeline IAM")
+	deploy := strings.Index(contents, "gcloud run deploy")
+	if auth < 0 || provenance < 0 || image < 0 || preflight < 0 || deploy < 0 {
+		t.Fatal("release workflow is missing the source, provenance, IAM, or deploy gates")
+	}
+	if auth < provenance || auth < image || auth > preflight || preflight > deploy {
+		t.Fatal("release authentication/deploy order is not fail-closed")
+	}
+	if strings.Contains(contents, "add-iam-policy-binding") || strings.Contains(contents, "set-iam-policy") {
+		t.Fatal("production BFF release must not mutate IAM")
+	}
+	if strings.Count(contents, "gcloud run deploy") != 1 {
+		t.Fatal("production BFF release must have exactly one Cloud Run deploy mutation")
+	}
+	if strings.Count(contents, "actions/upload-artifact@v4") != 1 {
+		t.Fatal("production BFF release must upload exactly one normalized evidence artifact")
+	}
+	if strings.Index(contents, "Tag promoted production image") < strings.Index(contents, "Upload normalized deployment evidence") {
+		t.Fatal("production image tag must follow evidence upload")
 	}
 }
 
@@ -196,7 +238,7 @@ func TestDockerfileEmbedsBuildIdentityWithoutGitContext(t *testing.T) {
 func TestReleaseWorkflowPromotesExistingDigestWithoutRebuild(t *testing.T) {
 	contents := readWorkflow(t, ".github/workflows/release-bff.yml")
 	for _, want := range []string{
-		"gcloud run deploy ${{ env.SERVICE_NAME }} \\",
+		"gcloud run deploy \"$SERVICE_NAME\" \\",
 		"--image \"$IMMUTABLE_IMAGE\"",
 		"gcloud artifacts docker tags add",
 	} {
@@ -269,6 +311,15 @@ func TestBFFWorkflowsGrantOnlyMatchingRuntimeServiceAccountJobExecution(t *testi
 			assertWorkflowEnvDeclaration(t, contents, "RUNTIME_SERVICE_ACCOUNT", tc.runtimeServiceAcc)
 
 			commands := iamBindingCommands(contents)
+			if tc.name == "production" {
+				if len(commands) != 0 {
+					t.Fatalf("production workflow has %d IAM mutation commands, want none", len(commands))
+				}
+				if !strings.Contains(contents, "gcloud run jobs get-iam-policy") {
+					t.Fatal("production workflow must preflight the existing job IAM binding read-only")
+				}
+				return
+			}
 			if len(commands) != 1 {
 				t.Fatalf("workflow has %d gcloud run jobs add-iam-policy-binding commands, want exactly 1", len(commands))
 			}
