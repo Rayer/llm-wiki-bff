@@ -21,20 +21,23 @@ from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
-from click.testing import CliRunner
+bundle_helper_test = sys.argv[1:] == ["--test-publish-bridge-bundle"]
 
-import synto
-import synto.client_factory as client_factory
-from synto.cli import _load_config, cli
-from synto.pipeline.compile import _content_hash as compile_content_hash
-from synto.pipeline.ingest import _content_hash as ingest_content_hash
-from synto.pipeline.ingest import _ingest_prompt_version
-from synto.models import RawNoteRecord, WikiArticleRecord
-from synto.state import StateDB
-from synto.vault import parse_note, write_note
+if not bundle_helper_test:
+    from click.testing import CliRunner
+
+    import synto
+    import synto.client_factory as client_factory
+    from synto.cli import _load_config, cli
+    from synto.pipeline.compile import _content_hash as compile_content_hash
+    from synto.pipeline.ingest import _content_hash as ingest_content_hash
+    from synto.pipeline.ingest import _ingest_prompt_version
+    from synto.models import RawNoteRecord, WikiArticleRecord
+    from synto.state import StateDB
+    from synto.vault import parse_note, write_note
 
 
-if synto.__version__ != "0.7.0":
+if not bundle_helper_test and synto.__version__ != "0.7.0":
     raise SystemExit(f"expected synto 0.7.0, got {synto.__version__}")
 
 
@@ -133,31 +136,38 @@ def seed_bridge_article(vault: Path) -> None:
         db.close()
 
 
-run1_output = os.environ.get("LWC195_EXACT_INDEX_RUN1_PATH")
-run2_output = os.environ.get("LWC195_EXACT_INDEX_RUN2_PATH")
-raw_output = os.environ.get("LWC195_RAW_SOURCE_PATH")
-if not run1_output or not run2_output or not raw_output:
+run1_output = (os.environ.get("LWC195_EXACT_INDEX_RUN1_PATH") or "").strip()
+run2_output = (os.environ.get("LWC195_EXACT_INDEX_RUN2_PATH") or "").strip()
+raw_output = (os.environ.get("LWC195_RAW_SOURCE_PATH") or "").strip()
+config_output = (os.environ.get("LWC197_MIGRATED_CONFIG_PATH") or "").strip()
+if not bundle_helper_test and not all((run1_output, run2_output, raw_output, config_output)):
     raise SystemExit(
         "set LWC195_EXACT_INDEX_RUN1_PATH, LWC195_EXACT_INDEX_RUN2_PATH, "
-        "and LWC195_RAW_SOURCE_PATH for the bridge artifacts"
+        "LWC195_RAW_SOURCE_PATH, and LWC197_MIGRATED_CONFIG_PATH "
+        "for the bridge artifact bundle"
     )
 
 
-def clear_bridge_destinations() -> None:
+def clear_bridge_destinations(destinations: list[Path]) -> None:
     """Ensure a failed invocation cannot be mistaken for a prior successful bridge."""
-    for value in (run1_output, run2_output, raw_output):
-        path = Path(value).expanduser()
+    for path in destinations:
+        path = path.expanduser()
         if path.exists() and not path.is_file():
             raise AssertionError(f"bridge destination is not a regular file: {path}")
         path.unlink(missing_ok=True)
 
 
-clear_bridge_destinations()
+def bridge_destinations() -> list[Path]:
+    return [
+        Path(run1_output).expanduser(),
+        Path(run2_output).expanduser(),
+        Path(raw_output).expanduser(),
+        Path(config_output).expanduser(),
+    ]
 
-baseline = os.environ.get("OLW_BASELINE_ROOT")
-if not baseline:
-    raise SystemExit("set OLW_BASELINE_ROOT to the exact OLW 0.8.5 source tree")
 
+if not bundle_helper_test:
+    clear_bridge_destinations(bridge_destinations())
 
 def publish_bridge_file(staged: Path, destination: Path) -> None:
     """Atomically publish on the destination filesystem, including bind mounts."""
@@ -173,6 +183,71 @@ def publish_bridge_file(staged: Path, destination: Path) -> None:
         os.replace(temporary, destination)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def publish_bridge_bundle(
+    staged_outputs: Path,
+    outputs: list[tuple[str, Path]],
+    publisher=publish_bridge_file,
+) -> None:
+    """Publish the complete bridge or remove every destination on failure."""
+    destinations = [destination.expanduser() for _, destination in outputs]
+    clear_bridge_destinations(destinations)
+    try:
+        for staged_name, destination in outputs:
+            publisher(staged_outputs / staged_name, destination)
+    except BaseException:
+        clear_bridge_destinations(destinations)
+        raise
+
+
+def test_publish_bridge_bundle_rolls_back_injected_failure() -> None:
+    with tempfile.TemporaryDirectory(prefix="lwc195-bridge-helper-") as temp:
+        root = Path(temp)
+        staged = root / "staged"
+        staged.mkdir()
+        outputs = [
+            ("one", root / "dest-one"),
+            ("two", root / "dest-two"),
+            ("three", root / "dest-three"),
+            ("four", root / "dest-four"),
+        ]
+        for _, destination in outputs:
+            destination.write_bytes(b"stale")
+        for staged_name, _ in outputs:
+            (staged / staged_name).write_bytes(staged_name.encode())
+
+        calls = 0
+
+        def fail_on_second(staged_path: Path, destination: Path) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise RuntimeError("injected bridge publication failure")
+            publish_bridge_file(staged_path, destination)
+
+        try:
+            publish_bridge_bundle(staged, outputs, publisher=fail_on_second)
+        except RuntimeError as error:
+            if str(error) != "injected bridge publication failure":
+                raise
+        else:
+            raise AssertionError("injected bridge publication failure was not raised")
+        if calls != 2:
+            raise AssertionError(f"injected publisher calls={calls}, want 2")
+        if any(destination.exists() for _, destination in outputs):
+            raise AssertionError("bundle rollback left a bridge destination behind")
+
+
+if bundle_helper_test:
+    test_publish_bridge_bundle_rolls_back_injected_failure()
+    print("BUNDLE_PUBLICATION_ROLLBACK=PASS")
+    raise SystemExit(0)
+
+
+baseline = os.environ.get("OLW_BASELINE_ROOT")
+if not baseline:
+    raise SystemExit("set OLW_BASELINE_ROOT to the exact OLW 0.8.5 source tree")
 
 
 def export_agents_index(vault: Path) -> bytes:
@@ -252,6 +327,7 @@ with tempfile.TemporaryDirectory(prefix="lwc195-synto-exact-") as temp:
     synto_config_before = (vault / "synto.toml").read_bytes()
     staged_outputs = Path(temp) / "bridge-output"
     staged_outputs.mkdir()
+    (staged_outputs / "migrated-synto.toml").write_bytes(synto_config_before)
 
     # Seed before exact CLI run #1. Both runs therefore exercise the same
     # non-empty article/entity state through the real orchestrator and pack
@@ -310,18 +386,21 @@ with tempfile.TemporaryDirectory(prefix="lwc195-synto-exact-") as temp:
     # Publish only after both exact CLI runs, both real pack exports, all identity/hash
     # assertions, and the manual-edit companion have passed. Each replacement is atomic;
     # destinations were cleared before the run so a failed invocation leaves no stale bridge.
-    for staged_name, destination in (
+    bridge_outputs = [
         ("run1-INDEX.json", Path(run1_output).expanduser()),
         ("run2-INDEX.json", Path(run2_output).expanduser()),
         ("source.md", Path(raw_output).expanduser()),
-    ):
-        publish_bridge_file(staged_outputs / staged_name, destination)
+        ("migrated-synto.toml", Path(config_output).expanduser()),
+    ]
+    publish_bridge_bundle(staged_outputs, bridge_outputs)
     raw_path = Path(raw_output).expanduser()
 
     # Do not emit a PASS marker until every assertion, including the companion,
     # has succeeded.
     print("SYNTO_VERSION=0.7.0")
     print("MIGRATE_OLW=PASS")
+    print(f"EXACT_MIGRATED_CONFIG_BYTES={len(synto_config_before)}")
+    print(f"EXACT_MIGRATED_CONFIG_PATH={Path(config_output).expanduser()}")
     print("STATE_DB=PASS")
     print("EXACT_CLI_RUN_1=PASS")
     print("EXACT_CLI_PACK_EXPORT_1=PASS")

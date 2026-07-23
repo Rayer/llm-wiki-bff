@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -11,7 +12,9 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/BurntSushi/toml"
 	"github.com/rayer/llm-wiki-bff/internal/generation"
 	"github.com/rayer/llm-wiki-bff/internal/wikiindex"
 )
@@ -38,6 +41,10 @@ func TestSyntoMigrationRunsPrivatelyAndPreservesInputs(t *testing.T) {
 	mustWriteFile(t, filepath.Join(vault, "wiki", "alpha.md"), []byte("wiki bytes"))
 	mustWriteFile(t, filepath.Join(vault, "wiki.toml"), []byte("legacy config"))
 	writeValidSQLiteState(t, filepath.Join(vault, ".olw", "state.db"))
+	before, err := snapshotMigrationInputs(vault)
+	if err != nil {
+		t.Fatal(err)
+	}
 	old := execOLW
 	defer func() { execOLW = old }()
 	var commands [][]string
@@ -58,11 +65,322 @@ func TestSyntoMigrationRunsPrivatelyAndPreservesInputs(t *testing.T) {
 	if len(commands) != 1 || strings.Join(commands[0], " ") != "migrate-olw --vault "+vault {
 		t.Fatalf("migration commands = %#v", commands)
 	}
-	for path, want := range map[string]string{"raw/source.md": "raw bytes", "wiki/alpha.md": "wiki bytes"} {
+	for path, want := range map[string]string{"raw/source.md": "raw bytes", "wiki/alpha.md": "wiki bytes", "wiki.toml": "legacy config"} {
 		data, err := os.ReadFile(filepath.Join(vault, filepath.FromSlash(path)))
 		if err != nil || string(data) != want {
 			t.Fatalf("migration changed %s=%q err=%v", path, data, err)
 		}
+	}
+	after, err := snapshotMigrationInputs(vault)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !equalMigrationInputs(before, after) {
+		t.Fatal("migration changed rollback artifacts")
+	}
+}
+
+func TestSyntoMigrationRejectsOversizedConfigBeforeNormalization(t *testing.T) {
+	vault := t.TempDir()
+	mustWriteFile(t, filepath.Join(vault, "wiki.toml"), []byte("legacy\n"))
+	writeValidSQLiteState(t, filepath.Join(vault, ".olw", "state.db"))
+	const normalizerLimit = 1 << 20
+	migrated := []byte("# oversized migrated config\n" + strings.Repeat("x", normalizerLimit) + "\n")
+	expected := append([]byte(nil), migrated...)
+	old := execOLW
+	t.Cleanup(func() { execOLW = old })
+	var commands [][]string
+	execOLW = func(_ context.Context, work string, command []string, _ []string, _, _ io.Writer) error {
+		commands = append(commands, append([]string(nil), command...))
+		if len(commands) != 1 || strings.Join(command, " ") != "migrate-olw --vault "+vault {
+			return fmt.Errorf("unexpected Synto command %v", command)
+		}
+		mustWriteFile(t, filepath.Join(work, "synto.toml"), migrated)
+		writeValidSQLiteState(t, filepath.Join(work, ".synto", "state.db"))
+		return nil
+	}
+
+	err := ensureSyntoVault(context.Background(), vault, workerConfig{APIKey: "unused"}, nil)
+	if err == nil || !strings.Contains(err.Error(), "normalizer input limit") {
+		t.Fatalf("oversized migrated config error = %v, want normalizer input limit", err)
+	}
+	got, readErr := os.ReadFile(filepath.Join(vault, "synto.toml"))
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if !bytes.Equal(got, expected) {
+		t.Fatalf("oversized migrated config changed: size before=%d after=%d", len(expected), len(got))
+	}
+	if len(commands) != 1 || strings.Join(commands[0], " ") != "migrate-olw --vault "+vault {
+		t.Fatalf("Synto child calls = %#v, want migration only", commands)
+	}
+}
+
+func TestSyntoLimitedEncoderStopsExpansionBeforeMaterializingOutput(t *testing.T) {
+	writer := newSyntoLimitedWriter(16)
+	err := toml.NewEncoder(writer).Encode(map[string]interface{}{"payload": strings.Repeat("x", 64)})
+	if err == nil {
+		t.Fatal("limited Synto encoder accepted output beyond its configured limit")
+	}
+	if writer.Len() > 16 {
+		t.Fatalf("limited Synto encoder materialized %d bytes beyond limit", writer.Len())
+	}
+}
+
+func TestExactSyntoBridgeEnvironmentRequiresCombinedOutputs(t *testing.T) {
+	allPaths := []string{"run1", "run2", "raw", "config"}
+	if err := validateExactSyntoBridgeEnv(allPaths...); err != nil {
+		t.Fatalf("complete bridge environment rejected: %v", err)
+	}
+	if err := validateExactSyntoBridgeEnv("", "", "", ""); err != nil {
+		t.Fatalf("unset bridge environment should be skippable: %v", err)
+	}
+	for i := range allPaths {
+		paths := append([]string(nil), allPaths...)
+		paths[i] = ""
+		if err := validateExactSyntoBridgeEnv(paths...); err == nil {
+			t.Fatalf("bridge environment missing %s was accepted", allPaths[i])
+		}
+	}
+}
+
+func TestSyntoMigrationMissingPipelineReachesRunAfterNormalization(t *testing.T) {
+	vault := t.TempDir()
+	mustWriteFile(t, filepath.Join(vault, "wiki.toml"), []byte("[models]\nfast = \"offline\"\nheavy = \"offline\"\n"))
+	writeValidSQLiteState(t, filepath.Join(vault, ".olw", "state.db"))
+	old := execOLW
+	defer func() { execOLW = old }()
+	var commands [][]string
+	execOLW = func(_ context.Context, work string, command []string, _ []string, _, _ io.Writer) error {
+		commands = append(commands, append([]string(nil), command...))
+		switch strings.Join(command, " ") {
+		case "migrate-olw --vault " + vault:
+			// Exact observed Synto 0.7.0 migrate-olw output for a legacy
+			// config containing [models]: no [pipeline] table is emitted.
+			mustWriteFile(t, filepath.Join(work, "synto.toml"), []byte("[models]\nfast = \"offline\"\nheavy = \"offline\"\n"))
+			writeValidSQLiteState(t, filepath.Join(work, ".synto", "state.db"))
+		case "run --auto-approve":
+		default:
+			return fmt.Errorf("unexpected Synto command %v", command)
+		}
+		return nil
+	}
+
+	err := runWorkerBatchAtVault(context.Background(), workerConfig{APIKey: "offline"}, [][]string{{"run", "--auto-approve"}}, vault)
+	if err != nil {
+		t.Fatalf("missing-pipeline migrated config was rejected: %v", err)
+	}
+	if len(commands) != 2 || strings.Join(commands[0], " ") != "migrate-olw --vault "+vault || strings.Join(commands[1], " ") != "run --auto-approve" {
+		t.Fatalf("Synto commands = %#v, want migration followed by run", commands)
+	}
+}
+
+func TestNormalizeMigratedSyntoConfigPreservesSemantics(t *testing.T) {
+	input := []byte(`title = "migrated"
+numbers = [1, 2, 3]
+ratios = [1.5, 2.5]
+
+[providers.default]
+name = "offline"
+url = "https://example.invalid/v1"
+options = { retries = 2, labels = ["a", "b"] }
+
+[models.fast]
+provider = "default"
+model = "offline-fast"
+ctx = 16384
+
+[unknown.nested]
+enabled = true
+limits = [1, 2, 3]
+
+[[unknown.array]]
+name = "first"
+
+[[unknown.array]]
+name = "second"
+
+[pipeline]
+auto_commit = true
+article_max_tokens = 32768
+ingest_parallel = false
+`)
+	vault := t.TempDir()
+	mustWriteFile(t, filepath.Join(vault, "synto.toml"), input)
+	if err := normalizeMigratedSyntoConfig(vault); err != nil {
+		t.Fatal(err)
+	}
+	output, err := os.ReadFile(filepath.Join(vault, "synto.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateSyntoPipelineSafety(filepath.Join(vault, "synto.toml")); err != nil {
+		t.Fatalf("normalized config is unsafe: %v", err)
+	}
+	var before, after map[string]interface{}
+	if _, err := toml.Decode(string(input), &before); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := toml.Decode(string(output), &after); err != nil {
+		t.Fatal(err)
+	}
+	if !equalSyntoConfigSemanticsWithoutSafety(before, after) {
+		t.Fatalf("normalized config changed non-safety semantics:\n%s", output)
+	}
+	pipeline, ok := after["pipeline"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("normalized pipeline = %#v", after["pipeline"])
+	}
+	for _, key := range syntoPipelineSafetyKeys {
+		if value, ok := pipeline[key].(bool); !ok || value {
+			t.Fatalf("pipeline.%s = %#v, want explicit false", key, pipeline[key])
+		}
+	}
+}
+
+func TestBurntSushiTemporalSupportAndMetadata(t *testing.T) {
+	tests := []struct {
+		name       string
+		literal    string
+		supported  bool
+		wantHour   int
+		wantOffset string
+	}{
+		{name: "offset datetime", literal: "1979-05-27T07:32:00-07:00", supported: true, wantHour: 7, wantOffset: "-07:00"},
+		{name: "local datetime", literal: "1979-05-27T07:32:00", supported: true, wantHour: 7, wantOffset: ""},
+		{name: "local date", literal: "1979-05-27", supported: true, wantHour: 0, wantOffset: ""},
+		{name: "local time", literal: "07:32:00", supported: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var document map[string]interface{}
+			metadata, err := toml.Decode("value = "+test.literal+"\n", &document)
+			if !test.supported {
+				if err == nil {
+					t.Fatalf("pinned TOML decoder unexpectedly accepted local time: %#v", document)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := metadata.Type("value"); got != "Datetime" {
+				t.Fatalf("MetaData.Type(value)=%q, want Datetime", got)
+			}
+			value, ok := document["value"].(time.Time)
+			if !ok {
+				t.Fatalf("decoded temporal value=%T %#v, want time.Time", document["value"], document["value"])
+			}
+			if value.Hour() != test.wantHour {
+				t.Fatalf("decoded hour=%d, want %d", value.Hour(), test.wantHour)
+			}
+			if test.wantOffset != "" && value.Format("-07:00") != test.wantOffset {
+				t.Fatalf("decoded offset=%q, want %q", value.Format("-07:00"), test.wantOffset)
+			}
+		})
+	}
+}
+
+func TestNormalizeMigratedSyntoConfigFailsClosedForSupportedTemporalForms(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		literal string
+	}{
+		{name: "offset datetime", literal: "1979-05-27T07:32:00-07:00"},
+		{name: "local datetime", literal: "1979-05-27T07:32:00"},
+		{name: "local date", literal: "1979-05-27"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			input := []byte("created = " + test.literal + "\n\n[pipeline]\nauto_commit = true\n")
+			vault := t.TempDir()
+			path := filepath.Join(vault, "synto.toml")
+			mustWriteFile(t, path, input)
+			if err := normalizeMigratedSyntoConfig(vault); err == nil || !strings.Contains(err.Error(), "temporal") {
+				t.Fatalf("temporal config error=%v, want fail-closed temporal error", err)
+			}
+			got, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(got, input) {
+				t.Fatalf("failed temporal normalization changed original bytes: %q", got)
+			}
+			entries, err := os.ReadDir(vault)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, entry := range entries {
+				if strings.HasPrefix(entry.Name(), ".atomic-") {
+					t.Fatalf("failed temporal normalization left temporary file %q", entry.Name())
+				}
+			}
+		})
+	}
+}
+
+func TestEqualSyntoTOMLValuesDoesNotCollapseTemporalRepresentations(t *testing.T) {
+	offset := time.Date(1979, 5, 27, 7, 32, 0, 0, time.FixedZone("-0700", -7*60*60))
+	utc := offset.UTC()
+	if offset.Equal(utc) != true {
+		t.Fatal("test temporal values do not represent the same instant")
+	}
+	if equalSyntoTOMLValues(offset, utc) {
+		t.Fatal("equalSyntoTOMLValues collapsed distinct temporal representations")
+	}
+}
+
+func TestNormalizeMigratedSyntoConfigCreatesMissingPipeline(t *testing.T) {
+	vault := t.TempDir()
+	mustWriteFile(t, filepath.Join(vault, "synto.toml"), []byte("[models]\nfast = \"offline\"\n"))
+	if err := normalizeMigratedSyntoConfig(vault); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(vault, "synto.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "[pipeline]") {
+		t.Fatalf("normalized config has no pipeline table: %s", data)
+	}
+	if err := validateSyntoPipelineSafetyBytes(data); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestNormalizeMigratedSyntoConfigFailsClosedWithoutPartialWrite(t *testing.T) {
+	tests := map[string]string{
+		"malformed":                "[pipeline]\nauto_commit = false\nnot valid",
+		"duplicate key":            "[pipeline]\nauto_commit = false\nauto_commit = true",
+		"duplicate table":          "[pipeline]\nauto_commit = false\n\n[pipeline]\nauto_maintain = false",
+		"non-boolean safety value": "[pipeline]\nauto_commit = \"false\"",
+		"non-table pipeline":       "pipeline = true",
+	}
+	for name, input := range tests {
+		t.Run(name, func(t *testing.T) {
+			vault := t.TempDir()
+			path := filepath.Join(vault, "synto.toml")
+			before := []byte(input)
+			mustWriteFile(t, path, before)
+			if err := normalizeMigratedSyntoConfig(vault); err == nil {
+				t.Fatal("invalid migrated config was accepted")
+			}
+			after, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(before, after) {
+				t.Fatalf("failed normalization changed config: %q", after)
+			}
+			entries, err := os.ReadDir(vault)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, entry := range entries {
+				if strings.HasPrefix(entry.Name(), ".atomic-") {
+					t.Fatalf("failed normalization left temporary file %q", entry.Name())
+				}
+			}
+		})
 	}
 }
 
@@ -168,6 +486,32 @@ func TestSyntoConfigMaterializationIsIndependentAndBytePreserving(t *testing.T) 
 	}
 }
 
+func TestExistingSafeSyntoConfigIsByteIdenticalAndSkipsMigration(t *testing.T) {
+	vault := t.TempDir()
+	config := []byte("# user-owned\n[pipeline]\nauto_commit = false\nauto_maintain = false\nrelation_extraction = false\n")
+	mustWriteFile(t, filepath.Join(vault, "synto.toml"), config)
+	old := execOLW
+	defer func() { execOLW = old }()
+	childCalls := 0
+	execOLW = func(context.Context, string, []string, []string, io.Writer, io.Writer) error {
+		childCalls++
+		return errors.New("migration must not run for an existing Synto config")
+	}
+	if err := ensureSyntoVault(context.Background(), vault, workerConfig{APIKey: "unused"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(filepath.Join(vault, "synto.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, config) {
+		t.Fatalf("existing safe config changed: %q", got)
+	}
+	if childCalls != 0 {
+		t.Fatalf("existing safe config made %d migration/child calls", childCalls)
+	}
+}
+
 func TestSyntoPipelineSafetyRejectsUnsafeEffectiveValues(t *testing.T) {
 	tests := map[string]string{
 		"omitted auto_commit": `[pipeline]
@@ -256,7 +600,7 @@ label = "relation_extraction = true"
 	}
 }
 
-func TestSyntoPipelineSafetyRejectsUnsafeMigratedConfig(t *testing.T) {
+func TestSyntoPipelineSafetyNormalizesMigratedConfig(t *testing.T) {
 	vault := t.TempDir()
 	mustWriteFile(t, filepath.Join(vault, "wiki.toml"), []byte("legacy\n"))
 	writeValidSQLiteState(t, filepath.Join(vault, ".olw", "state.db"))
@@ -268,15 +612,25 @@ func TestSyntoPipelineSafetyRejectsUnsafeMigratedConfig(t *testing.T) {
 		if strings.Join(command, " ") != "migrate-olw --vault "+vault {
 			return fmt.Errorf("unexpected migration command %v", command)
 		}
-		mustWriteFile(t, filepath.Join(work, "synto.toml"), []byte("[pipeline]\nrelation_extraction = false\n"))
+		mustWriteFile(t, filepath.Join(work, "synto.toml"), []byte("[pipeline]\nauto_commit = true\narticle_max_tokens = 32768\n"))
 		writeValidSQLiteState(t, filepath.Join(work, ".synto", "state.db"))
 		return nil
 	}
-	if err := ensureSyntoVault(context.Background(), vault, workerConfig{APIKey: "unused"}, nil); err == nil {
-		t.Fatal("unsafe migrated Synto configuration was accepted")
+	if err := ensureSyntoVault(context.Background(), vault, workerConfig{APIKey: "unused"}, nil); err != nil {
+		t.Fatalf("migrated Synto configuration was not normalized: %v", err)
 	}
 	if migrationCalls != 1 {
 		t.Fatalf("migration calls = %d, want 1", migrationCalls)
+	}
+	data, err := os.ReadFile(filepath.Join(vault, "synto.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateSyntoPipelineSafetyBytes(data); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "article_max_tokens = 32768") {
+		t.Fatalf("normalization discarded unrelated pipeline field: %s", data)
 	}
 }
 
@@ -604,8 +958,12 @@ func TestExactSyntoPackExportBridge(t *testing.T) {
 	run1Path := strings.TrimSpace(os.Getenv("LWC195_EXACT_INDEX_RUN1_PATH"))
 	run2Path := strings.TrimSpace(os.Getenv("LWC195_EXACT_INDEX_RUN2_PATH"))
 	rawPath := strings.TrimSpace(os.Getenv("LWC195_RAW_SOURCE_PATH"))
-	if run1Path == "" || run2Path == "" || rawPath == "" {
-		t.Skip("set both exact INDEX paths and LWC195_RAW_SOURCE_PATH for the bridge")
+	configPath := strings.TrimSpace(os.Getenv("LWC197_MIGRATED_CONFIG_PATH"))
+	if err := validateExactSyntoBridgeEnv(run1Path, run2Path, rawPath, configPath); err != nil {
+		t.Fatal(err)
+	}
+	if run1Path == "" {
+		t.Skip("set the four exact Synto bridge output paths")
 	}
 
 	readExport := func(path string) syntoIndexTruth {
@@ -752,6 +1110,56 @@ func TestExactSyntoPackExportBridge(t *testing.T) {
 		t.Fatalf("changed source did not dormant stable identity: %#v", ids)
 	}
 	t.Log("LWC195_CHANGED_SOURCE_DORMANT_STABLE_ID=PASS stable_id=stable-alpha")
+}
+
+// TestExactSyntoMigratedConfigBridge consumes bytes emitted by the real
+// Synto 0.7.0 migrate-olw smoke and sends them through the Go normalization
+// and safety-validation seam.
+func TestExactSyntoMigratedConfigBridge(t *testing.T) {
+	run1Path := strings.TrimSpace(os.Getenv("LWC195_EXACT_INDEX_RUN1_PATH"))
+	run2Path := strings.TrimSpace(os.Getenv("LWC195_EXACT_INDEX_RUN2_PATH"))
+	rawPath := strings.TrimSpace(os.Getenv("LWC195_RAW_SOURCE_PATH"))
+	path := strings.TrimSpace(os.Getenv("LWC197_MIGRATED_CONFIG_PATH"))
+	if err := validateExactSyntoBridgeEnv(run1Path, run2Path, rawPath, path); err != nil {
+		t.Fatal(err)
+	}
+	if run1Path == "" {
+		t.Skip("set the four exact Synto bridge output paths")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read exact migrated config %q: %v", path, err)
+	}
+	if len(data) == 0 {
+		t.Fatal("exact migrated config is empty")
+	}
+	var before map[string]interface{}
+	if _, err := toml.Decode(string(data), &before); err != nil {
+		t.Fatalf("exact migrated config is not valid TOML: %v", err)
+	}
+	if _, exists := before["pipeline"]; exists {
+		t.Fatalf("exact migrated fixture unexpectedly already has pipeline: %s", data)
+	}
+	vault := t.TempDir()
+	mustWriteFile(t, filepath.Join(vault, "synto.toml"), data)
+	if err := normalizeMigratedSyntoConfig(vault); err != nil {
+		t.Fatalf("Go normalization rejected exact migrated config: %v", err)
+	}
+	normalized, err := os.ReadFile(filepath.Join(vault, "synto.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateSyntoPipelineSafetyBytes(normalized); err != nil {
+		t.Fatalf("Go safety validation rejected normalized exact config: %v", err)
+	}
+	var after map[string]interface{}
+	if _, err := toml.Decode(string(normalized), &after); err != nil {
+		t.Fatal(err)
+	}
+	if !equalSyntoConfigSemanticsWithoutSafety(before, after) {
+		t.Fatalf("Go normalization changed exact migrated semantics: %s", normalized)
+	}
+	t.Logf("LWC197_EXACT_MIGRATED_CONFIG_NORMALIZED=PASS bytes_before=%d bytes_after=%d", len(data), len(normalized))
 }
 
 func TestPostprocessCreatesAndPreservesDormantCache(t *testing.T) {

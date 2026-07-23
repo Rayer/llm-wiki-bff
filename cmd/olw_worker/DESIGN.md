@@ -319,6 +319,7 @@ OLW_BASELINE_ROOT=/path/to/olw-0.8.5 \
   LWC195_EXACT_INDEX_RUN1_PATH="$bridge_dir/run1-INDEX.json" \
   LWC195_EXACT_INDEX_RUN2_PATH="$bridge_dir/run2-INDEX.json" \
   LWC195_RAW_SOURCE_PATH="$bridge_dir/source.md" \
+  LWC197_MIGRATED_CONFIG_PATH="$bridge_dir/migrated-synto.toml" \
   /path/to/synto-0.7.0/.venv/bin/python \
   cmd/olw_worker/testdata/synto_exact_release_smoke.py
 ```
@@ -329,9 +330,11 @@ runs `synto run --vault … --auto-approve` followed by the exact
 `synto pack export --target agents --out …` command twice. Both exports are
 non-empty and must contain `articles/Alpha.md`, the same article identity, the
 same non-empty engine entity ID, and the expected `raw/source.md`/`Alpha`
-source edge. The first and second authoritative `index/INDEX.json` bytes and
-the actual raw source bytes are written to bridge paths supplied by environment
-variables. The test process patches only exact-release client construction
+source edge. The first and second authoritative `index/INDEX.json` bytes, the
+actual raw source bytes, and the migrated `synto.toml` are written to four
+bridge paths supplied by environment variables. These paths are one bundle:
+any publication failure removes every destination, with no stale prior
+artifact retained. The test process patches only exact-release client construction
 with a local health-only/fail-if-called provider: the real CLI dependency
 loader, router, StateDB, orchestrator, and pack exporter remain exercised,
 while any generation or embedding call fails the gate. It does not claim a
@@ -375,11 +378,13 @@ OLW_BASELINE_ROOT=/path/to/olw-0.8.5 \
 LWC195_EXACT_INDEX_RUN1_PATH="$bridge_dir/run1-INDEX.json" \
 LWC195_EXACT_INDEX_RUN2_PATH="$bridge_dir/run2-INDEX.json" \
 LWC195_RAW_SOURCE_PATH="$bridge_dir/source.md" \
+LWC197_MIGRATED_CONFIG_PATH="$bridge_dir/migrated-synto.toml" \
   /path/to/synto-0.7.0/.venv/bin/python \
   cmd/olw_worker/testdata/synto_exact_release_smoke.py
 LWC195_EXACT_INDEX_RUN1_PATH="$bridge_dir/run1-INDEX.json" \
 LWC195_EXACT_INDEX_RUN2_PATH="$bridge_dir/run2-INDEX.json" \
 LWC195_RAW_SOURCE_PATH="$bridge_dir/source.md" \
+LWC197_MIGRATED_CONFIG_PATH="$bridge_dir/migrated-synto.toml" \
   go test ./cmd/olw_worker -run '^TestExactSyntoPackExportBridge$' -count=1 -v
 ```
 
@@ -396,11 +401,13 @@ docker run --rm --entrypoint python \
   -e LWC195_EXACT_INDEX_RUN1_PATH=/bridge/run1-INDEX.json \
   -e LWC195_EXACT_INDEX_RUN2_PATH=/bridge/run2-INDEX.json \
   -e LWC195_RAW_SOURCE_PATH=/bridge/source.md \
+  -e LWC197_MIGRATED_CONFIG_PATH=/bridge/migrated-synto.toml \
   llm-wiki-bff-olw-worker:test \
   /testdata/synto_exact_release_smoke.py
 LWC195_EXACT_INDEX_RUN1_PATH="$bridge_dir/run1-INDEX.json" \
 LWC195_EXACT_INDEX_RUN2_PATH="$bridge_dir/run2-INDEX.json" \
 LWC195_RAW_SOURCE_PATH="$bridge_dir/source.md" \
+LWC197_MIGRATED_CONFIG_PATH="$bridge_dir/migrated-synto.toml" \
   go test ./cmd/olw_worker -run '^TestExactSyntoPackExportBridge$' -count=1 -v
 ```
 
