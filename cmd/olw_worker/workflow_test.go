@@ -196,15 +196,23 @@ func TestWorkerPromotionWorkflowsContract(t *testing.T) {
 	if strings.Contains(rollback, "production-job-contract.json") {
 		t.Fatal("rollback freeze must not identify an unuploaded transient file")
 	}
+	if strings.Contains(release, "runner.temp") {
+		t.Fatal("release workflow job-level env must not reference runner.temp")
+	}
+	initializer := workflowSection(t, release, "      - name: Initialize deployment evidence paths", "      - name: Validate promotion commit")
 	for _, want := range []string{
-		"EVIDENCE_DIR: ${{ runner.temp }}/worker-deployment-evidence",
-		"ROLLBACK_CONTRACT: ${{ runner.temp }}/worker-deployment-evidence/rollback-contract.json",
-		"METADATA: ${{ runner.temp }}/worker-deployment-evidence/metadata.json",
-		"EVIDENCE: ${{ runner.temp }}/worker-deployment-evidence/deployment-evidence.json",
+		"EVIDENCE_DIR=\"$RUNNER_TEMP/worker-deployment-evidence\"",
+		"ROLLBACK_CONTRACT=\"$EVIDENCE_DIR/rollback-contract.json\"",
+		"METADATA=\"$EVIDENCE_DIR/metadata.json\"",
+		"EVIDENCE=\"$EVIDENCE_DIR/deployment-evidence.json\"",
+		">> \"$GITHUB_ENV\"",
 	} {
-		if !strings.Contains(release, want) {
-			t.Fatalf("release workflow missing canonical evidence path %q", want)
+		if !strings.Contains(initializer, want) {
+			t.Fatalf("evidence path initializer missing %q", want)
 		}
+	}
+	if strings.Index(release, "Initialize deployment evidence paths") > strings.Index(release, "Validate promotion commit") {
+		t.Fatal("evidence paths must be initialized before promotion validation")
 	}
 	if strings.Count(release, "EVIDENCE_ARTIFACT_NAME=\"worker-deployment-evidence-${COMMIT_SHA}\"") != 1 {
 		t.Fatal("release workflow must create exactly one frozen evidence artifact identity")
@@ -245,6 +253,9 @@ func TestWorkerPromotionWorkflowsContract(t *testing.T) {
 	}
 	if !strings.Contains(upload, "name: ${{ steps.rollback.outputs.artifact_name }}") {
 		t.Fatal("normalized evidence upload must use the frozen rollback artifact identity")
+	}
+	if strings.Count(upload, "path: ${{ env.EVIDENCE }}") != 1 {
+		t.Fatal("normalized evidence upload must retain exactly one canonical artifact path")
 	}
 	if !strings.Contains(release, "group: promote-olw-pipeline-production") || !strings.Contains(release, "cancel-in-progress: false") {
 		t.Fatal("production promotions must be serialized without cancellation")

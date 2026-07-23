@@ -28,18 +28,22 @@ jobs:
       contents: read
       actions: read
       id-token: write
-    env:
-      EVIDENCE_DIR: ${{ runner.temp }}/worker-deployment-evidence
-      ROLLBACK_CONTRACT: ${{ runner.temp }}/worker-deployment-evidence/rollback-contract.json
-      METADATA: ${{ runner.temp }}/worker-deployment-evidence/metadata.json
-      EVIDENCE: ${{ runner.temp }}/worker-deployment-evidence/deployment-evidence.json
-
     steps:
       - name: Checkout main
         uses: actions/checkout@v4
         with:
           ref: main
           fetch-depth: 0
+
+      - name: Initialize deployment evidence paths
+        run: |
+          set -euo pipefail
+          EVIDENCE_DIR="$RUNNER_TEMP/worker-deployment-evidence"
+          ROLLBACK_CONTRACT="$EVIDENCE_DIR/rollback-contract.json"
+          METADATA="$EVIDENCE_DIR/metadata.json"
+          EVIDENCE="$EVIDENCE_DIR/deployment-evidence.json"
+          printf 'EVIDENCE_DIR=%s\nROLLBACK_CONTRACT=%s\nMETADATA=%s\nEVIDENCE=%s\n' \
+            "$EVIDENCE_DIR" "$ROLLBACK_CONTRACT" "$METADATA" "$EVIDENCE" >> "$GITHUB_ENV"
 
       - name: Validate promotion commit
         id: commit
