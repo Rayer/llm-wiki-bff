@@ -210,6 +210,7 @@ class BFFDeploymentEvidenceTest(unittest.TestCase):
             "malformed SHA": lambda m: m["source"].update(commit_sha="bad"),
             "duplicate digest": lambda m: m["image"].update(digest="sha256:" + "a" * 64),
             "provenance mismatch": lambda m: m["dev_provenance"].update(head_sha="d" * 40),
+            "origin repository mismatch": lambda m: m["originating_workflow"].update(repository="fork/llm-wiki-bff"),
         }
         for name, mutate in cases.items():
             with self.subTest(name=name):

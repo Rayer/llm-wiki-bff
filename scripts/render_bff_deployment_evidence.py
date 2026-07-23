@@ -373,7 +373,7 @@ def validate_metadata(metadata, args):
     if not isinstance(image, dict) or set(image) != {"digest", "reference"} or not isinstance(image.get("digest"), str) or not DIGEST_RE.fullmatch(image["digest"]) or image.get("reference") != AR_REPO + "/llm-wiki-bff@" + image["digest"]:
         reject("promoted image identity is invalid")
     origin = metadata.get("originating_workflow")
-    if not isinstance(origin, dict) or set(origin) != {"repository", "workflow", "run_id", "run_attempt"} or not isinstance(origin.get("repository"), str) or not isinstance(origin.get("workflow"), str) or not isinstance(origin.get("run_id"), int) or origin["run_id"] <= 0 or not isinstance(origin.get("run_attempt"), int) or origin["run_attempt"] <= 0:
+    if not isinstance(origin, dict) or set(origin) != {"repository", "workflow", "run_id", "run_attempt"} or origin.get("repository") != "Rayer/llm-wiki-bff" or origin.get("workflow") != "Promote BFF to Cloud Run (production)" or not isinstance(origin.get("run_id"), int) or origin["run_id"] <= 0 or not isinstance(origin.get("run_attempt"), int) or origin["run_attempt"] <= 0:
         reject("originating workflow identity is invalid")
     return source["commit_sha"], image["reference"], artifact
 
