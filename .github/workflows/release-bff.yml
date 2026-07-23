@@ -169,6 +169,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$EVIDENCE_DIR"
+          ROLLBACK_ARTIFACT_NAME="bff-rollback-contract-${COMMIT_SHA}"
           EVIDENCE_ARTIFACT_NAME="bff-deployment-evidence-${COMMIT_SHA}"
           python3 scripts/render_bff_deployment_evidence.py prepare-rollback \
             --project "$PROJECT_ID" \
@@ -176,9 +177,10 @@ jobs:
             --service-name "$SERVICE_NAME" \
             --pipeline-job-name "$PIPELINE_JOB_NAME" \
             --ar-repo "$AR_REPO" \
-            --artifact-name "$EVIDENCE_ARTIFACT_NAME" \
+            --artifact-name "$ROLLBACK_ARTIFACT_NAME" \
             --output "$ROLLBACK_CONTRACT"
-          echo "artifact_name=$EVIDENCE_ARTIFACT_NAME" >> "$GITHUB_OUTPUT"
+          echo "rollback_artifact_name=$ROLLBACK_ARTIFACT_NAME" >> "$GITHUB_OUTPUT"
+          echo "evidence_artifact_name=$EVIDENCE_ARTIFACT_NAME" >> "$GITHUB_OUTPUT"
 
       - name: Prepare validated deployment metadata before mutation
         env:
@@ -190,7 +192,7 @@ jobs:
           DEV_RUN_HEAD_BRANCH: ${{ steps.dev_run.outputs.run_head_branch }}
           DEV_RUN_HEAD_SHA: ${{ steps.dev_run.outputs.run_head_sha }}
           DEV_RUN_CONCLUSION: ${{ steps.dev_run.outputs.run_conclusion }}
-          EVIDENCE_ARTIFACT_NAME: ${{ steps.rollback.outputs.artifact_name }}
+          ROLLBACK_ARTIFACT_NAME: ${{ steps.rollback.outputs.rollback_artifact_name }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           GITHUB_WORKFLOW: ${{ github.workflow }}
           GITHUB_RUN_ID: ${{ github.run_id }}
@@ -214,7 +216,7 @@ jobs:
             --arg dev_run_url "$DEV_RUN_URL" \
             --arg image "$IMMUTABLE_IMAGE" \
             --arg digest "${IMMUTABLE_IMAGE##*@}" \
-            --arg rollback_artifact_name "$EVIDENCE_ARTIFACT_NAME" \
+            --arg rollback_artifact_name "$ROLLBACK_ARTIFACT_NAME" \
             --arg repository "$GITHUB_REPOSITORY" \
             --arg workflow "$GITHUB_WORKFLOW" \
             --argjson workflow_run_id "$GITHUB_RUN_ID" \
@@ -225,6 +227,14 @@ jobs:
             --project "$PROJECT_ID" --region "$REGION" --service-name "$SERVICE_NAME" \
             --pipeline-job-name "$PIPELINE_JOB_NAME" --ar-repo "$AR_REPO" \
             --metadata "$METADATA"
+
+      - name: Upload immutable rollback contract
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ steps.rollback.outputs.rollback_artifact_name }}
+          path: ${{ env.ROLLBACK_CONTRACT }}
+          if-no-files-found: error
+          retention-days: 90
 
       - name: Deploy existing immutable image to Cloud Run
         env:
@@ -277,7 +287,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: ${{ steps.rollback.outputs.artifact_name }}
+          name: ${{ steps.rollback.outputs.evidence_artifact_name }}
           path: ${{ env.EVIDENCE }}
           if-no-files-found: error
           retention-days: 90

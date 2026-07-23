@@ -19,7 +19,8 @@ PRIOR_IMAGE = f"{AR_REPO}/llm-wiki-bff@{PRIOR_DIGEST}"
 SA = "lwc-bff-prod@llm-wiki-cloud.iam.gserviceaccount.com"
 JOB = "olw-pipeline"
 SERVICE = "llm-wiki-bff"
-ARTIFACT = "bff-deployment-evidence-" + "c" * 40
+ARTIFACT = "bff-rollback-contract-" + "c" * 40
+EVIDENCE_ARTIFACT = "bff-deployment-evidence-" + "c" * 40
 
 
 FIXTURES = ROOT / "scripts" / "fixtures"
@@ -142,6 +143,8 @@ class BFFDeploymentEvidenceTest(unittest.TestCase):
         self.assertEqual(rendered.returncode, 0, rendered.stderr)
         document = json.loads(output.read_text())
         self.assertEqual(document["status"], "HEALTHY")
+        self.assertEqual(document["provider"]["rollback_artifact_name"], ARTIFACT)
+        self.assertNotEqual(document["provider"]["rollback_artifact_name"], EVIDENCE_ARTIFACT)
         self.assertEqual(document["source"]["commit_sha"], "c" * 40)
         self.assertEqual(document["image"], {"digest": DIGEST, "reference": IMAGE})
         self.assertEqual(document["observed_service"]["ready_revision"], "llm-wiki-bff-00002-new")

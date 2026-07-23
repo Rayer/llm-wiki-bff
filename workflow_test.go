@@ -187,11 +187,57 @@ func TestReleaseWorkflowAuthenticatesOnlyAfterReadOnlyGatesAndHasOneProviderMuta
 	if strings.Count(contents, "gcloud run deploy") != 1 {
 		t.Fatal("production BFF release must have exactly one Cloud Run deploy mutation")
 	}
-	if strings.Count(contents, "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02") != 1 {
-		t.Fatal("production BFF release must upload exactly one normalized evidence artifact")
+	if strings.Count(contents, "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02") != 2 {
+		t.Fatal("production BFF release must upload exactly two pinned artifacts")
 	}
 	if strings.Index(contents, "Tag promoted production image") < strings.Index(contents, "Upload normalized deployment evidence") {
 		t.Fatal("production image tag must follow evidence upload")
+	}
+}
+
+func TestReleaseWorkflowDurablyUploadsRollbackBeforeMutation(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/release-bff.yml")
+	freeze := strings.Index(contents, "- name: Freeze production rollback contract")
+	metadata := strings.Index(contents, "- name: Prepare validated deployment metadata before mutation")
+	rollbackUpload := strings.Index(contents, "- name: Upload immutable rollback contract")
+	deploy := strings.Index(contents, "gcloud run deploy")
+	evidenceUpload := strings.Index(contents, "- name: Upload normalized deployment evidence")
+	if freeze < 0 || metadata < 0 || rollbackUpload < 0 || deploy < 0 || evidenceUpload < 0 {
+		t.Fatal("release workflow is missing the freeze, metadata, rollback upload, deploy, or evidence upload stage")
+	}
+	if !(freeze < metadata && metadata < rollbackUpload && rollbackUpload < deploy && deploy < evidenceUpload) {
+		t.Fatal("release workflow must freeze, validate metadata, durably upload rollback, deploy once, then upload final evidence")
+	}
+	if strings.Count(contents, "gcloud run deploy") != 1 {
+		t.Fatal("production BFF release must have exactly one Cloud Run deploy mutation")
+	}
+	for _, want := range []string{
+		`ROLLBACK_ARTIFACT_NAME="bff-rollback-contract-${COMMIT_SHA}"`,
+		`EVIDENCE_ARTIFACT_NAME="bff-deployment-evidence-${COMMIT_SHA}"`,
+		`--artifact-name "$ROLLBACK_ARTIFACT_NAME"`,
+		`echo "rollback_artifact_name=$ROLLBACK_ARTIFACT_NAME" >> "$GITHUB_OUTPUT"`,
+		"ROLLBACK_ARTIFACT_NAME: ${{ steps.rollback.outputs.rollback_artifact_name }}",
+		`--arg rollback_artifact_name "$ROLLBACK_ARTIFACT_NAME"`,
+		"name: ${{ steps.rollback.outputs.rollback_artifact_name }}",
+		"path: ${{ env.ROLLBACK_CONTRACT }}",
+		"path: ${{ env.EVIDENCE }}",
+		"if-no-files-found: error",
+		"retention-days: 90",
+	} {
+		if !strings.Contains(contents, want) {
+			t.Errorf("release workflow is missing durable rollback contract %q", want)
+		}
+	}
+	rollbackBlock := contents[rollbackUpload:deploy]
+	if strings.Contains(rollbackBlock, "if: always()") || strings.Contains(rollbackBlock, "continue-on-error") {
+		t.Fatal("rollback contract upload must fail closed before deploy")
+	}
+	evidenceBlock := contents[evidenceUpload:]
+	if !strings.Contains(evidenceBlock, "if: always()") {
+		t.Fatal("final deployment evidence upload must run always")
+	}
+	if !strings.Contains(evidenceBlock, "name: ${{ steps.rollback.outputs.evidence_artifact_name }}") {
+		t.Fatal("final deployment evidence must use the distinct evidence artifact name")
 	}
 }
 
