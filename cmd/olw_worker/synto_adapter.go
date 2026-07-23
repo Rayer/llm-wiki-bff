@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"time"
 
 	"github.com/BurntSushi/toml"
 	fm "github.com/adrg/frontmatter"
@@ -148,6 +149,9 @@ func ensureSyntoVault(ctx context.Context, vault string, cfg workerConfig, env [
 		}
 		if err := validateSQLiteArtifact(vault, ".synto/state.db"); err != nil {
 			return fmt.Errorf("invalid migrated .synto/state.db: %w", err)
+		}
+		if err := normalizeMigratedSyntoConfig(vault); err != nil {
+			return fmt.Errorf("normalize migrated synto.toml: %w", err)
 		}
 		return validateSyntoPipelineSafety(syntoConfig)
 	}
@@ -422,11 +426,249 @@ func equalMigrationInputs(a, b migrationInputSnapshot) bool {
 	return true
 }
 
+var syntoPipelineSafetyKeys = [...]string{"auto_commit", "auto_maintain", "relation_extraction"}
+
+// migrate-olw emits a 44-byte synto.toml for the exact Synto 0.7.0 fixture.
+// One MiB leaves ample room for ordinary provider/model tables and comments,
+// while keeping the migration-only normalizer far below the generic 64 MiB
+// generation bound before TOML decoding creates interface values.
+const syntoMigratedConfigMaxBytes int64 = 1 << 20
+
+var errSyntoOutputLimit = errors.New("Synto normalization output limit exceeded")
+
+type syntoLimitedWriter struct {
+	buffer bytes.Buffer
+	limit  int64
+}
+
+func newSyntoLimitedWriter(limit int64) *syntoLimitedWriter {
+	return &syntoLimitedWriter{limit: limit}
+}
+
+func (w *syntoLimitedWriter) Write(data []byte) (int, error) {
+	if w.limit < 0 || int64(w.buffer.Len()) > w.limit || int64(len(data)) > w.limit-int64(w.buffer.Len()) {
+		return 0, fmt.Errorf("%w: limit=%d", errSyntoOutputLimit, w.limit)
+	}
+	return w.buffer.Write(data)
+}
+
+func (w *syntoLimitedWriter) Len() int {
+	return w.buffer.Len()
+}
+
+func (w *syntoLimitedWriter) Bytes() []byte {
+	return w.buffer.Bytes()
+}
+
+// normalizeMigratedSyntoConfig is intentionally restricted to the config just
+// produced by migrate-olw. Existing Synto configs are user-owned and must go
+// through validation without this rewrite.
+func normalizeMigratedSyntoConfig(vault string) error {
+	data, err := readBoundedRegularFileWithinLimit(vault, "synto.toml", syntoMigratedConfigMaxBytes)
+	if err != nil {
+		return fmt.Errorf("read migrated synto.toml with normalizer input limit of %d bytes: %w", syntoMigratedConfigMaxBytes, err)
+	}
+
+	var document map[string]interface{}
+	metadata, err := toml.Decode(string(data), &document)
+	if err != nil {
+		return fmt.Errorf("parse migrated synto.toml: %w", err)
+	}
+	if err := rejectUnsupportedSyntoTemporalValues(document, metadata); err != nil {
+		return err
+	}
+	pipeline, exists := document["pipeline"]
+	if !exists {
+		pipeline = map[string]interface{}{}
+		document["pipeline"] = pipeline
+	}
+	pipelineTable, ok := pipeline.(map[string]interface{})
+	if !ok {
+		return errors.New("pipeline is not a table")
+	}
+	for _, key := range syntoPipelineSafetyKeys {
+		if value, exists := pipelineTable[key]; exists {
+			if _, ok := value.(bool); !ok {
+				return fmt.Errorf("pipeline.%s is not a boolean", key)
+			}
+		}
+		pipelineTable[key] = false
+	}
+
+	normalized := newSyntoLimitedWriter(syntoMigratedConfigMaxBytes)
+	if err := toml.NewEncoder(normalized).Encode(document); err != nil {
+		if errors.Is(err, errSyntoOutputLimit) {
+			return fmt.Errorf("encoded migrated synto.toml exceeds normalizer output limit of %d bytes: %w", syntoMigratedConfigMaxBytes, err)
+		}
+		return fmt.Errorf("encode migrated synto.toml: %w", err)
+	}
+	normalizedData := normalized.Bytes()
+	if err := validateSyntoPipelineSafetyBytes(normalizedData); err != nil {
+		return fmt.Errorf("validate normalized synto.toml: %w", err)
+	}
+	var roundTripped map[string]interface{}
+	if _, err := toml.Decode(string(normalizedData), &roundTripped); err != nil {
+		return fmt.Errorf("parse normalized synto.toml: %w", err)
+	}
+	if !equalSyntoConfigSemanticsWithoutSafety(document, roundTripped) {
+		return errors.New("normalized synto.toml changed non-safety configuration semantics")
+	}
+	if err := writeFileAtomicWithin(vault, "synto.toml", normalizedData); err != nil {
+		return fmt.Errorf("write normalized synto.toml: %w", err)
+	}
+	return nil
+}
+
+func validateExactSyntoBridgeEnv(paths ...string) error {
+	if len(paths) != 4 {
+		return fmt.Errorf("exact Synto bridge expects four output paths, got %d", len(paths))
+	}
+	anySet := false
+	for _, path := range paths {
+		if strings.TrimSpace(path) != "" {
+			anySet = true
+			break
+		}
+	}
+	if !anySet {
+		return nil
+	}
+	labels := [...]string{
+		"LWC195_EXACT_INDEX_RUN1_PATH",
+		"LWC195_EXACT_INDEX_RUN2_PATH",
+		"LWC195_RAW_SOURCE_PATH",
+		"LWC197_MIGRATED_CONFIG_PATH",
+	}
+	missing := make([]string, 0, len(labels))
+	for i, path := range paths {
+		if strings.TrimSpace(path) == "" {
+			missing = append(missing, labels[i])
+		}
+	}
+	if len(missing) != 0 {
+		return fmt.Errorf("exact Synto bridge requires all four output paths; missing %s", strings.Join(missing, ", "))
+	}
+	return nil
+}
+
+func rejectUnsupportedSyntoTemporalValues(document map[string]interface{}, metadata toml.MetaData) error {
+	for _, key := range metadata.Keys() {
+		if metadata.Type(key...) == "Datetime" {
+			return fmt.Errorf("temporal TOML value %q cannot be safely normalized with the pinned decoder/encoder", key)
+		}
+	}
+	if syntoTOMLContainsTime(document) {
+		return errors.New("temporal TOML value in an array cannot be safely normalized with the pinned decoder/encoder")
+	}
+	return nil
+}
+
+func syntoTOMLContainsTime(value interface{}) bool {
+	switch value := value.(type) {
+	case time.Time:
+		return true
+	case map[string]interface{}:
+		for _, nested := range value {
+			if syntoTOMLContainsTime(nested) {
+				return true
+			}
+		}
+	case []interface{}:
+		for _, nested := range value {
+			if syntoTOMLContainsTime(nested) {
+				return true
+			}
+		}
+	case []map[string]interface{}:
+		for _, nested := range value {
+			if syntoTOMLContainsTime(nested) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func equalSyntoConfigSemanticsWithoutSafety(a, b map[string]interface{}) bool {
+	strip := func(document map[string]interface{}) map[string]interface{} {
+		copy := make(map[string]interface{}, len(document))
+		for key, value := range document {
+			copy[key] = value
+		}
+		if pipeline, ok := copy["pipeline"].(map[string]interface{}); ok {
+			pipelineCopy := make(map[string]interface{}, len(pipeline))
+			for key, value := range pipeline {
+				pipelineCopy[key] = value
+			}
+			for _, key := range syntoPipelineSafetyKeys {
+				delete(pipelineCopy, key)
+			}
+			copy["pipeline"] = pipelineCopy
+		}
+		return copy
+	}
+	left, right := strip(a), strip(b)
+	if _, existed := a["pipeline"]; !existed {
+		if pipeline, exists := right["pipeline"].(map[string]interface{}); exists && len(pipeline) == 0 {
+			delete(right, "pipeline")
+		}
+	}
+	return equalSyntoTOMLValues(left, right)
+}
+
+func equalSyntoTOMLValues(a, b interface{}) bool {
+	switch left := a.(type) {
+	case time.Time:
+		right, ok := b.(time.Time)
+		return ok && reflect.DeepEqual(left, right)
+	case map[string]interface{}:
+		right, ok := b.(map[string]interface{})
+		if !ok || len(left) != len(right) {
+			return false
+		}
+		for key, value := range left {
+			other, ok := right[key]
+			if !ok || !equalSyntoTOMLValues(value, other) {
+				return false
+			}
+		}
+		return true
+	case []interface{}:
+		right, ok := b.([]interface{})
+		if !ok || len(left) != len(right) {
+			return false
+		}
+		for i := range left {
+			if !equalSyntoTOMLValues(left[i], right[i]) {
+				return false
+			}
+		}
+		return true
+	case []map[string]interface{}:
+		right, ok := b.([]map[string]interface{})
+		if !ok || len(left) != len(right) {
+			return false
+		}
+		for i := range left {
+			if !equalSyntoTOMLValues(left[i], right[i]) {
+				return false
+			}
+		}
+		return true
+	default:
+		return reflect.DeepEqual(a, b)
+	}
+}
+
 func validateSyntoPipelineSafety(path string) error {
-	data, err := os.ReadFile(path)
+	data, err := readBoundedRegularFileWithinLimit(filepath.Dir(path), filepath.Base(path), generation.MaxFileBytes)
 	if err != nil {
 		return fmt.Errorf("read synto.toml: %w", err)
 	}
+	return validateSyntoPipelineSafetyBytes(data)
+}
+
+func validateSyntoPipelineSafetyBytes(data []byte) error {
 	var document map[string]interface{}
 	if _, err := toml.Decode(string(data), &document); err != nil {
 		return fmt.Errorf("parse synto.toml: %w", err)
