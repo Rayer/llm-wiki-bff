@@ -22,32 +22,11 @@ SERVICE = "llm-wiki-bff"
 ARTIFACT = "bff-deployment-evidence-" + "c" * 40
 
 
-def env_entries():
-    return [
-        {"name": "GCP_PROJECT", "value": "llm-wiki-cloud"},
-        {"name": "BUCKET", "value": "llm-wiki-data"},
-        {"name": "FIRESTORE_DATABASE_ID", "value": "llm-wiki-cloud-prod"},
-        {"name": "PIPELINE_JOB_URL", "value": "https://run.googleapis.com/v2/projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline:run"},
-        {"name": "ALLOWED_ORIGINS", "value": "https://wiki.rayer.idv.tw,https://llm-wiki-frontend.vercel.app"},
-        {"name": "DEV_JWT", "value": "false"},
-        {"name": "JWT_SECRET", "valueSource": {"secretKeyRef": {"secret": "jwt-secret-prod", "version": "latest"}}},
-        {"name": "DEEPSEEK_API_KEY", "valueSource": {"secretKeyRef": {"secret": "deepseek-apikey", "version": "latest"}}},
-    ]
+FIXTURES = ROOT / "scripts" / "fixtures"
 
 
-def service(revision, image, traffic):
-    return {
-        "metadata": {"name": SERVICE, "annotations": {"run.googleapis.com/ingress": "all"}},
-        "spec": {"template": {"metadata": {"annotations": {
-            "run.googleapis.com/vpc-access-egress": "private-ranges-only",
-            "run.googleapis.com/network-interfaces": '[{"network":"default","subnetwork":"default"}]',
-        }}, "spec": {"serviceAccountName": SA, "containers": [{"image": image, "env": env_entries()}]}}},
-        "status": {"url": "https://llm-wiki-bff-abc-asia-east1.a.run.app", "latestReadyRevisionName": revision, "traffic": traffic},
-    }
-
-
-def revision(name, image, digest=DIGEST):
-    return {"metadata": {"name": name}, "spec": {"serviceAccountName": SA, "containers": [{"image": image, "env": env_entries()}]}, "status": {"imageDigest": digest}}
+def fixture(name):
+    return json.loads((FIXTURES / name).read_text())
 
 
 class BFFDeploymentEvidenceTest(unittest.TestCase):
@@ -103,10 +82,10 @@ class BFFDeploymentEvidenceTest(unittest.TestCase):
         self.revision_path = self.root / "revision.json"
         self.service_iam = self.root / "service-iam.json"
         self.job_iam = self.root / "job-iam.json"
-        self.before.write_text(json.dumps(service("llm-wiki-bff-00001-old", PRIOR_IMAGE, [{"revisionName": "llm-wiki-bff-00001-old", "percent": 100}])))
-        self.after.write_text(json.dumps(service("llm-wiki-bff-00002-new", IMAGE, [{"revisionName": "llm-wiki-bff-00002-new", "percent": 100}])))
-        self.prior_revision_path.write_text(json.dumps(revision("llm-wiki-bff-00001-old", PRIOR_IMAGE, PRIOR_DIGEST)))
-        self.revision_path.write_text(json.dumps(revision("llm-wiki-bff-00002-new", IMAGE)))
+        self.before.write_text(json.dumps(fixture("bff-service-before.json")))
+        self.after.write_text(json.dumps(fixture("bff-service-after.json")))
+        self.prior_revision_path.write_text(json.dumps(fixture("bff-revision-before.json")))
+        self.revision_path.write_text(json.dumps(fixture("bff-revision-after.json")))
         self.service_iam.write_text(json.dumps({"bindings": [{"role": "roles/run.invoker", "members": ["allUsers"]}]}))
         self.job_iam.write_text(json.dumps({"bindings": [{"role": "roles/run.jobsExecutorWithOverrides", "members": [f"serviceAccount:{SA}"]}]}))
         self.env = {**os.environ, "PATH": f"{self.bin}:{os.environ['PATH']}", "FAKE_LOG": str(self.root / "provider.log"), "FAKE_SERVICE_STATE": str(self.root / "service-state"), "FAKE_SERVICE_FIXTURES": f"{self.before},{self.before}", "FAKE_REVISION_FIXTURE": str(self.prior_revision_path), "FAKE_SERVICE_IAM": str(self.service_iam), "FAKE_JOB_IAM": str(self.job_iam), "FAKE_VERSION_JSON": json.dumps({"product_version": "1.2.3", "commit": "c" * 40, "branch": "main", "tag": "", "image_tag": "c" * 40, "service": SERVICE, "revision": "llm-wiki-bff-00002-new"})}
@@ -125,7 +104,7 @@ class BFFDeploymentEvidenceTest(unittest.TestCase):
         self.custom_revision = False
         for path in (self.root / "deployment-evidence.json", self.root / "failure.json"):
             path.unlink(missing_ok=True)
-        self.after.write_text(json.dumps(service("llm-wiki-bff-00002-new", IMAGE, [{"revisionName": "llm-wiki-bff-00002-new", "percent": 100}])))
+        self.after.write_text(json.dumps(fixture("bff-service-after.json")))
         self.revision_path.write_text(self.prior_revision_path.read_text())
         self.env["FAKE_SERVICE_FIXTURES"] = f"{self.before},{self.before}"
         self.env["FAKE_REVISION_FIXTURE"] = str(self.prior_revision_path)
@@ -142,7 +121,7 @@ class BFFDeploymentEvidenceTest(unittest.TestCase):
         self.env["FAKE_SERVICE_FIXTURES"] = f"{self.after},{self.after}"
         self.env["FAKE_REVISION_FIXTURE"] = str(self.revision_path)
         if not getattr(self, "custom_revision", False):
-            self.revision_path.write_text(json.dumps(revision("llm-wiki-bff-00002-new", IMAGE)))
+            self.revision_path.write_text(json.dumps(fixture("bff-revision-after.json")))
         result = self.invoke("render-evidence", "--expected-runtime-service-account", SA, "--rollback-contract", str(self.root / "rollback.json"), "--metadata", str(metadata_path), "--output", str(output), "--failure-output", str(failure))
         return result, output, failure
 
@@ -164,6 +143,10 @@ class BFFDeploymentEvidenceTest(unittest.TestCase):
         self.assertEqual(document["source"]["commit_sha"], "c" * 40)
         self.assertEqual(document["image"], {"digest": DIGEST, "reference": IMAGE})
         self.assertEqual(document["observed_service"]["ready_revision"], "llm-wiki-bff-00002-new")
+        self.assertEqual(document["observed_service"]["image_reference"], IMAGE)
+        self.assertEqual(document["observed_service"]["image_digest"], DIGEST)
+        self.assertEqual(document["observed_service"]["traffic"], [{"revision_name": "llm-wiki-bff-00002-new", "percent": 100}])
+        self.assertEqual(document["config"]["allowlisted"]["legacy_preserved"], [{"name": "PROJECT_ID", "value": "demo"}, {"name": "USER_ID", "value": "test-user"}])
         self.assertEqual(document["health"]["identity"]["commit"], "c" * 40)
         self.assertNotIn("secret-value", output.read_text())
         self.assertIn('"secret_references"', output.read_text())
@@ -177,6 +160,48 @@ class BFFDeploymentEvidenceTest(unittest.TestCase):
         first_document["health"]["checked_at"] = second["health"]["checked_at"]
         first_document["provider_verification"]["checked_at"] = second["provider_verification"]["checked_at"]
         self.assertEqual(output.read_text(), json.dumps(first_document, sort_keys=True, separators=(",", ":")) + "\n")
+
+    def test_old_v2_secret_shape_and_bare_revision_digest_are_rejected(self):
+        before = fixture("bff-revision-before.json")
+        before["spec"]["containers"][0]["env"][6] = {"name": "JWT_SECRET", "valueSource": {"secretKeyRef": {"secret": "jwt-secret-prod", "version": "latest"}}}
+        before["status"]["imageDigest"] = PRIOR_DIGEST
+        self.prior_revision_path.write_text(json.dumps(before))
+        result = self.invoke("prepare-rollback", "--artifact-name", ARTIFACT, "--output", str(self.root / "rollback.json"))
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_rollback_uses_prior_revision_effective_network_and_legacy_values(self):
+        service_before = fixture("bff-service-before.json")
+        service_before["spec"]["template"]["metadata"]["annotations"]["run.googleapis.com/vpc-access-egress"] = "all-traffic"
+        self.before.write_text(json.dumps(service_before))
+        prepared, rollback = self.prepare()
+        self.assertEqual(prepared.returncode, 0, prepared.stderr)
+        document = json.loads(rollback.read_text())
+        self.assertEqual(document["prior_revision_handle"], "projects/llm-wiki-cloud/locations/asia-east1/revisions/llm-wiki-bff-00001-old")
+        self.assertEqual(document["image_reference"], PRIOR_IMAGE)
+        self.assertEqual(document["image_digest"], PRIOR_DIGEST)
+        self.assertEqual(document["config"]["network"]["vpc_egress"], "private-ranges-only")
+        self.assertEqual(document["config"]["legacy_preserved"], [{"name": "PROJECT_ID", "value": "demo"}, {"name": "USER_ID", "value": "test-user"}])
+
+    def test_service_and_revision_effective_config_must_match(self):
+        prepared, rollback = self.prepare()
+        self.assertEqual(prepared.returncode, 0, prepared.stderr)
+        observed_revision = fixture("bff-revision-after.json")
+        observed_revision["metadata"]["annotations"]["run.googleapis.com/vpc-access-egress"] = "all-traffic"
+        result, output, failure = self.render_documents(fixture("bff-service-after.json"), observed_revision)
+        self.assertNotEqual(result.returncode, 0)
+        marker = json.loads(failure.read_text())
+        self.assertEqual(marker["reason_code"], "config_mismatch")
+        self.assertFalse(output.exists())
+
+    def test_legacy_values_must_be_preserved_by_new_revision(self):
+        prepared, rollback = self.prepare()
+        self.assertEqual(prepared.returncode, 0, prepared.stderr)
+        observed_revision = fixture("bff-revision-after.json")
+        observed_revision["spec"]["containers"][0]["env"][-1]["value"] = "changed-user"
+        result, output, failure = self.render_documents(fixture("bff-service-after.json"), observed_revision)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(json.loads(failure.read_text())["reason_code"], "config_mismatch")
+        self.assertFalse(output.exists())
 
     def test_invalid_metadata_and_provider_contracts_fail_closed(self):
         prepared, _ = self.prepare()
@@ -196,6 +221,11 @@ class BFFDeploymentEvidenceTest(unittest.TestCase):
 
         self.env["FAKE_JOB_IAM"] = str(self.root / "missing-iam.json")
         Path(self.env["FAKE_JOB_IAM"]).write_text(json.dumps({"bindings": []}))
+        result, _, _ = self.render()
+        self.assertNotEqual(result.returncode, 0)
+        self.env["FAKE_JOB_IAM"] = str(self.job_iam)
+        self.env["FAKE_SERVICE_IAM"] = str(self.root / "malformed-service-iam.json")
+        Path(self.env["FAKE_SERVICE_IAM"]).write_text(json.dumps({"bindings": {}}))
         result, _, _ = self.render()
         self.assertNotEqual(result.returncode, 0)
 

@@ -161,8 +161,10 @@ def normalized_traffic(traffic):
     for entry in traffic:
         if isinstance(entry, dict) and "revision_name" in entry:
             entry = {"revisionName": entry.get("revision_name"), "percent": entry.get("percent"), **({"tag": entry["tag"]} if "tag" in entry else {})}
-        if not isinstance(entry, dict) or set(entry) - {"revisionName", "percent", "tag"}:
+        if not isinstance(entry, dict) or set(entry) - {"latestRevision", "revisionName", "percent", "tag"}:
             reject("traffic snapshot shape is unsupported", "provider_shape_unsupported")
+        if "latestRevision" in entry and not isinstance(entry["latestRevision"], bool):
+            reject("traffic latestRevision value is invalid", "provider_shape_unsupported")
         revision = entry.get("revisionName")
         percent = entry.get("percent")
         if not isinstance(revision, str) or not revision or isinstance(percent, bool) or not isinstance(percent, int) or percent < 0 or percent > 100:
@@ -190,74 +192,96 @@ EXPECTED_SECRETS = {
     "JWT_SECRET": {"secret": "jwt-secret-prod", "version": "latest"},
     "DEEPSEEK_API_KEY": {"secret": "deepseek-apikey", "version": "latest"},
 }
+LEGACY_PRESERVED_NAMES = {"USER_ID", "PROJECT_ID"}
 
 
-def normalized_env(env):
+def normalized_env(env, legacy_preserved=None):
     values = {}
     secrets = {}
+    legacy = {}
     for entry in env:
-        if not isinstance(entry, dict) or set(entry) - {"name", "value", "valueSource"} or not isinstance(entry.get("name"), str):
+        if not isinstance(entry, dict) or set(entry) - {"name", "value", "valueFrom"} or not isinstance(entry.get("name"), str):
             reject("environment entry shape is unsupported", "config_mismatch")
         name = entry["name"]
-        if name in values or name in secrets:
+        if name in values or name in secrets or name in legacy:
             reject("duplicate environment entry", "config_mismatch")
         if name in EXPECTED_VALUES:
             if set(entry) != {"name", "value"} or not isinstance(entry["value"], str) or entry["value"] != EXPECTED_VALUES[name]:
                 reject("environment value does not match production contract", "config_mismatch")
             values[name] = entry["value"]
         elif name in EXPECTED_SECRETS:
-            source = entry.get("valueSource")
+            source = entry.get("valueFrom")
             ref = source.get("secretKeyRef") if isinstance(source, dict) else None
-            if set(entry) != {"name", "valueSource"} or not isinstance(ref, dict) or set(ref) != {"secret", "version"} or ref != EXPECTED_SECRETS[name]:
+            expected = {"name": EXPECTED_SECRETS[name]["secret"], "key": EXPECTED_SECRETS[name]["version"]}
+            if set(entry) != {"name", "valueFrom"} or not isinstance(ref, dict) or set(ref) != {"name", "key"} or ref != expected:
                 reject("secret reference does not match production contract", "config_mismatch")
-            secrets[name] = {"secret": ref["secret"], "version": ref["version"]}
+            secrets[name] = {"secret": ref["name"], "version": ref["key"]}
+        elif name in LEGACY_PRESERVED_NAMES:
+            if set(entry) != {"name", "value"} or not isinstance(entry["value"], str):
+                reject("legacy environment entry is invalid", "config_mismatch")
+            legacy[name] = entry["value"]
         else:
             reject("environment is not allowlisted", "config_mismatch")
-    if set(values) != set(EXPECTED_VALUES) or set(secrets) != set(EXPECTED_SECRETS):
+    if set(values) != set(EXPECTED_VALUES) or set(secrets) != set(EXPECTED_SECRETS) or set(legacy) != LEGACY_PRESERVED_NAMES:
         reject("production environment is incomplete", "config_mismatch")
+    normalized_legacy = [{"name": key, "value": legacy[key]} for key in sorted(legacy)]
+    if legacy_preserved is not None:
+        if not isinstance(legacy_preserved, list) or legacy_preserved != normalized_legacy:
+            reject("legacy environment does not match the immutable prior revision", "config_mismatch")
     return {
         "env": [{"name": key, "value": values[key]} for key in sorted(values)],
         "secret_references": [{"name": key, **secrets[key]} for key in sorted(secrets)],
+        "legacy_preserved": normalized_legacy,
     }
 
 
-def network_config(service_annotations, template_annotations):
+def network_config(service_annotations, network_annotations):
     if service_annotations.get("run.googleapis.com/ingress") != "all":
         reject("service ingress does not match production", "config_mismatch")
-    if template_annotations.get("run.googleapis.com/vpc-access-egress") != "private-ranges-only":
-        reject("service VPC egress does not match production", "config_mismatch")
+    if network_annotations.get("run.googleapis.com/vpc-access-egress") != "private-ranges-only":
+        reject("Cloud Run VPC egress does not match production", "config_mismatch")
     try:
-        interfaces = json.loads(template_annotations.get("run.googleapis.com/network-interfaces", ""))
+        interfaces = json.loads(network_annotations.get("run.googleapis.com/network-interfaces", ""))
     except (TypeError, json.JSONDecodeError):
-        reject("service network configuration is invalid", "config_mismatch")
+        reject("Cloud Run network configuration is invalid", "config_mismatch")
     if interfaces != [{"network": "default", "subnetwork": "default"}]:
-        reject("service network does not match production", "config_mismatch")
+        reject("Cloud Run network does not match production", "config_mismatch")
     return {"network": "default", "subnet": "default", "vpc_egress": "private-ranges-only", "ingress": "all"}
 
 
-def normalized_config(parts):
+def normalized_config(parts, legacy_preserved):
     _, service_annotations, template_annotations, spec, container, service_account, _ = parts
     if service_account != RUNTIME_SERVICE_ACCOUNT:
         reject("runtime service account does not match production", "runtime_service_account_mismatch")
-    env = normalized_env(container["env"])
+    env = normalized_env(container["env"], legacy_preserved)
     config = {**env, "network": network_config(service_annotations, template_annotations), "runtime_service_account": service_account}
     return config
 
 
+def normalized_revision_config(revision, service_annotations, legacy_preserved=None, expected_image=None):
+    metadata = revision.get("metadata") if isinstance(revision, dict) else None
+    expected_name = metadata.get("name") if isinstance(metadata, dict) else None
+    parts = revision_parts(revision, expected_name, expected_image)
+    env = normalized_env(parts["container"]["env"], legacy_preserved)
+    return {**env, "network": network_config(service_annotations, parts["metadata_annotations"]), "runtime_service_account": parts["service_account"]}
+
+
 def validate_saved_config(config):
-    expected = {"env", "secret_references", "network", "runtime_service_account"}
+    expected = {"env", "secret_references", "legacy_preserved", "network", "runtime_service_account"}
     if not isinstance(config, dict) or set(config) != expected:
         reject("rollback config contains unsupported fields", "rollback_unavailable")
     env = config.get("env")
     refs = config.get("secret_references")
-    if not isinstance(env, list) or not isinstance(refs, list):
+    legacy = config.get("legacy_preserved")
+    if not isinstance(env, list) or not isinstance(refs, list) or not isinstance(legacy, list):
         reject("rollback config collections are invalid", "rollback_unavailable")
     reconstructed = list(env)
     for ref in refs:
         if not isinstance(ref, dict) or set(ref) != {"name", "secret", "version"}:
             reject("rollback secret reference shape is invalid", "rollback_unavailable")
-        reconstructed.append({"name": ref["name"], "valueSource": {"secretKeyRef": {"secret": ref["secret"], "version": ref["version"]}}})
-    normalized = normalized_env(reconstructed)
+        reconstructed.append({"name": ref["name"], "valueFrom": {"secretKeyRef": {"name": ref["secret"], "key": ref["version"]}}})
+    reconstructed.extend(legacy)
+    normalized = normalized_env(reconstructed, legacy)
     if config.get("network") != {"network": "default", "subnet": "default", "vpc_egress": "private-ranges-only", "ingress": "all"} or config.get("runtime_service_account") != RUNTIME_SERVICE_ACCOUNT:
         reject("rollback network or identity config is invalid", "rollback_unavailable")
     return {**normalized, "network": config["network"], "runtime_service_account": config["runtime_service_account"]}
@@ -269,15 +293,20 @@ def revision_parts(document, expected_name, expected_image=None):
     status = document.get("status")
     if not isinstance(metadata, dict) or metadata.get("name") != expected_name or not isinstance(spec, dict) or not isinstance(status, dict):
         reject("revision identity shape does not match", "revision_mismatch")
+    metadata_annotations = metadata.get("annotations")
+    if not isinstance(metadata_annotations, dict):
+        reject("revision network annotations are missing", "provider_shape_unsupported")
     containers = spec.get("containers")
     if not isinstance(containers, list) or len(containers) != 1 or not isinstance(containers[0], dict):
         reject("revision container shape is unsupported", "provider_shape_unsupported")
     container = containers[0]
     image = container.get("image")
     digest = status.get("imageDigest")
-    if not isinstance(image, str) or not isinstance(digest, str) or not DIGEST_RE.fullmatch(digest):
+    if not isinstance(image, str) or not isinstance(digest, str):
         reject("revision image digest is not immutable", "image_mismatch")
-    if not image.startswith(AR_REPO + "/llm-wiki-bff@") or image.rsplit("@", 1)[-1] != digest:
+    immutable_image(image)
+    immutable_image(digest)
+    if image != digest:
         reject("revision image is not the expected immutable reference", "image_mismatch")
     if expected_image is not None and image != expected_image:
         reject("revision image does not match promoted image", "image_mismatch")
@@ -285,7 +314,7 @@ def revision_parts(document, expected_name, expected_image=None):
         reject("revision runtime service account does not match", "runtime_service_account_mismatch")
     if not isinstance(container.get("env"), list):
         reject("revision environment is unsupported", "provider_shape_unsupported")
-    return image, digest
+    return {"image_reference": image, "image_digest": digest.rsplit("@", 1)[-1], "metadata_annotations": metadata_annotations, "spec": spec, "container": container, "service_account": spec["serviceAccountName"]}
 
 
 def binding(policy, role, member):
@@ -304,6 +333,10 @@ def immutable_image(image):
     return image
 
 
+def revision_handle(args, revision):
+    return f"projects/{args.project}/locations/{args.region}/revisions/{revision}"
+
+
 def prepare_rollback(args):
     remove_output(args.output)
     first = service_json(args)
@@ -311,12 +344,13 @@ def prepare_rollback(args):
     ready = parts[-1]["latestReadyRevisionName"]
     traffic = normalized_traffic(parts[-1]["traffic"])
     prior = revision_json(args, ready)
-    prior_image, prior_digest = revision_parts(prior, ready)
+    prior_parts = revision_parts(prior, ready)
+    prior_config = normalized_revision_config(prior, parts[1])
     second = service_json(args)
     second_parts = service_parts(second, args)
-    if second_parts[-1]["latestReadyRevisionName"] != ready or normalized_traffic(second_parts[-1]["traffic"]) != traffic:
+    if second_parts[-1]["latestReadyRevisionName"] != ready or normalized_traffic(second_parts[-1]["traffic"]) != traffic or second_parts[1].get("run.googleapis.com/ingress") != parts[1].get("run.googleapis.com/ingress"):
         reject("service changed while freezing rollback", "rollback_race")
-    rollback = {"provider_handle": handle(args), "artifact_name": args.artifact_name, "ready_revision": ready, "image_reference": immutable_image(prior_image), "image_digest": prior_digest, "traffic": traffic, "config": normalized_config(parts)}
+    rollback = {"provider_handle": handle(args), "artifact_name": args.artifact_name, "ready_revision": ready, "prior_revision_handle": revision_handle(args, ready), "image_reference": prior_parts["image_reference"], "image_digest": prior_parts["image_digest"], "traffic": traffic, "config": prior_config}
     write_json(args.output, rollback)
 
 
@@ -345,8 +379,8 @@ def validate_metadata(metadata, args):
 
 
 def validate_rollback(rollback, args):
-    expected = {"provider_handle", "artifact_name", "ready_revision", "image_reference", "image_digest", "traffic", "config"}
-    if not isinstance(rollback, dict) or set(rollback) != expected or rollback.get("provider_handle") != handle(args) or not isinstance(rollback.get("artifact_name"), str) or not ARTIFACT_RE.fullmatch(rollback["artifact_name"]) or not isinstance(rollback.get("ready_revision"), str) or not isinstance(rollback.get("image_digest"), str) or not DIGEST_RE.fullmatch(rollback["image_digest"]) or rollback.get("image_reference") != AR_REPO + "/llm-wiki-bff@" + rollback["image_digest"]:
+    expected = {"provider_handle", "artifact_name", "ready_revision", "prior_revision_handle", "image_reference", "image_digest", "traffic", "config"}
+    if not isinstance(rollback, dict) or set(rollback) != expected or rollback.get("provider_handle") != handle(args) or not isinstance(rollback.get("artifact_name"), str) or not ARTIFACT_RE.fullmatch(rollback["artifact_name"]) or not isinstance(rollback.get("ready_revision"), str) or rollback.get("prior_revision_handle") != revision_handle(args, rollback["ready_revision"]) or not isinstance(rollback.get("image_digest"), str) or not DIGEST_RE.fullmatch(rollback["image_digest"]) or rollback.get("image_reference") != AR_REPO + "/llm-wiki-bff@" + rollback["image_digest"]:
         reject("rollback contract is invalid")
     traffic = normalized_traffic(rollback["traffic"])
     config = validate_saved_config(rollback["config"])
@@ -357,8 +391,12 @@ def identity(args, url, commit, revision):
     parsed = urlsplit(url)
     if parsed.scheme != "https" or parsed.username or parsed.password or not parsed.netloc:
         reject("identity endpoint URL is invalid", "identity_unavailable")
-    headers_path = tempfile.mktemp(prefix="bff-identity-headers-")
-    body_path = tempfile.mktemp(prefix="bff-identity-body-")
+    temporary_paths = []
+    for prefix in ("bff-identity-headers-", "bff-identity-body-"):
+        handle = tempfile.NamedTemporaryFile(prefix=prefix, delete=False)
+        handle.close()
+        temporary_paths.append(handle.name)
+    headers_path, body_path = temporary_paths
     try:
         command = ["curl", "--silent", "--show-error", "--fail-with-body", "--max-time", "20", "-D", headers_path, "-o", body_path, url.rstrip("/") + "/api/v1/public/version"]
         try:
@@ -386,7 +424,7 @@ def identity(args, url, commit, revision):
             reject("identity body does not match expected structured identity", "identity_body_mismatch")
         return {"commit": body["commit"], "branch": body["branch"], "image_tag": body["image_tag"], "service": body["service"], "revision": body["revision"]}
     finally:
-        for path in (headers_path, body_path):
+        for path in temporary_paths:
             try:
                 Path(path).unlink()
             except OSError:
@@ -406,9 +444,16 @@ def render_strict(args):
     ready = parts[-1]["latestReadyRevisionName"]
     if not ready:
         reject("new ready revision is missing", "revision_mismatch")
+    legacy_preserved = rollback["config"]["legacy_preserved"]
+    if parts[4]["image"] != expected_image:
+        reject("service template image does not match promoted image", "image_mismatch")
+    config = normalized_config(parts, legacy_preserved)
     revision = revision_json(args, ready)
-    observed_image, observed_digest = revision_parts(revision, ready, expected_image)
-    config = normalized_config(parts)
+    revision_parts_value = revision_parts(revision, ready, expected_image)
+    if normalized_revision_config(revision, parts[1], legacy_preserved, expected_image) != config:
+        reject("service template and immutable revision config differ", "config_mismatch")
+    observed_image = revision_parts_value["image_reference"]
+    observed_digest = revision_parts_value["image_digest"]
     service_policy = iam_json(args, "services", args.service_name)
     binding(service_policy, "roles/run.invoker", "allUsers")
     job_policy = iam_json(args, "jobs", args.pipeline_job_name)
@@ -420,7 +465,9 @@ def render_strict(args):
         reject("new ready revision changed during read-back", "revision_mismatch")
     if len(traffic) != 1 or traffic[0]["revision_name"] != ready or traffic[0]["percent"] != 100:
         reject("effective traffic is not 100 percent on the new revision", "traffic_mismatch")
-    url = args.service_url or parts[-1].get("url")
+    if second_parts[4]["image"] != expected_image or normalized_config(second_parts, legacy_preserved) != config:
+        reject("service template changed during read-back", "config_mismatch")
+    url = args.service_url or second_parts[-1].get("url")
     if not isinstance(url, str):
         reject("service URL is unavailable", "identity_unavailable")
     identity_result = identity(args, url, commit, ready)

@@ -38,10 +38,11 @@ jobs:
 
     steps:
       - name: Checkout main
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d596a326750d5838078e36cf38b85af677262 # v4.2.2
         with:
-          ref: main
+          ref: ${{ github.sha }}
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Initialize deployment evidence paths
         run: |
@@ -127,26 +128,37 @@ jobs:
           echo "image=${AR_REPO}/llm-wiki-bff@${DIGEST}" >> "$GITHUB_OUTPUT"
 
       - name: Authenticate to Google Cloud
-        uses: google-github-actions/auth@v3
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v2.1.10
         with:
           project_id: ${{ env.PROJECT_ID }}
           workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
           service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
 
       - name: Set up Cloud SDK
-        uses: google-github-actions/setup-gcloud@v2
+        uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2.1.30
         with:
           project_id: ${{ env.PROJECT_ID }}
 
-      - name: Verify production pipeline IAM
+      - name: Verify production IAM preflight
         run: |
           set -euo pipefail
-          POLICY=$(gcloud run jobs get-iam-policy "$PIPELINE_JOB_NAME" \
+          SERVICE_POLICY=$(gcloud run services get-iam-policy "$SERVICE_NAME" \
+            --project "$PROJECT_ID" --region "$REGION" --format=json --quiet)
+          if ! jq -e --arg member "allUsers" '
+            if (.bindings | type) != "array" then false
+            else ([.bindings[] | select(type == "object" and .role == "roles/run.invoker" and (.members | type) == "array" and (.members | index($member)))] | length == 1)
+            end' <<<"$SERVICE_POLICY" >/dev/null; then
+            echo "required production service IAM binding is missing or malformed; refusing to deploy"
+            exit 1
+          fi
+          JOB_POLICY=$(gcloud run jobs get-iam-policy "$PIPELINE_JOB_NAME" \
             --project "$PROJECT_ID" --region "$REGION" --format=json --quiet)
           if ! jq -e --arg member "serviceAccount:${RUNTIME_SERVICE_ACCOUNT}" \
-            '[.bindings[]? | select(.role == "roles/run.jobsExecutorWithOverrides" and (.members | index($member)))] | length == 1' \
-            <<<"$POLICY" >/dev/null; then
-            echo "required production pipeline IAM binding is missing; refusing to deploy"
+            'if (.bindings | type) != "array" then false
+             else ([.bindings[] | select(type == "object" and .role == "roles/run.jobsExecutorWithOverrides" and (.members | type) == "array" and (.members | index($member)))] | length == 1)
+             end' \
+            <<<"$JOB_POLICY" >/dev/null; then
+            echo "required production pipeline IAM binding is missing or malformed; refusing to deploy"
             exit 1
           fi
 
@@ -227,7 +239,6 @@ jobs:
             --network default --subnet default \
             --vpc-egress private-ranges-only \
             --ingress all \
-            --allow-unauthenticated \
             --update-secrets "JWT_SECRET=${JWT_SECRET_NAME}:latest,DEEPSEEK_API_KEY=${DEEPSEEK_SECRET_NAME}:latest" \
             --update-env-vars "^@^GCP_PROJECT=${PROJECT_ID}@BUCKET=${BUCKET}@FIRESTORE_DATABASE_ID=${FIRESTORE_DATABASE_ID}@PIPELINE_JOB_URL=https://run.googleapis.com/v2/projects/${PROJECT_ID}/locations/${REGION}/jobs/${PIPELINE_JOB_NAME}:run@ALLOWED_ORIGINS=${ALLOWED_ORIGINS}@DEV_JWT=false" \
             --quiet
@@ -264,7 +275,7 @@ jobs:
 
       - name: Upload normalized deployment evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ steps.rollback.outputs.artifact_name }}
           path: ${{ env.EVIDENCE }}

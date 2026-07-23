@@ -109,7 +109,16 @@ func TestReleaseWorkflowRequiresMainBuildProvenance(t *testing.T) {
 		"group: promote-bff-production",
 		"cancel-in-progress: false",
 		"- name: Checkout main",
-		"ref: main",
+		"actions/checkout@11d596a326750d5838078e36cf38b85af677262",
+		"# v4.2.2",
+		"ref: ${{ github.sha }}",
+		"persist-credentials: false",
+		"google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093",
+		"# v2.1.10",
+		"google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f",
+		"# v2.1.30",
+		"actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
+		"# v4.6.2",
 		"git fetch origin main --force --no-tags",
 		`git merge-base --is-ancestor "$COMMIT_SHA" origin/main`,
 		"commit_sha is not an ancestor of main",
@@ -125,7 +134,7 @@ func TestReleaseWorkflowRequiresMainBuildProvenance(t *testing.T) {
 		"scripts/render_bff_deployment_evidence.py render-evidence",
 		"scripts/render_bff_deployment_evidence.py render-partial",
 		"/api/v1/public/version",
-		"actions/upload-artifact@v4",
+		"actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
 	} {
 		if !strings.Contains(contents, want) {
 			t.Errorf("release workflow is missing main provenance contract %q", want)
@@ -141,7 +150,7 @@ func TestReleaseWorkflowAuthenticatesOnlyAfterReadOnlyGatesAndHasOneProviderMuta
 	auth := strings.Index(contents, "- name: Authenticate to Google Cloud")
 	provenance := strings.Index(contents, "- name: Locate successful main dev deployment")
 	image := strings.Index(contents, "- name: Download exact dev image digest")
-	preflight := strings.Index(contents, "- name: Verify production pipeline IAM")
+	preflight := strings.Index(contents, "- name: Verify production IAM preflight")
 	deploy := strings.Index(contents, "gcloud run deploy")
 	if auth < 0 || provenance < 0 || image < 0 || preflight < 0 || deploy < 0 {
 		t.Fatal("release workflow is missing the source, provenance, IAM, or deploy gates")
@@ -149,13 +158,21 @@ func TestReleaseWorkflowAuthenticatesOnlyAfterReadOnlyGatesAndHasOneProviderMuta
 	if auth < provenance || auth < image || auth > preflight || preflight > deploy {
 		t.Fatal("release authentication/deploy order is not fail-closed")
 	}
-	if strings.Contains(contents, "add-iam-policy-binding") || strings.Contains(contents, "set-iam-policy") {
+	serviceIAM := strings.Index(contents, "gcloud run services get-iam-policy")
+	jobIAM := strings.Index(contents, "gcloud run jobs get-iam-policy")
+	if serviceIAM < 0 || jobIAM < 0 || serviceIAM > deploy || jobIAM > deploy {
+		t.Fatal("production release must read service and job IAM before deploy")
+	}
+	if strings.Contains(contents, "--allow-unauthenticated") {
+		t.Fatal("production BFF release must not mutate service IAM through deploy")
+	}
+	if strings.Contains(contents, "add-iam-policy-binding") || strings.Contains(contents, "set-iam-policy") || strings.Contains(contents, "remove-iam-policy-binding") {
 		t.Fatal("production BFF release must not mutate IAM")
 	}
 	if strings.Count(contents, "gcloud run deploy") != 1 {
 		t.Fatal("production BFF release must have exactly one Cloud Run deploy mutation")
 	}
-	if strings.Count(contents, "actions/upload-artifact@v4") != 1 {
+	if strings.Count(contents, "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02") != 1 {
 		t.Fatal("production BFF release must upload exactly one normalized evidence artifact")
 	}
 	if strings.Index(contents, "Tag promoted production image") < strings.Index(contents, "Upload normalized deployment evidence") {
