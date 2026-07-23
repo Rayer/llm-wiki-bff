@@ -197,6 +197,7 @@ jobs:
             --metadata "$METADATA"
 
       - name: Upload validated rollback contract
+        id: rollback_upload
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: ${{ steps.rollback.outputs.rollback_artifact_name }}
@@ -240,8 +241,15 @@ jobs:
 
       - name: Finalize partial evidence when provider verification is unknown
         if: always()
+        env:
+          ROLLBACK_UPLOAD_OUTCOME: ${{ steps.rollback_upload.outcome }}
         run: |
           set -euo pipefail
+          if [[ "$ROLLBACK_UPLOAD_OUTCOME" != "success" ]]; then
+            rm -f "$EVIDENCE" "$EVIDENCE_FAILURE"
+            echo "rollback upload outcome '$ROLLBACK_UPLOAD_OUTCOME'; no mutation could start because fail-closed upload precedes mutation; no evidence fabricated"
+            exit 0
+          fi
           if [[ -e "$EVIDENCE" ]]; then
             echo "verified evidence already exists; preserving it"
           elif [[ -f "$ROLLBACK_CONTRACT" && -f "$METADATA" ]]; then

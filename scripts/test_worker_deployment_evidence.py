@@ -201,6 +201,22 @@ class WorkerDeploymentEvidenceTest(unittest.TestCase):
         )
         return result, output
 
+    def validate_evidence(self, document):
+        evidence_path = self.root / "evidence-to-validate.json"
+        evidence_path.write_text(json.dumps(document))
+        return subprocess.run(
+            [
+                "python3",
+                str(SCRIPT),
+                "validate-evidence",
+                "--evidence",
+                str(evidence_path),
+            ],
+            env=self.env,
+            capture_output=True,
+            text=True,
+        )
+
     def test_success_normalizes_evidence_after_provider_readback(self):
         prepared, rollback = self.prepare_rollback()
         self.assertEqual(prepared.returncode, 0, prepared.stderr)
@@ -210,6 +226,8 @@ class WorkerDeploymentEvidenceTest(unittest.TestCase):
         self.assertEqual(rendered.returncode, 0, rendered.stderr)
         document = json.loads(evidence.read_text())
         self.assertEqual(document["schema_version"], 1)
+        self.assertIs(type(document["job_executed"]), bool)
+        self.assertFalse(document["job_executed"])
         self.assertEqual(document["source"]["commit_sha"], "c" * 40)
         self.assertEqual(document["dev_provenance"]["run_id"], 123)
         self.assertEqual(document["image"], {"digest": "sha256:" + "b" * 64, "reference": IMAGE})
@@ -295,6 +313,8 @@ class WorkerDeploymentEvidenceTest(unittest.TestCase):
         self.assertEqual(partial.returncode, 0, partial.stderr)
         document = json.loads(evidence.read_text())
         self.assertEqual(document["status"], "UNHEALTHY")
+        self.assertIs(type(document["job_executed"]), bool)
+        self.assertFalse(document["job_executed"])
         self.assertEqual(document["provider_verification"]["result"], "failed")
         self.assertEqual(document["provider_verification"]["reason_code"], "observed_shape_unsupported")
         self.assertIsNotNone(document["provider_verification"]["checked_at"])
@@ -330,6 +350,8 @@ class WorkerDeploymentEvidenceTest(unittest.TestCase):
         self.assertEqual(partial.returncode, 0, partial.stderr)
         document = json.loads(evidence.read_text())
         self.assertEqual(document["status"], "PARTIAL")
+        self.assertIs(type(document["job_executed"]), bool)
+        self.assertFalse(document["job_executed"])
         self.assertEqual(document["provider_verification"], {
             "result": "unknown",
             "checked_at": None,
@@ -351,6 +373,8 @@ class WorkerDeploymentEvidenceTest(unittest.TestCase):
         self.assertEqual(partial.returncode, 0, partial.stderr)
         document = json.loads(evidence.read_text())
         self.assertEqual(document["status"], "UNHEALTHY")
+        self.assertIs(type(document["job_executed"]), bool)
+        self.assertFalse(document["job_executed"])
         self.assertEqual(document["config"]["result"], "failed")
         self.assertEqual(document["provider_verification"]["reason_code"], "image_mismatch")
         self.assertIsNotNone(document["provider_verification"]["checked_at"])
@@ -384,8 +408,25 @@ class WorkerDeploymentEvidenceTest(unittest.TestCase):
         self.assertEqual(partial.returncode, 0, partial.stderr)
         document = json.loads(evidence.read_text())
         self.assertEqual(document["status"], "PARTIAL")
+        self.assertIs(type(document["job_executed"]), bool)
+        self.assertFalse(document["job_executed"])
         self.assertEqual(document["provider_verification"]["result"], "unknown")
         self.assertIsNone(document["provider_verification"]["checked_at"])
+
+    def test_normalized_evidence_schema_rejects_job_execution_claims(self):
+        prepared, _ = self.prepare_rollback()
+        self.assertEqual(prepared.returncode, 0, prepared.stderr)
+        rendered, evidence = self.render(self.metadata())
+        self.assertEqual(rendered.returncode, 0, rendered.stderr)
+        document = json.loads(evidence.read_text())
+
+        self.assertEqual(self.validate_evidence(document).returncode, 0)
+        for value in [True, 1, "false", None]:
+            with self.subTest(value=value):
+                invalid = dict(document)
+                invalid["job_executed"] = value
+                result = self.validate_evidence(invalid)
+                self.assertNotEqual(result.returncode, 0, result.stderr)
 
     def test_partial_fallback_never_overwrites_existing_success_evidence(self):
         prepared, _ = self.prepare_rollback()

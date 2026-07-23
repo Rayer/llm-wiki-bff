@@ -257,6 +257,19 @@ func TestWorkerPromotionWorkflowsContract(t *testing.T) {
 	if !strings.Contains(finalizer, "if: always()") || !strings.Contains(finalizer, "scripts/render_worker_deployment_evidence.py render-partial") {
 		t.Fatal("release workflow must finalize truthful partial evidence after any failure")
 	}
+	for _, want := range []string{
+		"ROLLBACK_UPLOAD_OUTCOME: ${{ steps.rollback_upload.outcome }}",
+		`if [[ "$ROLLBACK_UPLOAD_OUTCOME" != "success" ]]; then`,
+		"no mutation could start because fail-closed upload precedes mutation",
+		"no evidence fabricated",
+	} {
+		if !strings.Contains(finalizer, want) {
+			t.Fatalf("partial finalizer missing rollback upload fail-closed guard %q", want)
+		}
+	}
+	if strings.Contains(finalizer[:strings.Index(finalizer, `if [[ "$ROLLBACK_UPLOAD_OUTCOME" != "success" ]]; then`)], "EVIDENCE_ARTIFACT_NAME") {
+		t.Fatal("rollback upload failure branch must not reference the intended evidence artifact")
+	}
 	if !strings.Contains(finalizer, "-f \"$ROLLBACK_CONTRACT\" && -f \"$METADATA\"") || !strings.Contains(finalizer, "[[ -e \"$EVIDENCE\" ]]") || !strings.Contains(finalizer, "--failure-output \"$EVIDENCE_FAILURE\"") {
 		t.Fatal("partial finalizer must require frozen inputs and preserve existing evidence")
 	}
@@ -271,6 +284,9 @@ func TestWorkerPromotionWorkflowsContract(t *testing.T) {
 		t.Fatal("normalized evidence upload must retain exactly one canonical artifact path")
 	}
 	preUpload := workflowSection(t, release, "      - name: Upload validated rollback contract", "      - name: Update production worker")
+	if !strings.Contains(preUpload, "id: rollback_upload") {
+		t.Fatal("rollback contract upload must expose its outcome as rollback_upload")
+	}
 	if !strings.Contains(preUpload, "uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02") ||
 		!strings.Contains(preUpload, "name: ${{ steps.rollback.outputs.rollback_artifact_name }}") ||
 		!strings.Contains(preUpload, "path: ${{ env.ROLLBACK_CONTRACT }}") ||
@@ -332,6 +348,49 @@ func TestWorkerReleaseEmitsOneNormalizedEvidenceArtifactAfterReadback(t *testing
 	}
 	if strings.Contains(evidenceSection, "production-job-contract.json") {
 		t.Fatal("release workflow must not upload the legacy standalone rollback artifact")
+	}
+}
+
+func TestWorkerReleaseRollbackUploadFailureOutcomesBlockEvidenceFinalization(t *testing.T) {
+	release := readWorkflow(t, "../../.github/workflows/release-worker.yml")
+	finalizer := workflowSection(t, release, "      - name: Finalize partial evidence when provider verification is unknown", "      - name: Upload normalized deployment evidence")
+	match := regexp.MustCompile(`(?m)^        run: \|\n((?:          .+\n?)+)`).FindStringSubmatch(finalizer)
+	if len(match) != 2 {
+		t.Fatal("partial finalizer is missing a shell run block")
+	}
+	lines := strings.Split(strings.TrimSpace(match[1]), "\n")
+	for index, line := range lines {
+		lines[index] = strings.TrimPrefix(line, "          ")
+	}
+	body := strings.Join(lines, "\n") + "\n"
+
+	for _, outcome := range []string{"failed", "skipped"} {
+		t.Run(outcome, func(t *testing.T) {
+			root := t.TempDir()
+			evidence := filepath.Join(root, "deployment-evidence.json")
+			failure := filepath.Join(root, "deployment-evidence-failure.json")
+			cmd := exec.Command("bash", "-c", body)
+			cmd.Env = append(os.Environ(),
+				"ROLLBACK_UPLOAD_OUTCOME="+outcome,
+				"EVIDENCE="+evidence,
+				"EVIDENCE_FAILURE="+failure,
+				"ROLLBACK_CONTRACT="+filepath.Join(root, "rollback-contract.json"),
+				"METADATA="+filepath.Join(root, "metadata.json"),
+			)
+			output, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("finalizer outcome %s failed: %v\n%s", outcome, err, output)
+			}
+			if _, err := os.Stat(evidence); !os.IsNotExist(err) {
+				t.Fatalf("finalizer outcome %s created evidence file: %v", outcome, err)
+			}
+			if strings.Contains(string(output), "worker-deployment-evidence-") {
+				t.Fatalf("finalizer outcome %s referenced a non-durable evidence artifact: %s", outcome, output)
+			}
+			if !strings.Contains(string(output), "no evidence fabricated") {
+				t.Fatalf("finalizer outcome %s did not log fail-closed evidence behavior: %s", outcome, output)
+			}
+		})
 	}
 }
 

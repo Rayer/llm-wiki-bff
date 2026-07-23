@@ -326,6 +326,13 @@ def validate_no_secret_like_fields(value):
         reject(f"secret-like field is not permitted: {found}")
 
 
+def validate_normalized_evidence(evidence):
+    if not isinstance(evidence, dict):
+        reject("normalized evidence must be an object")
+    if type(evidence.get("job_executed")) is not bool or evidence["job_executed"] is not False:
+        reject("normalized evidence job_executed must be exactly false")
+
+
 def write_json(path, value):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -577,6 +584,8 @@ def _render_evidence(args):
     provider_handle = canonical_handle(args.project, args.region, args.job_name)
     evidence = {
         "schema_version": EXPECTED_SCHEMA_VERSION,
+        # Deployment evidence does not assert Job execution or data success.
+        "job_executed": False,
         "project": metadata["project"],
         "component": metadata["component"],
         "environment": metadata["environment"],
@@ -603,6 +612,7 @@ def _render_evidence(args):
         "originating_workflow": normalized_metadata["originating_workflow"],
         "rollback": {"image_reference": rollback_image, "config": rollback_config},
     }
+    validate_normalized_evidence(evidence)
     validate_no_secret_like_fields(evidence)
     write_json(args.output, evidence)
 
@@ -643,6 +653,8 @@ def render_partial(args):
     evidence = {
         "schema_version": EXPECTED_SCHEMA_VERSION,
         "status": status,
+        # Deployment evidence does not assert Job execution or data success.
+        "job_executed": False,
         "project": metadata["project"],
         "component": metadata["component"],
         "environment": metadata["environment"],
@@ -661,6 +673,7 @@ def render_partial(args):
         "rollback": {"image_reference": rollback_image, "config": rollback_config},
         "next_action": "independent provider read-back required before retry or rollback",
     }
+    validate_normalized_evidence(evidence)
     validate_no_secret_like_fields(evidence)
     write_json(args.output, evidence)
 
@@ -699,6 +712,8 @@ def build_parser():
     partial.add_argument("--metadata", required=True)
     partial.add_argument("--output", required=True)
     partial.add_argument("--failure-output")
+    evidence = subparsers.add_parser("validate-evidence")
+    evidence.add_argument("--evidence", required=True)
     validate = subparsers.add_parser("validate-metadata")
     validate.add_argument("--project", required=True)
     validate.add_argument("--ar-repo", required=True)
@@ -715,6 +730,8 @@ def main(argv=None):
             render_evidence(args)
         elif args.mode == "render-partial":
             render_partial(args)
+        elif args.mode == "validate-evidence":
+            validate_normalized_evidence(read_json(args.evidence))
         else:
             validate_metadata_only(args)
     except EvidenceError as error:
