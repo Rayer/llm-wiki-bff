@@ -54,7 +54,7 @@ func TestDeployWorkflowPushesDevelopAndMain(t *testing.T) {
 		}
 		branches = append(branches, strings.TrimSpace(strings.TrimPrefix(line, "- ")))
 	}
-	want := []string{"develop/1.0", "main"}
+	want := []string{"develop", "main"}
 	if len(branches) != len(want) {
 		t.Fatalf("deploy workflow push branches = %q, want %q", branches, want)
 	}
@@ -116,8 +116,10 @@ func TestReleaseWorkflowRequiresMainBuildProvenance(t *testing.T) {
 			t.Errorf("release workflow is missing main provenance contract %q", want)
 		}
 	}
-	if strings.Contains(contents, "develop/1.0") {
-		t.Fatal("release workflow must not accept develop/1.0 provenance")
+	for _, forbidden := range []string{"ref: develop", `origin/develop`, `.head_branch == "develop"`} {
+		if strings.Contains(contents, forbidden) {
+			t.Fatalf("release workflow must not accept develop provenance %q", forbidden)
+		}
 	}
 }
 

@@ -21,7 +21,7 @@ func TestDeployWorkerWorkflowContract(t *testing.T) {
 	}
 	workflow := string(data)
 	for _, want := range []string{
-		"branches: [develop/1.0, main]",
+		"branches: [develop, main]",
 		"workflow_dispatch:",
 		"group: deploy-olw-pipeline-dev",
 		"cancel-in-progress: true",
@@ -123,7 +123,7 @@ func TestWorkerPromotionWorkflowsContract(t *testing.T) {
 	for _, want := range []string{
 		"SOURCE_BRANCH=",
 		"case \"${GITHUB_REF_NAME}\" in",
-		"develop/1.0|main)",
+		"develop|main)",
 		"GITHUB_SHA",
 		"worker-image-digest-${GITHUB_SHA}",
 		"sha256:[0-9a-f]{64}",
@@ -138,7 +138,7 @@ func TestWorkerPromotionWorkflowsContract(t *testing.T) {
 	if strings.Count(deploy, "actions/upload-artifact@v4") != 1 || strings.Count(deploy, "worker-image-digest-${GITHUB_SHA}.txt") != 1 || strings.Count(deploy, "path: worker-image-digest-${{ github.sha }}.txt") != 1 {
 		t.Fatal("dev workflow must persist and upload exactly one full-SHA digest artifact")
 	}
-	if strings.Contains(deploy, "origin/develop/1.0") {
+	if strings.Contains(deploy, "origin/develop") {
 		t.Fatal("dev workflow must not hardcode develop ordering for main runs")
 	}
 

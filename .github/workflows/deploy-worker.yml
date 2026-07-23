@@ -2,7 +2,7 @@ name: Deploy OLW worker to Cloud Run (dev)
 
 on:
   push:
-    branches: [develop/1.0, main]
+    branches: [develop, main]
   workflow_dispatch:
 
 concurrency:
@@ -99,7 +99,7 @@ jobs:
             exit 1
           fi
           case "${GITHUB_REF_NAME}" in
-            develop/1.0|main) SOURCE_BRANCH="${GITHUB_REF_NAME}" ;;
+            develop|main) SOURCE_BRANCH="${GITHUB_REF_NAME}" ;;
             *) echo "unsupported source branch: ${GITHUB_REF_NAME}"; exit 1 ;;
           esac
           git fetch --no-tags origin "${SOURCE_BRANCH}"
