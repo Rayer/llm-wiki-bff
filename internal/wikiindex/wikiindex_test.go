@@ -104,6 +104,92 @@ func TestRebuildWritesIDMapAndConceptsJSONL(t *testing.T) {
 	}
 }
 
+func TestRebuildWritesSyntoNestedFrontmatter(t *testing.T) {
+	store := &fakeStore{
+		files: map[string][]MarkdownFile{
+			"wiki/": {{
+				Slug: "alpha",
+				Path: "wiki/alpha.md",
+				Data: []byte("---\nid: concept-id\nlineage:\n  - operation: merge\n    source_ids:\n      - source-one\n    metadata:\n      reason: rename\nrelations:\n  - type: related\n    target: beta\n---\nAlpha body"),
+			}},
+			"wiki/sources/": {},
+		},
+		reads: map[string][]byte{},
+	}
+
+	_, err := Rebuild(context.Background(), store)
+	if err != nil {
+		t.Fatalf("Rebuild() error = %v", err)
+	}
+
+	var entry struct {
+		Frontmatter map[string]interface{} `json:"frontmatter"`
+	}
+	if err := json.Unmarshal(store.writes[ConceptsJSONLPath], &entry); err != nil {
+		t.Fatalf("concepts jsonl entry is not valid JSON: %v", err)
+	}
+	lineage := entry.Frontmatter["lineage"].([]interface{})
+	lineageEntry := lineage[0].(map[string]interface{})
+	if lineageEntry["operation"] != "merge" || lineageEntry["source_ids"].([]interface{})[0] != "source-one" || lineageEntry["metadata"].(map[string]interface{})["reason"] != "rename" {
+		t.Fatalf("lineage = %#v, want nested values preserved", lineage)
+	}
+	relations := entry.Frontmatter["relations"].([]interface{})
+	if relations[0].(map[string]interface{})["type"] != "related" || relations[0].(map[string]interface{})["target"] != "beta" {
+		t.Fatalf("relations = %#v, want nested values preserved", relations)
+	}
+}
+
+func TestRebuildPlansAllArtifactsBeforeWritingOnNonStringNestedKey(t *testing.T) {
+	store := &fakeStore{
+		files: map[string][]MarkdownFile{
+			"wiki/": {{
+				Slug: "alpha",
+				Path: "wiki/alpha.md",
+				Data: []byte("---\nid: concept-id\nmetadata:\n  123: value\n---\nAlpha body"),
+			}},
+			"wiki/sources/": {},
+		},
+		reads: map[string][]byte{},
+	}
+
+	if _, err := Rebuild(context.Background(), store); err == nil {
+		t.Fatal("Rebuild() error = nil, want non-string nested key rejection")
+	}
+	if len(store.writes) != 0 {
+		t.Fatalf("Rebuild() writes = %#v, want zero writes", store.writes)
+	}
+}
+
+func TestNormalizeJSONValueRejectsNonStringMapKeys(t *testing.T) {
+	_, err := normalizeJSONValue(map[interface{}]interface{}{1: "value"}, 0)
+	if err == nil || !strings.Contains(err.Error(), "non-string map key") {
+		t.Fatalf("normalizeJSONValue() error = %v, want non-string map key rejection", err)
+	}
+}
+
+func TestNormalizeJSONValueRejectsExcessiveDepth(t *testing.T) {
+	value := interface{}("leaf")
+	for i := 0; i <= maxJSONNormalizationDepth; i++ {
+		value = []interface{}{value}
+	}
+	_, err := normalizeJSONValue(value, 0)
+	if err == nil || !strings.Contains(err.Error(), "maximum nesting depth") {
+		t.Fatalf("normalizeJSONValue() error = %v, want depth limit rejection", err)
+	}
+}
+
+func TestNormalizeJSONValueDoesNotLeakNonStringMapKey(t *testing.T) {
+	const sentinel = "confidential-sentinel"
+	key := struct{ Value string }{Value: sentinel}
+	_, err := normalizeJSONValue(map[interface{}]interface{}{key: "value"}, 0)
+	if err == nil {
+		t.Fatal("normalizeJSONValue() error = nil, want non-string map key rejection")
+	}
+	if strings.Contains(err.Error(), sentinel) {
+		t.Fatalf("normalizeJSONValue() error = %q, must not contain sentinel", err)
+	}
+}
+
 func TestRebuildPreservesRedirects(t *testing.T) {
 	old := IDMap{
 		Concept:   map[string]string{"same-id": "old-alpha"},
