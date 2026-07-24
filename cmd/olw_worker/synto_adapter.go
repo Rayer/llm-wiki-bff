@@ -1343,12 +1343,27 @@ func decodeSyntoSources(dec *json.Decoder) error {
 		if err != nil {
 			return err
 		}
-		if !seen["id"] || !seen["title"] || !seen["source_type"] || !annotation.ValidSourceID(id) || sourceType == "" {
+		if !seen["id"] || !seen["title"] || !seen["source_type"] || !safeSyntoSourceID(id) || sourceType == "" {
 			return errors.New("invalid Synto source entry")
 		}
 	}
 	_, err := dec.Token()
 	return err
+}
+
+func safeSyntoSourceID(value string) bool {
+	if strings.IndexFunc(value, func(r rune) bool {
+		return r < 0x20 || r == 0x7f
+	}) >= 0 {
+		return false
+	}
+	if len(value) >= 2 && value[1] == ':' {
+		first := value[0]
+		if ('A' <= first && first <= 'Z') || ('a' <= first && first <= 'z') {
+			return false
+		}
+	}
+	return value != "." && safeSyntoRelativePath(value)
 }
 
 func decodeSyntoSynthesis(dec *json.Decoder) error {
