@@ -1220,6 +1220,48 @@ func TestSyntoPackExportArticlesPathIsConsumedByAdapter(t *testing.T) {
 	}
 }
 
+func TestSyntoPackExportSourcesIDAcceptsRawRelativePath(t *testing.T) {
+	const sourcesSeam = `"sources":[]`
+	index := syntoIndexFixture("article", "entity", "alpha", true)
+	if !strings.Contains(index, sourcesSeam) {
+		t.Fatalf("fixture missing sources seam %q", sourcesSeam)
+	}
+	index = strings.Replace(index, sourcesSeam, `"sources":[{"id":"raw/source.md","title":"Source File","source_type":"raw"}]`, 1)
+	workspace := t.TempDir()
+	mustWriteFile(t, filepath.Join(workspace, ".synto", "INDEX.json"), []byte(index))
+	if _, err := readSyntoIndexTruth(workspace); err != nil {
+		t.Fatalf("exact Synto pack export source id path was rejected: %v", err)
+	}
+}
+
+func TestSafeSyntoSourceID(t *testing.T) {
+	for _, c := range []struct {
+		name  string
+		value string
+		ok    bool
+	}{
+		{name: "accept bare id", value: "s1", ok: true},
+		{name: "accept raw path", value: "raw/source.md", ok: true},
+		{name: "reject empty", value: "", ok: false},
+		{name: "reject dot", value: ".", ok: false},
+		{name: "reject dotdot", value: "..", ok: false},
+		{name: "reject absolute", value: "/outside", ok: false},
+		{name: "reject traversal", value: "../outside", ok: false},
+		{name: "reject normalized traversal", value: "raw/../outside", ok: false},
+		{name: "reject backslash path", value: `raw\\source.md`, ok: false},
+		{name: "reject windows volume", value: "C:/outside", ok: false},
+		{name: "reject windows partial volume", value: "C:outside", ok: false},
+		{name: "reject newline", value: "raw\nsource.md", ok: false},
+		{name: "reject del", value: "raw\x7fsource.md", ok: false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			if got := safeSyntoSourceID(c.value); got != c.ok {
+				t.Fatalf("safeSyntoSourceID(%q) = %v, want %v", c.value, got, c.ok)
+			}
+		})
+	}
+}
+
 func TestSyntoArticlePathNormalizationIsStrict(t *testing.T) {
 	for _, path := range []string{"articles/Alpha.md", "wiki/Alpha.md"} {
 		if got, err := normalizeSyntoArticlePath(path); err != nil || got != "Alpha" {
