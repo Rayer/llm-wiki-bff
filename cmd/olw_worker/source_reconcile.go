@@ -158,6 +158,244 @@ func equalStrings(a, b []string) bool {
 	return true
 }
 
+type syntoSourcePage struct {
+	fields map[string]interface{}
+}
+
+func collapseSyntoSourceRegeneration(workspace string, data []byte, prior []sourceSnapshot) ([]byte, []string, error) {
+	ids, err := wikiindex.DecodeIDMap(data)
+	if err != nil {
+		return nil, nil, fmt.Errorf("decode generated source map: %w", err)
+	}
+	oldByRaw := make(map[string]string, len(prior))
+	for _, source := range prior {
+		if !annotation.ValidSourceID(source.SourceID) || !safeMappedRawPath(source.RawPath) {
+			return nil, nil, errors.New("unsafe prior source mapping")
+		}
+		oldByRaw[source.RawPath] = source.SourceID
+	}
+
+	byRaw := make(map[string][]string)
+	for currentID, meta := range ids.SourceMeta {
+		if _, ok := ids.Source[currentID]; !ok {
+			return nil, nil, fmt.Errorf("source metadata %q has no source mapping", currentID)
+		}
+		byRaw[meta.SourceFile] = append(byRaw[meta.SourceFile], currentID)
+	}
+
+	rawPaths := make([]string, 0, len(byRaw))
+	for rawPath := range byRaw {
+		rawPaths = append(rawPaths, rawPath)
+	}
+	sort.Strings(rawPaths)
+
+	var removals []string
+	for _, rawPath := range rawPaths {
+		currentIDs := byRaw[rawPath]
+		sort.Strings(currentIDs)
+		if len(currentIDs) != 2 {
+			continue
+		}
+		priorID, ok := oldByRaw[rawPath]
+		if !ok {
+			continue
+		}
+		stableCurrent := ""
+		transientCurrent := ""
+		for _, currentID := range currentIDs {
+			if currentID == priorID {
+				if stableCurrent != "" {
+					return nil, nil, errors.New("unprovable Synto source regeneration pair")
+				}
+				stableCurrent = currentID
+			} else {
+				if transientCurrent != "" {
+					return nil, nil, errors.New("unprovable Synto source regeneration pair")
+				}
+				transientCurrent = currentID
+			}
+		}
+		if stableCurrent == "" || transientCurrent == "" {
+			return nil, nil, errors.New("unprovable Synto source regeneration pair")
+		}
+
+		stableSlug := ids.Source[stableCurrent]
+		transientSlug := ids.Source[transientCurrent]
+		stableRel, err := safeSourcePagePath(stableSlug)
+		if err != nil {
+			return nil, nil, err
+		}
+		transientRel, err := safeSourcePagePath(transientSlug)
+		if err != nil || stableRel == transientRel {
+			return nil, nil, errors.New("unprovable Synto source regeneration pair")
+		}
+		stablePage, err := readBoundedRegularFileWithin(workspace, stableRel)
+		if err != nil {
+			return nil, nil, errors.New("legacy Synto source page is unavailable")
+		}
+		transientPage, err := readBoundedRegularFileWithin(workspace, transientRel)
+		if err != nil {
+			return nil, nil, errors.New("generated Synto source page is unavailable")
+		}
+		stableMatter, err := parseSyntoSourcePage(stablePage)
+		if err != nil || !sourcePageMatches(stableMatter, priorID, rawPath) {
+			return nil, nil, errors.New("unprovable Synto source regeneration pair")
+		}
+		transientMatter, err := parseSyntoSourcePage(transientPage)
+		if err != nil || !isSyntoSourceSummary(transientMatter, rawPath) {
+			return nil, nil, errors.New("unprovable Synto source regeneration pair")
+		}
+		if transientCurrent != wikiindex.ContentDerivedID(transientPage) {
+			return nil, nil, errors.New("unprovable Synto source regeneration pair")
+		}
+
+		for otherID, otherSlug := range ids.Source {
+			if (otherID != stableCurrent && otherSlug == stableSlug) || (otherID != transientCurrent && otherSlug == transientSlug) {
+				return nil, nil, errors.New("source page collision")
+			}
+		}
+		redirected := false
+		for _, redirect := range ids.Redirects[priorID] {
+			if redirect == stableSlug {
+				redirected = true
+				break
+			}
+		}
+		if stableSlug != "" && stableSlug != transientSlug && !redirected {
+			ids.Redirects[priorID] = append(ids.Redirects[priorID], stableSlug)
+		}
+		delete(ids.Source, stableCurrent)
+		delete(ids.SourceMeta, stableCurrent)
+		removals = append(removals, stableRel)
+	}
+	if len(removals) == 0 {
+		return data, nil, nil
+	}
+	collapsed, err := json.MarshalIndent(ids, "", "  ")
+	if err != nil {
+		return nil, nil, err
+	}
+	return collapsed, removals, nil
+}
+
+func safeSourcePagePath(slug string) (string, error) {
+	if strings.TrimSpace(slug) == "" || strings.ContainsAny(slug, "/\\") || slug == "." || slug == ".." || strings.IndexFunc(slug, func(r rune) bool { return r < 0x20 || r == 0x7f }) >= 0 {
+		return "", errors.New("unsafe generated source page path")
+	}
+	return filepath.ToSlash(filepath.Join("wiki", "sources", slug+".md")), nil
+}
+
+func parseSyntoSourcePage(data []byte) (syntoSourcePage, error) {
+	lines := bytes.SplitAfter(data, []byte("\n"))
+	if len(lines) == 0 || strings.TrimSpace(string(lines[0])) != "---" {
+		return syntoSourcePage{}, errors.New("source frontmatter is missing")
+	}
+	end := -1
+	for i := 1; i < len(lines); i++ {
+		if isFrontmatterDelimiter(lines[i]) {
+			end = i
+			break
+		}
+	}
+	if end < 0 {
+		return syntoSourcePage{}, errors.New("source frontmatter is unterminated")
+	}
+	fields := make(map[string]interface{})
+	if err := yaml.UnmarshalStrict(bytes.Join(lines[1:end], nil), &fields); err != nil {
+		return syntoSourcePage{}, err
+	}
+	return syntoSourcePage{fields: fields}, nil
+}
+
+func sourcePageMatches(page syntoSourcePage, id, rawPath string) bool {
+	value, ok := page.fields["id"].(string)
+	if !ok || value != id {
+		return false
+	}
+	return sourcePageRawPath(page) == rawPath
+}
+
+func sourcePageRawPath(page syntoSourcePage) string {
+	value, _ := page.fields["source_file"].(string)
+	return value
+}
+
+func isSyntoSourceSummary(page syntoSourcePage, rawPath string) bool {
+	if _, hasID := page.fields["id"]; hasID {
+		return false
+	}
+	allowed := map[string]bool{
+		"title": true, "aliases": true, "tags": true, "status": true,
+		"source_file": true, "quality": true, "created": true, "source_url": true,
+	}
+	for key := range page.fields {
+		if !allowed[key] {
+			return false
+		}
+	}
+	title, ok := boundedSyntoString(page.fields["title"], true)
+	if !ok || title == "" {
+		return false
+	}
+	if sourceFile, ok := boundedSyntoString(page.fields["source_file"], true); !ok || sourceFile != rawPath || !safeMappedRawPath(sourceFile) {
+		return false
+	}
+	if _, ok := boundedSyntoString(page.fields["status"], true); !ok {
+		return false
+	}
+	if _, ok := boundedSyntoString(page.fields["quality"], true); !ok {
+		return false
+	}
+	if _, ok := boundedSyntoString(page.fields["created"], true); !ok {
+		return false
+	}
+	if _, ok := syntoStringList(page.fields["aliases"]); !ok {
+		return false
+	}
+	if sourceURL, present := page.fields["source_url"]; present {
+		if _, ok := boundedSyntoString(sourceURL, false); !ok {
+			return false
+		}
+	}
+	tags, ok := syntoStringList(page.fields["tags"])
+	if !ok {
+		return false
+	}
+	for _, tag := range tags {
+		if tag == "source" {
+			return true
+		}
+	}
+	return false
+}
+
+func boundedSyntoString(value interface{}, nonEmpty bool) (string, bool) {
+	text, ok := value.(string)
+	if !ok || len(text) > 4096 || strings.IndexFunc(text, func(r rune) bool { return r < 0x20 || r == 0x7f }) >= 0 {
+		return "", false
+	}
+	if nonEmpty && strings.TrimSpace(text) == "" {
+		return "", false
+	}
+	return text, true
+}
+
+func syntoStringList(value interface{}) ([]string, bool) {
+	items, ok := value.([]interface{})
+	if !ok || len(items) > generation.MaxFiles {
+		return nil, false
+	}
+	result := make([]string, len(items))
+	for i, item := range items {
+		text, ok := boundedSyntoString(item, false)
+		if !ok {
+			return nil, false
+		}
+		result[i] = text
+	}
+	return result, true
+}
+
 func reconcileWorkspaceSources(workspace string, prior []sourceSnapshot) error {
 	// Plan/validate every output first, then apply. Input validation errors
 	// must leave the live vault byte-identical (zero writes).
@@ -165,7 +403,19 @@ func reconcileWorkspaceSources(workspace string, prior []sourceSnapshot) error {
 	if err != nil {
 		return fmt.Errorf("read generated source map: %w", err)
 	}
-	reconciledMap, sources, err := reconcileSourceIDMap(data, prior)
+	collapsedData, sourceRemovals, err := collapseSyntoSourceRegeneration(workspace, data, prior)
+	if err != nil {
+		return err
+	}
+	for _, rel := range sourceRemovals {
+		if !strings.HasPrefix(rel, "wiki/sources/") {
+			return errors.New("unsafe source page removal")
+		}
+		if _, err := lstatRegularWithin(workspace, rel); err != nil {
+			return err
+		}
+	}
+	reconciledMap, sources, err := reconcileSourceIDMap(collapsedData, prior)
 	if err != nil {
 		return err
 	}
@@ -202,6 +452,11 @@ func reconcileWorkspaceSources(workspace string, prior []sourceSnapshot) error {
 	// Deterministic apply only after all validation succeeds.
 	for _, w := range writes {
 		if err := writeFileAtomicWithin(workspace, w.rel, w.data); err != nil {
+			return err
+		}
+	}
+	for _, rel := range sourceRemovals {
+		if err := removeRegularFileWithin(workspace, rel); err != nil {
 			return err
 		}
 	}
