@@ -121,6 +121,39 @@ reconciliation, and preflight before publication. Local `--no-postprocess`
 compatibility runs still execute only in a private scratch workspace and never
 publish generation outputs.
 
+## Cloud Failure Diagnostic Artifact
+
+For a failed cloud execution, the worker writes the operator-only object
+`cache/pipeline-<execution>.failure.json` alongside the existing fixed
+`cache/pipeline-<execution>.log` event and fixed source receipt error. The
+failure object is versioned, deterministic JSON and is written create-only; it
+is not part of a generation, does not create a current pointer, and is never
+written on success. A diagnostic write failure is reported through the
+existing fixed failure-recording category and cannot publish a generation.
+
+The payload is bounded to 4 KiB and contains only `version: 1`,
+`status: "failed"`, a finite stage, a finite error class, and when proven at a
+child-process boundary a finite child command plus numeric exit code. Stages
+include input materialization, Synto migration/config/run/index export,
+source/concept reconciliation, postprocess, generation publication, receipt
+recording, and lease cleanup. Error classes include validation, child exit, timeout,
+cancellation, I/O, invalid state, publication conflict, recording failure, and
+unknown. The accepted user command is only `run`; migration and index export
+are worker-owned child seams.
+
+The artifact never stores child stdout/stderr, error strings, provider HTTP
+status, URLs, paths, arguments, provider bodies, model responses, source or
+article text, credentials, tokens, tenant/user/project/execution IDs, or
+timestamps. The fixed pipeline log and source receipt contracts remain
+sanitized and unchanged; this object is the separate operator diagnostic
+channel and is not exposed through a BFF API/UI.
+
+The one deliberate exception is `errManifestCommitOutcomeUnknown`: when the
+manifest CAS/readback outcome is ambiguous, the worker writes no failed
+diagnostic object and no failure source receipt. The manifest may already have
+committed, so recording failure would falsify publication truth and encourage
+an unsafe replay; the explicit ambiguous outcome is preserved instead.
+
 ## Generated Artifacts
 
 Postprocess uses `internal/wikiindex/fsstore` and writes:

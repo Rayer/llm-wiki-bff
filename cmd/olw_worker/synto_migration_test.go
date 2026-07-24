@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -20,6 +21,323 @@ import (
 )
 
 const expectedSyntoWheelSHA256 = "4bc8dcf14b53f45fac32ce737ecf878f1a46d6d0b010c7decbe6c3b7b10afa77"
+
+func TestSyntoMigrationChildFailureCarriesBoundedDiagnosticMetadata(t *testing.T) {
+	vault := t.TempDir()
+	mustWriteFile(t, filepath.Join(vault, "wiki.toml"), []byte("legacy config"))
+	writeValidSQLiteState(t, filepath.Join(vault, ".olw", "state.db"))
+
+	child := exec.Command("sh", "-c", "exit 17")
+	childErr := child.Run()
+	var exitErr *exec.ExitError
+	if !errors.As(childErr, &exitErr) {
+		t.Fatalf("child error=%T %v, want *exec.ExitError", childErr, childErr)
+	}
+	old := execOLW
+	t.Cleanup(func() { execOLW = old })
+	execOLW = func(context.Context, string, []string, []string, io.Writer, io.Writer) error {
+		return childErr
+	}
+
+	err := ensureSyntoVault(context.Background(), vault, workerConfig{APIKey: "unused"}, nil)
+	if err == nil {
+		t.Fatal("migration unexpectedly succeeded")
+	}
+	var failure *workerFailure
+	if !errors.As(err, &failure) {
+		t.Fatalf("error=%v does not carry worker failure metadata", err)
+	}
+	if failure.Stage != failureStageSyntoMigration || failure.Class != failureClassChildExit || failure.Child != failureChildMigrateOLW || failure.ExitCode == nil || *failure.ExitCode != 17 {
+		t.Fatalf("failure metadata=%+v", failure)
+	}
+	data, err := marshalFailureDiagnostic(err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var diagnostic failureDiagnostic
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&diagnostic); err != nil {
+		t.Fatal(err)
+	}
+	if diagnostic.Stage != failureStageSyntoMigration || diagnostic.ErrorClass != failureClassChildExit || diagnostic.Child != failureChildMigrateOLW || diagnostic.ExitCode == nil || *diagnostic.ExitCode != 17 {
+		t.Fatalf("diagnostic=%+v", diagnostic)
+	}
+}
+
+func TestSyntoChildBoundariesClassifyRunExportAndContext(t *testing.T) {
+	newExitError := func(t *testing.T, code int) error {
+		t.Helper()
+		child := exec.Command("sh", "-c", fmt.Sprintf("exit %d", code))
+		err := child.Run()
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) {
+			t.Fatalf("child error=%T %v, want *exec.ExitError", err, err)
+		}
+		return err
+	}
+
+	t.Run("accepted run", func(t *testing.T) {
+		vault := t.TempDir()
+		mustWriteFile(t, filepath.Join(vault, "synto.toml"), []byte("[pipeline]\nauto_commit = false\nauto_maintain = false\nrelation_extraction = false\n"))
+		old := execOLW
+		t.Cleanup(func() { execOLW = old })
+		execOLW = func(context.Context, string, []string, []string, io.Writer, io.Writer) error {
+			return newExitError(t, 19)
+		}
+		err := runOLWBatch(context.Background(), vault, [][]string{{"run"}}, true, nil, nil, nil)
+		var failure *workerFailure
+		if !errors.As(err, &failure) || failure.Stage != failureStageSyntoRun || failure.Class != failureClassChildExit || failure.Child != failureChildRun || failure.ExitCode == nil || *failure.ExitCode != 19 {
+			t.Fatalf("error=%v metadata=%+v", err, failure)
+		}
+	})
+
+	t.Run("pack export", func(t *testing.T) {
+		vault := t.TempDir()
+		old := execOLW
+		t.Cleanup(func() { execOLW = old })
+		execOLW = func(context.Context, string, []string, []string, io.Writer, io.Writer) error {
+			return newExitError(t, 29)
+		}
+		err := ensureSyntoIndex(context.Background(), vault, nil)
+		var failure *workerFailure
+		if !errors.As(err, &failure) || failure.Stage != failureStageSyntoIndexExport || failure.Class != failureClassChildExit || failure.Child != failureChildPackExport || failure.ExitCode == nil || *failure.ExitCode != 29 {
+			t.Fatalf("error=%v metadata=%+v", err, failure)
+		}
+	})
+
+	for _, tc := range []struct {
+		name  string
+		ctx   func() (context.Context, context.CancelFunc)
+		class failureErrorClass
+	}{
+		{name: "deadline", ctx: func() (context.Context, context.CancelFunc) {
+			return context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+		}, class: failureClassTimeout},
+		{name: "cancelled", ctx: func() (context.Context, context.CancelFunc) { return context.WithCancel(context.Background()) }, class: failureClassCancelled},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			vault := t.TempDir()
+			mustWriteFile(t, filepath.Join(vault, "synto.toml"), []byte("[pipeline]\nauto_commit = false\nauto_maintain = false\nrelation_extraction = false\n"))
+			ctx, cancel := tc.ctx()
+			cancel()
+			old := execOLW
+			t.Cleanup(func() { execOLW = old })
+			execOLW = func(ctx context.Context, _ string, _ []string, _ []string, _, _ io.Writer) error {
+				return ctx.Err()
+			}
+			err := runOLWBatch(ctx, vault, [][]string{{"run"}}, true, nil, nil, nil)
+			var failure *workerFailure
+			if !errors.As(err, &failure) || failure.Stage != failureStageSyntoRun || failure.Class != tc.class || failure.Child != failureChildRun || failure.ExitCode != nil {
+				t.Fatalf("error=%v metadata=%+v", err, failure)
+			}
+		})
+	}
+}
+
+func TestSyntoChildBoundariesKeepOrdinaryErrorsUnknown(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		setup  func(t *testing.T) string
+		invoke func(context.Context, string) error
+		stage  failureStage
+		child  failureChildCommand
+	}{
+		{
+			name: "migrate-olw",
+			setup: func(t *testing.T) string {
+				vault := t.TempDir()
+				mustWriteFile(t, filepath.Join(vault, "wiki.toml"), []byte("legacy config"))
+				writeValidSQLiteState(t, filepath.Join(vault, ".olw", "state.db"))
+				return vault
+			},
+			invoke: func(ctx context.Context, vault string) error {
+				return ensureSyntoVault(ctx, vault, workerConfig{APIKey: "unused"}, nil)
+			},
+			stage: failureStageSyntoMigration,
+			child: failureChildMigrateOLW,
+		},
+		{
+			name: "run",
+			setup: func(t *testing.T) string {
+				vault := t.TempDir()
+				mustWriteFile(t, filepath.Join(vault, "synto.toml"), []byte("[pipeline]\nauto_commit = false\nauto_maintain = false\nrelation_extraction = false\n"))
+				return vault
+			},
+			invoke: func(ctx context.Context, vault string) error {
+				return runOLWBatch(ctx, vault, [][]string{{"run"}}, true, nil, nil, nil)
+			},
+			stage: failureStageSyntoRun,
+			child: failureChildRun,
+		},
+		{
+			name:  "pack-export",
+			setup: func(t *testing.T) string { return t.TempDir() },
+			invoke: func(ctx context.Context, vault string) error {
+				return ensureSyntoIndex(ctx, vault, nil)
+			},
+			stage: failureStageSyntoIndexExport,
+			child: failureChildPackExport,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			old := execOLW
+			t.Cleanup(func() { execOLW = old })
+			execOLW = func(context.Context, string, []string, []string, io.Writer, io.Writer) error {
+				return errors.New("ordinary child failure")
+			}
+			err := tc.invoke(context.Background(), tc.setup(t))
+			diagnostic := diagnosticForError(err)
+			if diagnostic.Stage != tc.stage || diagnostic.Child != tc.child || diagnostic.ErrorClass != failureClassUnknown || diagnostic.ExitCode != nil {
+				t.Fatalf("diagnostic=%+v error=%v", diagnostic, err)
+			}
+		})
+	}
+}
+
+func TestWorkerFailureTypedNilExitErrorIsSafe(t *testing.T) {
+	var typedNil *exec.ExitError
+	var err error = typedNil
+	failure := newWorkerFailure(context.Background(), failureStageSyntoRun, failureClassChildExit, failureChildRun, err)
+	if failure == nil {
+		t.Fatal("typed-nil failure unexpectedly normalized to nil")
+	}
+	if got := failure.Error(); got == "" {
+		t.Fatal("typed-nil failure has empty safe error")
+	}
+	diagnostic := diagnosticForError(failure)
+	if diagnostic.ErrorClass != failureClassUnknown || diagnostic.Child != failureChildRun || diagnostic.ExitCode != nil {
+		t.Fatalf("diagnostic=%+v", diagnostic)
+	}
+}
+
+func TestSyntoMigrationAndIndexChildBoundariesHonorContextClassification(t *testing.T) {
+	t.Run("migration timeout wins over canceled child cause", func(t *testing.T) {
+		vault := t.TempDir()
+		mustWriteFile(t, filepath.Join(vault, "wiki.toml"), []byte("legacy"))
+		writeValidSQLiteState(t, filepath.Join(vault, ".olw", "state.db"))
+		ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+		defer cancel()
+		old := execOLW
+		t.Cleanup(func() { execOLW = old })
+		execOLW = func(context.Context, string, []string, []string, io.Writer, io.Writer) error {
+			return fmt.Errorf("child: %w", context.Canceled)
+		}
+		err := ensureSyntoVault(ctx, vault, workerConfig{APIKey: "unused"}, nil)
+		var failure *workerFailure
+		if !errors.As(err, &failure) || failure.Stage != failureStageSyntoMigration || failure.Class != failureClassTimeout || failure.Child != failureChildMigrateOLW {
+			t.Fatalf("error=%v metadata=%+v", err, failure)
+		}
+	})
+
+	t.Run("index export cancelled wins over deadline child cause", func(t *testing.T) {
+		vault := t.TempDir()
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		old := execOLW
+		t.Cleanup(func() { execOLW = old })
+		execOLW = func(context.Context, string, []string, []string, io.Writer, io.Writer) error {
+			return fmt.Errorf("child: %w", context.DeadlineExceeded)
+		}
+		err := ensureSyntoIndex(ctx, vault, nil)
+		var failure *workerFailure
+		if !errors.As(err, &failure) || failure.Stage != failureStageSyntoIndexExport || failure.Class != failureClassCancelled || failure.Child != failureChildPackExport {
+			t.Fatalf("error=%v metadata=%+v", err, failure)
+		}
+	})
+}
+
+func TestSyntoMigrationPostconditionsAreStateInvalid(t *testing.T) {
+	vault := t.TempDir()
+	mustWriteFile(t, filepath.Join(vault, "raw", "source.md"), []byte("before"))
+	mustWriteFile(t, filepath.Join(vault, "wiki.toml"), []byte("legacy"))
+	writeValidSQLiteState(t, filepath.Join(vault, ".olw", "state.db"))
+	old := execOLW
+	t.Cleanup(func() { execOLW = old })
+	execOLW = func(_ context.Context, work string, _ []string, _ []string, _, _ io.Writer) error {
+		mustWriteFile(t, filepath.Join(work, "raw", "source.md"), []byte("changed"))
+		mustWriteFile(t, filepath.Join(work, "synto.toml"), []byte("[pipeline]\nauto_commit=false\nauto_maintain=false\nrelation_extraction=false\n"))
+		writeValidSQLiteState(t, filepath.Join(work, ".synto", "state.db"))
+		return nil
+	}
+	err := ensureSyntoVault(context.Background(), vault, workerConfig{APIKey: "unused"}, nil)
+	diagnostic := diagnosticForError(err)
+	if diagnostic.Stage != failureStageSyntoMigration || diagnostic.ErrorClass != failureClassStateInvalid {
+		t.Fatalf("diagnostic=%+v error=%v", diagnostic, err)
+	}
+}
+
+func TestWorkerIncoherentSyntoStateFailsBeforeChildWithStateDiagnostic(t *testing.T) {
+	vault := t.TempDir()
+	mustWriteFile(t, filepath.Join(vault, "synto.toml"), []byte("[pipeline]\nauto_commit = false\nauto_maintain = false\nrelation_extraction = false\n"))
+	mustWriteFile(t, filepath.Join(vault, "wiki.toml"), []byte("legacy"))
+	old := execOLW
+	t.Cleanup(func() { execOLW = old })
+	called := false
+	execOLW = func(context.Context, string, []string, []string, io.Writer, io.Writer) error {
+		called = true
+		return errors.New("child must not run")
+	}
+
+	err := runWorkerBatchAtVault(context.Background(), workerConfig{APIKey: "unused", Postprocess: true}, [][]string{{"run"}}, vault)
+	if err == nil {
+		t.Fatal("incoherent Synto/legacy state unexpectedly succeeded")
+	}
+	if called {
+		t.Fatal("child ran before incoherent state was rejected")
+	}
+	diagnostic := diagnosticForError(err)
+	if diagnostic.Stage != failureStageSyntoConfigValidation || diagnostic.ErrorClass != failureClassStateInvalid || diagnostic.Child != "" {
+		t.Fatalf("diagnostic=%+v error=%v", diagnostic, err)
+	}
+}
+
+func TestRunOLWBatchSafetyValidationCarriesConfigDiagnostic(t *testing.T) {
+	vault := t.TempDir()
+	mustWriteFile(t, filepath.Join(vault, "synto.toml"), []byte("[pipeline]\nauto_commit = true\n"))
+	old := execOLW
+	t.Cleanup(func() { execOLW = old })
+	called := false
+	execOLW = func(context.Context, string, []string, []string, io.Writer, io.Writer) error {
+		called = true
+		return errors.New("child must not run")
+	}
+
+	err := runOLWBatch(context.Background(), vault, [][]string{{"run"}}, true, nil, nil, nil)
+	if err == nil {
+		t.Fatal("unsafe Synto config unexpectedly succeeded")
+	}
+	if called {
+		t.Fatal("child ran before safety validation")
+	}
+	diagnostic := diagnosticForError(err)
+	if diagnostic.Stage != failureStageSyntoConfigValidation || diagnostic.ErrorClass != failureClassValidation || diagnostic.Child != "" {
+		t.Fatalf("diagnostic=%+v error=%v", diagnostic, err)
+	}
+}
+
+func TestSyntoIndexExportValidationCarriesIndexStateDiagnostic(t *testing.T) {
+	vault := t.TempDir()
+	old := execOLW
+	t.Cleanup(func() { execOLW = old })
+	execOLW = func(_ context.Context, _ string, command []string, _ []string, _, _ io.Writer) error {
+		out := command[len(command)-1]
+		if err := os.MkdirAll(filepath.Join(out, "index"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		mustWriteFile(t, filepath.Join(out, "index", "INDEX.json"), []byte(`{"version":999}`))
+		return nil
+	}
+
+	err := ensureSyntoIndex(context.Background(), vault, nil)
+	if err == nil {
+		t.Fatal("invalid exported INDEX unexpectedly succeeded")
+	}
+	diagnostic := diagnosticForError(err)
+	if diagnostic.Stage != failureStageSyntoIndexExport || diagnostic.ErrorClass != failureClassStateInvalid || diagnostic.Child != "" {
+		t.Fatalf("diagnostic=%+v error=%v", diagnostic, err)
+	}
+}
 
 func TestSyntoWorkerImagePinsExactWheel(t *testing.T) {
 	data, err := os.ReadFile("Dockerfile")

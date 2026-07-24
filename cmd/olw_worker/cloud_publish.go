@@ -52,6 +52,7 @@ var errObjectGenerationConflict = errors.New("object generation conflict")
 var errObjectNotFound = errors.New("object not found")
 
 const cloudManifestReadbackTimeout = 3 * time.Second
+const cloudFailureRecordingTimeout = 5 * time.Second
 
 var errManifestCommitOutcomeUnknown = errors.New("manifest commit outcome unknown")
 var errCloudFailureRecording = errors.New("failure state recording failed")
@@ -64,7 +65,18 @@ var errCloudCommittedReceipt = errors.New("pipeline committed but receipt record
 var errCloudCleanup = errors.New("pipeline cleanup failed")
 var errCloudCommittedCleanup = errors.New("pipeline committed but cleanup failed")
 
+func cloudFailureRecordingContext(parent context.Context) (context.Context, context.CancelFunc) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	return context.WithTimeout(context.WithoutCancel(parent), cloudFailureRecordingTimeout)
+}
+
 const cloudLeaseReleaseAttempts = 3
+
+var cloudMkdirTemp = os.MkdirTemp
+var cloudReconcileSources = reconcileWorkspaceSources
+var cloudReconcileConcepts = reconcileWorkspaceConcepts
 
 const (
 	cloudPipelineCompletedEvent        = "pipeline completed\n"
@@ -73,8 +85,9 @@ const (
 )
 
 type cloudFailureRecordingError struct {
-	pipelineLog  bool
-	sourceStatus bool
+	pipelineLog       bool
+	sourceStatus      bool
+	failureDiagnostic bool
 }
 
 func (e cloudFailureRecordingError) Error() string { return errCloudFailureRecording.Error() }
@@ -263,10 +276,17 @@ func runCloudWorkerBatch(ctx context.Context, cfg workerConfig, commands [][]str
 	workspace := ""
 	defer func() {
 		if cleanupErr := lease.Release(ctx); cleanupErr != nil {
-			_ = writeCloudPipelineEvent(context.Background(), objects, prefix, cfg, cloudPipelineCommittedCleanupEvent)
+			recordingCtx, cancel := cloudFailureRecordingContext(ctx)
+			defer cancel()
+			_ = writeCloudPipelineEvent(recordingCtx, objects, prefix, cfg, cloudPipelineCommittedCleanupEvent)
 			if result == nil {
 				if committed {
-					result = errCloudCommittedCleanup
+					failure := newWorkerFailure(nil, failureStageLeaseCleanup, failureClassIO, "", cleanupErr)
+					if diagnosticErr := writeCloudFailureDiagnosticWithContext(recordingCtx, objects, prefix, cfg, failure); diagnosticErr != nil {
+						result = errors.Join(errCloudCommittedCleanup, cloudFailureRecordingError{failureDiagnostic: true})
+					} else {
+						result = errCloudCommittedCleanup
+					}
 				} else {
 					result = cleanupErr
 				}
@@ -277,14 +297,20 @@ func runCloudWorkerBatch(ctx context.Context, cfg workerConfig, commands [][]str
 	}()
 	// Cloud workers are deliberately detached from DATA_DIR, WORKSPACE and any
 	// mount. Their private work area is always local /tmp.
-	workspace, err = os.MkdirTemp("/tmp", "olw-cloud-")
+	workspace, err = cloudMkdirTemp("/tmp", "olw-cloud-")
 	if err != nil {
-		return errors.New("pipeline workspace unavailable")
+		failure := newWorkerFailure(ctx, failureStageInputMaterialization, failureClassIO, "", err)
+		primary := errors.New("pipeline workspace unavailable")
+		if recordErr := writeCloudFailureReceipts(ctx, objects, prefix, "", cfg, nil, failure); recordErr != nil {
+			return errors.Join(primary, recordErr)
+		}
+		return primary
 	}
 	defer os.RemoveAll(workspace)
 	snapshots, manifestData, manifestAttrs, err := materializeCloudWorkspace(ctx, objects, prefix, workspace)
 	if err != nil {
-		if recordErr := writeCloudFailureReceipts(ctx, objects, prefix, workspace, cfg, snapshots); recordErr != nil {
+		failure := preserveWorkerFailure(err, failureStageInputMaterialization, failureClassUnknown)
+		if recordErr := writeCloudFailureReceipts(ctx, objects, prefix, workspace, cfg, snapshots, failure); recordErr != nil {
 			return errors.Join(errCloudMaterialization, recordErr)
 		}
 		return errCloudMaterialization
@@ -293,13 +319,15 @@ func runCloudWorkerBatch(ctx context.Context, cfg workerConfig, commands [][]str
 	// workspace id_map before OLW regenerates transient concept identities.
 	priorConcepts, err := snapshotConcepts(workspace)
 	if err != nil {
-		if recordErr := writeCloudFailureReceipts(ctx, objects, prefix, workspace, cfg, snapshots); recordErr != nil {
+		failure := preserveWorkerFailure(err, failureStageInputMaterialization, failureClassUnknown)
+		if recordErr := writeCloudFailureReceipts(ctx, objects, prefix, workspace, cfg, snapshots, failure); recordErr != nil {
 			return errors.Join(errCloudMaterialization, recordErr)
 		}
 		return errCloudMaterialization
 	}
 	if err := materializeSnapshots(workspace, snapshots); err != nil {
-		if recordErr := writeCloudFailureReceipts(ctx, objects, prefix, workspace, cfg, snapshots); recordErr != nil {
+		failure := preserveWorkerFailure(err, failureStageInputMaterialization, failureClassUnknown)
+		if recordErr := writeCloudFailureReceipts(ctx, objects, prefix, workspace, cfg, snapshots, failure); recordErr != nil {
 			return errors.Join(errCloudMaterialization, recordErr)
 		}
 		return errCloudMaterialization
@@ -308,20 +336,23 @@ func runCloudWorkerBatch(ctx context.Context, cfg workerConfig, commands [][]str
 	cfg.Workspace = false
 	cfg.SuppressOutput = true
 	if err := runWorkerBatchAtVault(ctx, cfg, commands, workspace); err != nil {
+		failure := preserveWorkerFailure(err, failureStageSyntoRun, failureClassUnknown)
 		primary := errCloudPipelineExecution
-		if recordErr := writeCloudFailureReceipts(ctx, objects, prefix, workspace, cfg, snapshots); recordErr != nil {
+		if recordErr := writeCloudFailureReceipts(ctx, objects, prefix, workspace, cfg, snapshots, failure); recordErr != nil {
 			return errors.Join(primary, recordErr)
 		}
 		return primary
 	}
-	if err := reconcileWorkspaceSources(workspace, snapshots); err != nil {
-		if recordErr := writeCloudFailureReceipts(ctx, objects, prefix, workspace, cfg, snapshots); recordErr != nil {
+	if err := cloudReconcileSources(workspace, snapshots); err != nil {
+		failure := preserveWorkerFailure(err, failureStageSourceReconciliation, failureClassUnknown)
+		if recordErr := writeCloudFailureReceipts(ctx, objects, prefix, workspace, cfg, snapshots, failure); recordErr != nil {
 			return errors.Join(errCloudPipelinePublish, recordErr)
 		}
 		return errCloudPipelinePublish
 	}
-	if err := reconcileWorkspaceConcepts(workspace, priorConcepts, snapshots); err != nil {
-		if recordErr := writeCloudFailureReceipts(ctx, objects, prefix, workspace, cfg, snapshots); recordErr != nil {
+	if err := cloudReconcileConcepts(workspace, priorConcepts, snapshots); err != nil {
+		failure := preserveWorkerFailure(err, failureStageConceptReconciliation, failureClassUnknown)
+		if recordErr := writeCloudFailureReceipts(ctx, objects, prefix, workspace, cfg, snapshots, failure); recordErr != nil {
 			return errors.Join(errCloudPipelinePublish, recordErr)
 		}
 		return errCloudPipelinePublish
@@ -331,13 +362,22 @@ func runCloudWorkerBatch(ctx context.Context, cfg workerConfig, commands [][]str
 			return errManifestCommitOutcomeUnknown
 		}
 		primary := errCloudPipelinePublish
-		if recordErr := writeCloudFailureReceipts(ctx, objects, prefix, workspace, cfg, snapshots); recordErr != nil {
+		failureClass := failureClassIO
+		if errors.Is(err, errObjectGenerationConflict) {
+			failureClass = failureClassPublishConflict
+		}
+		failure := preserveWorkerFailure(err, failureStageGenerationPublish, failureClass)
+		if recordErr := writeCloudFailureReceipts(ctx, objects, prefix, workspace, cfg, snapshots, failure); recordErr != nil {
 			return errors.Join(primary, recordErr)
 		}
 		return primary
 	}
 	committed = true
 	if err := writeCloudReceipts(ctx, objects, prefix, workspace, cfg, snapshots); err != nil {
+		failure := preserveWorkerFailure(err, failureStageReceiptRecording, failureClassRecordingFailure)
+		if diagnosticErr := writeCloudFailureDiagnostic(ctx, objects, prefix, cfg, failure); diagnosticErr != nil {
+			return errors.Join(errCloudCommittedReceipt, cloudFailureRecordingError{failureDiagnostic: true})
+		}
 		return errCloudCommittedReceipt
 	}
 	return nil
@@ -635,7 +675,7 @@ func publishCloudGenerationWithFiles(ctx context.Context, objects objectStore, p
 		} else if errors.Is(outcome, errManifestCommitOutcomeUnknown) {
 			return generation.Manifest{}, 0, errManifestCommitOutcomeUnknown
 		}
-		return generation.Manifest{}, 0, errors.New("generation manifest commit conflicted")
+		return generation.Manifest{}, 0, fmt.Errorf("generation manifest commit conflicted: %w", errObjectGenerationConflict)
 	}
 	return m, a.Generation, nil
 }
@@ -846,13 +886,16 @@ func writeCloudReceipts(ctx context.Context, objects objectStore, prefix, worksp
 	}
 	return mergeCloudSuccess(ctx, objects, prefix, snapshots)
 }
-func writeCloudFailureReceipts(ctx context.Context, objects objectStore, prefix, workspace string, cfg workerConfig, snapshots []sourceSnapshot) error {
-	logErr := writeCloudPipelineEvent(ctx, objects, prefix, cfg, cloudPipelineFailedEvent)
-	statusErr := mergeCloudFailure(ctx, objects, prefix, snapshots)
-	if logErr == nil && statusErr == nil {
+func writeCloudFailureReceipts(ctx context.Context, objects objectStore, prefix, workspace string, cfg workerConfig, snapshots []sourceSnapshot, failure error) error {
+	recordingCtx, cancel := cloudFailureRecordingContext(ctx)
+	defer cancel()
+	logErr := writeCloudPipelineEvent(recordingCtx, objects, prefix, cfg, cloudPipelineFailedEvent)
+	statusErr := mergeCloudFailure(recordingCtx, objects, prefix, snapshots)
+	diagnosticErr := writeCloudFailureDiagnosticWithContext(recordingCtx, objects, prefix, cfg, failure)
+	if logErr == nil && statusErr == nil && diagnosticErr == nil {
 		return nil
 	}
-	return cloudFailureRecordingError{pipelineLog: logErr != nil, sourceStatus: statusErr != nil}
+	return cloudFailureRecordingError{pipelineLog: logErr != nil, sourceStatus: statusErr != nil, failureDiagnostic: diagnosticErr != nil}
 }
 func writeCloudPipelineLog(ctx context.Context, objects objectStore, prefix, workspace string, cfg workerConfig) error {
 	return writeCloudPipelineEvent(ctx, objects, prefix, cfg, cloudPipelineCompletedEvent)
@@ -867,6 +910,38 @@ func writeCloudPipelineEvent(ctx context.Context, objects objectStore, prefix st
 	}
 	_, err := objects.Write(ctx, prefix+"cache/pipeline-"+cfg.ExecutionID+".log", []byte(event), nil, objectConditions{})
 	return err
+}
+
+func writeCloudFailureDiagnostic(ctx context.Context, objects objectStore, prefix string, cfg workerConfig, failure error) error {
+	recordingCtx, cancel := cloudFailureRecordingContext(ctx)
+	defer cancel()
+	return writeCloudFailureDiagnosticWithContext(recordingCtx, objects, prefix, cfg, failure)
+}
+
+func writeCloudFailureDiagnosticWithContext(ctx context.Context, objects objectStore, prefix string, cfg workerConfig, failure error) error {
+	if !validPipelineExecutionID(cfg.ExecutionID) {
+		return nil
+	}
+	data, err := marshalFailureDiagnostic(failure)
+	if err != nil {
+		return err
+	}
+	name := prefix + "cache/pipeline-" + cfg.ExecutionID + ".failure.json"
+	_, err = objects.Write(ctx, name, data, nil, objectConditions{DoesNotExist: true})
+	if err == nil {
+		return nil
+	}
+	if !isObjectGenerationConflict(err) {
+		return err
+	}
+	existing, _, readErr := objects.Read(ctx, name, 0, 4<<10)
+	if readErr != nil {
+		return err
+	}
+	if _, decodeErr := decodeFailureDiagnostic(existing); decodeErr != nil || !bytes.Equal(existing, data) {
+		return err
+	}
+	return nil
 }
 func mergeCloudSuccess(ctx context.Context, objects objectStore, prefix string, snapshots []sourceSnapshot) error {
 	return mergeCloudReceipts(ctx, objects, prefix, func(artifact *sourcestatus.Artifact) {
