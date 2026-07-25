@@ -572,6 +572,11 @@ func containsString(values []string, needle string) bool {
 }
 
 func generateID(data []byte) string {
+	return ContentDerivedID(data)
+}
+
+// ContentDerivedID returns the ID Rebuild assigns to markdown without an explicit ID.
+func ContentDerivedID(data []byte) string {
 	h := md5.Sum(data)
 	return hex.EncodeToString(h[:])[:12]
 }
