@@ -189,6 +189,10 @@ func Rebuild(ctx context.Context, store Store) (IDMap, error) {
 	return next, nil
 }
 
+func isSyntoRootPage(path string) bool {
+	return path == "wiki/index.md" || path == "wiki/log.md"
+}
+
 func BuildIDMap(ctx context.Context, store Store) (IDMap, error) {
 	next := IDMap{
 		Concept:         map[string]string{},
@@ -248,6 +252,9 @@ func addIDMapEntries(ctx context.Context, store Store, dir string, entries map[s
 		return fmt.Errorf("list %s: %w", dir, err)
 	}
 	for _, file := range files {
+		if isSyntoRootPage(file.Path) {
+			continue
+		}
 		matter, err := parseMarkdownMatter(file.Data)
 		if err != nil {
 			return fmt.Errorf("parse %s: %w", file.Path, err)
@@ -421,6 +428,9 @@ func buildConceptsJSONL(ctx context.Context, store Store) ([]byte, error) {
 
 	var builder strings.Builder
 	for _, file := range files {
+		if isSyntoRootPage(file.Path) {
+			continue
+		}
 		entry := parseCacheEntry(file.Slug, string(file.Data))
 		normalizedFrontmatter, err := normalizeJSONValue(entry.Frontmatter, 0)
 		if err != nil {
