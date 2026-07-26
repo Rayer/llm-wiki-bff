@@ -1591,6 +1591,219 @@ func TestStrictJSONNestingDepthBoundary(t *testing.T) {
 	}
 }
 
+func testEntityMappingErrorDetail(t *testing.T, err error, want conceptReconcileDetailCode) {
+	t.Helper()
+	var detail conceptReconciliationDetail
+	if !errors.As(err, &detail) {
+		t.Fatalf("expected concept detail, got %T: %v", err, err)
+	}
+	if got := detail.ConceptReconciliationDetail(); got != want {
+		t.Fatalf("got detail %q, want %q", got, want)
+	}
+}
+
+func testEntityMappingErrorDetailCode(t *testing.T, err error) conceptReconcileDetailCode {
+	t.Helper()
+	var detail conceptReconciliationDetail
+	if !errors.As(err, &detail) {
+		t.Fatalf("expected concept detail, got %T: %v", err, err)
+	}
+	return detail.ConceptReconciliationDetail()
+}
+
+func syntoIndexTruthForEntityMapping(articles []syntoIndexEntry, sourceConcepts []syntoSourceConcept, extraActiveEntities []string) syntoIndexTruth {
+	active := make(map[string]bool, len(sourceConcepts)+len(extraActiveEntities))
+	for _, concept := range sourceConcepts {
+		active[concept.EntityID] = true
+	}
+	for _, entityID := range extraActiveEntities {
+		active[entityID] = true
+	}
+	return syntoIndexTruth{
+		Articles:       articles,
+		SourceConcepts: sourceConcepts,
+		ActiveEntities: active,
+		Present:        true,
+	}
+}
+
+func TestReadSyntoEntityIDsReturnsReasonedDetailCodes(t *testing.T) {
+	workspace := t.TempDir()
+	mustWriteFile(t, filepath.Join(workspace, ".synto", "INDEX.json"), []byte(`{"schema_version":1}`))
+	if _, err := readSyntoEntityIDs(workspace, map[string]string{}); err == nil {
+		t.Fatal("malformed INDEX expected to fail")
+	} else {
+		testEntityMappingErrorDetail(t, err, conceptDetailEntityMappingIndexTruth)
+	}
+
+	base := syntoIndexFixture("article-a", "entity-a", "alpha", true)
+	decoderBranches := []struct {
+		name string
+		path string
+		want conceptReconcileDetailCode
+	}{
+		{
+			name: "decode article identity",
+			path: strings.Replace(base, `"id":"article-a"`, `"id":"article/a"`, 1),
+			want: conceptDetailEntityMappingArticleIdentity,
+		},
+		{
+			name: "decode article path",
+			path: strings.Replace(base, `"wiki/alpha.md"`, `"exports/alpha.md"`, 1),
+			want: conceptDetailEntityMappingArticlePath,
+		},
+		{
+			name: "decode source concept identity",
+			path: strings.Replace(base, `"name":"alpha","entity_id":"entity-a"`, `"name":"alpha","entity_id":"entity/a"`, 1),
+			want: conceptDetailEntityMappingSourceConceptIdentity,
+		},
+	}
+	for _, tc := range decoderBranches {
+		t.Run(tc.name, func(t *testing.T) {
+			mustWriteFile(t, filepath.Join(workspace, ".synto", "INDEX.json"), []byte(tc.path))
+			if _, err := readSyntoEntityIDs(workspace, map[string]string{}); err == nil {
+				t.Fatalf("decoder-level branch %q accepted", tc.name)
+			} else {
+				testEntityMappingErrorDetail(t, err, tc.want)
+			}
+		})
+	}
+
+	conceptBranches := []struct {
+		name     string
+		index    syntoIndexTruth
+		concepts map[string]string
+		want     conceptReconcileDetailCode
+	}{
+		{
+			name:     "source concept identity",
+			index:    syntoIndexTruthForEntityMapping([]syntoIndexEntry{}, []syntoSourceConcept{{Name: "", EntityID: "entity-a"}}, nil),
+			concepts: map[string]string{},
+			want:     conceptDetailEntityMappingSourceConceptIdentity,
+		},
+		{
+			name:     "article identity",
+			index:    syntoIndexTruthForEntityMapping([]syntoIndexEntry{{ID: "article/a", EntityID: "entity-a", Name: "Alpha", Path: "wiki/alpha.md"}}, []syntoSourceConcept{{Name: "Alpha", EntityID: "entity-a"}}, nil),
+			concepts: map[string]string{},
+			want:     conceptDetailEntityMappingArticleIdentity,
+		},
+		{
+			name: "source concept ambiguity",
+			index: syntoIndexTruthForEntityMapping(
+				[]syntoIndexEntry{{ID: "article-a", Name: "Alpha", Path: "wiki/alpha.md"}},
+				[]syntoSourceConcept{
+					{Name: "Alpha", EntityID: "entity-a"},
+					{Name: "Alpha", EntityID: "entity-b"},
+				}, nil),
+			concepts: map[string]string{"article-a": "alpha"},
+			want:     conceptDetailEntityMappingArticleSourceAmbiguity,
+		},
+		{
+			name:     "source concept missing",
+			index:    syntoIndexTruthForEntityMapping([]syntoIndexEntry{{ID: "article-a", Name: "Alpha", Path: "wiki/alpha.md"}}, []syntoSourceConcept{{Name: "Beta", EntityID: "entity-b"}}, nil),
+			concepts: map[string]string{"article-a": "alpha"},
+			want:     conceptDetailEntityMappingArticleSourceMissing,
+		},
+		{
+			name:     "article path",
+			index:    syntoIndexTruthForEntityMapping([]syntoIndexEntry{{ID: "article-a", EntityID: "entity-a", Name: "Alpha", Path: "articles/nested/alpha.md"}}, []syntoSourceConcept{{Name: "Alpha", EntityID: "entity-a"}}, nil),
+			concepts: map[string]string{"article-a": "alpha"},
+			want:     conceptDetailEntityMappingArticlePath,
+		},
+		{
+			name: "article source disagreement",
+			index: syntoIndexTruthForEntityMapping(
+				[]syntoIndexEntry{{ID: "article-a", EntityID: "entity-a", Name: "Alpha", Path: "wiki/alpha.md"}},
+				[]syntoSourceConcept{{Name: "Alpha", EntityID: "entity-b"}}, nil),
+			concepts: map[string]string{"article-a": "alpha"},
+			want:     conceptDetailEntityMappingArticleSourceDisagreement,
+		},
+		{
+			name:     "duplicate article ID",
+			index:    syntoIndexTruthForEntityMapping([]syntoIndexEntry{{ID: "article-a", EntityID: "entity-a", Name: "Alpha", Path: "wiki/alpha.md"}, {ID: "article-a", EntityID: "entity-b", Name: "Beta", Path: "wiki/beta.md"}}, []syntoSourceConcept{{Name: "Alpha", EntityID: "entity-a"}, {Name: "Beta", EntityID: "entity-b"}}, nil),
+			concepts: map[string]string{"article-a": "alpha", "article-b": "beta"},
+			want:     conceptDetailEntityMappingDuplicateArticleID,
+		},
+		{
+			name: "duplicate article path",
+			index: syntoIndexTruthForEntityMapping(
+				[]syntoIndexEntry{
+					{ID: "article-a", EntityID: "entity-a", Name: "Alpha", Path: "wiki/Alpha.md"},
+					{ID: "article-b", EntityID: "entity-b", Name: "Alpha", Path: "wiki/alpha.md"},
+				},
+				[]syntoSourceConcept{{Name: "Alpha", EntityID: "entity-a"}, {Name: "Alpha", EntityID: "entity-b"}},
+				nil,
+			),
+			concepts: map[string]string{"article-a": "alpha"},
+			want:     conceptDetailEntityMappingDuplicateArticlePath,
+		},
+		{
+			name:     "duplicate entity ID",
+			index:    syntoIndexTruthForEntityMapping([]syntoIndexEntry{{ID: "article-a", EntityID: "entity-a", Name: "Alpha", Path: "wiki/alpha.md"}, {ID: "article-b", EntityID: "entity-a", Name: "Beta", Path: "wiki/beta.md"}}, []syntoSourceConcept{{Name: "Alpha", EntityID: "entity-a"}, {Name: "Beta", EntityID: "entity-a"}}, nil),
+			concepts: map[string]string{"article-a": "alpha", "article-b": "beta"},
+			want:     conceptDetailEntityMappingDuplicateEntityID,
+		},
+		{
+			name:     "active entity collision",
+			index:    syntoIndexTruthForEntityMapping([]syntoIndexEntry{{ID: "article-a", EntityID: "entity-a", Name: "Alpha", Path: "wiki/alpha.md"}}, []syntoSourceConcept{{Name: "Alpha", EntityID: "entity-a"}}, []string{"entity-b"}),
+			concepts: map[string]string{"article-a": "alpha"},
+			want:     conceptDetailEntityMappingActiveEntityUnknown,
+		},
+		{
+			name:     "concept slug case mismatch",
+			index:    syntoIndexTruthForEntityMapping([]syntoIndexEntry{{ID: "article-a", EntityID: "entity-a", Name: "Alpha", Path: "wiki/alpha.md"}}, []syntoSourceConcept{{Name: "Alpha", EntityID: "entity-a"}}, nil),
+			concepts: map[string]string{"article-a": "ALPHA"},
+			want:     conceptDetailEntityMappingConceptSlugCase,
+		},
+		{
+			name: "concept ID-path disagreement",
+			index: syntoIndexTruthForEntityMapping(
+				[]syntoIndexEntry{
+					{ID: "article-a", EntityID: "entity-a", Name: "Alpha", Path: "wiki/alpha.md"},
+					{ID: "article-b", EntityID: "entity-b", Name: "Beta", Path: "wiki/beta.md"},
+				},
+				[]syntoSourceConcept{{Name: "Alpha", EntityID: "entity-a"}, {Name: "Beta", EntityID: "entity-b"}},
+				nil,
+			),
+			concepts: map[string]string{"article-a": "beta"},
+			want:     conceptDetailEntityMappingConceptIDPathDisagreement,
+		},
+		{
+			name:     "concept missing mapping",
+			index:    syntoIndexTruthForEntityMapping([]syntoIndexEntry{{ID: "article-a", EntityID: "entity-a", Name: "Alpha", Path: "wiki/alpha.md"}}, []syntoSourceConcept{{Name: "Alpha", EntityID: "entity-a"}}, nil),
+			concepts: map[string]string{"article-a": "missing"},
+			want:     conceptDetailEntityMappingConceptMissingMapping,
+		},
+		{
+			name:     "concept ID has no matching path",
+			index:    syntoIndexTruthForEntityMapping([]syntoIndexEntry{{ID: "article-a", EntityID: "entity-a", Name: "Alpha", Path: "wiki/alpha.md"}}, []syntoSourceConcept{{Name: "Alpha", EntityID: "entity-a"}}, nil),
+			concepts: map[string]string{"article-a": "beta"},
+			want:     conceptDetailEntityMappingConceptMissingMapping,
+		},
+		{
+			name:     "concept is missing id and slug from INDEX",
+			index:    syntoIndexTruthForEntityMapping([]syntoIndexEntry{{ID: "article-a", EntityID: "entity-a", Name: "Alpha", Path: "wiki/alpha.md"}}, []syntoSourceConcept{{Name: "Alpha", EntityID: "entity-a"}}, nil),
+			concepts: map[string]string{"missing-id": "missing"},
+			want:     conceptDetailEntityMappingConceptMissingMapping,
+		},
+		{
+			name:     "concept entity collision",
+			index:    syntoIndexTruthForEntityMapping([]syntoIndexEntry{{ID: "article-a", EntityID: "entity-a", Name: "Alpha", Path: "wiki/alpha.md"}}, []syntoSourceConcept{{Name: "Alpha", EntityID: "entity-a"}}, nil),
+			concepts: map[string]string{"article-a": "alpha", "article-b": "alpha"},
+			want:     conceptDetailEntityMappingConceptEntityCollision,
+		},
+	}
+	for _, tc := range conceptBranches {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := mapSyntoEntityIDsFromIndexTruth(tc.index, tc.concepts); err == nil {
+				t.Fatalf("index variant accepted for %q", tc.name)
+			} else {
+				testEntityMappingErrorDetail(t, err, tc.want)
+			}
+		})
+	}
+}
+
 func TestSyntoEntityFirstMappingPreservesRenameAndFailsClosed(t *testing.T) {
 	prior := []conceptSnapshot{{ConceptID: "stable-alpha", Slug: "alpha", EntityID: "entity-alpha"}}
 	out, _, err := reconcileConceptIDMapWithEntities([]byte(`{"concept":{"generated":"renamed-alpha"},"concept_entity_id":{"generated":"entity-alpha"},"source":{},"redirects":{}}`), prior, true)
@@ -1629,6 +1842,45 @@ func TestSyntoIdentityLogRejectsMergeAndSplitLineage(t *testing.T) {
 		mustWriteFile(t, filepath.Join(workspace, ".synto", "INDEX.json"), []byte(index))
 		if err := reconcileWorkspaceConcepts(workspace, nil); err == nil {
 			t.Fatalf("%s lineage accepted", op)
+		}
+	}
+}
+
+func TestMapSyntoEntityIDsFromIndexTruthConceptIterationIsDeterministic(t *testing.T) {
+	index := syntoIndexTruthForEntityMapping(
+		[]syntoIndexEntry{
+			{ID: "article-a", EntityID: "entity-a", Name: "Alpha", Path: "wiki/alpha.md"},
+			{ID: "article-b", EntityID: "entity-b", Name: "Beta", Path: "wiki/beta.md"},
+		},
+		[]syntoSourceConcept{{Name: "Alpha", EntityID: "entity-a"}, {Name: "Beta", EntityID: "entity-b"}},
+		nil,
+	)
+	buildConcepts := func(order []string) map[string]string {
+		seed := make(map[string]string)
+		for _, entry := range order {
+			switch entry {
+			case "a":
+				seed["article-a"] = "ALPHA"
+			case "b":
+				seed["article-b"] = "alpha"
+			}
+		}
+		return seed
+	}
+	orders := [][]string{
+		{"a", "b"},
+		{"b", "a"},
+	}
+	for i := 0; i < 16; i++ {
+		for _, order := range orders {
+			_, err := mapSyntoEntityIDsFromIndexTruth(index, buildConcepts(order))
+			if err == nil {
+				t.Fatalf("conflicting concepts unexpectedly accepted")
+			}
+			detail := testEntityMappingErrorDetailCode(t, err)
+			if detail != conceptDetailEntityMappingConceptSlugCase {
+				t.Fatalf("non-deterministic concept reason=%q (order=%v run=%d)", detail, order, i)
+			}
 		}
 	}
 }
