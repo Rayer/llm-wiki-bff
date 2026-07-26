@@ -52,22 +52,44 @@ const (
 type conceptReconcileDetailCode string
 
 const (
-	conceptDetailGeneratedMapReadDecode conceptReconcileDetailCode = "generated_map_read_decode"
-	conceptDetailSyntoIndexTruth        conceptReconcileDetailCode = "synto_index_truth"
-	conceptDetailEntityMapping          conceptReconcileDetailCode = "entity_mapping"
-	conceptDetailEntityMerge            conceptReconcileDetailCode = "entity_merge"
-	conceptDetailIdentityReconciliation conceptReconcileDetailCode = "identity_reconciliation"
-	conceptDetailLifecyclePlanning      conceptReconcileDetailCode = "lifecycle_planning"
-	conceptDetailConceptPageRewrite     conceptReconcileDetailCode = "concept_page_rewrite"
-	conceptDetailLinkRewrite            conceptReconcileDetailCode = "link_rewrite"
-	conceptDetailCacheRewrite           conceptReconcileDetailCode = "cache_rewrite"
-	conceptDetailArtifactWrite          conceptReconcileDetailCode = "artifact_write"
-	conceptDetailArtifactRemove         conceptReconcileDetailCode = "artifact_remove"
+	conceptDetailGeneratedMapReadDecode                 conceptReconcileDetailCode = "generated_map_read_decode"
+	conceptDetailSyntoIndexTruth                        conceptReconcileDetailCode = "synto_index_truth"
+	conceptDetailEntityMapping                          conceptReconcileDetailCode = "entity_mapping"
+	conceptDetailEntityMappingIndexTruth                conceptReconcileDetailCode = "entity_mapping_index_truth"
+	conceptDetailEntityMappingSourceConceptIdentity     conceptReconcileDetailCode = "entity_mapping_source_concept_identity"
+	conceptDetailEntityMappingArticleIdentity           conceptReconcileDetailCode = "entity_mapping_article_identity"
+	conceptDetailEntityMappingArticlePath               conceptReconcileDetailCode = "entity_mapping_article_path"
+	conceptDetailEntityMappingArticleSourceAmbiguity    conceptReconcileDetailCode = "entity_mapping_article_source_ambiguity"
+	conceptDetailEntityMappingArticleSourceMissing      conceptReconcileDetailCode = "entity_mapping_article_source_missing"
+	conceptDetailEntityMappingArticleSourceDisagreement conceptReconcileDetailCode = "entity_mapping_article_source_disagreement"
+	conceptDetailEntityMappingDuplicateArticleID        conceptReconcileDetailCode = "entity_mapping_duplicate_article_id"
+	conceptDetailEntityMappingDuplicateArticlePath      conceptReconcileDetailCode = "entity_mapping_duplicate_article_path"
+	conceptDetailEntityMappingDuplicateEntityID         conceptReconcileDetailCode = "entity_mapping_duplicate_entity_id"
+	conceptDetailEntityMappingActiveEntityUnknown       conceptReconcileDetailCode = "entity_mapping_active_entity_unknown"
+	conceptDetailEntityMappingConceptSlugCase           conceptReconcileDetailCode = "entity_mapping_concept_slug_case"
+	conceptDetailEntityMappingConceptIDPathDisagreement conceptReconcileDetailCode = "entity_mapping_concept_id_path_disagreement"
+	conceptDetailEntityMappingConceptMissingMapping     conceptReconcileDetailCode = "entity_mapping_concept_missing_mapping"
+	conceptDetailEntityMappingConceptEntityCollision    conceptReconcileDetailCode = "entity_mapping_concept_entity_collision"
+	conceptDetailEntityMerge                            conceptReconcileDetailCode = "entity_merge"
+	conceptDetailIdentityReconciliation                 conceptReconcileDetailCode = "identity_reconciliation"
+	conceptDetailLifecyclePlanning                      conceptReconcileDetailCode = "lifecycle_planning"
+	conceptDetailConceptPageRewrite                     conceptReconcileDetailCode = "concept_page_rewrite"
+	conceptDetailLinkRewrite                            conceptReconcileDetailCode = "link_rewrite"
+	conceptDetailCacheRewrite                           conceptReconcileDetailCode = "cache_rewrite"
+	conceptDetailArtifactWrite                          conceptReconcileDetailCode = "artifact_write"
+	conceptDetailArtifactRemove                         conceptReconcileDetailCode = "artifact_remove"
 )
 
 var knownConceptDetailCodes = map[conceptReconcileDetailCode]struct{}{
 	conceptDetailGeneratedMapReadDecode: {}, conceptDetailSyntoIndexTruth: {},
-	conceptDetailEntityMapping: {}, conceptDetailEntityMerge: {}, conceptDetailIdentityReconciliation: {},
+	conceptDetailEntityMapping: {}, conceptDetailEntityMappingIndexTruth: {},
+	conceptDetailEntityMappingSourceConceptIdentity: {}, conceptDetailEntityMappingArticleIdentity: {},
+	conceptDetailEntityMappingArticlePath: {}, conceptDetailEntityMappingArticleSourceAmbiguity: {}, conceptDetailEntityMappingArticleSourceMissing: {},
+	conceptDetailEntityMappingArticleSourceDisagreement: {}, conceptDetailEntityMappingDuplicateArticleID: {},
+	conceptDetailEntityMappingDuplicateArticlePath: {}, conceptDetailEntityMappingDuplicateEntityID: {},
+	conceptDetailEntityMappingActiveEntityUnknown: {}, conceptDetailEntityMappingConceptSlugCase: {},
+	conceptDetailEntityMappingConceptIDPathDisagreement: {}, conceptDetailEntityMappingConceptMissingMapping: {},
+	conceptDetailEntityMappingConceptEntityCollision: {}, conceptDetailEntityMerge: {}, conceptDetailIdentityReconciliation: {},
 	conceptDetailLifecyclePlanning: {}, conceptDetailConceptPageRewrite: {},
 	conceptDetailLinkRewrite: {}, conceptDetailCacheRewrite: {},
 	conceptDetailArtifactWrite: {}, conceptDetailArtifactRemove: {},
@@ -106,6 +128,14 @@ func (e *conceptReconciliationFailure) ConceptReconciliationDetail() conceptReco
 func wrapConceptReconciliationError(detail conceptReconcileDetailCode, err error) error {
 	if err == nil {
 		return nil
+	}
+	var nestedDetail conceptReconciliationDetail
+	if errors.As(err, &nestedDetail) && nestedDetail != nil {
+		if code := nestedDetail.ConceptReconciliationDetail(); code != "" {
+			if _, ok := knownConceptDetailCodes[code]; ok {
+				return &conceptReconciliationFailure{detail: code, cause: err}
+			}
+		}
 	}
 	return &conceptReconciliationFailure{detail: detail, cause: err}
 }

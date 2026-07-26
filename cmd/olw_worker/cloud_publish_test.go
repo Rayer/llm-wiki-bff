@@ -881,6 +881,15 @@ func TestFailureDiagnosticDetailCodeUsesOnlyNestedTypedMetadata(t *testing.T) {
 	if unknown.DetailCode != "" {
 		t.Fatalf("unknown detail retained: %+v", unknown)
 	}
+	innerNested := wrapConceptReconciliationError(conceptDetailEntityMappingConceptMissingMapping, base)
+	preserved := diagnosticForError(newWorkerFailure(context.Background(), failureStageConceptReconciliation, failureClassUnknown, "", wrapConceptReconciliationError(conceptDetailEntityMapping, innerNested)))
+	if preserved.DetailCode != conceptDetailEntityMappingConceptMissingMapping {
+		t.Fatalf("nested detail not preserved: %+v", preserved)
+	}
+	fallback := diagnosticForError(newWorkerFailure(context.Background(), failureStageConceptReconciliation, failureClassUnknown, "", wrapConceptReconciliationError(conceptDetailEntityMapping, wrapConceptReconciliationError(conceptReconcileDetailCode("not-allowlisted"), base))))
+	if fallback.DetailCode != conceptDetailEntityMapping {
+		t.Fatalf("unknown nested detail leaked: %+v", fallback)
+	}
 	if wrapperOnly := diagnosticForError(wrapConceptReconciliationError(conceptDetailLinkRewrite, base)); wrapperOnly.DetailCode != "" {
 		t.Fatalf("wrapper-only detail retained: %+v", wrapperOnly)
 	}
@@ -939,6 +948,60 @@ func TestCloudPersistsConceptReconciliationDetailAndReplaysIdempotently(t *testi
 		t.Fatalf("diagnostic=%+v", diagnostic)
 	}
 	if bytes.Contains(first, []byte("not-json")) {
+		t.Fatalf("diagnostic leaked arbitrary error text: %q", first)
+	}
+	if err := runCloudWorkerBatch(context.Background(), cfg, commands, m); err == nil {
+		t.Fatal("cloud reconciliation replay unexpectedly succeeded")
+	}
+	second, _, err := m.Read(context.Background(), name, 0, generation.MaxFileBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(first, second) {
+		t.Fatalf("failure diagnostic changed on replay: first=%q second=%q", first, second)
+	}
+}
+
+func TestCloudPersistsNestedEntityMappingDetailAndReplaysIdempotently(t *testing.T) {
+	oldExec := execOLW
+	oldConcepts := cloudReconcileConcepts
+	t.Cleanup(func() {
+		execOLW = oldExec
+		cloudReconcileConcepts = oldConcepts
+	})
+	m := newMemoryObjects()
+	prefix := "users/user/projects/project/"
+	seedCloudSource(t, m, prefix, "raw", "", priorCloudReceipt())
+	execOLW = func(_ context.Context, vault string, _ []string, _ []string, _, _ io.Writer) error {
+		writeCloudRequiredOutputs(t, vault)
+		return nil
+	}
+	cloudReconcileConcepts = func(workspace string, prior []conceptSnapshot, current ...[]sourceSnapshot) error {
+		mustWriteFile(t, filepath.Join(workspace, "cache", "id_map.json"), []byte(`{"concept":{"article-a":"alpha","article-b":"alpha"},"source":{},"redirects":{}}`))
+		mustWriteFile(t, filepath.Join(workspace, ".synto", "INDEX.json"), []byte(syntoIndexFixtureWithEntitiesHash([]string{
+			"article-a:entity-a:alpha",
+			"article-b:entity-b:alpha",
+		}, []string{"entity-a", "entity-b"}, strings.Repeat("0", 64))))
+		return reconcileWorkspaceConcepts(workspace, prior, current...)
+	}
+	cfg := cloudCfgFor("user", "project", "execution-secret")
+	commands := [][]string{{"run"}}
+	if err := runCloudWorkerBatch(context.Background(), cfg, commands, m); err == nil {
+		t.Fatal("cloud reconciliation unexpectedly succeeded")
+	}
+	name := prefix + "cache/pipeline-execution-secret.failure.json"
+	first, _, err := m.Read(context.Background(), name, 0, generation.MaxFileBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	diagnostic, err := decodeFailureDiagnostic(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diagnostic.Stage != failureStageConceptReconciliation || diagnostic.DetailCode != conceptDetailEntityMappingDuplicateArticlePath {
+		t.Fatalf("diagnostic=%+v", diagnostic)
+	}
+	if bytes.Contains(first, []byte("Synto INDEX.json concept path collision")) {
 		t.Fatalf("diagnostic leaked arbitrary error text: %q", first)
 	}
 	if err := runCloudWorkerBatch(context.Background(), cfg, commands, m); err == nil {

@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"time"
 
@@ -745,6 +746,44 @@ type syntoIndexTruth struct {
 	AmbiguousLineage bool
 }
 
+type syntoIndexDecodeReason int
+
+const (
+	syntoIndexDecodeReasonSourceConceptIdentity syntoIndexDecodeReason = iota
+	syntoIndexDecodeReasonArticleIdentity
+	syntoIndexDecodeReasonArticlePath
+)
+
+type syntoIndexDecoder interface {
+	SyntoIndexDecodeReason() syntoIndexDecodeReason
+}
+
+type syntoIndexDecodeError struct {
+	reason syntoIndexDecodeReason
+	cause  error
+}
+
+func (e *syntoIndexDecodeError) Error() string {
+	if e == nil || e.cause == nil {
+		return "invalid Synto INDEX.json"
+	}
+	return e.cause.Error()
+}
+
+func (e *syntoIndexDecodeError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
+}
+
+func (e *syntoIndexDecodeError) SyntoIndexDecodeReason() syntoIndexDecodeReason {
+	if e == nil {
+		return -1
+	}
+	return e.reason
+}
+
 const maxSyntoIndexBytes = 8 << 20
 
 const sqliteHeader = "SQLite format 3\x00"
@@ -864,11 +903,26 @@ func isDefaultSyntoExecutor() bool {
 func readSyntoEntityIDs(workspace string, concepts map[string]string) (map[string]string, error) {
 	index, err := readSyntoIndexTruth(workspace)
 	if err != nil {
-		return nil, err
+		var decodeReason syntoIndexDecoder
+		if errors.As(err, &decodeReason) {
+			switch decodeReason.SyntoIndexDecodeReason() {
+			case syntoIndexDecodeReasonSourceConceptIdentity:
+				return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingSourceConceptIdentity, cause: err}
+			case syntoIndexDecodeReasonArticleIdentity:
+				return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingArticleIdentity, cause: err}
+			case syntoIndexDecodeReasonArticlePath:
+				return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingArticlePath, cause: err}
+			}
+		}
+		return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingIndexTruth, cause: err}
 	}
 	if !index.Present {
 		return nil, nil
 	}
+	return mapSyntoEntityIDsFromIndexTruth(index, concepts)
+}
+
+func mapSyntoEntityIDsFromIndexTruth(index syntoIndexTruth, concepts map[string]string) (map[string]string, error) {
 	byID := make(map[string]string, len(index.Articles))
 	bySlug := make(map[string]string, len(index.Articles))
 	byEntity := make(map[string]string, len(index.Articles))
@@ -876,7 +930,7 @@ func readSyntoEntityIDs(workspace string, concepts map[string]string) (map[strin
 	ambiguousNames := make(map[string]bool)
 	for _, edge := range index.SourceConcepts {
 		if edge.Name == "" || !annotation.ValidSourceID(edge.EntityID) {
-			return nil, errors.New("invalid Synto INDEX.json source concept identity")
+			return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingSourceConceptIdentity, cause: errors.New("invalid Synto INDEX.json source concept identity")}
 		}
 		if old, exists := byName[edge.Name]; exists && old != edge.EntityID {
 			ambiguousNames[edge.Name] = true
@@ -889,61 +943,67 @@ func readSyntoEntityIDs(workspace string, concepts map[string]string) (map[strin
 	}
 	for _, article := range index.Articles {
 		if (article.ID != "" && !annotation.ValidSourceID(article.ID)) || (article.EntityID != "" && !annotation.ValidSourceID(article.EntityID)) {
-			return nil, errors.New("invalid Synto INDEX.json article identity")
+			return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingArticleIdentity, cause: errors.New("invalid Synto INDEX.json article identity")}
 		}
 		slug, err := normalizeSyntoArticlePath(article.Path)
 		if err != nil {
-			return nil, err
+			return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingArticlePath, cause: err}
 		}
 		entityID := article.EntityID
 		if entityID == "" {
 			if ambiguousNames[article.Name] {
-				return nil, fmt.Errorf("Synto INDEX.json article %q has ambiguous source_concepts entity_id", slug)
+				return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingArticleSourceAmbiguity, cause: fmt.Errorf("Synto INDEX.json article %q has ambiguous source_concepts entity_id", slug)}
 			}
 			entityID = byName[article.Name]
 			if entityID == "" {
-				return nil, fmt.Errorf("Synto INDEX.json article %q has no source_concepts entity_id", slug)
+				return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingArticleSourceMissing, cause: fmt.Errorf("Synto INDEX.json article %q has no source_concepts entity_id", slug)}
 			}
 		} else if sourceEntity := byName[article.Name]; sourceEntity != "" && sourceEntity != entityID {
-			return nil, fmt.Errorf("Synto INDEX.json article/entity disagreement for %q", slug)
+			return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingArticleSourceDisagreement, cause: fmt.Errorf("Synto INDEX.json article/entity disagreement for %q", slug)}
 		}
 		if article.ID != "" {
 			if _, exists := byID[article.ID]; exists {
-				return nil, fmt.Errorf("Synto INDEX.json duplicate article ID %q", article.ID)
+				return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingDuplicateArticleID, cause: fmt.Errorf("Synto INDEX.json duplicate article ID %q", article.ID)}
 			}
 			byID[article.ID] = entityID
 		}
 		collisionKey := strings.ToLower(slug)
 		if old, exists := bySlug[collisionKey]; exists {
-			return nil, fmt.Errorf("Synto INDEX.json concept path collision between %q and %q", old, slug)
+			return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingDuplicateArticlePath, cause: fmt.Errorf("Synto INDEX.json concept path collision between %q and %q", old, slug)}
 		}
 		bySlug[collisionKey] = slug
 		if old, exists := byEntity[entityID]; exists && old != slug {
-			return nil, fmt.Errorf("Synto INDEX.json entity_id collision %q", entityID)
+			return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingDuplicateEntityID, cause: fmt.Errorf("Synto INDEX.json entity_id collision %q", entityID)}
 		}
 		byEntity[entityID] = slug
 	}
 	for entityID := range index.ActiveEntities {
 		if _, exists := byEntity[entityID]; !exists {
-			return nil, fmt.Errorf("Synto INDEX.json source edge references unknown entity_id %q", entityID)
+			return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingActiveEntityUnknown, cause: fmt.Errorf("Synto INDEX.json source edge references unknown entity_id %q", entityID)}
 		}
 	}
 	out := make(map[string]string, len(concepts))
 	used := make(map[string]string, len(concepts))
-	for currentID, slug := range concepts {
+	currentConcepts := make([]string, 0, len(concepts))
+	for currentID := range concepts {
+		currentConcepts = append(currentConcepts, currentID)
+	}
+	sort.Strings(currentConcepts)
+	for _, currentID := range currentConcepts {
+		slug := concepts[currentID]
 		idEntity, byIDPresent := byID[currentID]
 		pathSlug, byPathPresent := bySlug[strings.ToLower(slug)]
 		pathEntity := ""
 		if byPathPresent && pathSlug == slug {
 			pathEntity = byEntityForSlug(byEntity, pathSlug)
 		} else if byPathPresent {
-			return nil, fmt.Errorf("Synto INDEX.json slug case mismatch for concept %q", currentID)
+			return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingConceptSlugCase, cause: fmt.Errorf("Synto INDEX.json slug case mismatch for concept %q", currentID)}
 		}
 		if byIDPresent && byPathPresent && idEntity != pathEntity {
-			return nil, fmt.Errorf("Synto INDEX.json ID/path disagreement for concept %q", currentID)
+			return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingConceptIDPathDisagreement, cause: fmt.Errorf("Synto INDEX.json ID/path disagreement for concept %q", currentID)}
 		}
 		if byIDPresent && !byPathPresent {
-			return nil, fmt.Errorf("Synto INDEX.json article ID %q has no matching path %q", currentID, slug)
+			return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingConceptMissingMapping, cause: fmt.Errorf("Synto INDEX.json article ID %q has no matching path %q", currentID, slug)}
 		}
 		if byIDPresent && byPathPresent {
 			// An ID hit and a slug hit must resolve to the same article. This
@@ -951,21 +1011,21 @@ func readSyntoEntityIDs(workspace string, concepts map[string]string) (map[strin
 			// an entity to a different generated page.
 			entityID := idEntity
 			if entityID != pathEntity {
-				return nil, fmt.Errorf("Synto INDEX.json ID/path disagreement for concept %q", currentID)
+				return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingConceptIDPathDisagreement, cause: fmt.Errorf("Synto INDEX.json ID/path disagreement for concept %q", currentID)}
 			}
 			out[currentID] = entityID
 			if old, exists := used[entityID]; exists && old != currentID {
-				return nil, fmt.Errorf("Synto entity_id collision %q", entityID)
+				return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingConceptEntityCollision, cause: fmt.Errorf("Synto entity_id collision %q", entityID)}
 			}
 			used[entityID] = currentID
 			continue
 		}
 		entityID := pathEntity
 		if !byPathPresent {
-			return nil, fmt.Errorf("Synto INDEX.json missing entity_id for concept %q", currentID)
+			return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingConceptMissingMapping, cause: fmt.Errorf("Synto INDEX.json missing entity_id for concept %q", currentID)}
 		}
 		if old, exists := used[entityID]; exists && old != currentID {
-			return nil, fmt.Errorf("Synto entity_id collision %q", entityID)
+			return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingConceptEntityCollision, cause: fmt.Errorf("Synto entity_id collision %q", entityID)}
 		}
 		used[entityID] = currentID
 		out[currentID] = entityID
@@ -1182,10 +1242,10 @@ func decodeSyntoArticles(dec *json.Decoder) ([]syntoIndexEntry, error) {
 		}
 		if (article.ID != "" && !annotation.ValidSourceID(article.ID)) ||
 			(article.EntityID != "" && !annotation.ValidSourceID(article.EntityID)) || article.Name == "" {
-			return nil, errors.New("invalid Synto article identity")
+			return nil, &syntoIndexDecodeError{reason: syntoIndexDecodeReasonArticleIdentity, cause: errors.New("invalid Synto article identity")}
 		}
 		if _, err := normalizeSyntoArticlePath(article.Path); err != nil {
-			return nil, err
+			return nil, &syntoIndexDecodeError{reason: syntoIndexDecodeReasonArticlePath, cause: err}
 		}
 		out = append(out, article)
 	}
@@ -1289,7 +1349,7 @@ func decodeSyntoSourceConceptItems(dec *json.Decoder) ([]syntoSourceConcept, err
 				}
 				key, ok := keyToken.(string)
 				if !ok || seen[key] || (key != "name" && key != "entity_id") {
-					return nil, errors.New("invalid source concept identity")
+					return nil, &syntoIndexDecodeError{reason: syntoIndexDecodeReasonSourceConceptIdentity, cause: errors.New("invalid source concept identity")}
 				}
 				seen[key] = true
 				if key == "name" {
@@ -1304,7 +1364,7 @@ func decodeSyntoSourceConceptItems(dec *json.Decoder) ([]syntoSourceConcept, err
 				return nil, err
 			}
 			if !seen["name"] || !seen["entity_id"] || name == "" || !annotation.ValidSourceID(entity) {
-				return nil, errors.New("invalid source concept identity")
+				return nil, &syntoIndexDecodeError{reason: syntoIndexDecodeReasonSourceConceptIdentity, cause: errors.New("invalid source concept identity")}
 			}
 			out = append(out, syntoSourceConcept{Name: name, EntityID: entity})
 		} else if value, ok := token.(string); ok && value != "" {
