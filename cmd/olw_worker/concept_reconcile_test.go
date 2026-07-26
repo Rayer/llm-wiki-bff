@@ -1190,6 +1190,308 @@ func TestConceptCacheReconciliationPreservesLargeIntegerFidelity(t *testing.T) {
 	}
 }
 
+func TestSyntoMigrationConceptSlugChangeUsesExactSourceProvenance(t *testing.T) {
+	workspace := t.TempDir()
+	priorPage := []byte("---\nid: stable-old\nsources:\n  - stable-source\n---\nlegacy page\n")
+	mustWriteFile(t, filepath.Join(workspace, "wiki", "old.md"), priorPage)
+	mustWriteFile(t, filepath.Join(workspace, "cache", "id_map.json"), []byte(`{"concept":{"stable-old":"old"},"source":{"stable-source":"source"},"source_meta":{"stable-source":{"slug":"source","source_file":"raw/source.md"}},"redirects":{}}`))
+	mustWriteFile(t, filepath.Join(workspace, "cache", "concepts.jsonl"), []byte(`{"slug":"old","frontmatter":{"id":"stable-old","sources":["stable-source"]}}`+"\n"))
+	prior, err := snapshotConcepts(workspace, []sourceSnapshot{{SourceID: "stable-source", RawPath: "raw/source.md"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustWriteFile(t, filepath.Join(workspace, "cache", "id_map.json"), []byte(`{"concept":{"stable-old":"old","current-article":"new"},"source":{"stable-source":"source"},"source_meta":{"stable-source":{"slug":"source","source_file":"raw/source.md"}},"redirects":{}}`))
+	mustWriteFile(t, filepath.Join(workspace, "cache", "concepts.jsonl"), []byte(
+		`{"slug":"old","frontmatter":{"id":"stable-old","sources":["stable-source"]}}`+"\n"+`{"slug":"new","frontmatter":{"id":"current-article","sources":["stable-source"]}}`+"\n",
+	))
+	mustWriteFile(t, filepath.Join(workspace, "wiki", "new.md"), []byte("---\nid: current-article\nsources:\n  - stable-source\n---\nprovider article\n"))
+	mustWriteFile(t, filepath.Join(workspace, ".synto", "INDEX.json"), []byte(syntoIndexFixture("current-article", "entity-current", "new", true)))
+	err = reconcileWorkspaceConcepts(workspace, prior, []sourceSnapshot{{RawPath: "raw/source.md", SyntoContentHash: strings.Repeat("0", 64)}})
+	if err != nil {
+		t.Fatalf("slug-change reconciliation: %v", err)
+	}
+	ids := mustSnapshotIDMap(t, workspace)
+	if len(ids.Concept) != 1 || ids.Concept["stable-old"] != "new" || ids.ConceptEntityID["stable-old"] != "entity-current" {
+		t.Fatalf("reconciled map=%#v", ids)
+	}
+	if _, ok := ids.Concept["current-article"]; ok {
+		t.Fatalf("transient concept remained active: %#v", ids.Concept)
+	}
+	if _, err := os.Stat(filepath.Join(workspace, "wiki", "old.md")); !os.IsNotExist(err) {
+		t.Fatalf("legacy active page remained: %v", err)
+	}
+	page, err := os.ReadFile(filepath.Join(workspace, "wiki", "new.md"))
+	if err != nil || !bytes.Contains(page, []byte("id: stable-old\n")) {
+		t.Fatalf("current page identity=%q err=%v", page, err)
+	}
+}
+
+func TestSyntoMigrationMissingCandidatesRemainFailClosed(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		priorPage  []byte
+		currentOld []byte
+		generated  string
+	}{
+		{
+			name:       "modified prior page",
+			priorPage:  []byte("---\nid: stable-old\nsources:\n  - stable-source\n---\nlegacy\n"),
+			currentOld: []byte("---\nid: stable-old\nsources:\n  - stable-source\n---\nmodified\n"),
+			generated:  "stable-old",
+		},
+		{
+			name:       "arbitrary source reference",
+			priorPage:  []byte("---\nid: stable-old\nsources:\n  - raw/missing.md\n---\nlegacy\n"),
+			currentOld: []byte("---\nid: stable-old\nsources:\n  - raw/missing.md\n---\nlegacy\n"),
+			generated:  "stable-old",
+		},
+		{
+			name:       "candidate not in prior",
+			priorPage:  []byte("---\nid: stable-old\nsources:\n  - stable-source\n---\nlegacy\n"),
+			currentOld: []byte("---\nid: generated-ghost\n---\nghost\n"),
+			generated:  "generated-ghost",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			workspace := t.TempDir()
+			mustWriteFile(t, filepath.Join(workspace, "wiki", "old.md"), tc.priorPage)
+			mustWriteFile(t, filepath.Join(workspace, "cache", "id_map.json"), []byte(`{"concept":{"stable-old":"old"},"source":{"stable-source":"source"},"source_meta":{"stable-source":{"slug":"source","source_file":"raw/source.md"}},"redirects":{}}`))
+			mustWriteFile(t, filepath.Join(workspace, "cache", "concepts.jsonl"), []byte(`{"slug":"old","frontmatter":{"id":"stable-old"}}`+"\n"))
+			prior, err := snapshotConcepts(workspace, []sourceSnapshot{{SourceID: "stable-source", RawPath: "raw/source.md"}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			mustWriteFile(t, filepath.Join(workspace, "wiki", "old.md"), tc.currentOld)
+			mustWriteFile(t, filepath.Join(workspace, "wiki", "new.md"), []byte("---\nid: current-article\n---\nprovider\n"))
+			mustWriteFile(t, filepath.Join(workspace, "cache", "id_map.json"), []byte(`{"concept":{"`+tc.generated+`":"old","current-article":"new"},"source":{},"redirects":{}}`))
+			mustWriteFile(t, filepath.Join(workspace, "cache", "concepts.jsonl"), []byte(`{"slug":"old","frontmatter":{"id":"`+tc.generated+`"}}`+"\n"+`{"slug":"new","frontmatter":{"id":"current-article"}}`+"\n"))
+			mustWriteFile(t, filepath.Join(workspace, ".synto", "INDEX.json"), []byte(syntoIndexFixture("current-article", "entity-current", "new", true)))
+			before := snapshotRelevantVaultBytes(t, workspace, "cache/id_map.json", "cache/concepts.jsonl", "wiki/old.md", "wiki/new.md", ".synto/INDEX.json")
+			err = reconcileWorkspaceConcepts(workspace, prior, []sourceSnapshot{{RawPath: "raw/source.md", SyntoContentHash: strings.Repeat("0", 64)}})
+			if err == nil {
+				t.Fatal("unprovable missing candidate was accepted")
+			}
+			testEntityMappingErrorDetail(t, err, conceptDetailEntityMappingConceptMissingMapping)
+			assertVaultBytesUnchanged(t, workspace, before)
+		})
+	}
+}
+
+func TestSyntoMigrationSourceSetAmbiguityDoesNotTransferIdentity(t *testing.T) {
+	index := syntoIndexTruthForEntityMapping(
+		[]syntoIndexEntry{{ID: "article-a", EntityID: "entity-a", Name: "A", Path: "wiki/a.md"}, {ID: "article-b", EntityID: "entity-b", Name: "B", Path: "wiki/b.md"}},
+		[]syntoSourceConcept{{Name: "A", EntityID: "entity-a", SourcePath: "raw/source.md"}, {Name: "B", EntityID: "entity-b", SourcePath: "raw/source.md"}},
+		nil,
+	)
+	for _, tc := range []struct {
+		name   string
+		prior  []conceptSnapshot
+		ids    map[string]string
+		proofs []reconciledConcept
+		wantID string
+	}{
+		{
+			name:   "multiple prior concepts",
+			prior:  []conceptSnapshot{{ConceptID: "stable-a", Slug: "old-a", SourcePaths: []string{"raw/source.md"}}, {ConceptID: "stable-b", Slug: "old-b", SourcePaths: []string{"raw/source.md"}}},
+			ids:    map[string]string{"article-a": "entity-a"},
+			proofs: nil,
+			wantID: "",
+		},
+		{
+			name:   "multiple current entities",
+			prior:  []conceptSnapshot{{ConceptID: "stable-a", Slug: "old-a", SourcePaths: []string{"raw/source.md"}}},
+			ids:    map[string]string{"article-a": "entity-a", "article-b": "entity-b"},
+			proofs: nil,
+			wantID: "",
+		},
+		{
+			name:   "non-omitted prior concept does not transfer",
+			prior:  []conceptSnapshot{{ConceptID: "stable-a", Slug: "old-a", SourcePaths: []string{"raw/source.md"}}},
+			ids:    map[string]string{"article-a": "entity-a"},
+			proofs: nil,
+			wantID: "",
+		},
+		{
+			name:   "proven prior transfers",
+			prior:  []conceptSnapshot{{ConceptID: "stable-a", Slug: "old-a", SourcePaths: []string{"raw/source.md"}}},
+			ids:    map[string]string{"article-a": "entity-a"},
+			proofs: []reconciledConcept{{StableID: "stable-a", CurrentID: "stable-a", Slug: "old-a"}},
+			wantID: "entity-a",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := augmentLegacyConceptEntities(tc.prior, tc.ids, index, tc.proofs)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got[0].EntityID != tc.wantID {
+				t.Fatalf("ambiguous source-set transfer=%q, want %q", got[0].EntityID, tc.wantID)
+			}
+		})
+	}
+}
+
+func TestFilterUnmappedLegacyConceptsRejectsDuplicateGeneratedSlugs(t *testing.T) {
+	workspace := t.TempDir()
+	mustWriteFile(t, filepath.Join(workspace, ".synto", "INDEX.json"), []byte(syntoIndexFixture("article-a", "entity-a", "alpha", true)))
+	indexTruth, err := readSyntoIndexTruth(workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	generated := wikiindex.IDMap{Concept: map[string]string{
+		"article-a": "alpha",
+		"article-b": "alpha",
+	}}
+	prior := []conceptSnapshot{{ConceptID: "stable-a", Slug: "alpha"}}
+	if _, _, err := filterUnmappedLegacyConcepts(workspace, generated, indexTruth, prior); err == nil || !strings.Contains(err.Error(), "duplicate generated concept slug") {
+		t.Fatalf("error=%v, want duplicate generated concept slug", err)
+	}
+}
+
+func TestSyntoMigrationCaseFoldIndexPathMatchRetainsCandidateAndFailsClosed(t *testing.T) {
+	workspace := t.TempDir()
+	priorPage := []byte("---\nid: stable-old\nsources:\n  - stable-source\n---\nlegacy page\n")
+	mustWriteFile(t, filepath.Join(workspace, "wiki", "ALPHA.md"), priorPage)
+	mustWriteFile(t, filepath.Join(workspace, "cache", "id_map.json"), []byte(`{"concept":{"stable-old":"ALPHA"},"source":{"stable-source":"source"},"source_meta":{"stable-source":{"slug":"source","source_file":"raw/source.md"}},"redirects":{}}`))
+	mustWriteFile(t, filepath.Join(workspace, "cache", "concepts.jsonl"), []byte(`{"slug":"ALPHA","frontmatter":{"id":"stable-old","sources":["stable-source"]}}`+"\n"))
+	prior, err := snapshotConcepts(workspace, []sourceSnapshot{{SourceID: "stable-source", RawPath: "raw/source.md"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustWriteFile(t, filepath.Join(workspace, ".synto", "INDEX.json"), []byte(syntoIndexFixture("current-article", "entity-a", "alpha", true)))
+	before := snapshotRelevantVaultBytes(t, workspace, "cache/id_map.json", "cache/concepts.jsonl", "wiki/ALPHA.md", ".synto/INDEX.json")
+	err = reconcileWorkspaceConcepts(workspace, prior, []sourceSnapshot{{RawPath: "raw/source.md", SyntoContentHash: strings.Repeat("0", 64)}})
+	if err == nil {
+		t.Fatal("case-only index path match was silently omitted")
+	}
+	testEntityMappingErrorDetail(t, err, conceptDetailEntityMappingConceptSlugCase)
+	assertVaultBytesUnchanged(t, workspace, before)
+}
+
+func TestReconcileConceptIDMapRejectsRedirectTranslationCollisions(t *testing.T) {
+	prior := []conceptSnapshot{{ConceptID: "stable-old", Slug: "old", EntityID: "entity-old"}}
+	success := []byte(`{
+  "concept": {"current-article":"new"},
+  "concept_entity_id": {"current-article": "entity-old"},
+  "source": {},
+  "source_meta": {},
+  "redirects": {"current-article":["legacy"],"stable-old":["legacy"]}
+}`)
+	out, _, err := reconcileConceptIDMap(success, prior)
+	if err != nil {
+		t.Fatalf("unexpected redirect translation rejection: %v", err)
+	}
+	var ids wikiindex.IDMap
+	if err := json.Unmarshal(out, &ids); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := ids.Concept["current-article"]; ok {
+		t.Fatalf("transient redirect key remained: %#v", ids.Concept)
+	}
+	if ids.Concept["stable-old"] != "new" || len(ids.Redirects["stable-old"]) != 1 || ids.Redirects["stable-old"][0] != "legacy" {
+		t.Fatalf("concept map after redirect translation=%#v", ids)
+	}
+	if _, ok := ids.Redirects["current-article"]; ok {
+		t.Fatalf("stale redirect key remained: %#v", ids.Redirects)
+	}
+
+	collision := []byte(`{
+  "concept": {"current-article":"new"},
+  "concept_entity_id": {"current-article":"entity-old"},
+  "source": {},
+  "source_meta": {},
+  "redirects": {"current-article":["legacy"],"stable-old":["different"]}
+}`)
+	if _, _, err := reconcileConceptIDMap(collision, prior); err == nil || !strings.Contains(err.Error(), "redirect ID collision") {
+		t.Fatalf("collision=%v, want redirect ID collision", err)
+	}
+}
+
+func TestRunWorkerBatchWorkspacePublishesStableConceptIDFromSourceProvenance(t *testing.T) {
+	old := execOLW
+	defer func() { execOLW = old }()
+
+	const rawBody = "source body"
+	vault := t.TempDir()
+	priorPage := []byte("---\nid: stable-old\nsources:\n  - stable-source\n---\nlegacy page\n")
+	mustWriteFile(t, filepath.Join(vault, "raw", "source.md"), []byte(rawBody))
+	mustWriteFile(t, filepath.Join(vault, "cache", "id_map.json"), []byte(`{"concept":{"stable-old":"old"},"source":{"stable-source":"source"},"source_meta":{"stable-source":{"slug":"source","source_file":"raw/source.md"}},"redirects":{}}`))
+	mustWriteFile(t, filepath.Join(vault, "cache", "concepts.jsonl"), []byte(`{"slug":"old","frontmatter":{"id":"stable-old","sources":["stable-source"]}}`+"\n"))
+	mustWriteFile(t, filepath.Join(vault, "wiki", "old.md"), priorPage)
+	mustWriteFile(t, filepath.Join(vault, "wiki", "sources", "source.md"), []byte("---\nid: stable-source\nsource_file: raw/source.md\n---\nsource body\n"))
+	mustWriteFile(t, filepath.Join(vault, "wiki.toml"), []byte("name = \"t\"\n"))
+	mustWriteFile(t, filepath.Join(vault, "synto.toml"), []byte("[pipeline]\nauto_commit = false\nauto_maintain = false\nrelation_extraction = false\n"))
+	writeValidSQLiteState(t, filepath.Join(vault, ".synto", "state.db"))
+	writeValidSQLiteState(t, filepath.Join(vault, ".olw", "state.db"))
+	mustWriteFile(t, filepath.Join(vault, ".synto", "INDEX.json"), []byte(syntoIndexFixture("old", "entity-old", "old", true)))
+	beforeRaw, err := os.ReadFile(filepath.Join(vault, "raw", "source.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeStates := make(map[string][]byte, 2)
+	for _, rel := range []string{".synto/state.db", ".olw/state.db"} {
+		data, err := os.ReadFile(filepath.Join(vault, rel))
+		if err != nil {
+			t.Fatalf("read %s: %v", rel, err)
+		}
+		beforeStates[rel] = append([]byte(nil), data...)
+	}
+	execOLW = func(_ context.Context, work string, _ []string, _ []string, _, _ io.Writer) error {
+		mustWriteFile(t, filepath.Join(work, "wiki", "old.md"), priorPage)
+		mustWriteFile(t, filepath.Join(work, "wiki", "new.md"), []byte("---\nid: transient-new\nsources:\n  - transient-source\n---\nprovider article\n"))
+		mustWriteFile(t, filepath.Join(work, "wiki", "sources", "source.md"), []byte("---\nid: transient-source\nsource_file: raw/source.md\n---\nsource for new\n"))
+		mustWriteFile(t, filepath.Join(work, "cache", "id_map.json"), []byte(`{"concept":{"stable-old":"old","current-article":"new"},"source":{"transient-source":"source"},"source_meta":{"transient-source":{"slug":"source","source_file":"raw/source.md"}},"redirects":{}}`))
+		mustWriteFile(t, filepath.Join(work, "cache", "concepts.jsonl"), []byte(`{"slug":"old","frontmatter":{"id":"stable-old","sources":["transient-source"]}}`+"\n"+`{"slug":"new","frontmatter":{"id":"current-article","sources":["transient-source"]}}`+"\n"))
+		mustWriteFile(t, filepath.Join(work, ".synto", "INDEX.json"), []byte(syntoIndexFixtureWithEntitiesHash([]string{"current-article:entity-stable:new"}, []string{"entity-stable"}, sha256Text(rawBody))))
+		return nil
+	}
+	cfg := workerConfig{VaultPath: vault, APIKey: "secret", Workspace: true, WorkspaceDir: t.TempDir(), Postprocess: true, StopOnError: true}
+	if err := runWorkerBatch(context.Background(), cfg, `[["run","--auto-approve"]]`); err != nil {
+		t.Fatalf("workspace run: %v", err)
+	}
+
+	ids := mustSnapshotIDMap(t, vault)
+	if len(ids.Concept) != 1 || ids.Concept["stable-old"] != "new" {
+		t.Fatalf("unexpected concept map: %#v", ids.Concept)
+	}
+	if ids.ConceptEntityID["stable-old"] != "entity-stable" || len(ids.ConceptEntityID) != 1 {
+		t.Fatalf("unexpected concept entity map: %#v", ids.ConceptEntityID)
+	}
+	if _, ok := ids.Concept["transient-new"]; ok {
+		t.Fatalf("transient concept remained active: %#v", ids.Concept)
+	}
+	if _, ok := ids.Concept["current-article"]; ok {
+		t.Fatalf("transient current mapping remained active: %#v", ids.Concept)
+	}
+	if _, err := os.Stat(filepath.Join(vault, "wiki", "old.md")); !os.IsNotExist(err) {
+		t.Fatalf("legacy active page remained: %v", err)
+	}
+	page, err := os.ReadFile(filepath.Join(vault, "wiki", "new.md"))
+	if err != nil || !bytes.Contains(page, []byte("id: stable-old\n")) {
+		t.Fatalf("new page identity=%q err=%v", page, err)
+	}
+	rawAfter, err := os.ReadFile(filepath.Join(vault, "raw", "source.md"))
+	if err != nil || !bytes.Equal(beforeRaw, rawAfter) {
+		t.Fatalf("raw source mutated: before=%q after=%q err=%v", beforeRaw, rawAfter, err)
+	}
+	for rel, want := range beforeStates {
+		got, err := os.ReadFile(filepath.Join(vault, rel))
+		if err != nil {
+			t.Fatalf("read %s after run: %v", rel, err)
+		}
+		if !bytes.Equal(got, want) {
+			t.Fatalf("state file changed: %s", rel)
+		}
+	}
+	cache, err := os.ReadFile(filepath.Join(vault, "cache", "concepts.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(cache), `"transient-`) || strings.Contains(string(cache), `"current-article"`) {
+		t.Fatalf("concept cache retained transient identifiers: %s", cache)
+	}
+}
+
 func snapshotRelevantVaultBytes(t *testing.T, root string, rels ...string) map[string][]byte {
 	t.Helper()
 	out := make(map[string][]byte, len(rels))

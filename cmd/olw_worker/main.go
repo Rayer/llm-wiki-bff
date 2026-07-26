@@ -305,7 +305,7 @@ func runWorkerBatchWorkspace(ctx context.Context, cfg workerConfig, commands [][
 	if err != nil {
 		return err
 	}
-	priorConcepts, err := snapshotConcepts(vault)
+	priorConcepts, err := snapshotConcepts(vault, snapshots)
 	if err != nil {
 		return err
 	}
