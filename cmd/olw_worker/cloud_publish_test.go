@@ -836,6 +836,123 @@ func TestWorkerFailureDiagnosticHandlesTypedNilAndInvalidExitCode(t *testing.T) 
 	}
 }
 
+func TestFailureDiagnosticDetailCodeIsBackwardCompatibleAndStrict(t *testing.T) {
+	old := []byte(`{"version":1,"status":"failed","stage":"concept_reconciliation","error_class":"unknown"}`)
+	diagnostic, err := decodeFailureDiagnostic(old)
+	if err != nil || diagnostic.DetailCode != "" {
+		t.Fatalf("old diagnostic=%+v err=%v", diagnostic, err)
+	}
+
+	for _, detail := range []string{"", "not-allowlisted", "concept_page_content", "source.md", "null"} {
+		data := []byte(fmt.Sprintf(`{"version":1,"status":"failed","stage":"concept_reconciliation","error_class":"unknown","detail_code":%q}`, detail))
+		if detail == "null" {
+			data = bytes.Replace(data, []byte(`"null"`), []byte(`null`), 1)
+		}
+		if _, err := decodeFailureDiagnostic(data); err == nil {
+			t.Fatalf("detail %q unexpectedly decoded", detail)
+		}
+	}
+	if _, err := decodeFailureDiagnostic([]byte(`{"version":1,"status":"failed","stage":"source_reconciliation","error_class":"unknown","detail_code":"link_rewrite"}`)); err == nil {
+		t.Fatal("detail code with non-concept stage unexpectedly decoded")
+	}
+	if _, err := decodeFailureDiagnostic([]byte(`{"version":1,"status":"failed","stage":"unknown","error_class":"unknown","detail_code":"link_rewrite"}`)); err == nil {
+		t.Fatal("detail code with unknown stage unexpectedly decoded")
+	}
+	valid := []byte(`{"version":1,"status":"failed","stage":"concept_reconciliation","error_class":"unknown","detail_code":"identity_reconciliation"}`)
+	diagnostic, err = decodeFailureDiagnostic(valid)
+	if err != nil || diagnostic.DetailCode != conceptDetailIdentityReconciliation {
+		t.Fatalf("valid diagnostic=%+v err=%v", diagnostic, err)
+	}
+}
+
+func TestFailureDiagnosticDetailCodeUsesOnlyNestedTypedMetadata(t *testing.T) {
+	base := errors.New("secret source content, https://example.invalid, --api-key=secret")
+	err := fmt.Errorf("outer: %w", newWorkerFailure(context.Background(), failureStageConceptReconciliation, failureClassUnknown, "", wrapConceptReconciliationError(conceptDetailLinkRewrite, base)))
+	diagnostic := diagnosticForError(err)
+	if diagnostic.DetailCode != conceptDetailLinkRewrite {
+		t.Fatalf("diagnostic=%+v", diagnostic)
+	}
+	data, marshalErr := marshalFailureDiagnostic(err)
+	if marshalErr != nil || bytes.Contains(data, []byte("secret")) || bytes.Contains(data, []byte("example.invalid")) {
+		t.Fatalf("data=%q err=%v", data, marshalErr)
+	}
+
+	unknown := diagnosticForError(newWorkerFailure(context.Background(), failureStageConceptReconciliation, failureClassUnknown, "", wrapConceptReconciliationError(conceptReconcileDetailCode("unknown"), base)))
+	if unknown.DetailCode != "" {
+		t.Fatalf("unknown detail retained: %+v", unknown)
+	}
+	if wrapperOnly := diagnosticForError(wrapConceptReconciliationError(conceptDetailLinkRewrite, base)); wrapperOnly.DetailCode != "" {
+		t.Fatalf("wrapper-only detail retained: %+v", wrapperOnly)
+	}
+	if otherStage := diagnosticForError(newWorkerFailure(context.Background(), failureStageSourceReconciliation, failureClassUnknown, "", wrapConceptReconciliationError(conceptDetailLinkRewrite, base))); otherStage.DetailCode != "" {
+		t.Fatalf("non-concept detail retained: %+v", otherStage)
+	}
+}
+
+func TestFailureDiagnosticDetailCodeTypedNilAndAllPhases(t *testing.T) {
+	var typedNil *conceptReconciliationFailure
+	err := fmt.Errorf("nested: %w", newWorkerFailure(context.Background(), failureStageConceptReconciliation, failureClassUnknown, "", typedNil))
+	if got := diagnosticForError(err); got.DetailCode != "" {
+		t.Fatalf("typed nil detail retained: %+v", got)
+	}
+	for detail := range knownConceptDetailCodes {
+		err := fmt.Errorf("nested: %w", newWorkerFailure(context.Background(), failureStageConceptReconciliation, failureClassUnknown, "", wrapConceptReconciliationError(detail, errors.New("phase failure"))))
+		if got := diagnosticForError(err); got.DetailCode != detail {
+			t.Fatalf("detail=%q diagnostic=%+v", detail, got)
+		}
+	}
+}
+
+func TestCloudPersistsConceptReconciliationDetailAndReplaysIdempotently(t *testing.T) {
+	oldExec := execOLW
+	oldConcepts := cloudReconcileConcepts
+	t.Cleanup(func() {
+		execOLW = oldExec
+		cloudReconcileConcepts = oldConcepts
+	})
+	m := newMemoryObjects()
+	prefix := "users/user/projects/project/"
+	seedCloudSource(t, m, prefix, "raw", "", priorCloudReceipt())
+	execOLW = func(_ context.Context, vault string, _ []string, _ []string, _, _ io.Writer) error {
+		writeCloudRequiredOutputs(t, vault)
+		return nil
+	}
+	cloudReconcileConcepts = func(workspace string, prior []conceptSnapshot, current ...[]sourceSnapshot) error {
+		mustWriteFile(t, filepath.Join(workspace, "cache", "id_map.json"), []byte("not-json"))
+		return reconcileWorkspaceConcepts(workspace, prior, current...)
+	}
+	cfg := cloudCfgFor("user", "project", "execution-secret")
+	commands := [][]string{{"run"}}
+	if err := runCloudWorkerBatch(context.Background(), cfg, commands, m); err == nil {
+		t.Fatal("cloud reconciliation unexpectedly succeeded")
+	}
+	name := prefix + "cache/pipeline-execution-secret.failure.json"
+	first, _, err := m.Read(context.Background(), name, 0, generation.MaxFileBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	diagnostic, err := decodeFailureDiagnostic(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diagnostic.Stage != failureStageConceptReconciliation || diagnostic.DetailCode != conceptDetailGeneratedMapReadDecode {
+		t.Fatalf("diagnostic=%+v", diagnostic)
+	}
+	if bytes.Contains(first, []byte("not-json")) {
+		t.Fatalf("diagnostic leaked arbitrary error text: %q", first)
+	}
+	if err := runCloudWorkerBatch(context.Background(), cfg, commands, m); err == nil {
+		t.Fatal("cloud reconciliation replay unexpectedly succeeded")
+	}
+	second, _, err := m.Read(context.Background(), name, 0, generation.MaxFileBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(first, second) {
+		t.Fatalf("failure diagnostic changed on replay: first=%q second=%q", first, second)
+	}
+}
+
 func TestCloudRejectsUnsafeCommandContractBeforeLeaseStorageOrChild(t *testing.T) {
 	for _, tc := range []struct {
 		name     string

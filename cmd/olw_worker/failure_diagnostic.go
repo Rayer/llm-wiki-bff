@@ -49,6 +49,67 @@ const (
 	failureChildPackExport failureChildCommand = "pack-export"
 )
 
+type conceptReconcileDetailCode string
+
+const (
+	conceptDetailGeneratedMapReadDecode conceptReconcileDetailCode = "generated_map_read_decode"
+	conceptDetailSyntoIndexTruth        conceptReconcileDetailCode = "synto_index_truth"
+	conceptDetailEntityMapping          conceptReconcileDetailCode = "entity_mapping"
+	conceptDetailEntityMerge            conceptReconcileDetailCode = "entity_merge"
+	conceptDetailIdentityReconciliation conceptReconcileDetailCode = "identity_reconciliation"
+	conceptDetailLifecyclePlanning      conceptReconcileDetailCode = "lifecycle_planning"
+	conceptDetailConceptPageRewrite     conceptReconcileDetailCode = "concept_page_rewrite"
+	conceptDetailLinkRewrite            conceptReconcileDetailCode = "link_rewrite"
+	conceptDetailCacheRewrite           conceptReconcileDetailCode = "cache_rewrite"
+	conceptDetailArtifactWrite          conceptReconcileDetailCode = "artifact_write"
+	conceptDetailArtifactRemove         conceptReconcileDetailCode = "artifact_remove"
+)
+
+var knownConceptDetailCodes = map[conceptReconcileDetailCode]struct{}{
+	conceptDetailGeneratedMapReadDecode: {}, conceptDetailSyntoIndexTruth: {},
+	conceptDetailEntityMapping: {}, conceptDetailEntityMerge: {}, conceptDetailIdentityReconciliation: {},
+	conceptDetailLifecyclePlanning: {}, conceptDetailConceptPageRewrite: {},
+	conceptDetailLinkRewrite: {}, conceptDetailCacheRewrite: {},
+	conceptDetailArtifactWrite: {}, conceptDetailArtifactRemove: {},
+}
+
+type conceptReconciliationDetail interface {
+	ConceptReconciliationDetail() conceptReconcileDetailCode
+}
+
+type conceptReconciliationFailure struct {
+	detail conceptReconcileDetailCode
+	cause  error
+}
+
+func (e *conceptReconciliationFailure) Error() string {
+	if e == nil || e.cause == nil {
+		return "concept reconciliation failed"
+	}
+	return e.cause.Error()
+}
+
+func (e *conceptReconciliationFailure) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
+}
+
+func (e *conceptReconciliationFailure) ConceptReconciliationDetail() conceptReconcileDetailCode {
+	if e == nil {
+		return ""
+	}
+	return e.detail
+}
+
+func wrapConceptReconciliationError(detail conceptReconcileDetailCode, err error) error {
+	if err == nil {
+		return nil
+	}
+	return &conceptReconciliationFailure{detail: detail, cause: err}
+}
+
 var (
 	knownFailureStages = map[failureStage]struct{}{
 		failureStageInputMaterialization: {}, failureStageSyntoMigration: {},
@@ -154,12 +215,13 @@ func preserveWorkerFailure(err error, stage failureStage, class failureErrorClas
 }
 
 type failureDiagnostic struct {
-	Version    int                 `json:"version"`
-	Status     string              `json:"status"`
-	Stage      failureStage        `json:"stage"`
-	ErrorClass failureErrorClass   `json:"error_class"`
-	Child      failureChildCommand `json:"child_command,omitempty"`
-	ExitCode   *int                `json:"exit_code,omitempty"`
+	Version    int                        `json:"version"`
+	Status     string                     `json:"status"`
+	Stage      failureStage               `json:"stage"`
+	ErrorClass failureErrorClass          `json:"error_class"`
+	DetailCode conceptReconcileDetailCode `json:"detail_code,omitempty"`
+	Child      failureChildCommand        `json:"child_command,omitempty"`
+	ExitCode   *int                       `json:"exit_code,omitempty"`
 }
 
 func diagnosticForError(err error) failureDiagnostic {
@@ -170,20 +232,28 @@ func diagnosticForError(err error) failureDiagnostic {
 		ErrorClass: failureClassUnknown,
 	}
 	var failure *workerFailure
-	if !errors.As(err, &failure) || failure == nil {
-		return diagnostic
+	if errors.As(err, &failure) && failure != nil {
+		if _, ok := knownFailureStages[failure.Stage]; ok {
+			diagnostic.Stage = failure.Stage
+		}
+		if _, ok := knownFailureClasses[failure.Class]; ok {
+			diagnostic.ErrorClass = failure.Class
+		}
 	}
-	if _, ok := knownFailureStages[failure.Stage]; ok {
-		diagnostic.Stage = failure.Stage
+	var detail conceptReconciliationDetail
+	if failure != nil && failure.Stage == failureStageConceptReconciliation && errors.As(err, &detail) && detail != nil {
+		code := detail.ConceptReconciliationDetail()
+		if _, ok := knownConceptDetailCodes[code]; ok {
+			diagnostic.DetailCode = code
+		}
 	}
-	if _, ok := knownFailureClasses[failure.Class]; ok {
-		diagnostic.ErrorClass = failure.Class
-	}
-	if _, ok := knownFailureChildren[failure.Child]; ok {
-		diagnostic.Child = failure.Child
-		if failure.ExitCode != nil && *failure.ExitCode >= 0 && *failure.ExitCode <= maxWorkerExitCode {
-			code := *failure.ExitCode
-			diagnostic.ExitCode = &code
+	if failure != nil {
+		if _, ok := knownFailureChildren[failure.Child]; ok {
+			diagnostic.Child = failure.Child
+			if failure.ExitCode != nil && *failure.ExitCode >= 0 && *failure.ExitCode <= maxWorkerExitCode {
+				code := *failure.ExitCode
+				diagnostic.ExitCode = &code
+			}
 		}
 	}
 	return diagnostic
@@ -211,6 +281,21 @@ func decodeFailureDiagnostic(data []byte) (failureDiagnostic, error) {
 	}
 	if _, ok := knownFailureClasses[diagnostic.ErrorClass]; !ok {
 		return failureDiagnostic{}, errors.New("invalid failure diagnostic error class")
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return failureDiagnostic{}, err
+	}
+	if raw, ok := fields["detail_code"]; ok && bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return failureDiagnostic{}, errors.New("invalid failure diagnostic detail code")
+	}
+	if _, present := fields["detail_code"]; present {
+		if diagnostic.DetailCode == "" || diagnostic.Stage != failureStageConceptReconciliation {
+			return failureDiagnostic{}, errors.New("invalid failure diagnostic detail code")
+		}
+		if _, ok := knownConceptDetailCodes[diagnostic.DetailCode]; !ok {
+			return failureDiagnostic{}, errors.New("invalid failure diagnostic detail code")
+		}
 	}
 	if diagnostic.Child != "" {
 		if _, ok := knownFailureChildren[diagnostic.Child]; !ok {

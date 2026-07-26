@@ -415,30 +415,30 @@ func reconcileWorkspaceConcepts(workspace string, prior []conceptSnapshot, curre
 	// must leave the live vault byte-identical (zero writes).
 	data, err := readBoundedRegularFileWithin(workspace, "cache/id_map.json")
 	if err != nil {
-		return fmt.Errorf("read generated concept map: %w", err)
+		return wrapConceptReconciliationError(conceptDetailGeneratedMapReadDecode, fmt.Errorf("read generated concept map: %w", err))
 	}
 	generated, err := wikiindex.DecodeIDMap(data)
 	if err != nil {
-		return fmt.Errorf("decode generated concept map: %w", err)
+		return wrapConceptReconciliationError(conceptDetailGeneratedMapReadDecode, fmt.Errorf("decode generated concept map: %w", err))
 	}
 	indexTruth, err := readSyntoIndexTruth(workspace)
 	if err != nil {
-		return err
+		return wrapConceptReconciliationError(conceptDetailSyntoIndexTruth, err)
 	}
 	if indexTruth.AmbiguousLineage {
-		return errors.New("Synto merge/split lineage requires an owner-approved identity mapping")
+		return wrapConceptReconciliationError(conceptDetailSyntoIndexTruth, errors.New("Synto merge/split lineage requires an owner-approved identity mapping"))
 	}
 	entityIDs, err := readSyntoEntityIDs(workspace, generated.Concept)
 	if err != nil {
-		return err
+		return wrapConceptReconciliationError(conceptDetailEntityMapping, err)
 	}
 	data, err = mergeSyntoEntityIDs(data, entityIDs)
 	if err != nil {
-		return err
+		return wrapConceptReconciliationError(conceptDetailEntityMerge, err)
 	}
 	reconciledMap, concepts, err := reconcileConceptIDMapWithEntities(data, prior, entityIDs != nil)
 	if err != nil {
-		return err
+		return wrapConceptReconciliationError(conceptDetailIdentityReconciliation, err)
 	}
 
 	translations := make(map[string]string, len(concepts))
@@ -461,7 +461,7 @@ func reconcileWorkspaceConcepts(workspace string, prior []conceptSnapshot, curre
 		}
 		reconciledMap, dormant, lifecycleWrites, removals, err = planConceptLifecycle(workspace, reconciledMap, concepts, prior, activeEntities)
 		if err != nil {
-			return err
+			return wrapConceptReconciliationError(conceptDetailLifecyclePlanning, err)
 		}
 	}
 	writes := make([]plannedWrite, 0, len(concepts)+len(lifecycleWrites)+3)
@@ -474,11 +474,11 @@ func reconcileWorkspaceConcepts(workspace string, prior []conceptSnapshot, curre
 		rel := filepath.ToSlash(filepath.Join("wiki", concept.Slug+".md"))
 		page, err := readBoundedRegularFileWithin(workspace, rel)
 		if err != nil {
-			return fmt.Errorf("read generated concept %q: %w", concept.Slug, err)
+			return wrapConceptReconciliationError(conceptDetailConceptPageRewrite, fmt.Errorf("read generated concept %q: %w", concept.Slug, err))
 		}
 		page, err = rewriteConceptPageID(page, concept.CurrentID, concept.StableID)
 		if err != nil {
-			return fmt.Errorf("reconcile generated concept %q: %w", concept.Slug, err)
+			return wrapConceptReconciliationError(conceptDetailConceptPageRewrite, fmt.Errorf("reconcile generated concept %q: %w", concept.Slug, err))
 		}
 		if len(translations) > 0 {
 			page = rewriteConceptIDBearingWikilinks(page, concepts, translations)
@@ -488,20 +488,20 @@ func reconcileWorkspaceConcepts(workspace string, prior []conceptSnapshot, curre
 
 	otherWrites, err := planOtherConceptPageWikilinks(workspace, concepts, translations)
 	if err != nil {
-		return err
+		return wrapConceptReconciliationError(conceptDetailLinkRewrite, err)
 	}
 	writes = append(writes, otherWrites...)
 
 	cacheData, cachePresent, err := planConceptCacheIDs(workspace, concepts, translations)
 	if err != nil {
-		return err
+		return wrapConceptReconciliationError(conceptDetailCacheRewrite, err)
 	}
 	if cachePresent {
 		if entityIDs != nil {
 			var dormantData []byte
 			cacheData, dormantData, err = partitionConceptCacheRows(cacheData, dormant, concepts, prior)
 			if err != nil {
-				return err
+				return wrapConceptReconciliationError(conceptDetailCacheRewrite, err)
 			}
 			writes = append(writes, plannedWrite{rel: "cache/dormant_concepts.jsonl", data: dormantData})
 		}
@@ -513,12 +513,12 @@ func reconcileWorkspaceConcepts(workspace string, prior []conceptSnapshot, curre
 	// other pages (walk order collected deterministically), then cache.
 	for _, w := range writes {
 		if err := writeFileAtomicWithin(workspace, w.rel, w.data); err != nil {
-			return err
+			return wrapConceptReconciliationError(conceptDetailArtifactWrite, err)
 		}
 	}
 	for _, rel := range removals {
 		if err := removeRegularFileWithin(workspace, rel); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return err
+			return wrapConceptReconciliationError(conceptDetailArtifactRemove, err)
 		}
 	}
 	return nil
