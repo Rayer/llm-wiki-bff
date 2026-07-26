@@ -139,6 +139,167 @@ func TestRebuildWritesSyntoNestedFrontmatter(t *testing.T) {
 	}
 }
 
+func TestIsSyntoRootPageExactPathsOnly(t *testing.T) {
+	tests := []struct {
+		path string
+		want bool
+	}{
+		{path: "wiki/index.md", want: true},
+		{path: "wiki/log.md", want: true},
+		{path: "wiki/Index.md", want: false},
+		{path: "wiki/Log.md", want: false},
+		{path: "wiki/index2.md", want: false},
+		{path: "wiki/logbook.md", want: false},
+		{path: "wiki/nested/index.md", want: false},
+		{path: "wiki/nested/log.md", want: false},
+	}
+	for _, tt := range tests {
+		if got := isSyntoRootPage(tt.path); got != tt.want {
+			t.Errorf("isSyntoRootPage(%q) = %v, want %v", tt.path, got, tt.want)
+		}
+	}
+}
+
+func TestRebuildExcludesExactRootSyntoPagesFromIDMapAndConcepts(t *testing.T) {
+	store := &fakeStore{
+		files: map[string][]MarkdownFile{
+			"wiki/": {
+				{
+					Slug: "index2",
+					Path: "wiki/index2.md",
+					Data: []byte("---\nid: index2-id\n---\nindex2"),
+				},
+				{
+					Slug: "alpha",
+					Path: "wiki/alpha.md",
+					Data: []byte("---\nid: alpha-id\n---\nalpha"),
+				},
+				{
+					Slug: "index",
+					Path: "wiki/index.md",
+					Data: []byte("---\nid: should-exclude-index\n---\nindex"),
+				},
+				{
+					Slug: "log",
+					Path: "wiki/log.md",
+					Data: []byte("---\nid: should-exclude-log\n---\nlog"),
+				},
+			},
+			"wiki/sources/": {},
+		},
+		reads: map[string][]byte{},
+	}
+
+	next, err := Rebuild(context.Background(), store)
+	if err != nil {
+		t.Fatalf("Rebuild() error = %v", err)
+	}
+	if _, ok := next.Concept["should-exclude-index"]; ok {
+		t.Fatalf("index concept not excluded from id map: %#v", next.Concept)
+	}
+	if _, ok := next.Concept["should-exclude-log"]; ok {
+		t.Fatalf("log concept not excluded from id map: %#v", next.Concept)
+	}
+	if got := next.Concept["index2-id"]; got != "index2" {
+		t.Fatalf("index2 concept = %q, want index2", got)
+	}
+	if got := next.Concept["alpha-id"]; got != "alpha" {
+		t.Fatalf("alpha concept = %q, want alpha", got)
+	}
+
+	jsonl := strings.TrimSpace(string(store.writes[ConceptsJSONLPath]))
+	lines := strings.Split(jsonl, "\n")
+	want := map[string]bool{
+		"alpha":   false,
+		"index2":  false,
+		"index":   false,
+		"log":     false,
+		"Index":   false,
+		"logbook": false,
+	}
+	for _, line := range lines {
+		var entry struct {
+			Slug string `json:"slug"`
+		}
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			t.Fatalf("concepts jsonl line invalid: %v", err)
+		}
+		if _, ok := want[entry.Slug]; ok {
+			want[entry.Slug] = true
+		}
+	}
+	if !want["alpha"] || !want["index2"] {
+		t.Fatalf("concepts entries = %#v, want alpha and index2 present", want)
+	}
+	if want["index"] || want["log"] {
+		t.Fatalf("root index/log must not be in concepts jsonl, got=%#v", want)
+	}
+}
+
+func TestRebuildDoesNotExcludeOtherSimilarPageNames(t *testing.T) {
+	store := &fakeStore{
+		files: map[string][]MarkdownFile{
+			"wiki/": {
+				{
+					Slug: "Index",
+					Path: "wiki/Index.md",
+					Data: []byte("---\nid: index-case-id\n---\ncase"),
+				},
+				{
+					Slug: "logbook",
+					Path: "wiki/logbook.md",
+					Data: []byte("---\nid: logbook-id\n---\nlogbook"),
+				},
+				{
+					Slug: "index",
+					Path: "wiki/index.md",
+					Data: []byte("---\nid: should-exclude-index\n---\nindex"),
+				},
+			},
+			"wiki/sources/": {},
+		},
+		reads: map[string][]byte{},
+	}
+
+	next, err := Rebuild(context.Background(), store)
+	if err != nil {
+		t.Fatalf("Rebuild() error = %v", err)
+	}
+	if _, ok := next.Concept["should-exclude-index"]; ok {
+		t.Fatalf("root index concept unexpectedly indexed: %#v", next.Concept)
+	}
+	if got := next.Concept["index-case-id"]; got != "Index" {
+		t.Fatalf("case variant index = %q, want Index", got)
+	}
+	if got := next.Concept["logbook-id"]; got != "logbook" {
+		t.Fatalf("logbook concept = %q, want logbook", got)
+	}
+
+	jsonl := strings.TrimSpace(string(store.writes[ConceptsJSONLPath]))
+	lines := strings.Split(jsonl, "\n")
+	seen := map[string]bool{}
+	for _, line := range lines {
+		var entry struct {
+			Slug string `json:"slug"`
+		}
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			t.Fatalf("concepts jsonl line invalid: %v", err)
+		}
+		seen[entry.Slug] = true
+	}
+	if len(seen) != len(next.Concept) {
+		t.Fatalf("id map/concepts jsonl cardinality mismatch: concepts=%#v jsonl=%#v", next.Concept, seen)
+	}
+	for _, slug := range next.Concept {
+		if !seen[slug] {
+			t.Fatalf("id map concept slug %q missing from concepts jsonl: concepts=%#v jsonl=%#v", slug, next.Concept, seen)
+		}
+	}
+	if !seen["Index"] || !seen["logbook"] {
+		t.Fatalf("concepts entries missing for similar non-root names: %#v", seen)
+	}
+}
+
 func TestRebuildPlansAllArtifactsBeforeWritingOnNonStringNestedKey(t *testing.T) {
 	store := &fakeStore{
 		files: map[string][]MarkdownFile{
