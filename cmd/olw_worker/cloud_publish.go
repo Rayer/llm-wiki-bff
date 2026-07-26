@@ -317,7 +317,7 @@ func runCloudWorkerBatch(ctx context.Context, cfg workerConfig, commands [][]str
 	}
 	// Capture concept IDs from the immediately prior committed/materialized
 	// workspace id_map before OLW regenerates transient concept identities.
-	priorConcepts, err := snapshotConcepts(workspace)
+	priorConcepts, err := snapshotConcepts(workspace, snapshots)
 	if err != nil {
 		failure := preserveWorkerFailure(err, failureStageInputMaterialization, failureClassUnknown)
 		if recordErr := writeCloudFailureReceipts(ctx, objects, prefix, workspace, cfg, snapshots, failure); recordErr != nil {

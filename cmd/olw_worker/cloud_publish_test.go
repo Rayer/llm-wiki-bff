@@ -998,7 +998,7 @@ func TestCloudPersistsNestedEntityMappingDetailAndReplaysIdempotently(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	if diagnostic.Stage != failureStageConceptReconciliation || diagnostic.DetailCode != conceptDetailEntityMappingDuplicateArticlePath {
+	if diagnostic.Stage != failureStageConceptReconciliation || diagnostic.DetailCode != conceptDetailEntityMapping {
 		t.Fatalf("diagnostic=%+v", diagnostic)
 	}
 	if bytes.Contains(first, []byte("Synto INDEX.json concept path collision")) {
