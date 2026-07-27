@@ -1563,12 +1563,20 @@ func (h *Handler) Status(c *gin.Context) {
 	concepts, _ := listConceptsCacheFirst(ctx, gcsClient, true)
 
 	resp := handler.StatusResponse{
-		SourcesCount:  len(sources),
-		ConceptsCount: len(concepts),
-		RawCount:      rawFileCount(ctx, gcsClient),
-		IndexSources:  h.index.SourceCount(),
-		IndexConcepts: h.index.ConceptCount(),
+		SourcesCount:     len(sources),
+		ConceptsCount:    len(concepts),
+		RawCount:         rawFileCount(ctx, gcsClient),
+		IndexSources:     h.index.SourceCount(),
+		IndexConcepts:    h.index.ConceptCount(),
+		SuggestedQueries: []string{},
 	}
+
+	suggestedQueries, err := h.loadSuggestedQueries(ctx, c)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "generated data unavailable"})
+		return
+	}
+	resp.SuggestedQueries = suggestedQueries
 
 	if lastExecution, err := h.pipelineExecutionStatus(ctx, ""); err == nil {
 		resp.LastExecution = lastExecution
@@ -1601,11 +1609,28 @@ func (h *Handler) loadSuggestedQueries(ctx context.Context, c *gin.Context) ([]s
 	data, err := wikiStore.ReadFile(ctx, suggestedqueries.Path)
 	if err != nil {
 		if errors.Is(err, storage.ErrObjectNotExist) {
+			// fall through to concepts-derived suggestions.
+		} else {
+			return nil, err
+		}
+	} else {
+		artifact, err := suggestedqueries.Decode(data)
+		if err != nil {
+			return nil, err
+		}
+		queries := suggestedqueries.Queries(artifact)
+		if len(queries) > 0 {
+			return queries, nil
+		}
+	}
+	conceptsData, err := wikiStore.ReadFile(ctx, wikiindex.ConceptsJSONLPath)
+	if err != nil {
+		if errors.Is(err, storage.ErrObjectNotExist) {
 			return []string{}, nil
 		}
 		return nil, err
 	}
-	artifact, err := suggestedqueries.Decode(data)
+	artifact, err := suggestedqueries.BuildFromConceptsJSONL(conceptsData, nil, time.Now())
 	if err != nil {
 		return nil, err
 	}
