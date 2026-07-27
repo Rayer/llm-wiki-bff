@@ -132,6 +132,7 @@ type StatusResponse struct {
 	RawCount         int                        `json:"raw_count"`
 	IndexSources     int                        `json:"index_sources"`
 	IndexConcepts    int                        `json:"index_concepts"`
+	SuggestedQueries []string                   `json:"suggested_queries"`
 	RunningPipelines int                        `json:"running_pipelines"`
 	LastExecution    *PipelineExecutionResponse `json:"last_execution,omitempty"`
 	Locked           bool                       `json:"locked,omitempty"`

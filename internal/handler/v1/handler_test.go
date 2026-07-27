@@ -2224,6 +2224,152 @@ func TestStatusIncludesLatestPipelineExecutionWhenAvailable(t *testing.T) {
 	}
 }
 
+func TestStatusIncludesEmptySuggestedQueriesWhenMissingArtifact(t *testing.T) {
+	root := t.TempDir()
+	h := New(localfs.New(root), nil, search.NewIndex(), conceptcache.New(), nil, nil)
+	h.metadataTokenURL = "http://metadata.test/token"
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/api/v1/status", nil)
+	c.Set("userID", "request-user")
+	c.Set("projectID", "demo-project")
+
+	h.Status(c)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var body struct {
+		SuggestedQueries []string `json:"suggested_queries"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if body.SuggestedQueries == nil {
+		t.Fatal("suggested_queries = nil, want explicit empty array")
+	}
+	if len(body.SuggestedQueries) != 0 {
+		t.Fatalf("suggested_queries = %#v, want []", body.SuggestedQueries)
+	}
+}
+
+func readSuggestedQueriesFromStatusEndpoints(t *testing.T, root string) []string {
+	t.Helper()
+
+	h := New(localfs.New(root), nil, search.NewIndex(), conceptcache.New(), nil, nil)
+	h.httpClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == "/token" {
+			return testHTTPResponse(http.StatusOK, `{"access_token":"test-token"}`), nil
+		}
+		return testHTTPResponse(http.StatusOK, `{}`), nil
+	})}
+	h.metadataTokenURL = "http://metadata.test/token"
+	h.cloudRunJobURL = "https://run.googleapis.com/v2/projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline:run"
+
+	read := func(path string) []string {
+		recorder := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(recorder)
+		c.Request = httptest.NewRequest(http.MethodGet, path, nil)
+		c.Set("userID", "request-user")
+		c.Set("projectID", "demo-project")
+
+		switch path {
+		case "/api/v1/pipeline/status":
+			h.PipelineStatus(c)
+		default:
+			h.Status(c)
+		}
+
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status endpoint %s: status = %d, want %d; body = %s", path, recorder.Code, http.StatusOK, recorder.Body.String())
+		}
+		var body struct {
+			SuggestedQueries []string `json:"suggested_queries"`
+		}
+		if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+			t.Fatalf("decode %s response: %v", path, err)
+		}
+		if body.SuggestedQueries == nil {
+			t.Fatalf("suggested_queries = nil for %s, want explicit []", path)
+		}
+		return body.SuggestedQueries
+	}
+
+	statusQueries := read("/api/v1/status")
+	pipelineQueries := read("/api/v1/pipeline/status")
+	if !reflect.DeepEqual(statusQueries, pipelineQueries) {
+		t.Fatalf("parity mismatch: status=%#v pipeline=%#v", statusQueries, pipelineQueries)
+	}
+	return statusQueries
+}
+
+func writeSuggestionFixtures(t *testing.T, projectRoot string, suggestedJSON string, conceptsJSONL string) {
+	t.Helper()
+
+	cacheRoot := filepath.Join(projectRoot, "cache")
+	if err := os.MkdirAll(cacheRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if suggestedJSON != "" {
+		if err := os.WriteFile(filepath.Join(cacheRoot, "suggested_queries.json"), []byte(suggestedJSON), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if conceptsJSONL != "" {
+		if err := os.WriteFile(filepath.Join(cacheRoot, "concepts.jsonl"), []byte(conceptsJSONL), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestStatusAndPipelineStatusSuggestedQueriesUsePresentArtifact(t *testing.T) {
+	root := t.TempDir()
+	projectRoot := filepath.Join(root, "users", "request-user", "projects", "demo-project")
+	writeSuggestionFixtures(t, projectRoot, `{"queries":["Beta","Alpha"],"updated_at":"2026-07-10T00:00:00Z"}`, "")
+
+	got := readSuggestedQueriesFromStatusEndpoints(t, root)
+	if !reflect.DeepEqual(got, []string{"Beta", "Alpha"}) {
+		t.Fatalf("suggested_queries = %#v, want [Beta Alpha]", got)
+	}
+}
+
+func TestStatusAndPipelineStatusSuggestedQueriesFromConceptsWhenArtifactMissing(t *testing.T) {
+	root := t.TempDir()
+	projectRoot := filepath.Join(root, "users", "request-user", "projects", "demo-project")
+	writeSuggestionFixtures(t, projectRoot, "", `{"slug":"a","title":"Newest","frontmatter":{"updated":"2026-07-12T00:00:00Z"}}`+"\n"+
+		`{"slug":"b","title":"Newest-2","frontmatter":{"updated":"2026-07-11T00:00:00Z"}}`+"\n"+
+		`{"slug":"c","title":"Newest-3","frontmatter":{"updated":"2026-07-10T00:00:00Z"}}`+"\n"+
+		`{"slug":"d","title":"Newest-4","frontmatter":{"updated":"2026-07-09T00:00:00Z"}}`+"\n"+
+		`{"slug":"e","title":"Newest-5","frontmatter":{"updated":"2026-07-08T00:00:00Z"}}`+"\n"+
+		`{"slug":"f","title":"Newest-6","frontmatter":{"updated":"2026-07-07T00:00:00Z"}}`)
+
+	got := readSuggestedQueriesFromStatusEndpoints(t, root)
+	if !reflect.DeepEqual(got, []string{"Newest", "Newest-2", "Newest-3", "Newest-4", "Newest-5"}) {
+		t.Fatalf("suggested_queries = %#v, want top 5 updated by time", got)
+	}
+}
+
+func TestStatusAndPipelineStatusSuggestedQueriesFromConceptsWhenArtifactEmpty(t *testing.T) {
+	root := t.TempDir()
+	projectRoot := filepath.Join(root, "users", "request-user", "projects", "demo-project")
+	writeSuggestionFixtures(t, projectRoot, `{"queries":[],"updated_at":"2026-07-10T00:00:00Z"}`, `{"slug":"a","title":"Alpha","frontmatter":{"updated":"2026-07-10T00:00:00Z"}}`+"\n"+
+		`{"slug":"b","title":"Beta","frontmatter":{"updated":"2026-07-09T00:00:00Z"}}`)
+
+	got := readSuggestedQueriesFromStatusEndpoints(t, root)
+	if !reflect.DeepEqual(got, []string{"Alpha", "Beta"}) {
+		t.Fatalf("suggested_queries = %#v, want [Alpha Beta]", got)
+	}
+}
+
+func TestStatusAndPipelineStatusSuggestedQueriesNoDataReturnsEmptySlice(t *testing.T) {
+	root := t.TempDir()
+	got := readSuggestedQueriesFromStatusEndpoints(t, root)
+	if got == nil || len(got) != 0 {
+		t.Fatalf("suggested_queries = %#v, want explicit []", got)
+	}
+}
+
 func TestStatusRawCountUsesLiveRawListing(t *testing.T) {
 	root := t.TempDir()
 	projectRoot := filepath.Join(root, "users", "request-user", "projects", "demo-project")
