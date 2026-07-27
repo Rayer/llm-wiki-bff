@@ -139,6 +139,52 @@ class LocalDevMakefileTests(unittest.TestCase):
                     process.kill()
                     process.wait()
 
+    def test_local_token_logs_in_with_demo_credential(self):
+        port = self.free_port()
+        server_code = r'''
+import http.server
+import json
+import sys
+
+expected = {"email": "demo@llm-wiki.dev", "password": "demo123456"}
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        body = json.loads(self.rfile.read(length))
+        if self.path != "/api/v1/auth/login" or body != expected:
+            self.send_response(400)
+            self.end_headers()
+            return
+        payload = json.dumps({"access_token": "header.payload.signature"}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, *_):
+        pass
+
+server = http.server.HTTPServer(("127.0.0.1", int(sys.argv[1])), Handler)
+server.serve_forever()
+'''
+        server = subprocess.Popen([sys.executable, "-c", server_code, str(port)])
+        try:
+            self.wait_for_listener(port)
+            result = subprocess.run(
+                ["make", "local-token", f"BFF_PORT={port}"],
+                cwd=ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.stdout.strip(), "header.payload.signature")
+        finally:
+            if server.poll() is None:
+                server.kill()
+                server.wait()
+
     def test_pipeline_test_runs_worker_tests(self):
         output = self.make_dry_run("pipeline-test")
         self.assertIn("go test ./cmd/olw_worker", output)

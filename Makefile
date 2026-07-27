@@ -5,8 +5,10 @@ IMAGE := $(IMAGE_REPO):$(IMAGE_TAG)
 FRONTEND_DIR ?= ../llm-wiki-frontend
 BFF_PORT ?= 8080
 FRONTEND_PORT ?= 3000
+LOCAL_LOGIN_EMAIL ?= demo@llm-wiki.dev
+LOCAL_LOGIN_PASSWORD ?= demo123456
 
-.PHONY: docker-build docker-push deploy deploy-dev deploy-prod all build-sync setup local-config seed ensure-local-data dev support-bff support-frontend support-pipeline bff-local frontend-local pipeline-test pipeline-run kill-local clean-local
+.PHONY: docker-build docker-push deploy deploy-dev deploy-prod all build-sync setup local-config seed ensure-local-data dev support-bff support-frontend support-pipeline bff-local frontend-local local-token pipeline-test pipeline-run kill-local clean-local
 
 docker-build:
 	docker build -t $(IMAGE) .
@@ -64,6 +66,12 @@ bff-local:
 
 frontend-local:
 	cd "$(FRONTEND_DIR)" && NODE_ENV=development npm run dev -- --hostname 127.0.0.1 --port $(FRONTEND_PORT)
+
+local-token:
+	@BFF_URL='http://127.0.0.1:$(BFF_PORT)' \
+		LOCAL_LOGIN_EMAIL='$(LOCAL_LOGIN_EMAIL)' \
+		LOCAL_LOGIN_PASSWORD='$(LOCAL_LOGIN_PASSWORD)' \
+		python3 -c 'import json, os, urllib.request; payload = json.dumps({"email": os.environ["LOCAL_LOGIN_EMAIL"], "password": os.environ["LOCAL_LOGIN_PASSWORD"]}).encode(); request = urllib.request.Request(os.environ["BFF_URL"] + "/api/v1/auth/login", data=payload, headers={"Content-Type": "application/json"}); response = json.load(urllib.request.urlopen(request)); token = response.get("access_token"); assert isinstance(token, str) and token, "login response has no access_token"; print(token)'
 
 pipeline-test:
 	go test ./cmd/olw_worker

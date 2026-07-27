@@ -84,15 +84,45 @@ make dev BFF_PORT=18080 FRONTEND_PORT=13000
 
 The generated Frontend `.env.local` automatically uses `BFF_PORT`.
 
-## URLs and login
+## URLs
 
 ```text
 Frontend: http://127.0.0.1:3000
 BFF:      http://127.0.0.1:8080
+```
 
+## Local authentication
+
+Local mode provides one admin-capable demo account:
+
+```text
 email:    demo@llm-wiki.dev
 password: demo123456
+user ID:  local-user
+role:     admin
 ```
+
+Get a fresh 15-minute JWT from the running BFF:
+
+```bash
+TOKEN="$(make local-token)"
+```
+
+Use it for normal or admin APIs:
+
+```bash
+curl -fsS \
+  -H "Authorization: Bearer $TOKEN" \
+  http://127.0.0.1:8080/api/v1/admin/settings
+```
+
+When overriding the BFF port:
+
+```bash
+TOKEN="$(make local-token BFF_PORT=18080)"
+```
+
+The credential and `JWT_SECRET=dev-secret` are local-only. Do not use them for deployed environments, and do not commit a generated JWT.
 
 Press `Ctrl-C` to stop the support processes.
 
