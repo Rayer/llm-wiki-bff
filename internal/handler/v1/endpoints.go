@@ -345,7 +345,7 @@ func (h *Handler) Query(c *gin.Context) {
 	searchQuery := query
 	var expandResult *llm.ExpandResult
 	if h.expander != nil {
-		if result, err := h.expander.Expand(query); err != nil {
+		if result, err := h.expander.Expand(c.Request.Context(), query); err != nil {
 			log.Printf("[expander] query expansion failed for %q: %v — falling back to raw query", query, err)
 		} else if result != nil {
 			expandResult = result
@@ -373,12 +373,12 @@ func (h *Handler) Query(c *gin.Context) {
 
 	if h.llm != nil && len(results) > 0 {
 		topN := min(10, len(results))
-		contexts := cachedContexts(h.cache, gcsClient, results[:topN])
+		contexts := cachedContexts(c.Request.Context(), h.cache, gcsClient, results[:topN])
 
 		if len(contexts) > 0 {
 			systemPrompt := buildSystemPrompt(mode)
 			userPrompt := buildUserPrompt(query, contexts)
-			if answer, err := h.llm.Chat(systemPrompt, userPrompt); err == nil {
+			if answer, err := h.llm.Chat(c.Request.Context(), systemPrompt, userPrompt); err == nil {
 				answer = ensureBrackets(answer, results)
 				resp.AISynth = answer
 				citations, filtered := search.ParseCitations(answer, results)
@@ -393,12 +393,12 @@ func (h *Handler) Query(c *gin.Context) {
 	c.JSON(http.StatusOK, resp)
 }
 
-func cachedContexts(conceptCache *conceptcache.Cache, reader conceptcache.Reader, results []search.Result) []string {
+func cachedContexts(ctx context.Context, conceptCache *conceptcache.Cache, reader conceptcache.Reader, results []search.Result) []string {
 	contexts := make([]string, 0, len(results))
 	for _, result := range results {
 		entry, ok := conceptCache.Entry(reader, result.Slug)
 		if !ok {
-			if _, err := conceptCache.Build(context.Background(), reader); err == nil {
+			if _, err := conceptCache.Build(ctx, reader); err == nil {
 				entry, ok = conceptCache.Entry(reader, result.Slug)
 			}
 		}
@@ -1609,32 +1609,21 @@ func (h *Handler) loadSuggestedQueries(ctx context.Context, c *gin.Context) ([]s
 	data, err := wikiStore.ReadFile(ctx, suggestedqueries.Path)
 	if err != nil {
 		if errors.Is(err, storage.ErrObjectNotExist) {
-			// fall through to concepts-derived suggestions.
+			return []string{}, nil
 		} else {
 			return nil, err
 		}
 	} else {
 		artifact, err := suggestedqueries.Decode(data)
 		if err != nil {
-			return nil, err
-		}
-		queries := suggestedqueries.Queries(artifact)
-		if len(queries) > 0 {
-			return queries, nil
-		}
-	}
-	conceptsData, err := wikiStore.ReadFile(ctx, wikiindex.ConceptsJSONLPath)
-	if err != nil {
-		if errors.Is(err, storage.ErrObjectNotExist) {
 			return []string{}, nil
 		}
-		return nil, err
+		if !suggestedqueries.IsPublishable(artifact) {
+			return []string{}, nil
+		}
+		queries := suggestedqueries.Queries(artifact)
+		return queries, nil
 	}
-	artifact, err := suggestedqueries.BuildFromConceptsJSONL(conceptsData, nil, time.Now())
-	if err != nil {
-		return nil, err
-	}
-	return suggestedqueries.Queries(artifact), nil
 }
 
 // rawFileCount returns the live number of files under project raw/ (ListRawFiles).

@@ -2,6 +2,7 @@ package llm
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -15,6 +16,8 @@ type Client struct {
 	baseURL string
 	client  *http.Client
 }
+
+const maxChatResponseBytes = 64 * 1024
 
 type chatMessage struct {
 	Role    string `json:"role"`
@@ -47,7 +50,7 @@ func NewClient(apiKey string) *Client {
 }
 
 // Chat sends a system + user message and returns the assistant's reply.
-func (c *Client) Chat(systemPrompt, userMessage string) (string, error) {
+func (c *Client) Chat(ctx context.Context, systemPrompt, userMessage string) (string, error) {
 	body := chatRequest{
 		Model: "deepseek-chat",
 		Messages: []chatMessage{
@@ -61,7 +64,7 @@ func (c *Client) Chat(systemPrompt, userMessage string) (string, error) {
 		return "", fmt.Errorf("marshal: %w", err)
 	}
 
-	req, err := http.NewRequest("POST", c.baseURL+"/chat/completions", bytes.NewReader(data))
+	req, err := http.NewRequestWithContext(ctx, "POST", c.baseURL+"/chat/completions", bytes.NewReader(data))
 	if err != nil {
 		return "", fmt.Errorf("new request: %w", err)
 	}
@@ -74,9 +77,12 @@ func (c *Client) Chat(systemPrompt, userMessage string) (string, error) {
 	}
 	defer resp.Body.Close()
 
-	respData, err := io.ReadAll(resp.Body)
+	respData, err := io.ReadAll(io.LimitReader(resp.Body, maxChatResponseBytes+1))
 	if err != nil {
 		return "", fmt.Errorf("read response: %w", err)
+	}
+	if len(respData) > maxChatResponseBytes {
+		return "", fmt.Errorf("response exceeds %d-byte limit", maxChatResponseBytes)
 	}
 
 	if resp.StatusCode != 200 {

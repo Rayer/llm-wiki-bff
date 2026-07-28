@@ -19,6 +19,9 @@ import (
 	"time"
 
 	"github.com/rayer/llm-wiki-bff/internal/annotation"
+	conceptcache "github.com/rayer/llm-wiki-bff/internal/cache"
+	"github.com/rayer/llm-wiki-bff/internal/generation"
+	"github.com/rayer/llm-wiki-bff/internal/llm"
 	"github.com/rayer/llm-wiki-bff/internal/rawstatus"
 	"github.com/rayer/llm-wiki-bff/internal/sourcestatus"
 	"github.com/rayer/llm-wiki-bff/internal/storage"
@@ -29,20 +32,22 @@ import (
 )
 
 type workerConfig struct {
-	VaultPath      string
-	Bucket         string
-	DataDir        string
-	UserID         string
-	ProjectID      string
-	ExecutionID    string
-	APIKey         string
-	InitVault      bool
-	Postprocess    bool
-	StopOnError    bool
-	Workspace      bool
-	WorkspaceDir   string
-	SuppressOutput bool
-	cloudMode      bool
+	VaultPath                string
+	Bucket                   string
+	DataDir                  string
+	UserID                   string
+	ProjectID                string
+	ExecutionID              string
+	APIKey                   string
+	InitVault                bool
+	Postprocess              bool
+	StopOnError              bool
+	Workspace                bool
+	WorkspaceDir             string
+	SuppressOutput           bool
+	SuggestedQueries         bool
+	cloudMode                bool
+	suggestedQueriesProvider suggestedqueries.Provider
 	// These record Cobra presence, rather than a truthy value, so an explicit
 	// false or empty local-routing flag cannot be replaced by inherited env.
 	vaultSet, dataDirSet, workspaceSet         bool
@@ -65,6 +70,7 @@ const (
 	maxWorkerArgBytes               = 4096
 	maxWorkerCommandBytes           = 1 << 20
 	maxWorkerCommandCumulativeBytes = 256 << 10
+	suggestedQueryModel             = "deepseek-chat"
 )
 
 func main() {
@@ -82,7 +88,7 @@ func executeWorkerCommand(cmd *cobra.Command) error {
 }
 
 func newRootCommand() *cobra.Command {
-	cfg := workerConfig{Postprocess: true, StopOnError: true}
+	cfg := workerConfig{Postprocess: true, StopOnError: true, SuggestedQueries: true}
 	var noPostprocess bool
 
 	rootCmd := &cobra.Command{
@@ -224,7 +230,7 @@ func configFromEnvironment(cfg workerConfig) workerConfig {
 		cfg.ExecutionID = envOr("EXECUTION_ID", envOr("CLOUD_RUN_EXECUTION", ""))
 	}
 	if cfg.APIKey == "" && !cfg.apiKeySet {
-		cfg.APIKey = envOr("LLM_API_KEY", "")
+		cfg.APIKey = envOr("LLM_API_KEY", envOr("DEEPSEEK_API_KEY", ""))
 	}
 	if cfg.WorkspaceDir == "" && !cfg.workspaceDirSet {
 		cfg.WorkspaceDir = envOr("WORKSPACE_DIR", "/tmp")
@@ -268,7 +274,7 @@ func runWorkerBatchAtVault(ctx context.Context, cfg workerConfig, commands [][]s
 		return preserveWorkerFailure(err, failureStageSyntoConfigValidation, failureClassValidation)
 	}
 	if cfg.Postprocess {
-		if err := runPostprocess(ctx, vault); err != nil {
+		if err := runPostprocessWithProvider(ctx, vault, suggestedQueryProvider(cfg)); err != nil {
 			return preserveWorkerFailure(err, failureStagePostprocess, failureClassIO)
 		}
 	}
@@ -356,6 +362,7 @@ func runWorkerBatchWorkspace(ctx context.Context, cfg workerConfig, commands [][
 }
 
 func runPostprocessCommand(ctx context.Context, cfg workerConfig) (runErr error) {
+	cfg = configFromEnvironment(cfg)
 	vault, err := resolveVaultPath(cfg)
 	if err != nil {
 		return err
@@ -381,7 +388,7 @@ func runPostprocessCommand(ctx context.Context, cfg workerConfig) (runErr error)
 		return err
 	}
 	defer os.RemoveAll(workspace)
-	if err := runPostprocess(ctx, workspace); err != nil {
+	if err := runPostprocessWithProvider(ctx, workspace, suggestedQueryProvider(cfg)); err != nil {
 		return err
 	}
 	return syncWorkspaceOutputs(workspace, vault, cfg.ExecutionID)
@@ -892,6 +899,20 @@ func cleanStaleLock(vault string, maxAge time.Duration) error {
 }
 
 func runPostprocess(ctx context.Context, vault string) error {
+	return runPostprocessWithProvider(ctx, vault, nil)
+}
+
+func suggestedQueryProvider(cfg workerConfig) suggestedqueries.Provider {
+	if cfg.suggestedQueriesProvider != nil {
+		return cfg.suggestedQueriesProvider
+	}
+	if !cfg.SuggestedQueries {
+		return nil
+	}
+	return llm.NewClient(cfg.APIKey)
+}
+
+func runPostprocessWithProvider(ctx context.Context, vault string, provider suggestedqueries.Provider) error {
 	store := fsstore.New(vault)
 	if _, err := wikiindex.Rebuild(ctx, store); err != nil {
 		return fmt.Errorf("postprocess: %w", err)
@@ -902,7 +923,7 @@ func runPostprocess(ctx context.Context, vault string) error {
 	if err := writeRawStatus(ctx, vault); err != nil {
 		return fmt.Errorf("postprocess raw status: %w", err)
 	}
-	if err := writeSuggestedQueries(ctx, vault); err != nil {
+	if err := writeSuggestedQueries(ctx, vault, provider); err != nil {
 		return fmt.Errorf("postprocess suggested queries: %w", err)
 	}
 	return nil
@@ -918,9 +939,12 @@ func ensureDormantConceptCache(vault string) error {
 	return writeFileAtomicWithin(vault, path, nil)
 }
 
-func writeSuggestedQueries(ctx context.Context, vault string) error {
+func writeSuggestedQueries(ctx context.Context, vault string, provider suggestedqueries.Provider) error {
+	if provider == nil {
+		return ensureEmptySuggestedQueries(ctx, vault)
+	}
 	store := fsstore.New(vault)
-	data, err := store.ReadFile(ctx, wikiindex.ConceptsJSONLPath)
+	data, err := readBoundedRegularFileWithin(vault, wikiindex.ConceptsJSONLPath)
 	if err != nil {
 		if errors.Is(err, wikiindex.ErrNotFound) || errors.Is(err, os.ErrNotExist) {
 			data = nil
@@ -934,15 +958,17 @@ func writeSuggestedQueries(ctx context.Context, vault string) error {
 		return fmt.Errorf("list concept mtimes: %w", err)
 	}
 
-	now := time.Now()
-	var artifact suggestedqueries.Artifact
-	if len(data) > 0 {
-		artifact, err = suggestedqueries.BuildFromConceptsJSONL(data, mtimes, now)
-		if err != nil {
-			return fmt.Errorf("build suggested queries: %w", err)
-		}
-	} else {
-		artifact = suggestedqueries.Build(nil, mtimes, now)
+	entries, err := decodeSuggestedQueryConcepts(data)
+	if err != nil {
+		return fmt.Errorf("decode suggested query concepts: %w", err)
+	}
+	artifact, err := suggestedqueries.Generate(ctx, provider, "", entries, mtimes, suggestedqueries.GenerationMetadata{
+		Model:         suggestedQueryModel,
+		PromptVersion: suggestedqueries.PromptVersion,
+	}, time.Now())
+	if err != nil {
+		log.Printf("postprocess suggested queries: generation failed; preserving last-known-good artifact: %v", err)
+		return ensureEmptySuggestedQueries(ctx, vault)
 	}
 
 	payload, err := json.MarshalIndent(artifact, "", "  ")
@@ -953,6 +979,51 @@ func writeSuggestedQueries(ctx context.Context, vault string) error {
 		return fmt.Errorf("write suggested queries: %w", err)
 	}
 	return nil
+}
+
+func ensureEmptySuggestedQueries(ctx context.Context, vault string) error {
+	store := fsstore.New(vault)
+	if _, err := store.ReadFile(ctx, suggestedqueries.Path); err == nil {
+		return nil
+	} else if !errors.Is(err, wikiindex.ErrNotFound) && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("read existing suggested queries: %w", err)
+	}
+	artifact := suggestedqueries.Artifact{
+		Version:    2,
+		Queries:    []string{},
+		Candidates: []suggestedqueries.Candidate{},
+		UpdatedAt:  time.Now().UTC().Format(time.RFC3339),
+	}
+	payload, err := json.MarshalIndent(artifact, "", "  ")
+	if err != nil {
+		return err
+	}
+	if _, err := store.WriteBytesAtomic(ctx, payload, "cache/suggested_queries.json.tmp", suggestedqueries.Path); err != nil {
+		return fmt.Errorf("write empty suggested queries: %w", err)
+	}
+	return nil
+}
+
+func decodeSuggestedQueryConcepts(data []byte) ([]conceptcache.Entry, error) {
+	if len(data) == 0 {
+		return nil, nil
+	}
+	entries := make([]conceptcache.Entry, 0)
+	for _, line := range bytes.Split(data, []byte{'\n'}) {
+		line = bytes.TrimSpace(line)
+		if len(line) == 0 {
+			continue
+		}
+		if len(entries) >= generation.MaxFiles {
+			return nil, generation.ErrLogicalEntryLimit
+		}
+		var entry conceptcache.Entry
+		if err := json.Unmarshal(line, &entry); err != nil {
+			return nil, err
+		}
+		entries = append(entries, entry)
+	}
+	return entries, nil
 }
 
 func listConceptMtTimes(vault string) (map[string]time.Time, error) {

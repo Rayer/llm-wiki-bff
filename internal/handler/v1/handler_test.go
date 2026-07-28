@@ -540,7 +540,7 @@ func TestCachedContextsIncludeConceptSources(t *testing.T) {
 	}
 	conceptCache := conceptcache.New()
 
-	contexts := cachedContexts(conceptCache, reader, []search.Result{{
+	contexts := cachedContexts(context.Background(), conceptCache, reader, []search.Result{{
 		Slug:  "alpha",
 		Title: "Alpha Concept",
 		Type:  "concept",
@@ -1211,7 +1211,7 @@ func TestPipelineStatusIncludesSuggestedQueries(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(projectRoot, "cache"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	queriesJSON := `{"queries":["Beta","Alpha"],"updated_at":"2026-07-10T00:00:00Z"}`
+	queriesJSON := validSuggestedQueriesJSON()
 	if err := os.WriteFile(filepath.Join(projectRoot, "cache", "suggested_queries.json"), []byte(queriesJSON), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -1244,8 +1244,8 @@ func TestPipelineStatusIncludesSuggestedQueries(t *testing.T) {
 	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if len(body.SuggestedQueries) != 2 || body.SuggestedQueries[0] != "Beta" {
-		t.Fatalf("suggested_queries = %#v, want [Beta Alpha]", body.SuggestedQueries)
+	if len(body.SuggestedQueries) != 3 || body.SuggestedQueries[0] != "哪些概念值得一起比較？" {
+		t.Fatalf("suggested_queries = %#v, want three generated questions", body.SuggestedQueries)
 	}
 }
 
@@ -2254,6 +2254,49 @@ func TestStatusIncludesEmptySuggestedQueriesWhenMissingArtifact(t *testing.T) {
 	}
 }
 
+func TestStatusSuggestedQueriesPathDoesNotWriteStorage(t *testing.T) {
+	writes := 0
+	root := &readOnlySuggestedRoot{Client: localfs.New(t.TempDir()), writes: &writes}
+	h := New(root, nil, search.NewIndex(), conceptcache.New(), nil, nil)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/api/v1/status", nil)
+	c.Set("userID", "request-user")
+	c.Set("projectID", "demo-project")
+
+	h.Status(c)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	if writes != 0 {
+		t.Fatalf("status suggested-query path writes = %d, want 0", writes)
+	}
+}
+
+type readOnlySuggestedRoot struct {
+	*localfs.Client
+	writes *int
+}
+
+func (r *readOnlySuggestedRoot) Scope(userID, projectID string) store.Store {
+	return &readOnlySuggestedStore{Store: r.Client.Scope(userID, projectID), writes: r.writes}
+}
+
+type readOnlySuggestedStore struct {
+	store.Store
+	writes *int
+}
+
+func (s *readOnlySuggestedStore) WriteBytes(context.Context, []byte, string) (string, error) {
+	*s.writes++
+	return "", errors.New("unexpected status write")
+}
+
+func (s *readOnlySuggestedStore) WriteBytesAtomic(context.Context, []byte, string, string) (string, error) {
+	*s.writes++
+	return "", errors.New("unexpected status atomic write")
+}
+
 func readSuggestedQueriesFromStatusEndpoints(t *testing.T, root string) []string {
 	t.Helper()
 
@@ -2326,11 +2369,74 @@ func writeSuggestionFixtures(t *testing.T, projectRoot string, suggestedJSON str
 func TestStatusAndPipelineStatusSuggestedQueriesUsePresentArtifact(t *testing.T) {
 	root := t.TempDir()
 	projectRoot := filepath.Join(root, "users", "request-user", "projects", "demo-project")
-	writeSuggestionFixtures(t, projectRoot, `{"queries":["Beta","Alpha"],"updated_at":"2026-07-10T00:00:00Z"}`, "")
+	writeSuggestionFixtures(t, projectRoot, validSuggestedQueriesJSON(), "")
 
 	got := readSuggestedQueriesFromStatusEndpoints(t, root)
-	if !reflect.DeepEqual(got, []string{"Beta", "Alpha"}) {
-		t.Fatalf("suggested_queries = %#v, want [Beta Alpha]", got)
+	if !reflect.DeepEqual(got, []string{"哪些概念值得一起比較？", "如何探索這個主題的不同面向？", "哪些選擇適合進一步查找？"}) {
+		t.Fatalf("suggested_queries = %#v, want generated questions", got)
+	}
+}
+
+func TestStatusAndPipelineStatusSuggestedQueriesRejectLegacyTitleArtifact(t *testing.T) {
+	root := t.TempDir()
+	projectRoot := filepath.Join(root, "users", "request-user", "projects", "demo-project")
+	writeSuggestionFixtures(t, projectRoot, `{"queries":["咖啡廳","公園"]}`, `{"slug":"cafe","title":"咖啡廳"}`+"\n")
+
+	got := readSuggestedQueriesFromStatusEndpoints(t, root)
+	if !reflect.DeepEqual(got, []string{}) {
+		t.Fatalf("suggested_queries = %#v, want [] for legacy title-only artifact", got)
+	}
+}
+
+func TestStatusAndPipelineStatusSuggestedQueriesTreatInvalidArtifactsAsEmpty(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		data string
+	}{
+		{name: "malformed truncated", data: `{"version":2,"queries":[`},
+		{name: "duplicate key", data: `{"version":2,"version":2,"queries":[],"candidates":[],"updated_at":""}`},
+		{name: "unknown key", data: `{"version":2,"queries":[],"candidates":[],"updated_at":"","extra":true}`},
+		{name: "wrong shape", data: `{"version":2,"queries":{},"candidates":[],"updated_at":""}`},
+		{name: "trailing json", data: validSuggestedQueriesJSON() + ` {"extra":true}`},
+		{name: "unsupported version", data: `{"version":1,"queries":[],"candidates":[],"updated_at":""}`},
+		{name: "legacy title-only", data: `{"queries":["咖啡廳","公園"]}`},
+		{name: "invalid v2", data: `{"version":2,"queries":["q?"],"candidates":[],"updated_at":""}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			projectRoot := filepath.Join(root, "users", "request-user", "projects", "demo-project")
+			writeSuggestionFixtures(t, projectRoot, tc.data, "")
+			got := readSuggestedQueriesFromStatusEndpoints(t, root)
+			if !reflect.DeepEqual(got, []string{}) {
+				t.Fatalf("suggested_queries = %#v, want [] for invalid artifact", got)
+			}
+		})
+	}
+}
+
+func TestStatusAndPipelineStatusKeepReadStateErrorsAsHTTP500(t *testing.T) {
+	for _, endpoint := range []string{"/api/v1/status", "/api/v1/pipeline/status"} {
+		t.Run(endpoint, func(t *testing.T) {
+			root := &suggestedQueriesStateFailureRoot{Client: localfs.New(t.TempDir()), err: errors.New("read state unavailable")}
+			h := New(root, nil, search.NewIndex(), conceptcache.New(), nil, nil)
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodGet, endpoint, nil)
+			c.Set("userID", "request-user")
+			c.Set("projectID", "demo-project")
+			if endpoint == "/api/v1/pipeline/status" {
+				h.PipelineStatus(c)
+			} else {
+				h.Status(c)
+			}
+			want := `{"error":"generated data unavailable"}`
+			if endpoint == "/api/v1/pipeline/status" {
+				want = `{"error":"pipeline status unavailable"}`
+			}
+			if recorder.Code != http.StatusInternalServerError || recorder.Body.String() != want {
+				t.Fatalf("status=%d body=%s, want fixed read-state error", recorder.Code, recorder.Body.String())
+			}
+		})
 	}
 }
 
@@ -2345,8 +2451,8 @@ func TestStatusAndPipelineStatusSuggestedQueriesFromConceptsWhenArtifactMissing(
 		`{"slug":"f","title":"Newest-6","frontmatter":{"updated":"2026-07-07T00:00:00Z"}}`)
 
 	got := readSuggestedQueriesFromStatusEndpoints(t, root)
-	if !reflect.DeepEqual(got, []string{"Newest", "Newest-2", "Newest-3", "Newest-4", "Newest-5"}) {
-		t.Fatalf("suggested_queries = %#v, want top 5 updated by time", got)
+	if !reflect.DeepEqual(got, []string{}) {
+		t.Fatalf("suggested_queries = %#v, want [] without a published artifact", got)
 	}
 }
 
@@ -2357,8 +2463,8 @@ func TestStatusAndPipelineStatusSuggestedQueriesFromConceptsWhenArtifactEmpty(t 
 		`{"slug":"b","title":"Beta","frontmatter":{"updated":"2026-07-09T00:00:00Z"}}`)
 
 	got := readSuggestedQueriesFromStatusEndpoints(t, root)
-	if !reflect.DeepEqual(got, []string{"Alpha", "Beta"}) {
-		t.Fatalf("suggested_queries = %#v, want [Alpha Beta]", got)
+	if !reflect.DeepEqual(got, []string{}) {
+		t.Fatalf("suggested_queries = %#v, want [] for an empty artifact", got)
 	}
 }
 
@@ -2368,6 +2474,13 @@ func TestStatusAndPipelineStatusSuggestedQueriesNoDataReturnsEmptySlice(t *testi
 	if got == nil || len(got) != 0 {
 		t.Fatalf("suggested_queries = %#v, want explicit []", got)
 	}
+}
+
+func validSuggestedQueriesJSON() string {
+	return `{"version":2,"queries":["哪些概念值得一起比較？","如何探索這個主題的不同面向？","哪些選擇適合進一步查找？"],"candidates":[
+{"question":"哪些概念值得一起比較？","intent/use_case":"comparison","corpus_anchor_concept_ids":["c1"],"generation":{"model":"fixture","prompt_version":"v1"}},
+{"question":"如何探索這個主題的不同面向？","intent/use_case":"exploration","corpus_anchor_concept_ids":["c1"],"generation":{"model":"fixture","prompt_version":"v1"}},
+{"question":"哪些選擇適合進一步查找？","intent/use_case":"retrieval","corpus_anchor_concept_ids":["c1"],"generation":{"model":"fixture","prompt_version":"v1"}}],"updated_at":"2026-07-10T00:00:00Z"}`
 }
 
 func TestStatusRawCountUsesLiveRawListing(t *testing.T) {

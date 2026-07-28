@@ -36,6 +36,7 @@ func New(gcs *gcs.Client, fs *firestore.Client, idx *search.Index, llmClient *ll
 
 // Query handles POST /api/query with JSON body {"q": "...", "mode": "wiki|full"}
 func (h *Handler) Query(c *gin.Context) {
+	ctx := c.Request.Context()
 	var req QueryRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "invalid JSON: " + err.Error()})
@@ -55,7 +56,7 @@ func (h *Handler) Query(c *gin.Context) {
 	searchQuery := q
 	var expandResult *llm.ExpandResult
 	if h.expander != nil {
-		if result, err := h.expander.Expand(q); err != nil {
+		if result, err := h.expander.Expand(ctx, q); err != nil {
 			log.Printf("[expander] query expansion failed for %q: %v — falling back to raw query", q, err)
 		} else if result != nil {
 			expandResult = result
@@ -82,7 +83,7 @@ func (h *Handler) Query(c *gin.Context) {
 		var contexts []string
 		for _, r := range results[:topN] {
 			category := r.Type + "s"
-			_, data, err := h.gcs.GetPage(context.Background(), r.Slug, category)
+			_, data, err := h.gcs.GetPage(ctx, r.Slug, category)
 			if err != nil {
 				continue
 			}
@@ -92,7 +93,7 @@ func (h *Handler) Query(c *gin.Context) {
 		if len(contexts) > 0 {
 			systemPrompt := buildSystemPrompt(mode)
 			userPrompt := buildUserPrompt(q, contexts)
-			if answer, err := h.llm.Chat(systemPrompt, userPrompt); err == nil {
+			if answer, err := h.llm.Chat(ctx, systemPrompt, userPrompt); err == nil {
 				// Post-process: ensure citation names are bracketed [like this]
 				answer = ensureBrackets(answer, results)
 				resp.AISynth = answer

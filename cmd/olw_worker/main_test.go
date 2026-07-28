@@ -17,7 +17,21 @@ import (
 
 	"github.com/rayer/llm-wiki-bff/internal/annotation"
 	"github.com/rayer/llm-wiki-bff/internal/sourcestatus"
+	"github.com/rayer/llm-wiki-bff/internal/suggestedqueries"
 )
+
+type testSuggestedQueryProvider struct {
+	calls int
+	user  string
+	raw   string
+	err   error
+}
+
+func (p *testSuggestedQueryProvider) Chat(_ context.Context, _, user string) (string, error) {
+	p.calls++
+	p.user = user
+	return p.raw, p.err
+}
 
 func TestParseCommandBatch(t *testing.T) {
 	commands, err := parseCommandBatch(`[["clear"],["run","--auto-approve"]]`)
@@ -384,7 +398,12 @@ func TestRunPostprocessWritesSuggestedQueriesFromConcepts(t *testing.T) {
 	mustWriteFile(t, filepath.Join(vault, "wiki", "alpha.md"), []byte("---\nid: alpha-id\ntitle: Alpha\nupdated: 2026-07-01T00:00:00Z\n---\nAlpha"))
 	mustWriteFile(t, filepath.Join(vault, "wiki", "beta.md"), []byte("---\nid: beta-id\ntitle: Beta\nupdated: 2026-07-10T00:00:00Z\n---\nBeta"))
 
-	if err := runPostprocess(context.Background(), vault); err != nil {
+	provider := &testSuggestedQueryProvider{raw: `{"candidates":[
+{"question":"哪些概念值得一起比較？","intent/use_case":"comparison","corpus_anchor_concept_ids":["alpha-id","beta-id"]},
+{"question":"如何探索這個主題的不同面向？","intent/use_case":"exploration","corpus_anchor_concept_ids":["alpha-id"]},
+{"question":"哪些選擇適合進一步查找？","intent/use_case":"retrieval","corpus_anchor_concept_ids":["beta-id"]}
+]}`}
+	if err := runPostprocessWithProvider(context.Background(), vault, provider); err != nil {
 		t.Fatalf("runPostprocess() error = %v", err)
 	}
 
@@ -399,14 +418,69 @@ func TestRunPostprocessWritesSuggestedQueriesFromConcepts(t *testing.T) {
 	if err := json.Unmarshal(data, &artifact); err != nil {
 		t.Fatalf("decode suggested_queries.json: %v", err)
 	}
-	if len(artifact.Queries) != 2 {
-		t.Fatalf("queries = %#v, want 2 entries", artifact.Queries)
+	if len(artifact.Queries) != 3 {
+		t.Fatalf("queries = %#v, want 3 entries", artifact.Queries)
 	}
-	if artifact.Queries[0] != "Beta" {
-		t.Fatalf("queries[0] = %q, want Beta", artifact.Queries[0])
+	if artifact.Queries[0] != "哪些概念值得一起比較？" || provider.calls != 1 {
+		t.Fatalf("queries[0] = %q, provider calls = %d", artifact.Queries[0], provider.calls)
 	}
 	if artifact.UpdatedAt == "" {
 		t.Fatal("updated_at is empty")
+	}
+}
+
+func TestSuggestedQueryGenerationDoesNotReadVaultRootIndexAsDescription(t *testing.T) {
+	vault := t.TempDir()
+	mustWriteFile(t, filepath.Join(vault, "index.md"), []byte("SYSTEM_INDEX_MUST_NOT_REACH_SUGGESTED_QUERY_PROVIDER"))
+	mustWriteFile(t, filepath.Join(vault, "wiki", "alpha.md"), []byte("---\nid: alpha-id\ntitle: Alpha\n---\nAlpha"))
+	provider := &testSuggestedQueryProvider{raw: `{"candidates":[
+{"question":"哪些概念值得一起比較？","intent/use_case":"comparison","corpus_anchor_concept_ids":["alpha-id"]},
+{"question":"如何探索這個主題的不同面向？","intent/use_case":"exploration","corpus_anchor_concept_ids":["alpha-id"]},
+{"question":"哪些選擇適合進一步查找？","intent/use_case":"retrieval","corpus_anchor_concept_ids":["alpha-id"]}
+]}`}
+	if err := runPostprocessWithProvider(context.Background(), vault, provider); err != nil {
+		t.Fatalf("runPostprocessWithProvider() error = %v", err)
+	}
+	if strings.Contains(provider.user, "SYSTEM_INDEX_MUST_NOT_REACH_SUGGESTED_QUERY_PROVIDER") {
+		t.Fatalf("provider user payload contains vault root index.md content: %q", provider.user)
+	}
+}
+
+func TestSuggestedQueryGenerationFailurePreservesLastKnownGoodBytes(t *testing.T) {
+	vault := t.TempDir()
+	mustWriteFile(t, filepath.Join(vault, "wiki", "alpha.md"), []byte("---\nid: alpha-id\ntitle: Alpha\n---\nAlpha"))
+	prior := []byte(`{"version":2,"queries":["哪些概念值得一起比較？","如何探索這個主題的不同面向？","哪些選擇適合進一步查找？"],"candidates":[{"question":"哪些概念值得一起比較？","intent/use_case":"comparison","corpus_anchor_concept_ids":["alpha-id"],"generation":{"model":"fixture","prompt_version":"v1"}},{"question":"如何探索這個主題的不同面向？","intent/use_case":"exploration","corpus_anchor_concept_ids":["alpha-id"],"generation":{"model":"fixture","prompt_version":"v1"}},{"question":"哪些選擇適合進一步查找？","intent/use_case":"retrieval","corpus_anchor_concept_ids":["alpha-id"],"generation":{"model":"fixture","prompt_version":"v1"}}],"updated_at":"2026-07-28T00:00:00Z"}`)
+	mustWriteFile(t, filepath.Join(vault, "cache", "suggested_queries.json"), prior)
+	provider := &testSuggestedQueryProvider{err: errors.New("provider unavailable")}
+	if err := runPostprocessWithProvider(context.Background(), vault, provider); err != nil {
+		t.Fatalf("runPostprocessWithProvider() error = %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(vault, "cache", "suggested_queries.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, prior) {
+		t.Fatalf("suggested query artifact changed on provider failure: got %q, want byte-identical prior", got)
+	}
+}
+
+func TestSuggestedQueryGenerationFailureWritesValidEmptyV2WhenAbsent(t *testing.T) {
+	vault := t.TempDir()
+	mustWriteFile(t, filepath.Join(vault, "wiki", "alpha.md"), []byte("---\nid: alpha-id\ntitle: Alpha\n---\nAlpha"))
+	provider := &testSuggestedQueryProvider{err: errors.New("provider unavailable")}
+	if err := runPostprocessWithProvider(context.Background(), vault, provider); err != nil {
+		t.Fatalf("runPostprocessWithProvider() error = %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(vault, suggestedqueries.Path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifact, err := suggestedqueries.Decode(data)
+	if err != nil {
+		t.Fatalf("empty fallback is not valid v2 JSON: %v", err)
+	}
+	if artifact.Version != 2 || artifact.Queries == nil || len(artifact.Queries) != 0 || artifact.Candidates == nil || len(artifact.Candidates) != 0 {
+		t.Fatalf("empty fallback = %#v, want valid empty v2 artifact", artifact)
 	}
 }
 
@@ -1047,6 +1121,25 @@ func TestExplicitEmptyAndFalseFlagsSuppressInheritedEnvironment(t *testing.T) {
 	})
 	if got.Bucket != "" || got.APIKey != "" || got.UserID != "" || got.ProjectID != "" || got.ExecutionID != "" || got.WorkspaceDir != "" || got.VaultPath != "" || got.DataDir != "" || got.Workspace {
 		t.Fatalf("explicit empty/false flags were replaced by environment: %+v", got)
+	}
+}
+
+func TestAPIKeyEnvironmentPrecedenceAndExplicitEmptySuppression(t *testing.T) {
+	t.Setenv("LLM_API_KEY", "llm-key")
+	t.Setenv("DEEPSEEK_API_KEY", "deepseek-key")
+
+	if got := configFromEnvironment(workerConfig{}).APIKey; got != "llm-key" {
+		t.Fatalf("LLM_API_KEY precedence = %q, want llm-key", got)
+	}
+	t.Setenv("LLM_API_KEY", "")
+	if got := configFromEnvironment(workerConfig{}).APIKey; got != "deepseek-key" {
+		t.Fatalf("DEEPSEEK_API_KEY fallback = %q, want deepseek-key", got)
+	}
+	if got := configFromEnvironment(workerConfig{APIKey: "explicit-key", apiKeySet: true}).APIKey; got != "explicit-key" {
+		t.Fatalf("explicit API key = %q, want explicit-key", got)
+	}
+	if got := configFromEnvironment(workerConfig{apiKeySet: true}).APIKey; got != "" {
+		t.Fatalf("explicit empty API key = %q, want suppression", got)
 	}
 }
 

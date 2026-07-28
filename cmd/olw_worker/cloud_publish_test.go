@@ -22,6 +22,7 @@ import (
 	"github.com/rayer/llm-wiki-bff/internal/annotation"
 	"github.com/rayer/llm-wiki-bff/internal/generation"
 	"github.com/rayer/llm-wiki-bff/internal/sourcestatus"
+	"github.com/rayer/llm-wiki-bff/internal/suggestedqueries"
 	_ "modernc.org/sqlite"
 )
 
@@ -1245,6 +1246,94 @@ func TestCloudSuccessWritesNoFailureDiagnostic(t *testing.T) {
 	}
 	if _, _, err := m.Read(context.Background(), prefix+"cache/pipeline-execution.failure.json", 0, generation.MaxFileBytes); !errors.Is(err, cloudstorage.ErrObjectNotExist) {
 		t.Fatalf("success failure diagnostic read error=%v, want object absent", err)
+	}
+}
+
+func TestCloudSuggestedQueriesGenerateInsidePrivateWorkspaceBeforeManifestPublish(t *testing.T) {
+	m := newMemoryObjects()
+	prefix := "users/user/projects/project/"
+	seedCloudSource(t, m, prefix, "raw-start", "", priorCloudReceipt())
+	provider := &testSuggestedQueryProvider{raw: `{"candidates":[
+{"question":"哪些概念值得一起比較？","intent/use_case":"comparison","corpus_anchor_concept_ids":["149603e6c035"]},
+{"question":"如何探索這個主題的不同面向？","intent/use_case":"exploration","corpus_anchor_concept_ids":["149603e6c035"]},
+{"question":"哪些選擇適合進一步查找？","intent/use_case":"retrieval","corpus_anchor_concept_ids":["149603e6c035"]}
+]}`}
+	cfg := cloudCfgFor("user", "project", "execution")
+	cfg.SuggestedQueries = true
+	cfg.suggestedQueriesProvider = provider
+	old := execOLW
+	t.Cleanup(func() { execOLW = old })
+	execOLW = func(_ context.Context, vault string, _ []string, _ []string, _, _ io.Writer) error {
+		writeCloudRequiredOutputs(t, vault)
+		mustWriteFile(t, filepath.Join(vault, "wiki", "old.md"), []byte("---\nid: 149603e6c035\ntitle: Old\n---\nOld"))
+		mustWriteFile(t, filepath.Join(vault, "cache", "concepts.jsonl"), []byte(`{"slug":"old","title":"Old","body":"Old","frontmatter":{"id":"149603e6c035"}}`+"\n"))
+		return nil
+	}
+	if err := runCloudWorkerBatch(context.Background(), cfg, [][]string{{"run", "--auto-approve"}}, m); err != nil {
+		t.Fatalf("runCloudWorkerBatch() error = %v", err)
+	}
+	if provider.calls != 1 {
+		t.Fatalf("provider calls = %d, want one call in cloud private-workspace path", provider.calls)
+	}
+	manifestData, _, err := m.Read(context.Background(), prefix+generation.ManifestPath, 0, generation.MaxManifestBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := generation.Decode(manifestData)
+	if err != nil {
+		t.Fatal(err)
+	}
+	published, _ := cloudGenerationFile(t, m, prefix, manifest, suggestedqueries.Path)
+	artifact, err := suggestedqueries.Decode(published)
+	if err != nil || !suggestedqueries.IsPublishable(artifact) {
+		t.Fatalf("published suggested-query artifact invalid: err=%v data=%q", err, published)
+	}
+}
+
+func TestCloudSuggestedQueryProviderFailurePreservesByteIdenticalLKG(t *testing.T) {
+	m := newMemoryObjects()
+	prefix := "users/user/projects/project/"
+	seedCloudSource(t, m, prefix, "raw-start", "", priorCloudReceipt())
+	priorArtifact := suggestedqueries.Artifact{
+		Version: 2,
+		Queries: []string{"lkg question one?", "lkg question two?", "lkg question three?"},
+		Candidates: []suggestedqueries.Candidate{
+			{Question: "lkg question one?", Intent: "fixture", CorpusAnchorConceptIDs: []string{"lkg"}, Generation: suggestedqueries.GenerationMetadata{Model: "fixture", PromptVersion: "v1"}},
+			{Question: "lkg question two?", Intent: "fixture", CorpusAnchorConceptIDs: []string{"lkg"}, Generation: suggestedqueries.GenerationMetadata{Model: "fixture", PromptVersion: "v1"}},
+			{Question: "lkg question three?", Intent: "fixture", CorpusAnchorConceptIDs: []string{"lkg"}, Generation: suggestedqueries.GenerationMetadata{Model: "fixture", PromptVersion: "v1"}},
+		},
+		UpdatedAt: "2026-07-28T00:00:00Z",
+	}
+	prior, err := json.Marshal(priorArtifact)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeCloudObject(t, m, prefix+suggestedqueries.Path, prior)
+	provider := &testSuggestedQueryProvider{err: errors.New("provider unavailable")}
+	cfg := cloudCfgFor("user", "project", "execution")
+	cfg.SuggestedQueries = true
+	cfg.suggestedQueriesProvider = provider
+	old := execOLW
+	t.Cleanup(func() { execOLW = old })
+	execOLW = func(_ context.Context, vault string, _ []string, _ []string, _, _ io.Writer) error {
+		writeCloudRequiredOutputs(t, vault)
+		mustWriteFile(t, filepath.Join(vault, "cache", "suggested_queries.json"), prior)
+		return nil
+	}
+	if err := runCloudWorkerBatch(context.Background(), cfg, [][]string{{"run", "--auto-approve"}}, m); err != nil {
+		t.Fatalf("runCloudWorkerBatch() error = %v", err)
+	}
+	manifestData, _, err := m.Read(context.Background(), prefix+generation.ManifestPath, 0, generation.MaxManifestBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := generation.Decode(manifestData)
+	if err != nil {
+		t.Fatal(err)
+	}
+	published, _ := cloudGenerationFile(t, m, prefix, manifest, suggestedqueries.Path)
+	if !bytes.Equal(published, prior) {
+		t.Fatalf("published LKG changed on provider failure: got %q want %q", published, prior)
 	}
 }
 

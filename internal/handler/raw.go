@@ -224,6 +224,7 @@ func (h *Handler) GenerateTitle(c *gin.Context) {
 	}
 
 	title, err := h.llm.Chat(
+		c.Request.Context(),
 		"Generate a concise, descriptive title for a wiki article based on its content. Return ONLY the title, nothing else. Use the same language as the content. Max 80 characters.",
 		req.Content[:min(len(req.Content), 2000)],
 	)
