@@ -21,6 +21,7 @@ const (
 	MaxConcepts      = 12
 	MaxQuestionBytes = 512
 	MaxProviderBytes = 64 * 1024
+	PromptVersion    = "lwc-205-v1"
 )
 
 var (
@@ -42,7 +43,8 @@ type GenerationMetadata struct {
 	PromptVersion string `json:"prompt_version"`
 }
 
-// Candidate is the structured, untrusted provider output before publication.
+// Candidate is the validated candidate retained in the published artifact.
+// Generation is attached locally after provider output validation.
 type Candidate struct {
 	Question               string             `json:"question"`
 	Intent                 string             `json:"intent/use_case"`
@@ -50,16 +52,18 @@ type Candidate struct {
 	Generation             GenerationMetadata `json:"generation"`
 }
 
+type providerCandidate struct {
+	Question               string
+	Intent                 string
+	CorpusAnchorConceptIDs []string
+}
+
 type Provider interface {
 	Chat(systemPrompt, userMessage string) (string, error)
 }
 
-type providerEnvelope struct {
-	Candidates []Candidate `json:"candidates"`
-}
-
 // Generate makes one bounded provider call for one postprocess operation.
-func Generate(ctx context.Context, provider Provider, description string, entries []conceptcache.Entry, mtimes map[string]time.Time, now time.Time) (Artifact, error) {
+func Generate(ctx context.Context, provider Provider, description string, entries []conceptcache.Entry, mtimes map[string]time.Time, trustedGeneration GenerationMetadata, now time.Time) (Artifact, error) {
 	if provider == nil {
 		return Artifact{}, errors.New("suggested-query provider is not configured")
 	}
@@ -69,6 +73,9 @@ func Generate(ctx context.Context, provider Provider, description string, entrie
 	concepts := RepresentativeConcepts(entries, mtimes)
 	if len(concepts) == 0 {
 		return Artifact{}, fmt.Errorf("%w: no corpus concepts", ErrInvalidCandidates)
+	}
+	if strings.TrimSpace(trustedGeneration.Model) == "" || strings.TrimSpace(trustedGeneration.PromptVersion) == "" {
+		return Artifact{}, fmt.Errorf("%w: trusted generation metadata is incomplete", ErrInvalidCandidates)
 	}
 	description = truncateBytes(strings.TrimSpace(description), 2048)
 	input := struct {
@@ -87,15 +94,18 @@ func Generate(ctx context.Context, provider Provider, description string, entrie
 	if err != nil {
 		return Artifact{}, err
 	}
-	if err := ValidateCandidates(candidates, concepts); err != nil {
+	if err := validateCandidates(candidates, concepts, true, false); err != nil {
 		return Artifact{}, err
+	}
+	for i := range candidates {
+		candidates[i].Generation = trustedGeneration
 	}
 	return ArtifactFromCandidates(candidates, now), nil
 }
 
 const generationSystemPrompt = `Generate natural-language discovery questions for the supplied corpus.
 Return only a JSON object with a candidates array. Each candidate must contain question,
-intent/use_case, corpus_anchor_concept_ids, and generation with model and prompt_version.
+intent/use_case, and corpus_anchor_concept_ids. Do not include generation metadata.
 Use only supplied concept IDs as corpus anchors. Use-case hypotheses are allowed only as
 questions to be decided by retrieval; do not assert unsupported attributes as facts.
 Return 3 to 5 distinct questions. Never return a bare title or a trivial title wrapper.`
@@ -168,17 +178,171 @@ func parseProviderCandidates(raw string) ([]Candidate, error) {
 		return nil, errors.New("suggested-query provider output exceeds byte limit")
 	}
 	dec := json.NewDecoder(bytes.NewReader([]byte(raw)))
-	var envelope providerEnvelope
-	if err := dec.Decode(&envelope); err != nil {
+	providerCandidates, err := decodeProviderEnvelope(dec)
+	if err != nil {
 		return nil, fmt.Errorf("decode suggested-query provider output: %w", err)
 	}
 	if err := generation.EnsureJSONEOF(dec); err != nil {
 		return nil, fmt.Errorf("decode suggested-query provider output: %w", err)
 	}
-	if len(envelope.Candidates) > MaxQueries {
+	if len(providerCandidates) > MaxQueries {
 		return nil, fmt.Errorf("%w: candidate count exceeds %d", ErrInvalidCandidates, MaxQueries)
 	}
-	return envelope.Candidates, nil
+	candidates := make([]Candidate, len(providerCandidates))
+	for i, candidate := range providerCandidates {
+		candidates[i] = Candidate{
+			Question:               candidate.Question,
+			Intent:                 candidate.Intent,
+			CorpusAnchorConceptIDs: candidate.CorpusAnchorConceptIDs,
+		}
+	}
+	return candidates, nil
+}
+
+func decodeProviderEnvelope(dec *json.Decoder) ([]providerCandidate, error) {
+	token, err := dec.Token()
+	if err != nil {
+		return nil, err
+	}
+	if delim, ok := token.(json.Delim); !ok || delim != '{' {
+		return nil, errors.New("expected provider envelope object")
+	}
+	seen := make(map[string]struct{}, 1)
+	var candidates []providerCandidate
+	for dec.More() {
+		key, err := dec.Token()
+		if err != nil {
+			return nil, err
+		}
+		name, ok := key.(string)
+		if !ok {
+			return nil, errors.New("expected provider envelope key")
+		}
+		if _, duplicate := seen[name]; duplicate {
+			return nil, fmt.Errorf("duplicate provider envelope key %q", name)
+		}
+		seen[name] = struct{}{}
+		if name != "candidates" {
+			return nil, fmt.Errorf("unknown provider envelope key %q", name)
+		}
+		candidates, err = decodeProviderCandidateArray(dec)
+		if err != nil {
+			return nil, err
+		}
+	}
+	end, err := dec.Token()
+	if err != nil {
+		return nil, err
+	}
+	if end != json.Delim('}') {
+		return nil, errors.New("expected provider envelope object end")
+	}
+	return candidates, nil
+}
+
+func decodeProviderCandidateArray(dec *json.Decoder) ([]providerCandidate, error) {
+	token, err := dec.Token()
+	if err != nil {
+		return nil, err
+	}
+	if delim, ok := token.(json.Delim); !ok || delim != '[' {
+		return nil, errors.New("expected provider candidates array")
+	}
+	candidates := make([]providerCandidate, 0, MinQueries)
+	for dec.More() {
+		if len(candidates) >= MaxQueries {
+			return nil, fmt.Errorf("%w: candidate count exceeds %d", ErrInvalidCandidates, MaxQueries)
+		}
+		candidate, err := decodeProviderCandidate(dec)
+		if err != nil {
+			return nil, err
+		}
+		candidates = append(candidates, candidate)
+	}
+	end, err := dec.Token()
+	if err != nil {
+		return nil, err
+	}
+	if end != json.Delim(']') {
+		return nil, errors.New("expected provider candidates array end")
+	}
+	return candidates, nil
+}
+
+func decodeProviderCandidate(dec *json.Decoder) (providerCandidate, error) {
+	token, err := dec.Token()
+	if err != nil {
+		return providerCandidate{}, err
+	}
+	if delim, ok := token.(json.Delim); !ok || delim != '{' {
+		return providerCandidate{}, errors.New("expected provider candidate object")
+	}
+	var candidate providerCandidate
+	seen := make(map[string]struct{}, 3)
+	for dec.More() {
+		key, err := dec.Token()
+		if err != nil {
+			return providerCandidate{}, err
+		}
+		name, ok := key.(string)
+		if !ok {
+			return providerCandidate{}, errors.New("expected provider candidate key")
+		}
+		if _, duplicate := seen[name]; duplicate {
+			return providerCandidate{}, fmt.Errorf("duplicate provider candidate key %q", name)
+		}
+		seen[name] = struct{}{}
+		switch name {
+		case "question":
+			candidate.Question, err = decodeJSONString(dec)
+		case "intent/use_case":
+			candidate.Intent, err = decodeJSONString(dec)
+		case "corpus_anchor_concept_ids":
+			candidate.CorpusAnchorConceptIDs, err = decodeAnchorIDs(dec)
+		default:
+			return providerCandidate{}, fmt.Errorf("unknown provider candidate key %q", name)
+		}
+		if err != nil {
+			return providerCandidate{}, err
+		}
+	}
+	end, err := dec.Token()
+	if err != nil {
+		return providerCandidate{}, err
+	}
+	if end != json.Delim('}') {
+		return providerCandidate{}, errors.New("expected provider candidate object end")
+	}
+	return candidate, nil
+}
+
+func decodeAnchorIDs(dec *json.Decoder) ([]string, error) {
+	token, err := dec.Token()
+	if err != nil {
+		return nil, err
+	}
+	if delim, ok := token.(json.Delim); !ok || delim != '[' {
+		return nil, errors.New("expected corpus anchor array")
+	}
+	ids := make([]string, 0, 1)
+	for dec.More() {
+		if len(ids) >= MaxConcepts {
+			return nil, fmt.Errorf("%w: anchor count exceeds %d", ErrInvalidCandidates, MaxConcepts)
+		}
+		id, err := decodeJSONString(dec)
+		if err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	end, err := dec.Token()
+	if err != nil {
+		return nil, err
+	}
+	if end != json.Delim(']') {
+		return nil, errors.New("expected corpus anchor array end")
+	}
+	return ids, nil
 }
 
 func ArtifactFromCandidates(candidates []Candidate, now time.Time) Artifact {
@@ -193,7 +357,7 @@ func IsPublishable(artifact Artifact) bool {
 	if artifact.Version != 2 || len(artifact.Candidates) < MinQueries || len(artifact.Candidates) > MaxQueries || len(artifact.Queries) != len(artifact.Candidates) {
 		return false
 	}
-	if err := validateCandidates(artifact.Candidates, nil, false); err != nil {
+	if err := validateCandidates(artifact.Candidates, nil, false, true); err != nil {
 		return false
 	}
 	for i, candidate := range artifact.Candidates {
@@ -215,10 +379,10 @@ func truncateBytes(value string, limit int) string {
 }
 
 func ValidateCandidates(candidates []Candidate, concepts []ConceptEvidence) error {
-	return validateCandidates(candidates, concepts, true)
+	return validateCandidates(candidates, concepts, true, true)
 }
 
-func validateCandidates(candidates []Candidate, concepts []ConceptEvidence, checkAnchors bool) error {
+func validateCandidates(candidates []Candidate, concepts []ConceptEvidence, checkAnchors, requireGeneration bool) error {
 	// This validator proves structure, question framing, and corpus-anchor IDs;
 	// it cannot prove arbitrary semantic attributes. Those remain provider
 	// hypotheses and are safe only when phrased as questions.
@@ -252,8 +416,11 @@ func validateCandidates(candidates []Candidate, concepts []ConceptEvidence, chec
 		if _, exactTitle := titles[questionKey]; exactTitle || isTitleWrapper(questionKey, titles) {
 			return fmt.Errorf("%w: candidate %d is title-like", ErrInvalidCandidates, i)
 		}
-		if strings.TrimSpace(candidate.Intent) == "" || strings.TrimSpace(candidate.Generation.Model) == "" || strings.TrimSpace(candidate.Generation.PromptVersion) == "" {
+		if strings.TrimSpace(candidate.Intent) == "" {
 			return fmt.Errorf("%w: candidate %d metadata is incomplete", ErrInvalidCandidates, i)
+		}
+		if requireGeneration && (strings.TrimSpace(candidate.Generation.Model) == "" || strings.TrimSpace(candidate.Generation.PromptVersion) == "") {
+			return fmt.Errorf("%w: candidate %d generation metadata is incomplete", ErrInvalidCandidates, i)
 		}
 		if len(candidate.CorpusAnchorConceptIDs) == 0 || len(candidate.CorpusAnchorConceptIDs) > MaxConcepts {
 			return fmt.Errorf("%w: candidate %d anchors are missing or oversized", ErrInvalidCandidates, i)

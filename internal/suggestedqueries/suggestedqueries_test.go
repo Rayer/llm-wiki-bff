@@ -91,6 +91,7 @@ func TestParseProviderCandidatesRejectsMalformedAndOversizedOutput(t *testing.T)
 	}{
 		{name: "malformed json", raw: `{"candidates":`},
 		{name: "wrong shape", raw: `[{"question":"哪些概念值得一起比較？"}]`},
+		{name: "trailing json", raw: `{"candidates":[]} {"extra":true}`},
 		{name: "oversized", raw: strings.Repeat("x", MaxProviderBytes+1)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -98,6 +99,102 @@ func TestParseProviderCandidatesRejectsMalformedAndOversizedOutput(t *testing.T)
 				t.Fatal("parseProviderCandidates() error = nil, want rejection")
 			}
 		})
+	}
+}
+
+func TestParseProviderCandidatesRejectsDuplicateAndUnknownKeys(t *testing.T) {
+	for _, raw := range []string{
+		`{"candidates":[],"candidates":[]}`,
+		`{"candidates":[],"extra":true}`,
+		`{"candidates":[{"question":"哪些概念值得一起比較？","intent/use_case":"comparison","corpus_anchor_concept_ids":["c1"],"generation":{}}]}`,
+		`{"candidates":[{"question":"哪些概念值得一起比較？","question":"哪些地方值得探索？","intent/use_case":"comparison","corpus_anchor_concept_ids":["c1"]}]}`,
+		`{"candidates":[{"question":"哪些概念值得一起比較？","intent/use_case":"comparison","corpus_anchor_concept_ids":["c1"],"extra":true}]}`,
+	} {
+		if _, err := parseProviderCandidates(raw); err == nil {
+			t.Fatalf("parseProviderCandidates(%s) error = nil, want strict rejection", raw)
+		}
+	}
+}
+
+func TestParseProviderCandidatesRejectsCandidateOverflow(t *testing.T) {
+	raw := `{"candidates":[{}, {}, {}, {}, {}, {}]}`
+	if _, err := parseProviderCandidates(raw); err == nil {
+		t.Fatal("parseProviderCandidates() error = nil, want candidate overflow rejection")
+	}
+}
+
+func TestGenerateAttachesTrustedMetadataAfterProviderValidation(t *testing.T) {
+	entries := []conceptcache.Entry{{Slug: "c1", Title: "Concept 1", Body: "Evidence"}}
+	provider := &fixtureProvider{raw: `{"candidates":[
+{"question":"哪些概念值得一起比較？","intent/use_case":"comparison","corpus_anchor_concept_ids":["c1"]},
+{"question":"如何探索這個主題的不同面向？","intent/use_case":"exploration","corpus_anchor_concept_ids":["c1"]},
+{"question":"哪些選擇適合進一步查找？","intent/use_case":"retrieval","corpus_anchor_concept_ids":["c1"]}
+]}`}
+	trusted := GenerationMetadata{Model: "fixture-model", PromptVersion: "fixture-prompt-v1"}
+	artifact, err := Generate(context.Background(), provider, "", entries, nil, trusted, time.Now())
+	if err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+	for _, candidate := range artifact.Candidates {
+		if candidate.Generation != trusted {
+			t.Fatalf("candidate generation = %#v, want trusted %#v", candidate.Generation, trusted)
+		}
+	}
+}
+
+func TestGeneratePassesExplicitOptionalDescription(t *testing.T) {
+	provider := &fixtureProvider{raw: `{"candidates":[
+{"question":"哪些概念值得一起比較？","intent/use_case":"comparison","corpus_anchor_concept_ids":["c1"]},
+{"question":"如何探索這個主題的不同面向？","intent/use_case":"exploration","corpus_anchor_concept_ids":["c1"]},
+{"question":"哪些選擇適合進一步查找？","intent/use_case":"retrieval","corpus_anchor_concept_ids":["c1"]}
+]}`}
+	if _, err := Generate(context.Background(), provider, "explicit description seam", []conceptcache.Entry{{Slug: "c1", Title: "Concept 1"}}, nil, GenerationMetadata{Model: "fixture", PromptVersion: "v1"}, time.Now()); err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+	if !strings.Contains(provider.user, `"project_description":"explicit description seam"`) {
+		t.Fatalf("provider user payload = %q, want explicit optional description", provider.user)
+	}
+}
+
+func TestDecodeRejectsDuplicateAndUnknownArtifactKeys(t *testing.T) {
+	for _, raw := range []string{
+		`{"version":2,"version":2,"queries":[],"candidates":[],"updated_at":""}`,
+		`{"version":2,"queries":[],"candidates":[],"updated_at":"","extra":true}`,
+	} {
+		if _, err := Decode([]byte(raw)); err == nil {
+			t.Fatalf("Decode(%s) error = nil, want strict rejection", raw)
+		}
+	}
+}
+
+func TestDecodeRejectsDuplicateAndUnknownPublishedCandidateKeys(t *testing.T) {
+	for _, raw := range []string{
+		`{"version":2,"queries":[],"candidates":[{"question":"q?","question":"r?","intent/use_case":"i","corpus_anchor_concept_ids":["c1"],"generation":{"model":"m","prompt_version":"p"}}],"updated_at":""}`,
+		`{"version":2,"queries":[],"candidates":[{"question":"q?","intent/use_case":"i","corpus_anchor_concept_ids":["c1"],"generation":{"model":"m","prompt_version":"p","extra":true}}],"updated_at":""}`,
+		`{"version":2,"queries":[],"candidates":[{"question":"q?","intent/use_case":"i","corpus_anchor_concept_ids":["c1"],"generation":{"model":"m","model":"other","prompt_version":"p"}}],"updated_at":""}`,
+	} {
+		if _, err := Decode([]byte(raw)); err == nil {
+			t.Fatalf("Decode(%s) error = nil, want strict rejection", raw)
+		}
+	}
+}
+
+func TestStrictDecodersRejectWrongShapes(t *testing.T) {
+	for _, raw := range []string{
+		`{"candidates":null}`,
+		`{"candidates":[{"question":null,"intent/use_case":"i","corpus_anchor_concept_ids":["c1"]}]}`,
+	} {
+		if _, err := parseProviderCandidates(raw); err == nil {
+			t.Fatalf("parseProviderCandidates(%s) error = nil, want wrong-shape rejection", raw)
+		}
+	}
+	for _, raw := range []string{
+		`{"version":null,"queries":[],"candidates":[],"updated_at":""}`,
+		`{"version":2,"queries":[null],"candidates":[],"updated_at":""}`,
+	} {
+		if _, err := Decode([]byte(raw)); err == nil {
+			t.Fatalf("Decode(%s) error = nil, want wrong-shape rejection", raw)
+		}
 	}
 }
 
@@ -150,11 +247,11 @@ func TestGenerateUsesBoundedRepresentativeConceptsAndOptionalDescription(t *test
 	}
 	entries = append(entries, conceptcache.Entry{Slug: "index", Title: "System Index", Frontmatter: map[string]interface{}{"id": "system"}})
 	provider := &fixtureProvider{raw: `{"candidates":[
-{"question":"哪些概念值得一起比較？","intent/use_case":"comparison","corpus_anchor_concept_ids":["id-c"],"generation":{"model":"fixture","prompt_version":"v1"}},
-{"question":"如何探索這個主題的不同面向？","intent/use_case":"exploration","corpus_anchor_concept_ids":["id-d"],"generation":{"model":"fixture","prompt_version":"v1"}},
-{"question":"哪些選擇適合進一步查找？","intent/use_case":"retrieval","corpus_anchor_concept_ids":["id-c"],"generation":{"model":"fixture","prompt_version":"v1"}}
+{"question":"哪些概念值得一起比較？","intent/use_case":"comparison","corpus_anchor_concept_ids":["id-c"]},
+{"question":"如何探索這個主題的不同面向？","intent/use_case":"exploration","corpus_anchor_concept_ids":["id-d"]},
+{"question":"哪些選擇適合進一步查找？","intent/use_case":"retrieval","corpus_anchor_concept_ids":["id-c"]}
 ]}`}
-	artifact, err := Generate(context.Background(), provider, "", entries, nil, time.Date(2026, 7, 28, 0, 0, 0, 0, time.UTC))
+	artifact, err := Generate(context.Background(), provider, "", entries, nil, GenerationMetadata{Model: "fixture", PromptVersion: "v1"}, time.Date(2026, 7, 28, 0, 0, 0, 0, time.UTC))
 	if err != nil {
 		t.Fatalf("Generate() error = %v", err)
 	}

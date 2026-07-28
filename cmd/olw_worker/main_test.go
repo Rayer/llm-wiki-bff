@@ -21,12 +21,14 @@ import (
 
 type testSuggestedQueryProvider struct {
 	calls int
+	user  string
 	raw   string
 	err   error
 }
 
-func (p *testSuggestedQueryProvider) Chat(_, _ string) (string, error) {
+func (p *testSuggestedQueryProvider) Chat(_, user string) (string, error) {
 	p.calls++
+	p.user = user
 	return p.raw, p.err
 }
 
@@ -396,9 +398,9 @@ func TestRunPostprocessWritesSuggestedQueriesFromConcepts(t *testing.T) {
 	mustWriteFile(t, filepath.Join(vault, "wiki", "beta.md"), []byte("---\nid: beta-id\ntitle: Beta\nupdated: 2026-07-10T00:00:00Z\n---\nBeta"))
 
 	provider := &testSuggestedQueryProvider{raw: `{"candidates":[
-{"question":"哪些概念值得一起比較？","intent/use_case":"comparison","corpus_anchor_concept_ids":["alpha-id","beta-id"],"generation":{"model":"fixture","prompt_version":"v1"}},
-{"question":"如何探索這個主題的不同面向？","intent/use_case":"exploration","corpus_anchor_concept_ids":["alpha-id"],"generation":{"model":"fixture","prompt_version":"v1"}},
-{"question":"哪些選擇適合進一步查找？","intent/use_case":"retrieval","corpus_anchor_concept_ids":["beta-id"],"generation":{"model":"fixture","prompt_version":"v1"}}
+{"question":"哪些概念值得一起比較？","intent/use_case":"comparison","corpus_anchor_concept_ids":["alpha-id","beta-id"]},
+{"question":"如何探索這個主題的不同面向？","intent/use_case":"exploration","corpus_anchor_concept_ids":["alpha-id"]},
+{"question":"哪些選擇適合進一步查找？","intent/use_case":"retrieval","corpus_anchor_concept_ids":["beta-id"]}
 ]}`}
 	if err := runPostprocessWithProvider(context.Background(), vault, provider); err != nil {
 		t.Fatalf("runPostprocess() error = %v", err)
@@ -423,6 +425,23 @@ func TestRunPostprocessWritesSuggestedQueriesFromConcepts(t *testing.T) {
 	}
 	if artifact.UpdatedAt == "" {
 		t.Fatal("updated_at is empty")
+	}
+}
+
+func TestSuggestedQueryGenerationDoesNotReadVaultRootIndexAsDescription(t *testing.T) {
+	vault := t.TempDir()
+	mustWriteFile(t, filepath.Join(vault, "index.md"), []byte("SYSTEM_INDEX_MUST_NOT_REACH_SUGGESTED_QUERY_PROVIDER"))
+	mustWriteFile(t, filepath.Join(vault, "wiki", "alpha.md"), []byte("---\nid: alpha-id\ntitle: Alpha\n---\nAlpha"))
+	provider := &testSuggestedQueryProvider{raw: `{"candidates":[
+{"question":"哪些概念值得一起比較？","intent/use_case":"comparison","corpus_anchor_concept_ids":["alpha-id"]},
+{"question":"如何探索這個主題的不同面向？","intent/use_case":"exploration","corpus_anchor_concept_ids":["alpha-id"]},
+{"question":"哪些選擇適合進一步查找？","intent/use_case":"retrieval","corpus_anchor_concept_ids":["alpha-id"]}
+]}`}
+	if err := runPostprocessWithProvider(context.Background(), vault, provider); err != nil {
+		t.Fatalf("runPostprocessWithProvider() error = %v", err)
+	}
+	if strings.Contains(provider.user, "SYSTEM_INDEX_MUST_NOT_REACH_SUGGESTED_QUERY_PROVIDER") {
+		t.Fatalf("provider user payload contains vault root index.md content: %q", provider.user)
 	}
 }
 

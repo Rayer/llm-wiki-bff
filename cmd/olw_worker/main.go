@@ -70,6 +70,7 @@ const (
 	maxWorkerArgBytes               = 4096
 	maxWorkerCommandBytes           = 1 << 20
 	maxWorkerCommandCumulativeBytes = 256 << 10
+	suggestedQueryModel             = "deepseek-chat"
 )
 
 func main() {
@@ -961,11 +962,10 @@ func writeSuggestedQueries(ctx context.Context, vault string, provider suggested
 	if err != nil {
 		return fmt.Errorf("decode suggested query concepts: %w", err)
 	}
-	description, err := readOptionalProjectDescription(vault)
-	if err != nil {
-		return fmt.Errorf("read project description: %w", err)
-	}
-	artifact, err := suggestedqueries.Generate(ctx, provider, description, entries, mtimes, time.Now())
+	artifact, err := suggestedqueries.Generate(ctx, provider, "", entries, mtimes, suggestedqueries.GenerationMetadata{
+		Model:         suggestedQueryModel,
+		PromptVersion: suggestedqueries.PromptVersion,
+	}, time.Now())
 	if err != nil {
 		log.Printf("postprocess suggested queries: generation failed; preserving last-known-good artifact: %v", err)
 		return ensureEmptySuggestedQueries(ctx, vault)
@@ -1024,17 +1024,6 @@ func decodeSuggestedQueryConcepts(data []byte) ([]conceptcache.Entry, error) {
 		entries = append(entries, entry)
 	}
 	return entries, nil
-}
-
-func readOptionalProjectDescription(vault string) (string, error) {
-	data, err := readBoundedRegularFileWithin(vault, "index.md")
-	if errors.Is(err, os.ErrNotExist) {
-		return "", nil
-	}
-	if err != nil {
-		return "", err
-	}
-	return string(data), nil
 }
 
 func listConceptMtTimes(vault string) (map[string]time.Time, error) {
