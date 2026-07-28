@@ -2,6 +2,7 @@ package llm
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -49,7 +50,7 @@ func NewClient(apiKey string) *Client {
 }
 
 // Chat sends a system + user message and returns the assistant's reply.
-func (c *Client) Chat(systemPrompt, userMessage string) (string, error) {
+func (c *Client) Chat(ctx context.Context, systemPrompt, userMessage string) (string, error) {
 	body := chatRequest{
 		Model: "deepseek-chat",
 		Messages: []chatMessage{
@@ -63,7 +64,7 @@ func (c *Client) Chat(systemPrompt, userMessage string) (string, error) {
 		return "", fmt.Errorf("marshal: %w", err)
 	}
 
-	req, err := http.NewRequest("POST", c.baseURL+"/chat/completions", bytes.NewReader(data))
+	req, err := http.NewRequestWithContext(ctx, "POST", c.baseURL+"/chat/completions", bytes.NewReader(data))
 	if err != nil {
 		return "", fmt.Errorf("new request: %w", err)
 	}

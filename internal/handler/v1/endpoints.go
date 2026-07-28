@@ -378,7 +378,7 @@ func (h *Handler) Query(c *gin.Context) {
 		if len(contexts) > 0 {
 			systemPrompt := buildSystemPrompt(mode)
 			userPrompt := buildUserPrompt(query, contexts)
-			if answer, err := h.llm.Chat(systemPrompt, userPrompt); err == nil {
+			if answer, err := h.llm.Chat(c.Request.Context(), systemPrompt, userPrompt); err == nil {
 				answer = ensureBrackets(answer, results)
 				resp.AISynth = answer
 				citations, filtered := search.ParseCitations(answer, results)
@@ -1616,7 +1616,7 @@ func (h *Handler) loadSuggestedQueries(ctx context.Context, c *gin.Context) ([]s
 	} else {
 		artifact, err := suggestedqueries.Decode(data)
 		if err != nil {
-			return nil, err
+			return []string{}, nil
 		}
 		if !suggestedqueries.IsPublishable(artifact) {
 			return []string{}, nil

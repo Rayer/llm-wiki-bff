@@ -59,7 +59,7 @@ type providerCandidate struct {
 }
 
 type Provider interface {
-	Chat(systemPrompt, userMessage string) (string, error)
+	Chat(ctx context.Context, systemPrompt, userMessage string) (string, error)
 }
 
 // Generate makes one bounded provider call for one postprocess operation.
@@ -86,7 +86,7 @@ func Generate(ctx context.Context, provider Provider, description string, entrie
 	if err != nil {
 		return Artifact{}, fmt.Errorf("marshal generation input: %w", err)
 	}
-	raw, err := provider.Chat(generationSystemPrompt, string(userData))
+	raw, err := provider.Chat(ctx, generationSystemPrompt, string(userData))
 	if err != nil {
 		return Artifact{}, fmt.Errorf("generate suggested queries: %w", err)
 	}
@@ -446,15 +446,47 @@ func validateCandidates(candidates []Candidate, concepts []ConceptEvidence, chec
 }
 
 func isTitleWrapper(question string, titles map[string]struct{}) bool {
+	if len([]rune(question)) > 512 {
+		return false
+	}
+	anchors := make([]string, 0, len(titles))
 	for title := range titles {
-		if len([]rune(title)) == 0 || !strings.Contains(question, title) {
-			continue
-		}
-		if len([]rune(question))-len([]rune(title)) <= 8 {
-			return true
+		if title != "" && strings.Contains(question, title) {
+			anchors = append(anchors, title)
 		}
 	}
-	return false
+	if len(anchors) == 0 {
+		return false
+	}
+	// Remove every normalized anchored title before checking the residual. This
+	// is only bounded anchor membership plus language heuristics; it cannot
+	// prove every semantic attribute of the question or corpus.
+	sort.Slice(anchors, func(i, j int) bool { return len([]rune(anchors[i])) > len([]rune(anchors[j])) })
+	residual := question
+	for _, anchor := range anchors {
+		residual = strings.ReplaceAll(residual, anchor, "")
+	}
+	return stripGenericWrapperLanguage(residual) == ""
+}
+
+var genericWrapperPhrases = []string{
+	// Chinese polite, topic, content, and information wrappers.
+	"請告訴我", "請問", "我想知道", "想了解", "可以介紹一下", "介紹", "關於", "所有", "相關", "資訊", "資料", "詳情", "這個主題", "這個概念", "主題", "有哪些", "內容", "哪個", "哪些", "有什麼", "可以", "嗎", "呢", "的", "和",
+	// English polite, topic, content, and information wrappers.
+	"pleasetellmeallinformationabout", "whatcontentisavailableaboutthe", "whatinformationisavailableaboutthe", "pleasetellme", "tellmeabout", "tellme", "allinformation", "information", "details", "detail", "overview", "available", "content", "about", "topic", "what", "which", "please", "couldyou", "can", "you", "provide", "all", "the", "is", "are",
+}
+
+func stripGenericWrapperLanguage(value string) string {
+	for pass := 0; pass < 2; pass++ {
+		before := value
+		for _, phrase := range genericWrapperPhrases {
+			value = strings.ReplaceAll(value, phrase, "")
+		}
+		if value == before {
+			break
+		}
+	}
+	return value
 }
 
 func normalize(value string) string {

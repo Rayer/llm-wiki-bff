@@ -1,6 +1,7 @@
 package llm
 
 import (
+	"context"
 	"embed"
 	"encoding/json"
 	"fmt"
@@ -63,7 +64,7 @@ func (e *QueryExpander) Expand(query string) (*ExpandResult, error) {
 		return nil, nil
 	}
 
-	raw, err := e.client.Chat(e.systemPrompt, query)
+	raw, err := e.client.Chat(context.Background(), e.systemPrompt, query)
 	if err != nil {
 		log.Printf("[expander] LLM call failed for query %q: %v", query, err)
 		return nil, fmt.Errorf("expander: chat: %w", err)

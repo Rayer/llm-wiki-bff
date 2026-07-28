@@ -109,6 +109,7 @@ jobs:
           fi
           gcloud run jobs update "${JOB_NAME}" \
             --image "$IMMUTABLE_IMAGE" \
+            --update-secrets "DEEPSEEK_API_KEY=deepseek-apikey:latest" \
             --update-env-vars "BUCKET=${BUCKET}" \
             --remove-env-vars "DATA_DIR,WORKSPACE,VAULT_PATH,WORKSPACE_DIR" \
             --args "^@^run@[[\"run\",\"--auto-approve\"]]" \
@@ -147,6 +148,21 @@ jobs:
           fi
           if [[ $(jq -r '.spec.template.spec.template.spec.containers[0].env[]? | select(.name == "BUCKET") | .value' <<<"$JOB_CONTRACT") != "${BUCKET}" ]]; then
             echo "worker BUCKET is missing or incorrect"
+            exit 1
+          fi
+          if ! jq -e --arg secret_name "projects/llm-wiki-cloud/secrets/deepseek-apikey" '
+            [.spec.template.spec.template.spec.containers[0].env[]? | select(.name == "DEEPSEEK_API_KEY")] as $entries
+            | if ($entries | length) != 1 then error("worker DEEPSEEK_API_KEY must have exactly one entry") else $entries[0] end
+            | if has("value") then error("worker DEEPSEEK_API_KEY must not contain plaintext value") else . end
+            | (if (.valueSource.secretKeyRef? // null) != null
+               then {name: .valueSource.secretKeyRef.secret, version: .valueSource.secretKeyRef.version}
+               elif (.valueFrom.secretKeyRef? // null) != null
+               then {name: .valueFrom.secretKeyRef.name, version: .valueFrom.secretKeyRef.key}
+               else {} end) as $ref
+            | if $ref.version != "latest" then error("worker DEEPSEEK_API_KEY must use latest secret version") else . end
+            | if $ref.name != "deepseek-apikey" and $ref.name != $secret_name then error("worker DEEPSEEK_API_KEY references the wrong secret") else . end
+          ' <<<"$JOB_CONTRACT" >/dev/null; then
+            echo "worker DEEPSEEK_API_KEY is not the expected secret-backed env entry"
             exit 1
           fi
           if jq -e '.spec.template.spec.template.spec.containers[0].env[]? | select(.name == "DATA_DIR" or .name == "WORKSPACE" or .name == "VAULT_PATH" or .name == "WORKSPACE_DIR")' <<<"$JOB_CONTRACT" >/dev/null; then

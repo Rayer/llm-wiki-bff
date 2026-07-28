@@ -230,7 +230,7 @@ func configFromEnvironment(cfg workerConfig) workerConfig {
 		cfg.ExecutionID = envOr("EXECUTION_ID", envOr("CLOUD_RUN_EXECUTION", ""))
 	}
 	if cfg.APIKey == "" && !cfg.apiKeySet {
-		cfg.APIKey = envOr("LLM_API_KEY", "")
+		cfg.APIKey = envOr("LLM_API_KEY", envOr("DEEPSEEK_API_KEY", ""))
 	}
 	if cfg.WorkspaceDir == "" && !cfg.workspaceDirSet {
 		cfg.WorkspaceDir = envOr("WORKSPACE_DIR", "/tmp")

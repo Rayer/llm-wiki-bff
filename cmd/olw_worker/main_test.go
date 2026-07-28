@@ -17,6 +17,7 @@ import (
 
 	"github.com/rayer/llm-wiki-bff/internal/annotation"
 	"github.com/rayer/llm-wiki-bff/internal/sourcestatus"
+	"github.com/rayer/llm-wiki-bff/internal/suggestedqueries"
 )
 
 type testSuggestedQueryProvider struct {
@@ -26,7 +27,7 @@ type testSuggestedQueryProvider struct {
 	err   error
 }
 
-func (p *testSuggestedQueryProvider) Chat(_, user string) (string, error) {
+func (p *testSuggestedQueryProvider) Chat(_ context.Context, _, user string) (string, error) {
 	p.calls++
 	p.user = user
 	return p.raw, p.err
@@ -460,6 +461,26 @@ func TestSuggestedQueryGenerationFailurePreservesLastKnownGoodBytes(t *testing.T
 	}
 	if !bytes.Equal(got, prior) {
 		t.Fatalf("suggested query artifact changed on provider failure: got %q, want byte-identical prior", got)
+	}
+}
+
+func TestSuggestedQueryGenerationFailureWritesValidEmptyV2WhenAbsent(t *testing.T) {
+	vault := t.TempDir()
+	mustWriteFile(t, filepath.Join(vault, "wiki", "alpha.md"), []byte("---\nid: alpha-id\ntitle: Alpha\n---\nAlpha"))
+	provider := &testSuggestedQueryProvider{err: errors.New("provider unavailable")}
+	if err := runPostprocessWithProvider(context.Background(), vault, provider); err != nil {
+		t.Fatalf("runPostprocessWithProvider() error = %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(vault, suggestedqueries.Path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifact, err := suggestedqueries.Decode(data)
+	if err != nil {
+		t.Fatalf("empty fallback is not valid v2 JSON: %v", err)
+	}
+	if artifact.Version != 2 || artifact.Queries == nil || len(artifact.Queries) != 0 || artifact.Candidates == nil || len(artifact.Candidates) != 0 {
+		t.Fatalf("empty fallback = %#v, want valid empty v2 artifact", artifact)
 	}
 }
 
@@ -1100,6 +1121,25 @@ func TestExplicitEmptyAndFalseFlagsSuppressInheritedEnvironment(t *testing.T) {
 	})
 	if got.Bucket != "" || got.APIKey != "" || got.UserID != "" || got.ProjectID != "" || got.ExecutionID != "" || got.WorkspaceDir != "" || got.VaultPath != "" || got.DataDir != "" || got.Workspace {
 		t.Fatalf("explicit empty/false flags were replaced by environment: %+v", got)
+	}
+}
+
+func TestAPIKeyEnvironmentPrecedenceAndExplicitEmptySuppression(t *testing.T) {
+	t.Setenv("LLM_API_KEY", "llm-key")
+	t.Setenv("DEEPSEEK_API_KEY", "deepseek-key")
+
+	if got := configFromEnvironment(workerConfig{}).APIKey; got != "llm-key" {
+		t.Fatalf("LLM_API_KEY precedence = %q, want llm-key", got)
+	}
+	t.Setenv("LLM_API_KEY", "")
+	if got := configFromEnvironment(workerConfig{}).APIKey; got != "deepseek-key" {
+		t.Fatalf("DEEPSEEK_API_KEY fallback = %q, want deepseek-key", got)
+	}
+	if got := configFromEnvironment(workerConfig{APIKey: "explicit-key", apiKeySet: true}).APIKey; got != "explicit-key" {
+		t.Fatalf("explicit API key = %q, want explicit-key", got)
+	}
+	if got := configFromEnvironment(workerConfig{apiKeySet: true}).APIKey; got != "" {
+		t.Fatalf("explicit empty API key = %q, want suppression", got)
 	}
 }
 

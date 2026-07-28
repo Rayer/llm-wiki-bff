@@ -2388,6 +2388,58 @@ func TestStatusAndPipelineStatusSuggestedQueriesRejectLegacyTitleArtifact(t *tes
 	}
 }
 
+func TestStatusAndPipelineStatusSuggestedQueriesTreatInvalidArtifactsAsEmpty(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		data string
+	}{
+		{name: "malformed truncated", data: `{"version":2,"queries":[`},
+		{name: "duplicate key", data: `{"version":2,"version":2,"queries":[],"candidates":[],"updated_at":""}`},
+		{name: "unknown key", data: `{"version":2,"queries":[],"candidates":[],"updated_at":"","extra":true}`},
+		{name: "wrong shape", data: `{"version":2,"queries":{},"candidates":[],"updated_at":""}`},
+		{name: "trailing json", data: validSuggestedQueriesJSON() + ` {"extra":true}`},
+		{name: "unsupported version", data: `{"version":1,"queries":[],"candidates":[],"updated_at":""}`},
+		{name: "legacy title-only", data: `{"queries":["咖啡廳","公園"]}`},
+		{name: "invalid v2", data: `{"version":2,"queries":["q?"],"candidates":[],"updated_at":""}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			projectRoot := filepath.Join(root, "users", "request-user", "projects", "demo-project")
+			writeSuggestionFixtures(t, projectRoot, tc.data, "")
+			got := readSuggestedQueriesFromStatusEndpoints(t, root)
+			if !reflect.DeepEqual(got, []string{}) {
+				t.Fatalf("suggested_queries = %#v, want [] for invalid artifact", got)
+			}
+		})
+	}
+}
+
+func TestStatusAndPipelineStatusKeepReadStateErrorsAsHTTP500(t *testing.T) {
+	for _, endpoint := range []string{"/api/v1/status", "/api/v1/pipeline/status"} {
+		t.Run(endpoint, func(t *testing.T) {
+			root := &suggestedQueriesStateFailureRoot{Client: localfs.New(t.TempDir()), err: errors.New("read state unavailable")}
+			h := New(root, nil, search.NewIndex(), conceptcache.New(), nil, nil)
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodGet, endpoint, nil)
+			c.Set("userID", "request-user")
+			c.Set("projectID", "demo-project")
+			if endpoint == "/api/v1/pipeline/status" {
+				h.PipelineStatus(c)
+			} else {
+				h.Status(c)
+			}
+			want := `{"error":"generated data unavailable"}`
+			if endpoint == "/api/v1/pipeline/status" {
+				want = `{"error":"pipeline status unavailable"}`
+			}
+			if recorder.Code != http.StatusInternalServerError || recorder.Body.String() != want {
+				t.Fatalf("status=%d body=%s, want fixed read-state error", recorder.Code, recorder.Body.String())
+			}
+		})
+	}
+}
+
 func TestStatusAndPipelineStatusSuggestedQueriesFromConceptsWhenArtifactMissing(t *testing.T) {
 	root := t.TempDir()
 	projectRoot := filepath.Join(root, "users", "request-user", "projects", "demo-project")

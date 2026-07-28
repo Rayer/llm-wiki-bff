@@ -84,6 +84,56 @@ func TestValidateCandidatesRejectsUnsafeStructuredOutput(t *testing.T) {
 	}
 }
 
+func TestValidateCandidatesRejectsLongGenericTitleWrappers(t *testing.T) {
+	concepts := []ConceptEvidence{{ID: "cafe", Title: "咖啡廳"}, {ID: "coffee-shops", Title: "Coffee Shops"}}
+	valid := func(question, anchor string) Candidate {
+		return Candidate{
+			Question:               question,
+			Intent:                 "discovery",
+			CorpusAnchorConceptIDs: []string{anchor},
+			Generation:             GenerationMetadata{Model: "fixture", PromptVersion: "v1"},
+		}
+	}
+	for _, tc := range []struct {
+		name     string
+		question string
+		anchor   string
+	}{
+		{name: "chinese information", question: "請告訴我關於咖啡廳的所有相關資訊？", anchor: "cafe"},
+		{name: "chinese topic content", question: "我想知道咖啡廳這個主題有哪些內容？", anchor: "cafe"},
+		{name: "chinese concept content", question: "可以介紹一下咖啡廳這個概念的內容嗎？", anchor: "cafe"},
+		{name: "english information", question: "Please tell me all information about Coffee Shops?", anchor: "coffee-shops"},
+		{name: "english topic content", question: "What content is available about the Coffee Shops topic?", anchor: "coffee-shops"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			candidates := []Candidate{valid(tc.question, tc.anchor), valid("哪些地方值得一起探索？", "cafe"), valid("如何比較不同選擇？", "coffee-shops")}
+			if err := ValidateCandidates(candidates, concepts); err == nil {
+				t.Fatal("ValidateCandidates() error = nil, want generic title wrapper rejection")
+			}
+		})
+	}
+}
+
+func TestValidateCandidatesPreservesSubstantiveUseCasesAndComparisons(t *testing.T) {
+	concepts := []ConceptEvidence{{ID: "cafe", Title: "咖啡廳"}, {ID: "park", Title: "公園"}}
+	valid := func(question string, anchors ...string) Candidate {
+		return Candidate{
+			Question:               question,
+			Intent:                 "discovery",
+			CorpusAnchorConceptIDs: anchors,
+			Generation:             GenerationMetadata{Model: "fixture", PromptVersion: "v1"},
+		}
+	}
+	candidates := []Candidate{
+		valid("台北有哪些適合工作的咖啡廳？", "cafe"),
+		valid("哪些咖啡廳適合雨天帶小孩？", "cafe"),
+		valid("咖啡廳和公園哪個更適合雨天帶小孩？", "cafe", "park"),
+	}
+	if err := ValidateCandidates(candidates, concepts); err != nil {
+		t.Fatalf("ValidateCandidates() rejected substantive questions: %v", err)
+	}
+}
+
 func TestParseProviderCandidatesRejectsMalformedAndOversizedOutput(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -227,10 +277,41 @@ type fixtureProvider struct {
 	err   error
 }
 
-func (p *fixtureProvider) Chat(_, user string) (string, error) {
+func (p *fixtureProvider) Chat(_ context.Context, _, user string) (string, error) {
 	p.calls++
 	p.user = user
 	return p.raw, p.err
+}
+
+type blockingProvider struct {
+	started chan struct{}
+}
+
+func (p *blockingProvider) Chat(ctx context.Context, _, _ string) (string, error) {
+	close(p.started)
+	<-ctx.Done()
+	return "", ctx.Err()
+}
+
+func TestGeneratePassesCancellationToProvider(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	provider := &blockingProvider{started: make(chan struct{})}
+	done := make(chan error, 1)
+	go func() {
+		_, err := Generate(ctx, provider, "", []conceptcache.Entry{{Slug: "c1", Title: "Concept 1"}}, nil, GenerationMetadata{Model: "fixture", PromptVersion: "v1"}, time.Now())
+		done <- err
+	}()
+	<-provider.started
+	cancel()
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "context canceled") {
+			t.Fatalf("Generate() error = %v, want context cancellation", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Generate() did not interrupt the provider call after cancellation")
+	}
 }
 
 func TestGenerateUsesBoundedRepresentativeConceptsAndOptionalDescription(t *testing.T) {

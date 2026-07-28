@@ -45,6 +45,9 @@ func TestDeployWorkerWorkflowContract(t *testing.T) {
 		"--args \"^@^run@[[\\\"run\\\",\\\"--auto-approve\\\"]]\"",
 		"--clear-volume-mounts",
 		"--clear-volumes",
+		"--update-secrets \"DEEPSEEK_API_KEY=deepseek-apikey:latest\"",
+		"DEEPSEEK_API_KEY",
+		"deepseek-apikey",
 		"worker must not retain GCSFuse volumes",
 		"worker args do not match the cloud worker contract",
 		"${DEPLOYED}\" != \"${IMMUTABLE_IMAGE}",
@@ -61,6 +64,12 @@ func TestDeployWorkerWorkflowContract(t *testing.T) {
 	}
 	if strings.Count(workflow, "git rev-parse \"origin/${SOURCE_BRANCH}\"") != 2 {
 		t.Fatal("workflow must recheck the selected source branch before and after the job update")
+	}
+	if !strings.Contains(workflow, `--update-secrets "DEEPSEEK_API_KEY=deepseek-apikey:latest"`) {
+		t.Fatal("dev workflow must declaratively bind DEEPSEEK_API_KEY to deepseek-apikey:latest")
+	}
+	if !strings.Contains(workflow, "secretKeyRef") || !strings.Contains(workflow, "valueSource") || !strings.Contains(workflow, "projects/llm-wiki-cloud/secrets/deepseek-apikey") {
+		t.Fatal("dev workflow must read back the exact secret-backed DEEPSEEK_API_KEY contract")
 	}
 	if !strings.Contains(workflow, `case "${GITHUB_REF_NAME}" in
             develop|main) SOURCE_BRANCH="${GITHUB_REF_NAME}" ;;`) {
@@ -196,6 +205,12 @@ func TestWorkerPromotionWorkflowsContract(t *testing.T) {
 		if strings.Contains(rollback, forbidden) {
 			t.Fatalf("rollback artifact must exclude secret material %q", forbidden)
 		}
+	}
+	if !strings.Contains(release, `--update-secrets "DEEPSEEK_API_KEY=deepseek-apikey:latest"`) {
+		t.Fatal("release workflow must declaratively bind DEEPSEEK_API_KEY to deepseek-apikey:latest")
+	}
+	if !strings.Contains(release, "secretKeyRef") || !strings.Contains(release, "valueSource") || !strings.Contains(release, "projects/llm-wiki-cloud/secrets/deepseek-apikey") {
+		t.Fatal("release workflow must read back the exact secret-backed DEEPSEEK_API_KEY contract")
 	}
 	if !strings.Contains(rollback, "image") || !strings.Contains(rollback, "args") || !strings.Contains(rollback, "BUCKET") {
 		t.Fatal("rollback artifact must preserve the immutable image and non-secret contract")
