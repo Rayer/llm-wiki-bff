@@ -16,6 +16,8 @@ type Client struct {
 	client  *http.Client
 }
 
+const maxChatResponseBytes = 64 * 1024
+
 type chatMessage struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
@@ -74,9 +76,12 @@ func (c *Client) Chat(systemPrompt, userMessage string) (string, error) {
 	}
 	defer resp.Body.Close()
 
-	respData, err := io.ReadAll(resp.Body)
+	respData, err := io.ReadAll(io.LimitReader(resp.Body, maxChatResponseBytes+1))
 	if err != nil {
 		return "", fmt.Errorf("read response: %w", err)
+	}
+	if len(respData) > maxChatResponseBytes {
+		return "", fmt.Errorf("response exceeds %d-byte limit", maxChatResponseBytes)
 	}
 
 	if resp.StatusCode != 200 {

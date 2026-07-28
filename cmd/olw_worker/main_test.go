@@ -19,6 +19,17 @@ import (
 	"github.com/rayer/llm-wiki-bff/internal/sourcestatus"
 )
 
+type testSuggestedQueryProvider struct {
+	calls int
+	raw   string
+	err   error
+}
+
+func (p *testSuggestedQueryProvider) Chat(_, _ string) (string, error) {
+	p.calls++
+	return p.raw, p.err
+}
+
 func TestParseCommandBatch(t *testing.T) {
 	commands, err := parseCommandBatch(`[["clear"],["run","--auto-approve"]]`)
 	if err != nil {
@@ -384,7 +395,12 @@ func TestRunPostprocessWritesSuggestedQueriesFromConcepts(t *testing.T) {
 	mustWriteFile(t, filepath.Join(vault, "wiki", "alpha.md"), []byte("---\nid: alpha-id\ntitle: Alpha\nupdated: 2026-07-01T00:00:00Z\n---\nAlpha"))
 	mustWriteFile(t, filepath.Join(vault, "wiki", "beta.md"), []byte("---\nid: beta-id\ntitle: Beta\nupdated: 2026-07-10T00:00:00Z\n---\nBeta"))
 
-	if err := runPostprocess(context.Background(), vault); err != nil {
+	provider := &testSuggestedQueryProvider{raw: `{"candidates":[
+{"question":"哪些概念值得一起比較？","intent/use_case":"comparison","corpus_anchor_concept_ids":["alpha-id","beta-id"],"generation":{"model":"fixture","prompt_version":"v1"}},
+{"question":"如何探索這個主題的不同面向？","intent/use_case":"exploration","corpus_anchor_concept_ids":["alpha-id"],"generation":{"model":"fixture","prompt_version":"v1"}},
+{"question":"哪些選擇適合進一步查找？","intent/use_case":"retrieval","corpus_anchor_concept_ids":["beta-id"],"generation":{"model":"fixture","prompt_version":"v1"}}
+]}`}
+	if err := runPostprocessWithProvider(context.Background(), vault, provider); err != nil {
 		t.Fatalf("runPostprocess() error = %v", err)
 	}
 
@@ -399,14 +415,32 @@ func TestRunPostprocessWritesSuggestedQueriesFromConcepts(t *testing.T) {
 	if err := json.Unmarshal(data, &artifact); err != nil {
 		t.Fatalf("decode suggested_queries.json: %v", err)
 	}
-	if len(artifact.Queries) != 2 {
-		t.Fatalf("queries = %#v, want 2 entries", artifact.Queries)
+	if len(artifact.Queries) != 3 {
+		t.Fatalf("queries = %#v, want 3 entries", artifact.Queries)
 	}
-	if artifact.Queries[0] != "Beta" {
-		t.Fatalf("queries[0] = %q, want Beta", artifact.Queries[0])
+	if artifact.Queries[0] != "哪些概念值得一起比較？" || provider.calls != 1 {
+		t.Fatalf("queries[0] = %q, provider calls = %d", artifact.Queries[0], provider.calls)
 	}
 	if artifact.UpdatedAt == "" {
 		t.Fatal("updated_at is empty")
+	}
+}
+
+func TestSuggestedQueryGenerationFailurePreservesLastKnownGoodBytes(t *testing.T) {
+	vault := t.TempDir()
+	mustWriteFile(t, filepath.Join(vault, "wiki", "alpha.md"), []byte("---\nid: alpha-id\ntitle: Alpha\n---\nAlpha"))
+	prior := []byte(`{"version":2,"queries":["哪些概念值得一起比較？","如何探索這個主題的不同面向？","哪些選擇適合進一步查找？"],"candidates":[{"question":"哪些概念值得一起比較？","intent/use_case":"comparison","corpus_anchor_concept_ids":["alpha-id"],"generation":{"model":"fixture","prompt_version":"v1"}},{"question":"如何探索這個主題的不同面向？","intent/use_case":"exploration","corpus_anchor_concept_ids":["alpha-id"],"generation":{"model":"fixture","prompt_version":"v1"}},{"question":"哪些選擇適合進一步查找？","intent/use_case":"retrieval","corpus_anchor_concept_ids":["alpha-id"],"generation":{"model":"fixture","prompt_version":"v1"}}],"updated_at":"2026-07-28T00:00:00Z"}`)
+	mustWriteFile(t, filepath.Join(vault, "cache", "suggested_queries.json"), prior)
+	provider := &testSuggestedQueryProvider{err: errors.New("provider unavailable")}
+	if err := runPostprocessWithProvider(context.Background(), vault, provider); err != nil {
+		t.Fatalf("runPostprocessWithProvider() error = %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(vault, "cache", "suggested_queries.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, prior) {
+		t.Fatalf("suggested query artifact changed on provider failure: got %q, want byte-identical prior", got)
 	}
 }
 

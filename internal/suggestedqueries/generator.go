@@ -1,0 +1,301 @@
+package suggestedqueries
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"sort"
+	"strings"
+	"time"
+	"unicode"
+	"unicode/utf8"
+
+	conceptcache "github.com/rayer/llm-wiki-bff/internal/cache"
+	"github.com/rayer/llm-wiki-bff/internal/generation"
+)
+
+const (
+	MinQueries       = 3
+	MaxConcepts      = 12
+	MaxQuestionBytes = 512
+	MaxProviderBytes = 64 * 1024
+)
+
+var (
+	ErrInvalidCandidates = errors.New("invalid suggested-query candidates")
+)
+
+// ConceptEvidence is the bounded corpus evidence supplied to generation and
+// used to validate candidate anchor IDs.
+type ConceptEvidence struct {
+	ID       string `json:"id"`
+	Title    string `json:"title"`
+	Evidence string `json:"evidence"`
+}
+
+// GenerationMetadata identifies the generation contract that produced a
+// candidate. It is retained in the published artifact for auditability.
+type GenerationMetadata struct {
+	Model         string `json:"model"`
+	PromptVersion string `json:"prompt_version"`
+}
+
+// Candidate is the structured, untrusted provider output before publication.
+type Candidate struct {
+	Question               string             `json:"question"`
+	Intent                 string             `json:"intent/use_case"`
+	CorpusAnchorConceptIDs []string           `json:"corpus_anchor_concept_ids"`
+	Generation             GenerationMetadata `json:"generation"`
+}
+
+type Provider interface {
+	Chat(systemPrompt, userMessage string) (string, error)
+}
+
+type providerEnvelope struct {
+	Candidates []Candidate `json:"candidates"`
+}
+
+// Generate makes one bounded provider call for one postprocess operation.
+func Generate(ctx context.Context, provider Provider, description string, entries []conceptcache.Entry, mtimes map[string]time.Time, now time.Time) (Artifact, error) {
+	if provider == nil {
+		return Artifact{}, errors.New("suggested-query provider is not configured")
+	}
+	if err := ctx.Err(); err != nil {
+		return Artifact{}, err
+	}
+	concepts := RepresentativeConcepts(entries, mtimes)
+	if len(concepts) == 0 {
+		return Artifact{}, fmt.Errorf("%w: no corpus concepts", ErrInvalidCandidates)
+	}
+	description = truncateBytes(strings.TrimSpace(description), 2048)
+	input := struct {
+		Description string            `json:"project_description,omitempty"`
+		Concepts    []ConceptEvidence `json:"concepts"`
+	}{Description: description, Concepts: concepts}
+	userData, err := json.Marshal(input)
+	if err != nil {
+		return Artifact{}, fmt.Errorf("marshal generation input: %w", err)
+	}
+	raw, err := provider.Chat(generationSystemPrompt, string(userData))
+	if err != nil {
+		return Artifact{}, fmt.Errorf("generate suggested queries: %w", err)
+	}
+	candidates, err := parseProviderCandidates(raw)
+	if err != nil {
+		return Artifact{}, err
+	}
+	if err := ValidateCandidates(candidates, concepts); err != nil {
+		return Artifact{}, err
+	}
+	return ArtifactFromCandidates(candidates, now), nil
+}
+
+const generationSystemPrompt = `Generate natural-language discovery questions for the supplied corpus.
+Return only a JSON object with a candidates array. Each candidate must contain question,
+intent/use_case, corpus_anchor_concept_ids, and generation with model and prompt_version.
+Use only supplied concept IDs as corpus anchors. Use-case hypotheses are allowed only as
+questions to be decided by retrieval; do not assert unsupported attributes as facts.
+Return 3 to 5 distinct questions. Never return a bare title or a trivial title wrapper.`
+
+func RepresentativeConcepts(entries []conceptcache.Entry, mtimes map[string]time.Time) []ConceptEvidence {
+	type ranked struct {
+		entry conceptcache.Entry
+		when  time.Time
+		order int
+	}
+	rankedEntries := make([]ranked, 0, len(entries))
+	for i, entry := range entries {
+		if isSystemMetaConcept(entry) || strings.TrimSpace(entry.Title) == "" {
+			continue
+		}
+		rankedEntries = append(rankedEntries, ranked{entry: entry, when: conceptUpdatedAt(entry, mtimes, i), order: i})
+	}
+	sort.SliceStable(rankedEntries, func(i, j int) bool {
+		if rankedEntries[i].when.Equal(rankedEntries[j].when) {
+			return rankedEntries[i].order < rankedEntries[j].order
+		}
+		return rankedEntries[i].when.After(rankedEntries[j].when)
+	})
+	if len(rankedEntries) > MaxConcepts {
+		rankedEntries = rankedEntries[:MaxConcepts]
+	}
+	result := make([]ConceptEvidence, 0, len(rankedEntries))
+	for _, item := range rankedEntries {
+		id := strings.TrimSpace(frontmatterString(item.entry.Frontmatter["id"]))
+		if id == "" {
+			id = strings.TrimSpace(item.entry.Slug)
+		}
+		if id == "" {
+			continue
+		}
+		evidence := strings.TrimSpace(item.entry.Body)
+		if evidence == "" {
+			evidence = strings.TrimSpace(item.entry.Title)
+		}
+		result = append(result, ConceptEvidence{
+			ID:       id,
+			Title:    truncateBytes(strings.TrimSpace(item.entry.Title), 256),
+			Evidence: truncateBytes(evidence, 1200),
+		})
+	}
+	return result
+}
+
+func isSystemMetaConcept(entry conceptcache.Entry) bool {
+	slug := strings.Trim(strings.ToLower(strings.TrimSpace(entry.Slug)), "/")
+	if slug == "index" || slug == "log" {
+		return true
+	}
+	for _, key := range []string{"path", "source_file"} {
+		value := strings.Trim(strings.ToLower(frontmatterString(entry.Frontmatter[key])), "/")
+		if value == "wiki/index.md" || value == "wiki/log.md" {
+			return true
+		}
+	}
+	return false
+}
+
+func frontmatterString(value interface{}) string {
+	text, _ := value.(string)
+	return text
+}
+
+func parseProviderCandidates(raw string) ([]Candidate, error) {
+	if len(raw) > MaxProviderBytes {
+		return nil, errors.New("suggested-query provider output exceeds byte limit")
+	}
+	dec := json.NewDecoder(bytes.NewReader([]byte(raw)))
+	var envelope providerEnvelope
+	if err := dec.Decode(&envelope); err != nil {
+		return nil, fmt.Errorf("decode suggested-query provider output: %w", err)
+	}
+	if err := generation.EnsureJSONEOF(dec); err != nil {
+		return nil, fmt.Errorf("decode suggested-query provider output: %w", err)
+	}
+	if len(envelope.Candidates) > MaxQueries {
+		return nil, fmt.Errorf("%w: candidate count exceeds %d", ErrInvalidCandidates, MaxQueries)
+	}
+	return envelope.Candidates, nil
+}
+
+func ArtifactFromCandidates(candidates []Candidate, now time.Time) Artifact {
+	queries := make([]string, len(candidates))
+	for i, candidate := range candidates {
+		queries[i] = strings.TrimSpace(candidate.Question)
+	}
+	return Artifact{Version: 2, Queries: queries, Candidates: append([]Candidate(nil), candidates...), UpdatedAt: now.UTC().Format(time.RFC3339)}
+}
+
+func IsPublishable(artifact Artifact) bool {
+	if artifact.Version != 2 || len(artifact.Candidates) < MinQueries || len(artifact.Candidates) > MaxQueries || len(artifact.Queries) != len(artifact.Candidates) {
+		return false
+	}
+	if err := validateCandidates(artifact.Candidates, nil, false); err != nil {
+		return false
+	}
+	for i, candidate := range artifact.Candidates {
+		if strings.TrimSpace(artifact.Queries[i]) != strings.TrimSpace(candidate.Question) {
+			return false
+		}
+	}
+	return true
+}
+
+func truncateBytes(value string, limit int) string {
+	if len(value) <= limit {
+		return value
+	}
+	for len(value) > limit || !utf8.ValidString(value) {
+		value = value[:len(value)-1]
+	}
+	return value
+}
+
+func ValidateCandidates(candidates []Candidate, concepts []ConceptEvidence) error {
+	return validateCandidates(candidates, concepts, true)
+}
+
+func validateCandidates(candidates []Candidate, concepts []ConceptEvidence, checkAnchors bool) error {
+	// This validator proves structure, question framing, and corpus-anchor IDs;
+	// it cannot prove arbitrary semantic attributes. Those remain provider
+	// hypotheses and are safe only when phrased as questions.
+	if len(candidates) < MinQueries || len(candidates) > MaxQueries {
+		return fmt.Errorf("%w: candidate count %d outside %d..%d", ErrInvalidCandidates, len(candidates), MinQueries, MaxQueries)
+	}
+	titles := make(map[string]struct{}, len(concepts))
+	knownIDs := make(map[string]struct{}, len(concepts))
+	for _, concept := range concepts {
+		if id := strings.TrimSpace(concept.ID); id != "" {
+			knownIDs[id] = struct{}{}
+		}
+		if title := normalize(concept.Title); title != "" {
+			titles[title] = struct{}{}
+		}
+	}
+	seen := make(map[string]struct{}, len(candidates))
+	for i, candidate := range candidates {
+		question := strings.TrimSpace(candidate.Question)
+		if question == "" || len([]byte(question)) > MaxQuestionBytes {
+			return fmt.Errorf("%w: candidate %d question is empty or oversized", ErrInvalidCandidates, i)
+		}
+		questionKey := normalize(question)
+		if questionKey == "" || strings.ContainsAny(question, "?？") == false {
+			return fmt.Errorf("%w: candidate %d is not a question", ErrInvalidCandidates, i)
+		}
+		if _, exists := seen[questionKey]; exists {
+			return fmt.Errorf("%w: duplicate question", ErrInvalidCandidates)
+		}
+		seen[questionKey] = struct{}{}
+		if _, exactTitle := titles[questionKey]; exactTitle || isTitleWrapper(questionKey, titles) {
+			return fmt.Errorf("%w: candidate %d is title-like", ErrInvalidCandidates, i)
+		}
+		if strings.TrimSpace(candidate.Intent) == "" || strings.TrimSpace(candidate.Generation.Model) == "" || strings.TrimSpace(candidate.Generation.PromptVersion) == "" {
+			return fmt.Errorf("%w: candidate %d metadata is incomplete", ErrInvalidCandidates, i)
+		}
+		if len(candidate.CorpusAnchorConceptIDs) == 0 || len(candidate.CorpusAnchorConceptIDs) > MaxConcepts {
+			return fmt.Errorf("%w: candidate %d anchors are missing or oversized", ErrInvalidCandidates, i)
+		}
+		anchorSeen := make(map[string]struct{}, len(candidate.CorpusAnchorConceptIDs))
+		for _, rawID := range candidate.CorpusAnchorConceptIDs {
+			id := strings.TrimSpace(rawID)
+			if id == "" {
+				return fmt.Errorf("%w: candidate %d has empty anchor", ErrInvalidCandidates, i)
+			}
+			if _, duplicate := anchorSeen[id]; duplicate {
+				return fmt.Errorf("%w: candidate %d has duplicate anchor", ErrInvalidCandidates, i)
+			}
+			anchorSeen[id] = struct{}{}
+			if checkAnchors {
+				if _, known := knownIDs[id]; !known {
+					return fmt.Errorf("%w: candidate %d has unsupported anchor %q", ErrInvalidCandidates, i, id)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func isTitleWrapper(question string, titles map[string]struct{}) bool {
+	for title := range titles {
+		if len([]rune(title)) == 0 || !strings.Contains(question, title) {
+			continue
+		}
+		if len([]rune(question))-len([]rune(title)) <= 8 {
+			return true
+		}
+	}
+	return false
+}
+
+func normalize(value string) string {
+	var b strings.Builder
+	for _, r := range strings.ToLower(strings.TrimSpace(value)) {
+		if unicode.IsLetter(r) || unicode.IsNumber(r) {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}

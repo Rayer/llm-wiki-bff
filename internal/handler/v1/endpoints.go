@@ -1609,7 +1609,7 @@ func (h *Handler) loadSuggestedQueries(ctx context.Context, c *gin.Context) ([]s
 	data, err := wikiStore.ReadFile(ctx, suggestedqueries.Path)
 	if err != nil {
 		if errors.Is(err, storage.ErrObjectNotExist) {
-			// fall through to concepts-derived suggestions.
+			return []string{}, nil
 		} else {
 			return nil, err
 		}
@@ -1618,23 +1618,12 @@ func (h *Handler) loadSuggestedQueries(ctx context.Context, c *gin.Context) ([]s
 		if err != nil {
 			return nil, err
 		}
-		queries := suggestedqueries.Queries(artifact)
-		if len(queries) > 0 {
-			return queries, nil
-		}
-	}
-	conceptsData, err := wikiStore.ReadFile(ctx, wikiindex.ConceptsJSONLPath)
-	if err != nil {
-		if errors.Is(err, storage.ErrObjectNotExist) {
+		if !suggestedqueries.IsPublishable(artifact) {
 			return []string{}, nil
 		}
-		return nil, err
+		queries := suggestedqueries.Queries(artifact)
+		return queries, nil
 	}
-	artifact, err := suggestedqueries.BuildFromConceptsJSONL(conceptsData, nil, time.Now())
-	if err != nil {
-		return nil, err
-	}
-	return suggestedqueries.Queries(artifact), nil
 }
 
 // rawFileCount returns the live number of files under project raw/ (ListRawFiles).
