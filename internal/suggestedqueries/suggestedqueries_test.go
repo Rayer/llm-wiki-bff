@@ -99,9 +99,13 @@ func TestValidateCandidatesRejectsLongGenericTitleWrappers(t *testing.T) {
 		question string
 		anchor   string
 	}{
+		{name: "english overview", question: "Could you please provide an overview of Coffee Shops?", anchor: "coffee-shops"},
+		{name: "english explanation", question: "Can you explain Coffee Shops?", anchor: "coffee-shops"},
 		{name: "chinese information", question: "請告訴我關於咖啡廳的所有相關資訊？", anchor: "cafe"},
 		{name: "chinese topic content", question: "我想知道咖啡廳這個主題有哪些內容？", anchor: "cafe"},
 		{name: "chinese concept content", question: "可以介紹一下咖啡廳這個概念的內容嗎？", anchor: "cafe"},
+		{name: "chinese complete information", question: "請提供咖啡廳的完整資訊？", anchor: "cafe"},
+		{name: "chinese explanation", question: "可以說明咖啡廳嗎？", anchor: "cafe"},
 		{name: "english information", question: "Please tell me all information about Coffee Shops?", anchor: "coffee-shops"},
 		{name: "english topic content", question: "What content is available about the Coffee Shops topic?", anchor: "coffee-shops"},
 	} {
@@ -115,7 +119,7 @@ func TestValidateCandidatesRejectsLongGenericTitleWrappers(t *testing.T) {
 }
 
 func TestValidateCandidatesPreservesSubstantiveUseCasesAndComparisons(t *testing.T) {
-	concepts := []ConceptEvidence{{ID: "cafe", Title: "咖啡廳"}, {ID: "park", Title: "公園"}}
+	concepts := []ConceptEvidence{{ID: "cafe", Title: "咖啡廳"}, {ID: "coffee-shops", Title: "Coffee Shops"}, {ID: "park", Title: "公園"}}
 	valid := func(question string, anchors ...string) Candidate {
 		return Candidate{
 			Question:               question,
@@ -128,9 +132,21 @@ func TestValidateCandidatesPreservesSubstantiveUseCasesAndComparisons(t *testing
 		valid("台北有哪些適合工作的咖啡廳？", "cafe"),
 		valid("哪些咖啡廳適合雨天帶小孩？", "cafe"),
 		valid("咖啡廳和公園哪個更適合雨天帶小孩？", "cafe", "park"),
+		valid("Which Coffee Shops are suitable for remote work?", "coffee-shops"),
+		valid("Compare Coffee Shops and Parks for rainy days with children?", "coffee-shops", "park"),
 	}
 	if err := ValidateCandidates(candidates, concepts); err != nil {
 		t.Fatalf("ValidateCandidates() rejected substantive questions: %v", err)
+	}
+}
+
+func TestTitleWrapperGuardPreservesLatinWordBoundaries(t *testing.T) {
+	titles := map[string]string{"coffeeshops": "Coffee Shops"}
+	if isTitleWrapper("Compare Coffee Shops and Parks for rainy days with children.", titles) {
+		t.Fatal("isTitleWrapper() rejected a substantive comparison")
+	}
+	if got := stripGenericWrapperLanguage("theater thesis alligator"); got != "theater thesis alligator" {
+		t.Fatalf("stripGenericWrapperLanguage() = %q, want substantive tokens preserved", got)
 	}
 }
 

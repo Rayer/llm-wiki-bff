@@ -1,7 +1,11 @@
 package llm
 
 import (
+	"context"
+	"errors"
+	"net/http"
 	"testing"
+	"time"
 )
 
 func TestParseExpandResult(t *testing.T) {
@@ -112,6 +116,58 @@ func TestLoadPrompt(t *testing.T) {
 	if err == nil {
 		t.Error("expected error for nonexistent domain")
 	}
+}
+
+func TestQueryExpanderExpandPropagatesCancellation(t *testing.T) {
+	started := make(chan struct{})
+	providerCanceled := make(chan struct{})
+	provider := blockingExpansionTransport{started: started, canceled: providerCanceled}
+
+	expander := &QueryExpander{
+		client:       &Client{apiKey: "test", baseURL: "http://expander.test", client: &http.Client{Transport: provider}},
+		systemPrompt: "test",
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := expander.Expand(ctx, "a query")
+		done <- err
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("provider did not receive expansion request")
+	}
+	cancel()
+
+	select {
+	case <-providerCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("provider request context was not canceled")
+	}
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Expand() error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Expand() did not return after cancellation")
+	}
+}
+
+type blockingExpansionTransport struct {
+	started  chan struct{}
+	canceled chan struct{}
+}
+
+func (t blockingExpansionTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	close(t.started)
+	<-req.Context().Done()
+	close(t.canceled)
+	return nil, req.Context().Err()
 }
 
 func contains(s, sub string) bool {

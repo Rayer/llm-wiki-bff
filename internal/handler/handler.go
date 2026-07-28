@@ -56,7 +56,7 @@ func (h *Handler) Query(c *gin.Context) {
 	searchQuery := q
 	var expandResult *llm.ExpandResult
 	if h.expander != nil {
-		if result, err := h.expander.Expand(q); err != nil {
+		if result, err := h.expander.Expand(ctx, q); err != nil {
 			log.Printf("[expander] query expansion failed for %q: %v — falling back to raw query", q, err)
 		} else if result != nil {
 			expandResult = result

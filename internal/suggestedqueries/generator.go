@@ -22,6 +22,7 @@ const (
 	MaxQuestionBytes = 512
 	MaxProviderBytes = 64 * 1024
 	PromptVersion    = "lwc-205-v1"
+	maxWrapperRunes  = 512
 )
 
 var (
@@ -389,14 +390,14 @@ func validateCandidates(candidates []Candidate, concepts []ConceptEvidence, chec
 	if len(candidates) < MinQueries || len(candidates) > MaxQueries {
 		return fmt.Errorf("%w: candidate count %d outside %d..%d", ErrInvalidCandidates, len(candidates), MinQueries, MaxQueries)
 	}
-	titles := make(map[string]struct{}, len(concepts))
+	titles := make(map[string]string, len(concepts))
 	knownIDs := make(map[string]struct{}, len(concepts))
 	for _, concept := range concepts {
 		if id := strings.TrimSpace(concept.ID); id != "" {
 			knownIDs[id] = struct{}{}
 		}
 		if title := normalize(concept.Title); title != "" {
-			titles[title] = struct{}{}
+			titles[title] = strings.TrimSpace(concept.Title)
 		}
 	}
 	seen := make(map[string]struct{}, len(candidates))
@@ -413,7 +414,7 @@ func validateCandidates(candidates []Candidate, concepts []ConceptEvidence, chec
 			return fmt.Errorf("%w: duplicate question", ErrInvalidCandidates)
 		}
 		seen[questionKey] = struct{}{}
-		if _, exactTitle := titles[questionKey]; exactTitle || isTitleWrapper(questionKey, titles) {
+		if _, exactTitle := titles[questionKey]; exactTitle || isTitleWrapper(question, titles) {
 			return fmt.Errorf("%w: candidate %d is title-like", ErrInvalidCandidates, i)
 		}
 		if strings.TrimSpace(candidate.Intent) == "" {
@@ -445,48 +446,150 @@ func validateCandidates(candidates []Candidate, concepts []ConceptEvidence, chec
 	return nil
 }
 
-func isTitleWrapper(question string, titles map[string]struct{}) bool {
-	if len([]rune(question)) > 512 {
+func isTitleWrapper(question string, titles map[string]string) bool {
+	if utf8.RuneCountInString(question) > maxWrapperRunes {
 		return false
 	}
-	anchors := make([]string, 0, len(titles))
-	for title := range titles {
-		if title != "" && strings.Contains(question, title) {
-			anchors = append(anchors, title)
+
+	questionTokens := tokenizeWrapperWords(question)
+	titleSequences := make(map[string]struct{}, len(titles))
+	for _, title := range titles {
+		if utf8.RuneCountInString(title) > maxWrapperRunes {
+			continue
+		}
+		tokens := tokenizeWrapperWords(title)
+		if len(tokens) > 0 && len(tokens) <= len(questionTokens) {
+			titleSequences[wrapperTokenKey(tokens)] = struct{}{}
 		}
 	}
-	if len(anchors) == 0 {
+	if len(titleSequences) == 0 {
 		return false
 	}
-	// Remove every normalized anchored title before checking the residual. This
-	// is only bounded anchor membership plus language heuristics; it cannot
-	// prove every semantic attribute of the question or corpus.
-	sort.Slice(anchors, func(i, j int) bool { return len([]rune(anchors[i])) > len([]rune(anchors[j])) })
-	residual := question
-	for _, anchor := range anchors {
-		residual = strings.ReplaceAll(residual, anchor, "")
+
+	anchored := make([]bool, len(questionTokens))
+	anchorFound := false
+	for start := range questionTokens {
+		for end := start + 1; end <= len(questionTokens); end++ {
+			if _, ok := titleSequences[wrapperTokenKey(questionTokens[start:end])]; !ok {
+				continue
+			}
+			anchorFound = true
+			for i := start; i < end; i++ {
+				anchored[i] = true
+			}
+		}
 	}
-	return stripGenericWrapperLanguage(residual) == ""
+	if !anchorFound {
+		return false
+	}
+
+	residualTokens := make([]wrapperToken, 0, len(questionTokens))
+	for i, token := range questionTokens {
+		if !anchored[i] {
+			residualTokens = append(residualTokens, token)
+		}
+	}
+	return stripGenericWrapperLanguage(wrapperTokensText(residualTokens)) == ""
+}
+
+var genericWrapperEnglishTokens = map[string]struct{}{
+	"a": {}, "about": {}, "all": {}, "an": {}, "are": {}, "available": {}, "can": {}, "content": {},
+	"could": {}, "detail": {}, "details": {}, "explain": {}, "for": {}, "information": {}, "is": {},
+	"me": {}, "of": {}, "overview": {}, "please": {}, "provide": {}, "tell": {}, "the": {}, "there": {},
+	"this": {}, "to": {}, "topic": {}, "what": {}, "which": {}, "with": {}, "you": {},
 }
 
 var genericWrapperPhrases = []string{
-	// Chinese polite, topic, content, and information wrappers.
-	"請告訴我", "請問", "我想知道", "想了解", "可以介紹一下", "介紹", "關於", "所有", "相關", "資訊", "資料", "詳情", "這個主題", "這個概念", "主題", "有哪些", "內容", "哪個", "哪些", "有什麼", "可以", "嗎", "呢", "的", "和",
-	// English polite, topic, content, and information wrappers.
-	"pleasetellmeallinformationabout", "whatcontentisavailableaboutthe", "whatinformationisavailableaboutthe", "pleasetellme", "tellmeabout", "tellme", "allinformation", "information", "details", "detail", "overview", "available", "content", "about", "topic", "what", "which", "please", "couldyou", "can", "you", "provide", "all", "the", "is", "are",
+	// Bounded Chinese polite, topic, content, information, and explanation phrases.
+	"請告訴我", "請問", "請提供", "我想知道", "想了解", "可以介紹一下", "可以說明", "介紹", "說明", "提供", "關於", "所有", "相關", "完整資訊", "完整內容", "資訊", "資料", "詳情", "這個主題", "這個概念", "主題", "有哪些", "內容", "哪個", "哪些", "有什麼", "可以", "嗎", "呢", "的", "和",
+}
+
+type wrapperToken struct {
+	text string
+}
+
+func tokenizeWrapperWords(value string) []wrapperToken {
+	runes := []rune(strings.ToLower(value))
+	tokens := make([]wrapperToken, 0, len(runes))
+	for i := 0; i < len(runes); {
+		r := runes[i]
+		if !unicode.IsLetter(r) && !unicode.IsNumber(r) {
+			i++
+			continue
+		}
+		if unicode.Is(unicode.Han, r) {
+			tokens = append(tokens, wrapperToken{text: string(r)})
+			i++
+			continue
+		}
+		start := i
+		for i < len(runes) && (unicode.IsLetter(runes[i]) || unicode.IsNumber(runes[i])) && !unicode.Is(unicode.Han, runes[i]) {
+			i++
+		}
+		tokens = append(tokens, wrapperToken{text: string(runes[start:i])})
+	}
+	return tokens
+}
+
+func wrapperTokenKey(tokens []wrapperToken) string {
+	values := make([]string, len(tokens))
+	for i, token := range tokens {
+		values[i] = token.text
+	}
+	return strings.Join(values, "\x00")
+}
+
+func wrapperTokensText(tokens []wrapperToken) string {
+	values := make([]string, len(tokens))
+	for i, token := range tokens {
+		values[i] = token.text
+	}
+	return strings.Join(values, " ")
 }
 
 func stripGenericWrapperLanguage(value string) string {
-	for pass := 0; pass < 2; pass++ {
-		before := value
-		for _, phrase := range genericWrapperPhrases {
-			value = strings.ReplaceAll(value, phrase, "")
-		}
-		if value == before {
-			break
+	tokens := tokenizeWrapperWords(value)
+	phrases := make([][]wrapperToken, 0, len(genericWrapperPhrases))
+	for _, phrase := range genericWrapperPhrases {
+		if phraseTokens := tokenizeWrapperWords(phrase); len(phraseTokens) > 0 {
+			phrases = append(phrases, phraseTokens)
 		}
 	}
-	return value
+
+	kept := make([]wrapperToken, 0, len(tokens))
+	for i := 0; i < len(tokens); {
+		if _, ok := genericWrapperEnglishTokens[tokens[i].text]; ok {
+			i++
+			continue
+		}
+		matched := 0
+		for _, phrase := range phrases {
+			if len(phrase) <= matched || i+len(phrase) > len(tokens) {
+				continue
+			}
+			match := true
+			for j := range phrase {
+				if phrase[j].text != tokens[i+j].text {
+					match = false
+					break
+				}
+			}
+			if match {
+				matched = len(phrase)
+			}
+		}
+		if matched > 0 {
+			i += matched
+			continue
+		}
+		kept = append(kept, tokens[i])
+		i++
+	}
+
+	// This is a deterministic Chinese/English generic-wrapper guard, not a
+	// universal semantic proof. It is deliberately bounded by the caller's
+	// question size and uses only exact tokens/phrases, with no domain lexicon.
+	return wrapperTokensText(kept)
 }
 
 func normalize(value string) string {

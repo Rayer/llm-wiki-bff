@@ -345,7 +345,7 @@ func (h *Handler) Query(c *gin.Context) {
 	searchQuery := query
 	var expandResult *llm.ExpandResult
 	if h.expander != nil {
-		if result, err := h.expander.Expand(query); err != nil {
+		if result, err := h.expander.Expand(c.Request.Context(), query); err != nil {
 			log.Printf("[expander] query expansion failed for %q: %v — falling back to raw query", query, err)
 		} else if result != nil {
 			expandResult = result
