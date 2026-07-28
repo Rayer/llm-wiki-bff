@@ -540,7 +540,7 @@ func TestCachedContextsIncludeConceptSources(t *testing.T) {
 	}
 	conceptCache := conceptcache.New()
 
-	contexts := cachedContexts(conceptCache, reader, []search.Result{{
+	contexts := cachedContexts(context.Background(), conceptCache, reader, []search.Result{{
 		Slug:  "alpha",
 		Title: "Alpha Concept",
 		Type:  "concept",

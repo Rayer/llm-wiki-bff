@@ -373,7 +373,7 @@ func (h *Handler) Query(c *gin.Context) {
 
 	if h.llm != nil && len(results) > 0 {
 		topN := min(10, len(results))
-		contexts := cachedContexts(h.cache, gcsClient, results[:topN])
+		contexts := cachedContexts(c.Request.Context(), h.cache, gcsClient, results[:topN])
 
 		if len(contexts) > 0 {
 			systemPrompt := buildSystemPrompt(mode)
@@ -393,12 +393,12 @@ func (h *Handler) Query(c *gin.Context) {
 	c.JSON(http.StatusOK, resp)
 }
 
-func cachedContexts(conceptCache *conceptcache.Cache, reader conceptcache.Reader, results []search.Result) []string {
+func cachedContexts(ctx context.Context, conceptCache *conceptcache.Cache, reader conceptcache.Reader, results []search.Result) []string {
 	contexts := make([]string, 0, len(results))
 	for _, result := range results {
 		entry, ok := conceptCache.Entry(reader, result.Slug)
 		if !ok {
-			if _, err := conceptCache.Build(context.Background(), reader); err == nil {
+			if _, err := conceptCache.Build(ctx, reader); err == nil {
 				entry, ok = conceptCache.Entry(reader, result.Slug)
 			}
 		}

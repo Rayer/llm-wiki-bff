@@ -99,12 +99,26 @@ func TestValidateCandidatesRejectsLongGenericTitleWrappers(t *testing.T) {
 		question string
 		anchor   string
 	}{
+		{name: "english describe", question: "Describe Coffee Shops?", anchor: "coffee-shops"},
+		{name: "english summarize", question: "Can you summarize Coffee Shops?", anchor: "coffee-shops"},
+		{name: "english summary", question: "A summary of Coffee Shops?", anchor: "coffee-shops"},
+		{name: "english introduction", question: "An introduction to Coffee Shops?", anchor: "coffee-shops"},
+		{name: "english elaborate", question: "Could you elaborate on Coffee Shops?", anchor: "coffee-shops"},
+		{name: "english outline", question: "Please outline Coffee Shops?", anchor: "coffee-shops"},
+		{name: "english show", question: "Show me Coffee Shops?", anchor: "coffee-shops"},
+		{name: "english define", question: "Define Coffee Shops?", anchor: "coffee-shops"},
 		{name: "english overview", question: "Could you please provide an overview of Coffee Shops?", anchor: "coffee-shops"},
 		{name: "english explanation", question: "Can you explain Coffee Shops?", anchor: "coffee-shops"},
+		{name: "chinese describe", question: "描述咖啡廳？", anchor: "cafe"},
+		{name: "chinese overview", question: "請概述咖啡廳？", anchor: "cafe"},
+		{name: "chinese summary", question: "咖啡廳的摘要？", anchor: "cafe"},
+		{name: "chinese intro", question: "咖啡廳簡介？", anchor: "cafe"},
+		{name: "chinese conclude", question: "請總結咖啡廳？", anchor: "cafe"},
 		{name: "chinese information", question: "請告訴我關於咖啡廳的所有相關資訊？", anchor: "cafe"},
 		{name: "chinese topic content", question: "我想知道咖啡廳這個主題有哪些內容？", anchor: "cafe"},
 		{name: "chinese concept content", question: "可以介紹一下咖啡廳這個概念的內容嗎？", anchor: "cafe"},
 		{name: "chinese complete information", question: "請提供咖啡廳的完整資訊？", anchor: "cafe"},
+		{name: "chinese explain", question: "可以解釋咖啡廳嗎？", anchor: "cafe"},
 		{name: "chinese explanation", question: "可以說明咖啡廳嗎？", anchor: "cafe"},
 		{name: "english information", question: "Please tell me all information about Coffee Shops?", anchor: "coffee-shops"},
 		{name: "english topic content", question: "What content is available about the Coffee Shops topic?", anchor: "coffee-shops"},
@@ -128,15 +142,27 @@ func TestValidateCandidatesPreservesSubstantiveUseCasesAndComparisons(t *testing
 			Generation:             GenerationMetadata{Model: "fixture", PromptVersion: "v1"},
 		}
 	}
-	candidates := []Candidate{
-		valid("台北有哪些適合工作的咖啡廳？", "cafe"),
-		valid("哪些咖啡廳適合雨天帶小孩？", "cafe"),
-		valid("咖啡廳和公園哪個更適合雨天帶小孩？", "cafe", "park"),
-		valid("Which Coffee Shops are suitable for remote work?", "coffee-shops"),
-		valid("Compare Coffee Shops and Parks for rainy days with children?", "coffee-shops", "park"),
+	substantive := []struct {
+		question string
+		anchors  []string
+	}{
+		{question: "Which Coffee Shops are suitable for remote work?", anchors: []string{"coffee-shops"}},
+		{question: "Which Coffee Shops are suitable for remote work and quiet seating?", anchors: []string{"coffee-shops"}},
+		{question: "Compare Coffee Shops and Parks for rainy days with children?", anchors: []string{"coffee-shops", "park"}},
+		{question: "有哪些咖啡廳符合預算並且有插座？", anchors: []string{"cafe"}},
+		{question: "咖啡廳和公園哪個更適合雨天帶小孩？", anchors: []string{"cafe", "park"}},
 	}
-	if err := ValidateCandidates(candidates, concepts); err != nil {
-		t.Fatalf("ValidateCandidates() rejected substantive questions: %v", err)
+
+	for _, tc := range substantive {
+		baseCandidates := []Candidate{
+			valid("哪些咖啡廳最適合遠端工作的靜謐場所？", "cafe"),
+			valid("想比較不同餐飲概念時我該注意什麼？", "coffee-shops"),
+			valid("親子適合的室外空間有哪些？", "park"),
+		}
+		testCandidates := append(baseCandidates, valid(tc.question, tc.anchors...))
+		if err := ValidateCandidates(testCandidates, concepts); err != nil {
+			t.Fatalf("ValidateCandidates() rejected substantive question %q: %v", tc.question, err)
+		}
 	}
 }
 

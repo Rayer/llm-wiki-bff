@@ -494,14 +494,25 @@ func isTitleWrapper(question string, titles map[string]string) bool {
 
 var genericWrapperEnglishTokens = map[string]struct{}{
 	"a": {}, "about": {}, "all": {}, "an": {}, "are": {}, "available": {}, "can": {}, "content": {},
-	"could": {}, "detail": {}, "details": {}, "explain": {}, "for": {}, "information": {}, "is": {},
-	"me": {}, "of": {}, "overview": {}, "please": {}, "provide": {}, "tell": {}, "the": {}, "there": {},
-	"this": {}, "to": {}, "topic": {}, "what": {}, "which": {}, "with": {}, "you": {},
+	"could": {}, "detail": {}, "details": {}, "define": {}, "definition": {}, "description": {}, "describe": {}, "discuss": {},
+	"elaborate": {}, "explain": {}, "for": {}, "give": {}, "how": {}, "information": {}, "introduction": {}, "tell": {},
+	"is": {}, "me": {}, "of": {}, "on": {}, "outline": {}, "overview": {}, "please": {}, "provide": {}, "rundown": {},
+	"show": {}, "summary": {}, "summarize": {}, "the": {}, "there": {}, "this": {}, "to": {}, "topic": {},
+	"what": {}, "which": {}, "with": {}, "you": {},
 }
 
 var genericWrapperPhrases = []string{
+	// English glue is already represented by exact token removal; these phrases keep
+	// bounded cross-token wrappers.
+	"can you",
+	"could you",
+	"please",
+	"what is",
+	"what's",
+
 	// Bounded Chinese polite, topic, content, information, and explanation phrases.
 	"請告訴我", "請問", "請提供", "我想知道", "想了解", "可以介紹一下", "可以說明", "介紹", "說明", "提供", "關於", "所有", "相關", "完整資訊", "完整內容", "資訊", "資料", "詳情", "這個主題", "這個概念", "主題", "有哪些", "內容", "哪個", "哪些", "有什麼", "可以", "嗎", "呢", "的", "和",
+	"請", "描述", "概述", "摘要", "簡介", "總結", "解釋",
 }
 
 type wrapperToken struct {
