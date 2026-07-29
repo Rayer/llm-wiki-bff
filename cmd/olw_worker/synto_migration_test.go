@@ -1220,6 +1220,80 @@ func TestSyntoPackExportArticlesPathIsConsumedByAdapter(t *testing.T) {
 	}
 }
 
+func TestSyntoPackExportOmittedArticleEntityUsesPriorStablePathIdentity(t *testing.T) {
+	workspace := t.TempDir()
+	raw := []byte("authoritative source\n")
+	contentHash := sha256Text(string(raw))
+	mustWriteFile(t, filepath.Join(workspace, "raw", "source.md"), raw)
+	mustWriteFile(t, filepath.Join(workspace, "wiki", "alpha.md"), []byte("---\nid: stable-alpha\nsources:\n  - stable-source\n---\nprior annotation\n"))
+	mustWriteFile(t, filepath.Join(workspace, "cache", "id_map.json"), []byte(`{"concept":{"stable-alpha":"alpha"},"concept_entity_id":{"stable-alpha":"entity-alpha"},"source":{"stable-source":"source"},"source_meta":{"stable-source":{"slug":"source","source_file":"raw/source.md"}},"redirects":{}}`))
+	mustWriteFile(t, filepath.Join(workspace, "cache", "concepts.jsonl"), []byte(`{"slug":"alpha","frontmatter":{"id":"stable-alpha","sources":["stable-source"]}}`+"\n"))
+	prior, err := snapshotConcepts(workspace, []sourceSnapshot{{SourceID: "stable-source", RawPath: "raw/source.md"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// This is the released pack-export shape: articles use articles/*.md,
+	// entity_id is omitted, and source_concepts is grouped under a source.
+	index := `{"schema_version":1,"pack":{"id":"fixture","name":"fixture","version":"0","language":["en"],"capabilities":["articles","concepts"]},"articles":[{"id":"generated-alpha","name":"Current Alpha Article","path":"articles/alpha.md","summary":null,"tags":[],"aliases":[],"confidence":"high"}],"terms":[],"papers":[],"sources":[],"source_concepts":[{"source_path":"raw/source.md","content_hash":"` + contentHash + `","concepts":[{"name":"Current Alpha Concept","entity_id":"entity-alpha"}]}],"synthesis":[],"stats":{"article_count":1,"draft_count":0,"concept_count":1,"alias_count":0,"knowledge_item_count":0,"source_count":1,"source_segment_count":0,"failed_note_count":0,"failed_concept_count":0}}`
+	mustWriteFile(t, filepath.Join(workspace, ".synto", "INDEX.json"), []byte(index))
+	mustWriteFile(t, filepath.Join(workspace, "cache", "id_map.json"), []byte(`{"concept":{"generated-alpha":"alpha"},"source":{"stable-source":"source"},"source_meta":{"stable-source":{"slug":"source","source_file":"raw/source.md"}},"redirects":{}}`))
+
+	if err := reconcileWorkspaceConcepts(workspace, prior, []sourceSnapshot{{SourceID: "stable-source", RawPath: "raw/source.md", RawBytes: raw, SyntoContentHash: contentHash}}); err != nil {
+		t.Fatalf("production-shaped pack export was not reconciled from prior stable identity: %v", err)
+	}
+	ids := mustSnapshotIDMap(t, workspace)
+	if ids.Concept["stable-alpha"] != "alpha" || ids.ConceptEntityID["stable-alpha"] != "entity-alpha" {
+		t.Fatalf("reconciled identity map = %#v, want stable-alpha -> alpha/entity-alpha", ids)
+	}
+	if _, exists := ids.Concept["generated-alpha"]; exists {
+		t.Fatalf("transient generated identity remained: %#v", ids.Concept)
+	}
+}
+
+func TestSyntoPackExportOmittedArticleEntityUsesPriorStableIdentityAcrossMultipleSources(t *testing.T) {
+	prior := []conceptSnapshot{{ConceptID: "stable-alpha", Slug: "alpha", EntityID: "entity-old", SourcePaths: []string{"raw/a.md", "raw/b.md"}}}
+	indexData := []byte(`{"schema_version":1,"pack":{"id":"fixture","name":"fixture","version":"0","language":["en"],"capabilities":["articles","concepts"]},"articles":[{"id":"generated-alpha","name":"Current Alpha","path":"articles/alpha.md","summary":null,"tags":[],"aliases":[],"confidence":"high"}],"terms":[],"papers":[],"sources":[],"source_concepts":[{"source_path":"raw/a.md","content_hash":"` + strings.Repeat("0", 64) + `","concepts":[{"name":"Current Alpha","entity_id":"entity-old"}]},{"source_path":"raw/b.md","content_hash":"` + strings.Repeat("1", 64) + `","concepts":[{"name":"Current Alpha","entity_id":"entity-old"}]}],"synthesis":[],"stats":{"article_count":1,"draft_count":0,"concept_count":1,"alias_count":0,"knowledge_item_count":0,"source_count":2,"source_segment_count":0,"failed_note_count":0,"failed_concept_count":0}}`)
+	index, err := decodeSyntoIndex(indexData)
+	if err != nil {
+		t.Fatalf("nested source_concepts fixture was rejected: %v", err)
+	}
+
+	got, err := mapSyntoEntityIDsFromIndexTruth(index, map[string]string{"generated-alpha": "alpha"}, prior)
+	if err != nil {
+		t.Fatalf("multiple prior-owned source groups were rejected: %v", err)
+	}
+	if got["generated-alpha"] != "entity-old" {
+		t.Fatalf("target entity=%q, want entity-old", got["generated-alpha"])
+	}
+}
+
+func TestSyntoPackExportOmittedArticleDoesNotReusePriorPathAcrossNestedSource(t *testing.T) {
+	workspace := t.TempDir()
+	priorPage := []byte("---\nid: stable-alpha\nsources:\n  - stable-old-source\n---\nprior annotation\n")
+	mustWriteFile(t, filepath.Join(workspace, "wiki", "alpha.md"), priorPage)
+	mustWriteFile(t, filepath.Join(workspace, "wiki", "other.md"), []byte("---\nid: generated-other\n---\nother\n"))
+	mustWriteFile(t, filepath.Join(workspace, "raw", "current.md"), []byte("current source\n"))
+	mustWriteFile(t, filepath.Join(workspace, "cache", "id_map.json"), []byte(`{"concept":{"stable-alpha":"alpha","generated-other":"other"},"concept_entity_id":{"stable-alpha":"entity-old","generated-other":"entity-other"},"source":{"stable-old-source":"old-source"},"source_meta":{"stable-old-source":{"slug":"old-source","source_file":"raw/old.md"}},"redirects":{}}`))
+	mustWriteFile(t, filepath.Join(workspace, "cache", "concepts.jsonl"), []byte(`{"slug":"alpha","frontmatter":{"id":"stable-alpha","sources":["stable-old-source"]}}`+"\n"+`{"slug":"other","frontmatter":{"id":"generated-other"}}`+"\n"))
+	prior, err := snapshotConcepts(workspace, []sourceSnapshot{{SourceID: "stable-old-source", RawPath: "raw/old.md"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	contentHash := sha256Text("current source\n")
+	index := `{"schema_version":1,"pack":{"id":"fixture","name":"fixture","version":"0","language":["en"],"capabilities":["articles","concepts"]},"articles":[{"id":"generated-new","name":"Unrelated Name","path":"articles/alpha.md","summary":null,"tags":[],"aliases":[],"confidence":"high"},{"id":"generated-other","entity_id":"entity-other","name":"Other Name","path":"articles/other.md","summary":null,"tags":[],"aliases":[],"confidence":"high"}],"terms":[],"papers":[],"sources":[],"source_concepts":[{"source_path":"raw/current.md","content_hash":"` + contentHash + `","concepts":[{"name":"Other Name","entity_id":"entity-other"}]}],"synthesis":[],"stats":{"article_count":2,"draft_count":0,"concept_count":2,"alias_count":0,"knowledge_item_count":0,"source_count":1,"source_segment_count":0,"failed_note_count":0,"failed_concept_count":0}}`
+	// The nested current source edge belongs to entity-other, not the prior
+	// entity-old. Reusing alpha's prior path would transfer identity silently.
+	mustWriteFile(t, filepath.Join(workspace, ".synto", "INDEX.json"), []byte(index))
+	mustWriteFile(t, filepath.Join(workspace, "cache", "id_map.json"), []byte(`{"concept":{"generated-new":"alpha","generated-other":"other"},"concept_entity_id":{"generated-other":"entity-other"},"source":{},"redirects":{}}`))
+	before := snapshotRelevantVaultBytes(t, workspace, "cache/id_map.json", "cache/concepts.jsonl", "wiki/alpha.md", "wiki/other.md", ".synto/INDEX.json")
+	if err := reconcileWorkspaceConcepts(workspace, prior, []sourceSnapshot{{RawPath: "raw/current.md", RawBytes: []byte("current source\n"), SyntoContentHash: contentHash}}); err == nil {
+		t.Fatal("omitted article reused prior path identity across an unrelated nested source")
+	}
+	assertVaultBytesUnchanged(t, workspace, before)
+}
+
 func TestSyntoPackExportSourcesIDAcceptsRawRelativePath(t *testing.T) {
 	const sourcesSeam = `"sources":[]`
 	index := syntoIndexFixture("article", "entity", "alpha", true)
@@ -1832,6 +1906,181 @@ func TestSyntoEntityFirstMappingPreservesRenameAndFailsClosed(t *testing.T) {
 	}
 }
 
+func TestSyntoOmittedArticleAmbiguityRequiresPriorOwnedSourceEvidence(t *testing.T) {
+	prior := []conceptSnapshot{{ConceptID: "stable-alpha", Slug: "alpha", EntityID: "entity-old", SourcePaths: []string{"raw/alpha.md", "raw/beta.md"}}}
+	newIndex := func(edges []syntoSourceConcept) syntoIndexTruth {
+		return syntoIndexTruthForEntityMapping(
+			[]syntoIndexEntry{
+				{ID: "generated-new", Name: "Shared Name", Path: "articles/alpha.md"},
+				{ID: "generated-other", EntityID: "entity-other", Name: "Other", Path: "articles/other.md"},
+			},
+			edges,
+			nil,
+		)
+	}
+	baseEdges := []syntoSourceConcept{
+		{Name: "Shared Name", EntityID: "entity-old", SourcePath: "raw/alpha.md"},
+		{Name: "Shared Name", EntityID: "entity-old", SourcePath: "raw/beta.md"},
+		{Name: "Shared Name", EntityID: "entity-other", SourcePath: "raw/other.md"},
+		{Name: "Other", EntityID: "entity-other", SourcePath: "raw/other.md"},
+	}
+
+	t.Run("one prior-owned match selects prior entity", func(t *testing.T) {
+		got, err := mapSyntoEntityIDsFromIndexTruth(newIndex(baseEdges), map[string]string{"generated-new": "alpha", "generated-other": "other"}, prior)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got["generated-new"] != "entity-old" {
+			t.Fatalf("target entity=%q, want entity-old", got["generated-new"])
+		}
+	})
+
+	t.Run("duplicate prior-owned support selects prior entity", func(t *testing.T) {
+		edges := append(append([]syntoSourceConcept(nil), baseEdges...), syntoSourceConcept{Name: "Shared Name", EntityID: "entity-old", SourcePath: "raw/alpha.md"})
+		got, err := mapSyntoEntityIDsFromIndexTruth(newIndex(edges), map[string]string{"generated-new": "alpha", "generated-other": "other"}, prior)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got["generated-new"] != "entity-old" {
+			t.Fatalf("target entity=%q, want entity-old", got["generated-new"])
+		}
+	})
+
+	for _, tc := range []struct {
+		name  string
+		edges []syntoSourceConcept
+	}{
+		{name: "zero prior-owned matches", edges: []syntoSourceConcept{
+			{Name: "Shared Name", EntityID: "entity-other", SourcePath: "raw/other.md"},
+			{Name: "Shared Name", EntityID: "entity-third", SourcePath: "raw/third.md"},
+			{Name: "Other", EntityID: "entity-other", SourcePath: "raw/other.md"},
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := mapSyntoEntityIDsFromIndexTruth(newIndex(tc.edges), map[string]string{"generated-new": "alpha", "generated-other": "other"}, prior); err == nil {
+				t.Fatal("omitted article was accepted without prior-owned source evidence")
+			} else {
+				testEntityMappingErrorDetail(t, err, conceptDetailEntityMappingArticleSourceAmbiguity)
+			}
+		})
+	}
+}
+
+func TestSyntoOmittedArticlePriorRecoveryIgnoresCurrentArticleTitle(t *testing.T) {
+	prior := []conceptSnapshot{{ConceptID: "stable-alpha", Slug: "alpha", EntityID: "entity-old", SourcePaths: []string{"raw/alpha.md"}}}
+	index := syntoIndexTruthForEntityMapping(
+		[]syntoIndexEntry{
+			{ID: "generated-alpha", Name: "Shared", Path: "articles/alpha.md"},
+			{ID: "generated-other", EntityID: "entity-other", Name: "Other", Path: "articles/other.md"},
+			{ID: "generated-third", EntityID: "entity-third", Name: "Third", Path: "articles/third.md"},
+		},
+		[]syntoSourceConcept{
+			{Name: "Old Concept", EntityID: "entity-old", SourcePath: "raw/alpha.md"},
+			{Name: "Shared", EntityID: "entity-other", SourcePath: "raw/other.md"},
+			{Name: "Shared", EntityID: "entity-third", SourcePath: "raw/third.md"},
+		}, nil,
+	)
+
+	got, err := mapSyntoEntityIDsFromIndexTruth(index, map[string]string{"generated-alpha": "alpha", "generated-other": "other", "generated-third": "third"}, prior)
+	if err != nil {
+		t.Fatalf("prior-owned source edge should recover omitted entity despite changed title: %v", err)
+	}
+	if got["generated-alpha"] != "entity-old" {
+		t.Fatalf("target entity=%q, want entity-old", got["generated-alpha"])
+	}
+}
+
+func TestSyntoArticleEntityMustMatchCurrentTitleCandidates(t *testing.T) {
+	articles := []syntoIndexEntry{
+		{ID: "generated-alpha", EntityID: "entity-third", Name: "Shared", Path: "articles/alpha.md"},
+		{ID: "generated-old", EntityID: "entity-old", Name: "Old", Path: "articles/old.md"},
+		{ID: "generated-other", EntityID: "entity-other", Name: "Other", Path: "articles/other.md"},
+	}
+	baseEdges := []syntoSourceConcept{
+		{Name: "Shared", EntityID: "entity-old", SourcePath: "raw/shared.md"},
+		{Name: "Shared", EntityID: "entity-other", SourcePath: "raw/shared.md"},
+		{Name: "Old", EntityID: "entity-old", SourcePath: "raw/old.md"},
+		{Name: "Other", EntityID: "entity-other", SourcePath: "raw/other.md"},
+	}
+	index := syntoIndexTruthForEntityMapping(articles, baseEdges, nil)
+
+	if _, err := mapSyntoEntityIDsFromIndexTruth(index, map[string]string{
+		"generated-alpha": "alpha",
+		"generated-old":   "old",
+		"generated-other": "other",
+	}, nil); err == nil {
+		t.Fatal("direct entity outside ambiguous title candidates was accepted")
+	} else {
+		testEntityMappingErrorDetail(t, err, conceptDetailEntityMappingArticleSourceDisagreement)
+	}
+
+	omitted := syntoIndexTruthForEntityMapping(
+		[]syntoIndexEntry{
+			{ID: "generated-alpha", Name: "Shared", Path: "articles/alpha.md"},
+			{ID: "generated-old", EntityID: "entity-old", Name: "Old", Path: "articles/old.md"},
+			{ID: "generated-other", EntityID: "entity-other", Name: "Other", Path: "articles/other.md"},
+		},
+		baseEdges, nil,
+	)
+	prior := []conceptSnapshot{{ConceptID: "stable-alpha", Slug: "alpha", EntityID: "entity-old", SourcePaths: []string{"raw/alpha.md"}}}
+	if _, err := mapSyntoEntityIDsFromIndexTruth(omitted, map[string]string{
+		"generated-alpha": "alpha",
+		"generated-old":   "old",
+		"generated-other": "other",
+	}, prior); err == nil {
+		t.Fatal("omitted prior mapping was accepted without prior source/entity proof")
+	} else {
+		testEntityMappingErrorDetail(t, err, conceptDetailEntityMappingArticleSourceAmbiguity)
+	}
+}
+
+func TestSyntoOmittedArticleIdentityRejectsUnprovenSourceOwnership(t *testing.T) {
+	prior := []conceptSnapshot{{ConceptID: "stable-alpha", Slug: "alpha", EntityID: "entity-old", SourcePaths: []string{"raw/alpha.md"}}}
+	tests := []struct {
+		name  string
+		index syntoIndexTruth
+		want  conceptReconcileDetailCode
+	}{
+		{
+			name: "wrong current source path",
+			index: syntoIndexTruthForEntityMapping(
+				[]syntoIndexEntry{{ID: "generated-alpha", Name: "Alpha", Path: "articles/alpha.md"}},
+				[]syntoSourceConcept{{Name: "Alpha", EntityID: "entity-old", SourcePath: "raw/current.md"}}, nil),
+			want: conceptDetailEntityMappingConceptIDPathDisagreement,
+		},
+		{
+			name: "same path wrong entity",
+			index: syntoIndexTruthForEntityMapping(
+				[]syntoIndexEntry{{ID: "generated-alpha", Name: "Alpha", Path: "articles/alpha.md"}},
+				[]syntoSourceConcept{{Name: "Alpha", EntityID: "entity-other", SourcePath: "raw/alpha.md"}}, nil),
+			want: conceptDetailEntityMappingConceptIDPathDisagreement,
+		},
+		{
+			name: "ordinary unknown article",
+			index: syntoIndexTruthForEntityMapping(
+				[]syntoIndexEntry{{ID: "generated-beta", Name: "Beta", Path: "articles/beta.md"}},
+				[]syntoSourceConcept{{Name: "Other", EntityID: "entity-other", SourcePath: "raw/other.md"}}, nil),
+			want: conceptDetailEntityMappingArticleSourceMissing,
+		},
+		{
+			name: "direct entity disagreement",
+			index: syntoIndexTruthForEntityMapping(
+				[]syntoIndexEntry{{ID: "generated-alpha", EntityID: "entity-old", Name: "Alpha", Path: "articles/alpha.md"}},
+				[]syntoSourceConcept{{Name: "Alpha", EntityID: "entity-other", SourcePath: "raw/alpha.md"}}, nil),
+			want: conceptDetailEntityMappingArticleSourceDisagreement,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := mapSyntoEntityIDsFromIndexTruth(tc.index, map[string]string{tc.index.Articles[0].ID: "alpha"}, prior); err == nil {
+				t.Fatal("unproven omitted article identity was accepted")
+			} else {
+				testEntityMappingErrorDetail(t, err, tc.want)
+			}
+		})
+	}
+}
+
 func TestSyntoIdentityLogRejectsMergeAndSplitLineage(t *testing.T) {
 	for _, op := range []string{"merge", "split"} {
 		workspace := t.TempDir()
@@ -1843,30 +2092,6 @@ func TestSyntoIdentityLogRejectsMergeAndSplitLineage(t *testing.T) {
 		if err := reconcileWorkspaceConcepts(workspace, nil); err == nil {
 			t.Fatalf("%s lineage accepted", op)
 		}
-	}
-}
-
-func TestMapSyntoEntityIDsFromIndexTruthIgnoresReservedRootPages(t *testing.T) {
-	index := syntoIndexTruthForEntityMapping(
-		[]syntoIndexEntry{
-			{ID: "article-alpha", EntityID: "entity-alpha", Name: "Alpha", Path: "wiki/alpha.md"},
-			{ID: "article-index", Name: "Index", Path: "wiki/index.md"},
-			{ID: "article-log", Name: "Log", Path: "wiki/log.md"},
-		},
-		[]syntoSourceConcept{{Name: "Alpha", EntityID: "entity-alpha"}},
-		nil,
-	)
-
-	got, err := mapSyntoEntityIDsFromIndexTruth(index, map[string]string{"article-alpha": "alpha"})
-	if err != nil {
-		detail := testEntityMappingErrorDetailCode(t, err)
-		if detail != conceptDetailEntityMappingArticleSourceMissing {
-			t.Fatalf("unexpected detail: got %q want %q", detail, conceptDetailEntityMappingArticleSourceMissing)
-		}
-		t.Fatalf("expected reserved root pages to be ignored, got error %q (detail=%q)", err, detail)
-	}
-	if len(got) != 1 || got["article-alpha"] != "entity-alpha" {
-		t.Fatalf("entity mapping = %#v, want article-alpha -> entity-alpha only", got)
 	}
 }
 

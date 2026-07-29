@@ -755,7 +755,7 @@ func reconcileWorkspaceConcepts(workspace string, prior []conceptSnapshot, curre
 	if err != nil {
 		return wrapConceptReconciliationError(conceptDetailEntityMerge, err)
 	}
-	entityIDs, err := readSyntoEntityIDs(workspace, generated.Concept)
+	entityIDs, err := readSyntoEntityIDs(workspace, generated.Concept, prior)
 	if err != nil {
 		return wrapConceptReconciliationError(conceptDetailEntityMapping, err)
 	}
