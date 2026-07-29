@@ -1859,7 +1859,11 @@ func TestMapSyntoEntityIDsFromIndexTruthIgnoresReservedRootPages(t *testing.T) {
 
 	got, err := mapSyntoEntityIDsFromIndexTruth(index, map[string]string{"article-alpha": "alpha"})
 	if err != nil {
-		t.Fatal(err)
+		detail := testEntityMappingErrorDetailCode(t, err)
+		if detail != conceptDetailEntityMappingArticleSourceMissing {
+			t.Fatalf("unexpected detail: got %q want %q", detail, conceptDetailEntityMappingArticleSourceMissing)
+		}
+		t.Fatalf("expected reserved root pages to be ignored, got error %q (detail=%q)", err, detail)
 	}
 	if len(got) != 1 || got["article-alpha"] != "entity-alpha" {
 		t.Fatalf("entity mapping = %#v, want article-alpha -> entity-alpha only", got)
