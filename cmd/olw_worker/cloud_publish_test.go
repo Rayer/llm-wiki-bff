@@ -588,8 +588,8 @@ func TestCloudWorkspaceCreationFailureRecordsDiagnosticWithoutPublication(t *tes
 		t.Fatalf("error=%v, want sanitized workspace failure", err)
 	}
 	logData, _, err := m.Read(context.Background(), prefix+"cache/pipeline-execution.log", 0, generation.MaxFileBytes)
-	if err != nil || string(logData) != "pipeline failed\n" {
-		t.Fatalf("fixed failure log=%q err=%v", logData, err)
+	if err != nil || len(logData) != 0 {
+		t.Fatalf("failure log=%q err=%v, want empty raw log when child did not start", logData, err)
 	}
 	diagnosticData, _, err := m.Read(context.Background(), prefix+"cache/pipeline-execution.failure.json", 0, generation.MaxFileBytes)
 	if err != nil {
@@ -1143,7 +1143,7 @@ func TestCloudPublishFailureWithRecordingFailurePreservesPublishCategory(t *test
 	}
 }
 
-func TestCloudDiagnosticSinkDiscardsArbitraryChildOutput(t *testing.T) {
+func TestCloudWorkerPersistsArbitraryChildOutputWithBoundedMarker(t *testing.T) {
 	m := newMemoryObjects()
 	prefix := "users/user-secret/projects/project-secret/"
 	seedCloudSource(t, m, prefix, "raw-start", "", priorCloudReceipt())
@@ -1170,12 +1170,12 @@ func TestCloudDiagnosticSinkDiscardsArbitraryChildOutput(t *testing.T) {
 	if readErr != nil {
 		t.Fatal(readErr)
 	}
-	if string(logData) != "pipeline failed\n" {
-		t.Fatalf("cloud pipeline log was not fixed failure event: len=%d data=%q", len(logData), logData)
+	if len(logData) != maxPipelineLog || !strings.HasSuffix(string(logData), pipelineLogTruncationMarker) {
+		t.Fatalf("cloud pipeline log was not bounded with marker: len=%d", len(logData))
 	}
-	for _, forbidden := range []string{"unknown-provider.invalid", "olw-cloud-sentinel", "tenant-secret", "project-secret", "execution-secret", "command", "object/path", "generation/path"} {
-		if strings.Contains(string(logData), forbidden) {
-			t.Fatalf("cloud pipeline log retained child diagnostic %q: %q", forbidden, logData)
+	for _, preserved := range []string{"unknown-provider.invalid", "olw-cloud-sentinel", "tenant-secret", "project-secret", "execution-secret", "command", "object/path", "generation/path"} {
+		if !strings.Contains(string(logData), preserved) {
+			t.Fatalf("cloud pipeline log lost child output %q", preserved)
 		}
 	}
 }
@@ -1223,8 +1223,8 @@ func TestCloudRunFailureWritesStrictBoundedDiagnosticAndFixedReceipts(t *testing
 		}
 	}
 	logData, _, err := m.Read(context.Background(), prefix+"cache/pipeline-execution-secret.log", 0, generation.MaxFileBytes)
-	if err != nil || string(logData) != "pipeline failed\n" {
-		t.Fatalf("fixed pipeline log=%q err=%v", logData, err)
+	if err != nil || !strings.Contains(string(logData), malicious) {
+		t.Fatalf("raw pipeline log=%q err=%v", logData, err)
 	}
 	if receipt := cloudStatus(t, m, prefix).Sources["s1"]; receipt.Error != "pipeline failed" {
 		t.Fatalf("source receipt=%+v", receipt)
@@ -1237,7 +1237,9 @@ func TestCloudSuccessWritesNoFailureDiagnostic(t *testing.T) {
 	seedCloudSource(t, m, prefix, "raw-start", "", priorCloudReceipt())
 	old := execOLW
 	t.Cleanup(func() { execOLW = old })
-	execOLW = func(_ context.Context, vault string, _ []string, _ []string, _, _ io.Writer) error {
+	execOLW = func(_ context.Context, vault string, _ []string, _ []string, stdout, stderr io.Writer) error {
+		_, _ = io.WriteString(stdout, "success source path\n")
+		_, _ = io.WriteString(stderr, "success warning\n")
 		writeCloudRequiredOutputs(t, vault)
 		return nil
 	}
@@ -1246,6 +1248,10 @@ func TestCloudSuccessWritesNoFailureDiagnostic(t *testing.T) {
 	}
 	if _, _, err := m.Read(context.Background(), prefix+"cache/pipeline-execution.failure.json", 0, generation.MaxFileBytes); !errors.Is(err, cloudstorage.ErrObjectNotExist) {
 		t.Fatalf("success failure diagnostic read error=%v, want object absent", err)
+	}
+	log, _, err := m.Read(context.Background(), prefix+"cache/pipeline-execution.log", 0, generation.MaxFileBytes)
+	if err != nil || string(log) != "success source path\nsuccess warning\n" {
+		t.Fatalf("success raw log=%q err=%v", log, err)
 	}
 }
 
@@ -1389,7 +1395,7 @@ func TestCloudDiagnosticWriteFailureRecordsFixedCategoryBeforePublication(t *tes
 	}
 }
 
-func TestWriteCloudPipelineLogUsesOnlyFixedEvent(t *testing.T) {
+func TestWriteCloudPipelineLogBoundsExistingRawOutput(t *testing.T) {
 	workspace := t.TempDir()
 	mustWriteFile(t, filepath.Join(workspace, "cache", "pipeline-execution-secret.log"), []byte("https://unknown-provider.invalid/resource tenant-secret /tmp/workspace-suffix command --token=secret "+strings.Repeat("untrusted-bytes ", maxPipelineLog+1)))
 	m := newMemoryObjects()
@@ -1401,8 +1407,8 @@ func TestWriteCloudPipelineLogUsesOnlyFixedEvent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(data) != "pipeline completed\n" {
-		t.Fatalf("pipeline log = %q, want fixed event", data)
+	if len(data) != maxPipelineLog || !strings.HasSuffix(string(data), pipelineLogTruncationMarker) {
+		t.Fatalf("pipeline log = len %d, want bounded raw output", len(data))
 	}
 }
 
@@ -1491,8 +1497,8 @@ func TestCloudMaterializationFailureRecordsFixedFailureReceipt(t *testing.T) {
 		t.Fatalf("error=%v, want fixed materialization failure", err)
 	}
 	logData, _, err := m.Read(context.Background(), prefix+"cache/pipeline-execution-secret.log", 0, generation.MaxFileBytes)
-	if err != nil || string(logData) != "pipeline failed\n" {
-		t.Fatalf("failure log=%q err=%v", logData, err)
+	if err != nil || len(logData) != 0 {
+		t.Fatalf("failure log=%q err=%v, want empty raw log when child did not start", logData, err)
 	}
 	receipt := cloudStatus(t, m, prefix).Sources["s1"]
 	if receipt.Error != "pipeline failed" || receipt.FailedFingerprint == "" {
@@ -1812,7 +1818,7 @@ func TestCloudPreCommitFailuresKeepOldManifestAndRecordSanitizedFailure(t *testi
 	if !cloudSnapshotCurrent(context.Background(), m, prefix, sourceSnapshot{SourceID: "s1", RawPath: "raw/source.md", RawSHA256: sha256Text("raw-start"), AnnotationSHA: annotation.Digest("annotation-start")}) {
 		t.Fatal("seed source is unexpectedly not current")
 	}
-	assertCloudFailure(t, m, prefix, "api-secret", "user-secret", "project-secret", "--dangerous-arg")
+	assertCloudFailure(t, m, prefix, "api-secret")
 }
 
 func TestCloudPostCommitReceiptFailureDoesNotRollbackManifest(t *testing.T) {

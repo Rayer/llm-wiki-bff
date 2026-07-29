@@ -359,6 +359,41 @@ func (c *Client) ReadFile(ctx context.Context, relPath string) ([]byte, error) {
 	return c.readFileWithView(ctx, relPath, view)
 }
 
+func (c *Client) ReadFileLimited(ctx context.Context, relPath string, limit int64) ([]byte, error) {
+	if limit < 0 {
+		return nil, errors.New("invalid read limit")
+	}
+	view := generationView{}
+	var err error
+	if generation.GenerationOwned(relPath) {
+		view, err = c.operationView(ctx)
+		if err != nil {
+			return nil, err
+		}
+	}
+	path, expected, err := c.resolveReadPath(relPath, view)
+	if err != nil {
+		return nil, err
+	}
+	object, err := c.readObject(ctx, path, expected, limit)
+	if err != nil {
+		if objectNotFound(err) {
+			if view.manifest != nil {
+				return nil, store.ErrDeclaredObjectUnavailable
+			}
+			return nil, store.ErrObjectNotExist
+		}
+		if view.manifest != nil {
+			return nil, store.ErrDeclaredObjectUnavailable
+		}
+		return nil, fmt.Errorf("read %s: %w", path, err)
+	}
+	if err := c.verifyGenerationRead(relPath, view, object); err != nil {
+		return nil, err
+	}
+	return object.Data, nil
+}
+
 func (c *Client) readFileWithView(ctx context.Context, relPath string, view generationView) ([]byte, error) {
 	path, expected, err := c.resolveReadPath(relPath, view)
 	if err != nil {

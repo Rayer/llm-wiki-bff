@@ -1151,7 +1151,7 @@ const docTemplate = `{
                         "ProjectHeader": []
                     }
                 ],
-                "description": "Returns the finite pipeline event and, for failed executions, a bounded allowlisted failure diagnostic for the current project execution.",
+                "description": "Returns bounded raw pipeline stdout/stderr for the authenticated owning project execution.",
                 "produces": [
                     "text/plain"
                 ],

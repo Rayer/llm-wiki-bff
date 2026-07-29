@@ -123,9 +123,14 @@ publish generation outputs.
 
 ## Cloud Failure Diagnostic Artifact
 
-For a failed cloud execution, the worker writes the operator-only object
-`cache/pipeline-<execution>.failure.json` alongside the existing fixed
-`cache/pipeline-<execution>.log` event and fixed source receipt error. The
+For every owned cloud execution, the worker writes the bounded raw child
+stdout/stderr object `cache/pipeline-<execution>.log` alongside the typed
+operator diagnostic `cache/pipeline-<execution>.failure.json` when applicable.
+The raw log is captured locally while `SuppressOutput` keeps it out of Cloud
+Logging, then persisted on success and every failure after ownership is
+established. Its documented maximum is 4 MiB including the deterministic
+marker `\n[output truncated at 4194304 bytes]\n`; the marker replaces the tail
+when the child exceeds the cap. The
 failure object is versioned, deterministic JSON and is written create-only; it
 is not part of a generation, does not create a current pointer, and is never
 written on success. A diagnostic write failure is reported through the
@@ -141,12 +146,16 @@ cancellation, I/O, invalid state, publication conflict, recording failure, and
 unknown. The accepted user command is only `run`; migration and index export
 are worker-owned child seams.
 
-The artifact never stores child stdout/stderr, error strings, provider HTTP
-status, URLs, paths, arguments, provider bodies, model responses, source or
-article text, credentials, tokens, tenant/user/project/execution IDs, or
-timestamps. The fixed pipeline log and source receipt contracts remain
-sanitized and unchanged; this object is the separate operator diagnostic
-channel and is not exposed through a BFF API/UI.
+The typed artifact never stores child stdout/stderr, error strings, provider
+HTTP status, URLs, paths, arguments, provider bodies, model responses, source
+or article text, credentials, tokens, tenant/user/project/execution IDs, or
+timestamps. The raw log deliberately preserves ordinary operational output;
+only known application API-key values are prevented from reaching the log.
+The BFF reads only the exact owner/project/execution object, bounds its read to
+64 KiB, normalizes invalid UTF-8, and appends
+`\n[output truncated by API at 65536 bytes]\n` when returning an oversized
+response. Raw text is never parsed as a stage contract; the typed diagnostic
+remains the stable status/timeline/automation contract.
 
 The one deliberate exception is `errManifestCommitOutcomeUnknown`: when the
 manifest CAS/readback outcome is ambiguous, the worker writes no failed

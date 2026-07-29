@@ -73,6 +73,8 @@ const (
 	suggestedQueryModel             = "deepseek-chat"
 )
 
+const pipelineLogTruncationMarker = "\n[output truncated at 4194304 bytes]\n"
+
 func main() {
 	if err := executeWorkerCommand(newRootCommand()); err != nil {
 		log.Printf("worker: %v", err)
@@ -582,11 +584,8 @@ func allowlistedSyntoEnvironment(extra []string) []string {
 }
 
 func pipelineLogWriters(vault string, cfg workerConfig, commands [][]string, suppressOutput bool) (io.Writer, io.Writer, func() error, error) {
-	if cfg.cloudMode {
-		return io.Discard, io.Discard, func() error { return nil }, nil
-	}
 	if strings.TrimSpace(cfg.ExecutionID) == "" {
-		sink := newDiagnosticSink([]io.Writer{os.Stdout, os.Stderr}, diagnosticSecrets(cfg, commands))
+		sink := newDiagnosticSink([]io.Writer{os.Stdout, os.Stderr}, logSecrets(cfg))
 		return sink, sink, sink.Close, nil
 	}
 	path, err := pipelineLogPath(vault, cfg.ExecutionID)
@@ -604,7 +603,7 @@ func pipelineLogWriters(vault string, cfg workerConfig, commands [][]string, sup
 	if !suppressOutput {
 		destinations = append(destinations, os.Stdout, os.Stderr)
 	}
-	sink := newDiagnosticSink(destinations, diagnosticSecrets(cfg, commands))
+	sink := newDiagnosticSink(destinations, logSecrets(cfg))
 	return sink, sink, func() error {
 		if err := sink.Close(); err != nil {
 			_ = file.Close()
@@ -615,12 +614,13 @@ func pipelineLogWriters(vault string, cfg workerConfig, commands [][]string, sup
 }
 
 type diagnosticSink struct {
-	writers []io.Writer
-	secrets []string
-	pending []byte
-	written int
-	mu      sync.Mutex
-	closed  bool
+	writers   []io.Writer
+	secrets   []string
+	pending   []byte
+	written   int
+	mu        sync.Mutex
+	closed    bool
+	truncated bool
 }
 
 func newDiagnosticSink(writers []io.Writer, secrets []string) *diagnosticSink {
@@ -676,17 +676,30 @@ func (w *diagnosticSink) emitLocked(data []byte, final bool) error {
 	// Retain the fixed-size tail until close so a secret split across writes or
 	// stdout/stderr cannot reach any destination before redaction.
 	text := string(redactDiagnosticBytes(data, w.secrets))
-	if w.written < maxPipelineLog {
-		remaining := maxPipelineLog - w.written
-		text = truncateDiagnostic(text, remaining)
+	contentLimit := maxPipelineLog - len(pipelineLogTruncationMarker)
+	if w.written < contentLimit {
+		remaining := contentLimit - w.written
+		if len(text) > remaining {
+			text = text[:remaining]
+			w.truncated = true
+		}
 		for _, dst := range w.writers {
 			if _, err := io.WriteString(dst, text); err != nil {
 				return err
 			}
 		}
 		w.written += len(text)
+	} else if len(text) > 0 {
+		w.truncated = true
 	}
 	if final {
+		if w.truncated {
+			for _, dst := range w.writers {
+				if _, err := io.WriteString(dst, pipelineLogTruncationMarker); err != nil {
+					return err
+				}
+			}
+		}
 		w.pending = nil
 	} else {
 		w.pending = append(w.pending[:0], w.pending[len(data):]...)
@@ -779,19 +792,15 @@ func (w *cappedRedactingWriter) Write(data []byte) (int, error) {
 }
 
 func logSecrets(cfg workerConfig) []string {
-	values := []string{cfg.APIKey, os.Getenv("LLM_API_KEY"), os.Getenv("DEEPSEEK_API_KEY")}
+	values := []string{cfg.APIKey}
+	if !cfg.apiKeySet {
+		values = append(values, os.Getenv("LLM_API_KEY"), os.Getenv("DEEPSEEK_API_KEY"))
+	}
 	return values
 }
 
 func diagnosticSecrets(cfg workerConfig, commands [][]string) []string {
-	values := []string{cfg.APIKey, cfg.UserID, cfg.ProjectID, cfg.ExecutionID, cfg.VaultPath, cfg.WorkspaceDir, cfg.DataDir, cfg.Bucket}
-	if !cfg.apiKeySet {
-		values = append(values, os.Getenv("LLM_API_KEY"), os.Getenv("DEEPSEEK_API_KEY"))
-	}
-	for _, command := range commands {
-		values = append(values, command...)
-	}
-	return values
+	return logSecrets(cfg)
 }
 
 func validateWorkerInput(cfg workerConfig, commands [][]string) error {

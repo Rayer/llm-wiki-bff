@@ -286,6 +286,35 @@ func (c *Client) ReadFile(ctx context.Context, relPath string) ([]byte, error) {
 	return data, nil
 }
 
+func (c *Client) ReadFileLimited(ctx context.Context, relPath string, limit int64) ([]byte, error) {
+	if limit < 0 {
+		return nil, errors.New("invalid read limit")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	path, err := c.fullPath(relPath)
+	if err != nil {
+		return nil, err
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, storage.ErrObjectNotExist
+		}
+		return nil, fmt.Errorf("read %s: %w", relPath, err)
+	}
+	data, readErr := io.ReadAll(io.LimitReader(file, limit))
+	closeErr := file.Close()
+	if readErr != nil {
+		return nil, readErr
+	}
+	if closeErr != nil {
+		return nil, closeErr
+	}
+	return data, nil
+}
+
 func (c *Client) WriteBytes(ctx context.Context, data []byte, relPath string) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err

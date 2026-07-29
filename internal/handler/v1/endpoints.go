@@ -54,6 +54,8 @@ const (
 	maxPipelineLogBytes         = 64 << 10
 )
 
+const pipelineLogResponseTruncationMarker = "\n[output truncated by API at 65536 bytes]\n"
+
 var pipelineDiagnosticStages = map[string]struct{}{
 	"input_materialization": {}, "synto_migration": {}, "synto_config_normalization": {},
 	"synto_config_validation": {}, "synto_run": {}, "synto_index_export": {},
@@ -1342,12 +1344,8 @@ func (h *Handler) attachPipelineDiagnostic(ctx context.Context, response *handle
 	case "RUNNING", "UNKNOWN":
 		response.LogState = pipelineLogStatePending
 		return
-	case "SUCCEEDED", "CANCELLED":
-		response.LogState = pipelineLogStateAvailable
-		return
-	case "FAILED":
-		// Continue below: failed receipts are persisted asynchronously after the
-		// fixed failure event, so a missing object remains explicitly pending.
+	case "SUCCEEDED", "CANCELLED", "FAILED":
+		// Raw log availability is independent from the typed diagnostic.
 	default:
 		response.LogState = pipelineLogStateUnavailable
 		response.LogStateReason = "unsupported_execution_status"
@@ -1360,19 +1358,52 @@ func (h *Handler) attachPipelineDiagnostic(ctx context.Context, response *handle
 		response.LogStateReason = "storage_unavailable"
 		return
 	}
-	diagnostic, err := readPipelineFailureDiagnostic(ctx, projectStore.Scope(owner.userID, owner.projectID), response.Name)
-	if err == nil {
-		response.Diagnostic = diagnostic
+	project := projectStore.Scope(owner.userID, owner.projectID)
+	logData, logErr := readPipelineLog(ctx, project, response.Name)
+	if logErr == nil {
+		_ = logData
 		response.LogState = pipelineLogStateAvailable
-		return
-	}
-	if errors.Is(err, storage.ErrObjectNotExist) {
+	} else if errors.Is(logErr, storage.ErrObjectNotExist) {
 		response.LogState = pipelineLogStatePending
-		response.LogStateReason = "diagnostic_pending"
-		return
+		response.LogStateReason = "log_pending"
+	} else {
+		response.LogState = pipelineLogStateUnavailable
+		response.LogStateReason = "log_unavailable"
 	}
-	response.LogState = pipelineLogStateUnavailable
-	response.LogStateReason = "diagnostic_invalid"
+	if response.Status == "FAILED" {
+		if diagnostic, err := readPipelineFailureDiagnostic(ctx, project, response.Name); err == nil {
+			response.Diagnostic = diagnostic
+		}
+	}
+}
+
+type limitedPipelineLogReader interface {
+	ReadFileLimited(context.Context, string, int64) ([]byte, error)
+}
+
+func readPipelineLog(ctx context.Context, projectStore store.Store, executionName string) ([]byte, error) {
+	executionID := shortCloudRunExecutionName(executionName, true)
+	if executionID == "" {
+		return nil, errors.New("invalid execution name")
+	}
+	reader, ok := projectStore.(limitedPipelineLogReader)
+	if !ok {
+		return nil, errors.New("bounded pipeline log reader unavailable")
+	}
+	data, err := reader.ReadFileLimited(ctx, "cache/pipeline-"+executionID+".log", maxPipelineLogBytes+1)
+	if err != nil {
+		return nil, err
+	}
+	return boundedPipelineLogResponse(data), nil
+}
+
+func boundedPipelineLogResponse(data []byte) []byte {
+	text := strings.ToValidUTF8(string(data), "�")
+	if len(text) <= maxPipelineLogBytes {
+		return []byte(text)
+	}
+	limit := maxPipelineLogBytes - len(pipelineLogResponseTruncationMarker)
+	return []byte(text[:limit] + pipelineLogResponseTruncationMarker)
 }
 
 func readPipelineFailureDiagnostic(ctx context.Context, projectStore store.Store, executionName string) (*handler.PipelineFailureDiagnostic, error) {
@@ -1533,7 +1564,7 @@ func pipelineLogURLForExecution(execution cloudRunExecution) string {
 // PipelineLog handles GET /api/v1/pipeline/log.
 //
 //	@Summary		Read pipeline log
-//	@Description	Returns the finite pipeline event and, for failed executions, a bounded allowlisted failure diagnostic for the current project execution.
+//	@Description	Returns bounded raw pipeline stdout/stderr for the authenticated owning project execution.
 //	@Tags			pipeline
 //	@Produce		plain
 //	@Param			execution_id	query		string	true	"Cloud Run execution ID"
@@ -1558,7 +1589,7 @@ func (h *Handler) PipelineLog(c *gin.Context) {
 	}
 
 	executionID := strings.TrimSpace(c.Query("execution_id"))
-	logPath, err := pipelineLogPath(executionID)
+	_, err := pipelineLogPath(executionID)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, handler.ErrorResponse{Error: err.Error()})
 		return
@@ -1578,7 +1609,7 @@ func (h *Handler) PipelineLog(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: generatedDataUnavailableMessage})
 		return
 	}
-	data, err := wikiStore.ReadFile(c.Request.Context(), logPath)
+	data, err := readPipelineLog(c.Request.Context(), wikiStore, execution.Name)
 	if err != nil {
 		if errors.Is(err, storage.ErrObjectNotExist) {
 			c.JSON(http.StatusNotFound, handler.ErrorResponse{Error: "pipeline log not found"})
@@ -1587,46 +1618,7 @@ func (h *Handler) PipelineLog(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: generatedDataUnavailableMessage})
 		return
 	}
-	if len(data) > maxPipelineLogBytes {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: generatedDataUnavailableMessage})
-		return
-	}
-	if !isFinitePipelineEvent(data) {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: generatedDataUnavailableMessage})
-		return
-	}
-	if execution.Status == "FAILED" {
-		// Failed worker stdout/stderr is intentionally suppressed. Only the
-		// finite event and validated allowlist receipt may cross this boundary.
-		if execution.Diagnostic == nil {
-			c.Data(http.StatusOK, "text/plain; charset=utf-8", []byte("pipeline failed\n"))
-			return
-		}
-		var rendered strings.Builder
-		rendered.WriteString("pipeline failed\n")
-		fmt.Fprintf(&rendered, "stage: %s\nerror_class: %s\n", execution.Diagnostic.Stage, execution.Diagnostic.ErrorClass)
-		if execution.Diagnostic.DetailCode != "" {
-			fmt.Fprintf(&rendered, "detail_code: %s\n", execution.Diagnostic.DetailCode)
-		}
-		if execution.Diagnostic.Child != "" {
-			fmt.Fprintf(&rendered, "child_command: %s\n", execution.Diagnostic.Child)
-		}
-		if execution.Diagnostic.ExitCode != nil {
-			fmt.Fprintf(&rendered, "exit_code: %d\n", *execution.Diagnostic.ExitCode)
-		}
-		c.Data(http.StatusOK, "text/plain; charset=utf-8", []byte(rendered.String()))
-		return
-	}
 	c.Data(http.StatusOK, "text/plain; charset=utf-8", data)
-}
-
-func isFinitePipelineEvent(data []byte) bool {
-	switch string(data) {
-	case "pipeline completed\n", "pipeline failed\n", "pipeline committed cleanup failed\n":
-		return true
-	default:
-		return false
-	}
 }
 
 func pipelineLogPath(executionID string) (string, error) {
