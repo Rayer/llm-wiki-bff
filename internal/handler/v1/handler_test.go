@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -1974,7 +1975,7 @@ func TestPipelineLogReturnsOwnedExecutionLog(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(logPath), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(logPath, []byte("owned output\n"), 0o644); err != nil {
+	if err := os.WriteFile(logPath, []byte("pipeline completed\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	owned := pipelineOwnershipExecution("projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline/executions/owned-log", "request-user", "demo-project", "pipeline")
@@ -1997,7 +1998,7 @@ func TestPipelineLogReturnsOwnedExecutionLog(t *testing.T) {
 
 	h.PipelineLog(c)
 
-	if recorder.Code != http.StatusOK || recorder.Body.String() != "owned output\n" {
+	if recorder.Code != http.StatusOK || recorder.Body.String() != "pipeline completed\n" {
 		t.Fatalf("status = %d; body = %q", recorder.Code, recorder.Body.String())
 	}
 }
@@ -2084,13 +2085,208 @@ func TestPipelineStatusReturnsSpecificExecution(t *testing.T) {
 	}
 }
 
+func TestPipelineStatusProjectsOwnedFailureDiagnostic(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "users", "request-user", "projects", "demo-project", "cache", "pipeline-owned-failure.failure.json")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(`{"version":1,"status":"failed","stage":"concept_reconciliation","error_class":"child_exit","detail_code":"entity_mapping_article_source_missing","child_command":"run","exit_code":23}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	owned := strings.Replace(pipelineOwnershipExecution("projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline/executions/owned-failure", "request-user", "demo-project", "pipeline"), "EXECUTION_SUCCEEDED", "EXECUTION_FAILED", 1)
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == "/token" {
+			return testHTTPResponse(http.StatusOK, `{"access_token":"test-token"}`), nil
+		}
+		return testHTTPResponse(http.StatusOK, owned), nil
+	})}
+	h := New(localfs.New(root), nil, search.NewIndex(), conceptcache.New(), nil, nil)
+	h.httpClient = client
+	h.metadataTokenURL = "http://metadata.test/token"
+	h.cloudRunJobURL = "https://run.googleapis.com/v2/projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline:run"
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/api/v1/pipeline/status?execution_id=owned-failure", nil)
+	c.Set("userID", "request-user")
+	c.Set("projectID", "demo-project")
+
+	h.PipelineStatus(c)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var body struct {
+		LastExecution *struct {
+			LogState   string `json:"log_state"`
+			Diagnostic *struct {
+				Version    int    `json:"version"`
+				Status     string `json:"status"`
+				Stage      string `json:"stage"`
+				ErrorClass string `json:"error_class"`
+				DetailCode string `json:"detail_code"`
+				Child      string `json:"child_command"`
+				ExitCode   int    `json:"exit_code"`
+			} `json:"diagnostic"`
+		} `json:"last_execution"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if body.LastExecution == nil || body.LastExecution.LogState != "available" || body.LastExecution.Diagnostic == nil {
+		t.Fatalf("last_execution = %#v, want available diagnostic", body.LastExecution)
+	}
+	diagnostic := body.LastExecution.Diagnostic
+	if diagnostic.Version != 1 || diagnostic.Status != "failed" || diagnostic.Stage != "concept_reconciliation" || diagnostic.ErrorClass != "child_exit" || diagnostic.DetailCode != "entity_mapping_article_source_missing" || diagnostic.Child != "run" || diagnostic.ExitCode != 23 {
+		t.Fatalf("diagnostic = %#v", diagnostic)
+	}
+}
+
+func TestPipelineStatusDiagnosticStates(t *testing.T) {
+	tests := []struct {
+		name       string
+		statusBody string
+		diagnostic string
+		wantState  string
+		wantReason string
+	}{
+		{name: "running pending", statusBody: pipelineRunningOwnershipExecution("projects/p/locations/l/jobs/j/executions/running", "u", "p"), wantState: "pending"},
+		{name: "success available", statusBody: pipelineOwnershipExecution("projects/p/locations/l/jobs/j/executions/success", "u", "p", "pipeline"), wantState: "available"},
+		{name: "failed delayed", statusBody: strings.Replace(pipelineOwnershipExecution("projects/p/locations/l/jobs/j/executions/delayed", "u", "p", "pipeline"), "EXECUTION_SUCCEEDED", "EXECUTION_FAILED", 1), wantState: "pending", wantReason: "diagnostic_pending"},
+		{name: "failed malformed", statusBody: strings.Replace(pipelineOwnershipExecution("projects/p/locations/l/jobs/j/executions/malformed", "u", "p", "pipeline"), "EXECUTION_SUCCEEDED", "EXECUTION_FAILED", 1), diagnostic: `{"version":1,"status":"failed","stage":"unknown","error_class":"unknown","unknown":"nope"}`, wantState: "unavailable", wantReason: "diagnostic_invalid"},
+		{name: "failed oversized", statusBody: strings.Replace(pipelineOwnershipExecution("projects/p/locations/l/jobs/j/executions/oversized", "u", "p", "pipeline"), "EXECUTION_SUCCEEDED", "EXECUTION_FAILED", 1), diagnostic: strings.Repeat("x", maxPipelineDiagnosticBytes+1), wantState: "unavailable", wantReason: "diagnostic_invalid"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := t.TempDir()
+			if tt.diagnostic != "" {
+				id := shortCloudRunExecutionName(executionNameFromJSON(t, tt.statusBody), true)
+				path := filepath.Join(root, "users", "u", "projects", "p", "cache", "pipeline-"+id+".failure.json")
+				if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, []byte(tt.diagnostic), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				if r.URL.Path == "/token" {
+					return testHTTPResponse(http.StatusOK, `{"access_token":"test-token"}`), nil
+				}
+				return testHTTPResponse(http.StatusOK, tt.statusBody), nil
+			})}
+			h := New(localfs.New(root), nil, search.NewIndex(), conceptcache.New(), nil, nil)
+			h.httpClient = client
+			h.metadataTokenURL = "http://metadata.test/token"
+			h.cloudRunJobURL = "https://run.googleapis.com/v2/projects/p/locations/l/jobs/j:run"
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodGet, "/api/v1/pipeline/status?execution_id="+url.QueryEscape(shortCloudRunExecutionName(executionNameFromJSON(t, tt.statusBody), true)), nil)
+			c.Set("userID", "u")
+			c.Set("projectID", "p")
+
+			h.PipelineStatus(c)
+
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("status = %d; body = %s", recorder.Code, recorder.Body.String())
+			}
+			var body struct {
+				LastExecution *struct {
+					LogState       string `json:"log_state"`
+					LogStateReason string `json:"log_state_reason"`
+				} `json:"last_execution"`
+			}
+			if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+				t.Fatal(err)
+			}
+			if body.LastExecution == nil || body.LastExecution.LogState != tt.wantState || body.LastExecution.LogStateReason != tt.wantReason {
+				t.Fatalf("last_execution = %#v, want state=%q reason=%q", body.LastExecution, tt.wantState, tt.wantReason)
+			}
+		})
+	}
+}
+
+func TestPipelineStatusDoesNotUseDiagnosticFromAnotherProject(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "users", "u", "projects", "other", "cache", "pipeline-isolated.failure.json")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(`{"version":1,"status":"failed","stage":"unknown","error_class":"unknown"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	failed := strings.Replace(pipelineOwnershipExecution("projects/p/locations/l/jobs/j/executions/isolated", "u", "p", "pipeline"), "EXECUTION_SUCCEEDED", "EXECUTION_FAILED", 1)
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == "/token" {
+			return testHTTPResponse(http.StatusOK, `{"access_token":"test-token"}`), nil
+		}
+		return testHTTPResponse(http.StatusOK, failed), nil
+	})}
+	h := New(localfs.New(root), nil, search.NewIndex(), conceptcache.New(), nil, nil)
+	h.httpClient = client
+	h.metadataTokenURL = "http://metadata.test/token"
+	h.cloudRunJobURL = "https://run.googleapis.com/v2/projects/p/locations/l/jobs/j:run"
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/api/v1/pipeline/status?execution_id=isolated", nil)
+	c.Set("userID", "u")
+	c.Set("projectID", "p")
+	h.PipelineStatus(c)
+	if recorder.Code != http.StatusOK || strings.Contains(recorder.Body.String(), `"log_state":"available"`) || strings.Contains(recorder.Body.String(), `"stage":"unknown"`) {
+		t.Fatalf("cross-project diagnostic leaked: status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestPipelineLogRendersSafeFailedDiagnostic(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "users", "u", "projects", "p", "cache")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "pipeline-render.failure.json"), []byte(`{"version":1,"status":"failed","stage":"concept_reconciliation","error_class":"child_exit","detail_code":"entity_mapping_article_source_missing","child_command":"run","exit_code":23}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "pipeline-render.log"), []byte("pipeline failed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	failed := strings.Replace(pipelineOwnershipExecution("projects/p/locations/l/jobs/j/executions/render", "u", "p", "pipeline"), "EXECUTION_SUCCEEDED", "EXECUTION_FAILED", 1)
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == "/token" {
+			return testHTTPResponse(http.StatusOK, `{"access_token":"test-token"}`), nil
+		}
+		return testHTTPResponse(http.StatusOK, failed), nil
+	})}
+	h := New(localfs.New(root), nil, search.NewIndex(), conceptcache.New(), nil, nil)
+	h.httpClient = client
+	h.metadataTokenURL = "http://metadata.test/token"
+	h.cloudRunJobURL = "https://run.googleapis.com/v2/projects/p/locations/l/jobs/j:run"
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/api/v1/pipeline/log?execution_id=render", nil)
+	c.Set("userID", "u")
+	c.Set("projectID", "p")
+	h.PipelineLog(c)
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), "stage: concept_reconciliation") || !strings.Contains(recorder.Body.String(), "exit_code: 23") || strings.Contains(recorder.Body.String(), "raw secret stdout") {
+		t.Fatalf("unsafe failed log rendering: status=%d body=%q", recorder.Code, recorder.Body.String())
+	}
+}
+
+func executionNameFromJSON(t *testing.T, data string) string {
+	t.Helper()
+	var execution cloudRunExecution
+	if err := json.Unmarshal([]byte(data), &execution); err != nil {
+		t.Fatal(err)
+	}
+	return execution.Name
+}
+
 func TestPipelineLogReturnsProjectScopedLog(t *testing.T) {
 	root := t.TempDir()
 	logPath := filepath.Join(root, "users", "request-user", "projects", "demo-project", "cache", "pipeline-olw-pipeline-abc123.log")
 	if err := os.MkdirAll(filepath.Dir(logPath), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(logPath, []byte("pipeline output\nstderr output\n"), 0o644); err != nil {
+	if err := os.WriteFile(logPath, []byte("pipeline completed\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -2119,7 +2315,7 @@ func TestPipelineLogReturnsProjectScopedLog(t *testing.T) {
 	if contentType := recorder.Header().Get("Content-Type"); !strings.HasPrefix(contentType, "text/plain") {
 		t.Fatalf("Content-Type = %q, want text/plain", contentType)
 	}
-	if body := recorder.Body.String(); body != "pipeline output\nstderr output\n" {
+	if body := recorder.Body.String(); body != "pipeline completed\n" {
 		t.Fatalf("body = %q", body)
 	}
 }

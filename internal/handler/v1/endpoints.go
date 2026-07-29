@@ -46,6 +46,42 @@ var (
 	errWikiStorageNotConfigured  = errors.New("wiki storage is not configured")
 )
 
+const (
+	pipelineLogStatePending     = "pending"
+	pipelineLogStateAvailable   = "available"
+	pipelineLogStateUnavailable = "unavailable"
+	maxPipelineDiagnosticBytes  = 4 << 10
+	maxPipelineLogBytes         = 64 << 10
+)
+
+var pipelineDiagnosticStages = map[string]struct{}{
+	"input_materialization": {}, "synto_migration": {}, "synto_config_normalization": {},
+	"synto_config_validation": {}, "synto_run": {}, "synto_index_export": {},
+	"source_reconciliation": {}, "concept_reconciliation": {}, "postprocess": {},
+	"generation_publish": {}, "receipt_recording": {}, "lease_cleanup": {}, "unknown": {},
+}
+
+var pipelineDiagnosticClasses = map[string]struct{}{
+	"validation": {}, "child_exit": {}, "timeout": {}, "cancellation": {}, "io": {},
+	"invalid_state": {}, "publication_conflict": {}, "recording_failure": {}, "unknown": {},
+}
+
+var pipelineDiagnosticDetails = map[string]struct{}{
+	"generated_map_read_decode": {}, "synto_index_truth": {}, "entity_mapping": {},
+	"entity_mapping_index_truth": {}, "entity_mapping_source_concept_identity": {},
+	"entity_mapping_article_identity": {}, "entity_mapping_article_path": {},
+	"entity_mapping_article_source_ambiguity": {}, "entity_mapping_article_source_missing": {},
+	"entity_mapping_article_source_disagreement": {}, "entity_mapping_duplicate_article_id": {},
+	"entity_mapping_duplicate_article_path": {}, "entity_mapping_duplicate_entity_id": {},
+	"entity_mapping_active_entity_unknown": {}, "entity_mapping_concept_slug_case": {},
+	"entity_mapping_concept_id_path_disagreement": {}, "entity_mapping_concept_missing_mapping": {},
+	"entity_mapping_concept_entity_collision": {}, "entity_merge": {}, "identity_reconciliation": {},
+	"lifecycle_planning": {}, "concept_page_rewrite": {}, "link_rewrite": {}, "cache_rewrite": {},
+	"artifact_write": {}, "artifact_remove": {},
+}
+
+var pipelineDiagnosticChildren = map[string]struct{}{"migrate_olw": {}, "run": {}, "pack_export": {}}
+
 // Health handles GET /api/v1/health.
 //
 //	@Summary		Health check
@@ -957,7 +993,7 @@ type cloudRunCondition struct {
 // PipelineStatus handles GET /api/v1/pipeline/status.
 //
 //	@Summary		Pipeline execution status
-//	@Description	Returns the latest Cloud Run pipeline execution for the current project. Pass execution_id to fetch a specific execution. When an execution is available, last_execution.log_url points to the authenticated log endpoint.
+//	@Description	Returns the latest Cloud Run pipeline execution for the current project, including a bounded typed failure diagnostic when available. Pass execution_id to fetch a specific execution. When an execution is available, last_execution.log_url points to the authenticated log endpoint.
 //	@Tags			pipeline
 //	@Produce		json
 //	@Param			execution_id	query		string	false	"Cloud Run execution ID"
@@ -1259,10 +1295,17 @@ func (h *Handler) pipelineExecutionStatusWithOwner(ctx context.Context, executio
 		if err != nil {
 			return nil, err
 		}
+		if shortCloudRunExecutionName(execution.Name, true) != executionID {
+			return nil, errPipelineExecutionNotFound
+		}
 		if owner != nil && !cloudRunExecutionOwnedBy(execution, owner.userID, owner.projectID) {
 			return nil, errPipelineExecutionNotFound
 		}
-		return newPipelineExecutionResponse(execution), nil
+		response := newPipelineExecutionResponse(execution)
+		if owner != nil {
+			h.attachPipelineDiagnostic(ctx, response, owner)
+		}
+		return response, nil
 	}
 
 	pageToken := ""
@@ -1279,7 +1322,9 @@ func (h *Handler) pipelineExecutionStatusWithOwner(ctx context.Context, executio
 		}
 		for _, execution := range executions.Executions {
 			if cloudRunExecutionOwnedBy(execution, owner.userID, owner.projectID) {
-				return newPipelineExecutionResponse(execution), nil
+				response := newPipelineExecutionResponse(execution)
+				h.attachPipelineDiagnostic(ctx, response, owner)
+				return response, nil
 			}
 		}
 		if executions.NextPageToken == "" {
@@ -1287,6 +1332,99 @@ func (h *Handler) pipelineExecutionStatusWithOwner(ctx context.Context, executio
 		}
 		pageToken = executions.NextPageToken
 	}
+}
+
+func (h *Handler) attachPipelineDiagnostic(ctx context.Context, response *handler.PipelineExecutionResponse, owner *pipelineExecutionOwner) {
+	if response == nil || owner == nil {
+		return
+	}
+	switch response.Status {
+	case "RUNNING", "UNKNOWN":
+		response.LogState = pipelineLogStatePending
+		return
+	case "SUCCEEDED", "CANCELLED":
+		response.LogState = pipelineLogStateAvailable
+		return
+	case "FAILED":
+		// Continue below: failed receipts are persisted asynchronously after the
+		// fixed failure event, so a missing object remains explicitly pending.
+	default:
+		response.LogState = pipelineLogStateUnavailable
+		response.LogStateReason = "unsupported_execution_status"
+		return
+	}
+
+	projectStore := h.store
+	if projectStore == nil {
+		response.LogState = pipelineLogStateUnavailable
+		response.LogStateReason = "storage_unavailable"
+		return
+	}
+	diagnostic, err := readPipelineFailureDiagnostic(ctx, projectStore.Scope(owner.userID, owner.projectID), response.Name)
+	if err == nil {
+		response.Diagnostic = diagnostic
+		response.LogState = pipelineLogStateAvailable
+		return
+	}
+	if errors.Is(err, storage.ErrObjectNotExist) {
+		response.LogState = pipelineLogStatePending
+		response.LogStateReason = "diagnostic_pending"
+		return
+	}
+	response.LogState = pipelineLogStateUnavailable
+	response.LogStateReason = "diagnostic_invalid"
+}
+
+func readPipelineFailureDiagnostic(ctx context.Context, projectStore store.Store, executionName string) (*handler.PipelineFailureDiagnostic, error) {
+	executionID := shortCloudRunExecutionName(executionName, true)
+	if executionID == "" {
+		return nil, errors.New("invalid execution name")
+	}
+	data, err := projectStore.ReadFile(ctx, "cache/pipeline-"+executionID+".failure.json")
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > maxPipelineDiagnosticBytes {
+		return nil, errors.New("diagnostic too large")
+	}
+	var diagnostic handler.PipelineFailureDiagnostic
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&diagnostic); err != nil {
+		return nil, err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		return nil, errors.New("diagnostic has trailing data")
+	}
+	if diagnostic.Version != 1 || diagnostic.Status != "failed" {
+		return nil, errors.New("unsupported diagnostic")
+	}
+	if _, ok := pipelineDiagnosticStages[diagnostic.Stage]; !ok {
+		return nil, errors.New("invalid diagnostic stage")
+	}
+	if _, ok := pipelineDiagnosticClasses[diagnostic.ErrorClass]; !ok {
+		return nil, errors.New("invalid diagnostic class")
+	}
+	if diagnostic.DetailCode != "" {
+		if diagnostic.Stage != "concept_reconciliation" {
+			return nil, errors.New("invalid diagnostic detail")
+		}
+		if _, ok := pipelineDiagnosticDetails[diagnostic.DetailCode]; !ok {
+			return nil, errors.New("invalid diagnostic detail")
+		}
+	}
+	if diagnostic.Child != "" {
+		if _, ok := pipelineDiagnosticChildren[diagnostic.Child]; !ok {
+			return nil, errors.New("invalid diagnostic child")
+		}
+	} else if diagnostic.ExitCode != nil {
+		return nil, errors.New("diagnostic exit code without child")
+	}
+	if diagnostic.ExitCode != nil && (*diagnostic.ExitCode < 0 || *diagnostic.ExitCode > 255) {
+		return nil, errors.New("invalid diagnostic exit code")
+	}
+	return &diagnostic, nil
 }
 
 func (h *Handler) fetchCloudRunExecution(ctx context.Context, token, executionID string) (cloudRunExecution, error) {
@@ -1395,7 +1533,7 @@ func pipelineLogURLForExecution(execution cloudRunExecution) string {
 // PipelineLog handles GET /api/v1/pipeline/log.
 //
 //	@Summary		Read pipeline log
-//	@Description	Returns the stdout and stderr log captured by the pipeline worker for the current project execution.
+//	@Description	Returns the finite pipeline event and, for failed executions, a bounded allowlisted failure diagnostic for the current project execution.
 //	@Tags			pipeline
 //	@Produce		plain
 //	@Param			execution_id	query		string	true	"Cloud Run execution ID"
@@ -1425,7 +1563,8 @@ func (h *Handler) PipelineLog(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, handler.ErrorResponse{Error: err.Error()})
 		return
 	}
-	if _, err := h.pipelineExecutionStatusForOwner(c.Request.Context(), executionID, userID, projectID); err != nil {
+	execution, err := h.pipelineExecutionStatusForOwner(c.Request.Context(), executionID, userID, projectID)
+	if err != nil {
 		if errors.Is(err, errPipelineExecutionNotFound) {
 			c.JSON(http.StatusNotFound, handler.ErrorResponse{Error: errPipelineExecutionNotFound.Error()})
 			return
@@ -1448,7 +1587,46 @@ func (h *Handler) PipelineLog(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: generatedDataUnavailableMessage})
 		return
 	}
+	if len(data) > maxPipelineLogBytes {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: generatedDataUnavailableMessage})
+		return
+	}
+	if !isFinitePipelineEvent(data) {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: generatedDataUnavailableMessage})
+		return
+	}
+	if execution.Status == "FAILED" {
+		// Failed worker stdout/stderr is intentionally suppressed. Only the
+		// finite event and validated allowlist receipt may cross this boundary.
+		if execution.Diagnostic == nil {
+			c.Data(http.StatusOK, "text/plain; charset=utf-8", []byte("pipeline failed\n"))
+			return
+		}
+		var rendered strings.Builder
+		rendered.WriteString("pipeline failed\n")
+		fmt.Fprintf(&rendered, "stage: %s\nerror_class: %s\n", execution.Diagnostic.Stage, execution.Diagnostic.ErrorClass)
+		if execution.Diagnostic.DetailCode != "" {
+			fmt.Fprintf(&rendered, "detail_code: %s\n", execution.Diagnostic.DetailCode)
+		}
+		if execution.Diagnostic.Child != "" {
+			fmt.Fprintf(&rendered, "child_command: %s\n", execution.Diagnostic.Child)
+		}
+		if execution.Diagnostic.ExitCode != nil {
+			fmt.Fprintf(&rendered, "exit_code: %d\n", *execution.Diagnostic.ExitCode)
+		}
+		c.Data(http.StatusOK, "text/plain; charset=utf-8", []byte(rendered.String()))
+		return
+	}
 	c.Data(http.StatusOK, "text/plain; charset=utf-8", data)
+}
+
+func isFinitePipelineEvent(data []byte) bool {
+	switch string(data) {
+	case "pipeline completed\n", "pipeline failed\n", "pipeline committed cleanup failed\n":
+		return true
+	default:
+		return false
+	}
 }
 
 func pipelineLogPath(executionID string) (string, error) {
