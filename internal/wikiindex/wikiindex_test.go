@@ -154,8 +154,8 @@ func TestIsSyntoRootPageExactPathsOnly(t *testing.T) {
 		{path: "wiki/nested/log.md", want: false},
 	}
 	for _, tt := range tests {
-		if got := IsSyntoRootPage(tt.path); got != tt.want {
-			t.Errorf("IsSyntoRootPage(%q) = %v, want %v", tt.path, got, tt.want)
+		if got := isSyntoRootPage(tt.path); got != tt.want {
+			t.Errorf("isSyntoRootPage(%q) = %v, want %v", tt.path, got, tt.want)
 		}
 	}
 }
