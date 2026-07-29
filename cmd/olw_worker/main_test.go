@@ -692,6 +692,94 @@ func TestWorkspaceRejectsDuplicateMappedRawPath(t *testing.T) {
 	}
 }
 
+func TestSnapshotSourcesLegacyFallback(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		idMap     string
+		pages     map[string]string
+		raw       map[string]string
+		wantError string
+	}{
+		{
+			name:  "success uses authoritative source ID",
+			idMap: `{"concept":{},"source":{"stable-source":"source"},"redirects":{}}`,
+			pages: map[string]string{"source": "---\nid: not-the-stable-id\nsource_file: raw/source.md\n---\nsource\n"},
+			raw:   map[string]string{"raw/source.md": "raw source"},
+		},
+		{
+			name:      "missing page",
+			idMap:     `{"source":{"stable-source":"source"}}`,
+			wantError: "missing legacy source page",
+		},
+		{
+			name:      "malformed frontmatter",
+			idMap:     `{"source":{"stable-source":"source"}}`,
+			pages:     map[string]string{"source": "not frontmatter\n"},
+			wantError: "parse legacy source page",
+		},
+		{
+			name:      "missing source_file",
+			idMap:     `{"source":{"stable-source":"source"}}`,
+			pages:     map[string]string{"source": "---\nid: source\n---\nsource\n"},
+			wantError: "missing or unsafe legacy source_file",
+		},
+		{
+			name:      "unsafe source_file",
+			idMap:     `{"source":{"stable-source":"source"}}`,
+			pages:     map[string]string{"source": "---\nsource_file: raw/../escape.md\n---\nsource\n"},
+			wantError: "missing or unsafe legacy source_file",
+		},
+		{
+			name:      "duplicate raw path",
+			idMap:     `{"source":{"stable-a":"a","stable-b":"b"}}`,
+			pages:     map[string]string{"a": "---\nsource_file: raw/same.md\n---\n", "b": "---\nsource_file: raw/same.md\n---\n"},
+			wantError: "duplicate source mapping",
+		},
+		{
+			name:      "duplicate source slug",
+			idMap:     `{"source":{"stable-a":"same","stable-b":"same"}}`,
+			pages:     map[string]string{"same": "---\nsource_file: raw/same.md\n---\n"},
+			wantError: "duplicate legacy source slug",
+		},
+		{
+			name:      "source and source metadata disagree",
+			idMap:     `{"source":{"stable-source":"source"},"source_meta":{"stable-source":{"slug":"other","source_file":"raw/source.md"}}}`,
+			wantError: "source metadata slug disagrees",
+		},
+		{
+			name:      "mixed metadata duplicate raw path",
+			idMap:     `{"source":{"stable-a":"a","stable-b":"b"},"source_meta":{"stable-a":{"slug":"a","source_file":"raw/same.md"}}}`,
+			pages:     map[string]string{"b": "---\nsource_file: raw/same.md\n---\n"},
+			wantError: "duplicate source mapping",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			vault := t.TempDir()
+			for path, body := range tc.raw {
+				mustWriteFile(t, filepath.Join(vault, filepath.FromSlash(path)), []byte(body))
+			}
+			for slug, page := range tc.pages {
+				mustWriteFile(t, filepath.Join(vault, "wiki", "sources", slug+".md"), []byte(page))
+			}
+			mustWriteFile(t, filepath.Join(vault, "cache", "id_map.json"), []byte(tc.idMap))
+
+			got, err := snapshotSources(vault)
+			if tc.wantError != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantError) {
+					t.Fatalf("snapshotSources() error=%v, want substring %q", err, tc.wantError)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("snapshotSources() error=%v", err)
+			}
+			if len(got) != 1 || got[0].SourceID != "stable-source" || got[0].RawPath != "raw/source.md" || string(got[0].RawBytes) != "raw source" || got[0].Tombstone || !got[0].Dirty {
+				t.Fatalf("snapshotSources() = %#v", got)
+			}
+		})
+	}
+}
+
 func TestWorkspaceRequiresFirstCommandToBeRunBeforeLeaseOrExecution(t *testing.T) {
 	old := execOLW
 	defer func() { execOLW = old }()

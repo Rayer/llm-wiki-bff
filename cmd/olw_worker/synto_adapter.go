@@ -857,12 +857,6 @@ func readSyntoIndexTruth(workspace string) (syntoIndexTruth, error) {
 // pack export is the release-supported path that serializes the authoritative
 // schema-v1 INDEX.json without another provider call.
 func ensureSyntoIndex(ctx context.Context, vault string, env []string) error {
-	exportDir, err := os.MkdirTemp("", "lwc-synto-index-")
-	if err != nil {
-		return newWorkerFailure(ctx, failureStageSyntoIndexExport, failureClassIO, "", fmt.Errorf("create Synto INDEX export directory: %w", err))
-	}
-	defer os.RemoveAll(exportDir)
-	command := []string{"pack", "export", "--target", "agents", "--out", exportDir}
 	if !isDefaultSyntoExecutor() {
 		// Existing reconciliation fixtures install an already validated INDEX
 		// from their fake Synto run. They do not model the external pack exporter;
@@ -874,18 +868,9 @@ func ensureSyntoIndex(ctx context.Context, vault string, env []string) error {
 			}
 		}
 	}
-	if err := execOLW(ctx, vault, command, env, io.Discard, io.Discard); err != nil {
-		return fmt.Errorf("Synto offline INDEX export failed: %w", newWorkerFailure(ctx, failureStageSyntoIndexExport, failureClassChildExit, failureChildPackExport, err))
-	}
-	data, err := readBoundedRegularFileWithin(exportDir, "index/INDEX.json")
+	data, err := exportSyntoIndex(ctx, vault, env)
 	if err != nil {
-		// Existing unit fixtures predate the production export gate and replace
-		// the executor with a no-op. Keep those fixtures focused on reconciliation;
-		// the real executor remains fail-closed when the documented export is absent.
-		return newWorkerFailure(ctx, failureStageSyntoIndexExport, failureClassStateInvalid, "", fmt.Errorf("Synto offline INDEX export missing index/INDEX.json: %w", err))
-	}
-	if _, err := decodeSyntoIndex(data); err != nil {
-		return newWorkerFailure(ctx, failureStageSyntoIndexExport, failureClassStateInvalid, "", fmt.Errorf("Synto offline INDEX export is invalid: %w", err))
+		return err
 	}
 	if err := writeFileAtomicWithin(vault, ".synto/INDEX.json", data); err != nil {
 		return newWorkerFailure(ctx, failureStageSyntoIndexExport, failureClassIO, "", fmt.Errorf("install authoritative .synto/INDEX.json: %w", err))
@@ -893,6 +878,293 @@ func ensureSyntoIndex(ctx context.Context, vault string, env []string) error {
 	if _, err := readSyntoIndexTruth(vault); err != nil {
 		return newWorkerFailure(ctx, failureStageSyntoIndexExport, failureClassStateInvalid, "", fmt.Errorf("validate installed .synto/INDEX.json: %w", err))
 	}
+	return nil
+}
+
+func exportSyntoIndex(ctx context.Context, vault string, env []string) ([]byte, error) {
+	exportDir, err := os.MkdirTemp("", "lwc-synto-index-")
+	if err != nil {
+		return nil, newWorkerFailure(ctx, failureStageSyntoIndexExport, failureClassIO, "", fmt.Errorf("create Synto INDEX export directory: %w", err))
+	}
+	defer os.RemoveAll(exportDir)
+	command := []string{"pack", "export", "--target", "agents", "--out", exportDir}
+	if err := execOLW(ctx, vault, command, env, io.Discard, io.Discard); err != nil {
+		return nil, fmt.Errorf("Synto offline INDEX export failed: %w", newWorkerFailure(ctx, failureStageSyntoIndexExport, failureClassChildExit, failureChildPackExport, err))
+	}
+	data, err := readBoundedRegularFileWithin(exportDir, "index/INDEX.json")
+	if err != nil {
+		return nil, newWorkerFailure(ctx, failureStageSyntoIndexExport, failureClassStateInvalid, "", fmt.Errorf("Synto offline INDEX export missing index/INDEX.json: %w", err))
+	}
+	concepts, err := readBoundedRegularFileWithinLimit(exportDir, "agent/concepts.json", maxSyntoIndexBytes)
+	if err != nil {
+		return nil, newWorkerFailure(ctx, failureStageSyntoIndexExport, failureClassStateInvalid, "", fmt.Errorf("Synto offline concepts export missing agent/concepts.json: %w", err))
+	}
+	data, err = enrichSyntoIndexWithAgentConcepts(data, concepts)
+	if err != nil {
+		return nil, newWorkerFailure(ctx, failureStageSyntoIndexExport, failureClassStateInvalid, "", fmt.Errorf("Synto offline export identity join failed: %w", err))
+	}
+	if _, err := decodeSyntoIndex(data); err != nil {
+		return nil, newWorkerFailure(ctx, failureStageSyntoIndexExport, failureClassStateInvalid, "", fmt.Errorf("Synto offline INDEX export is invalid: %w", err))
+	}
+	return data, nil
+}
+
+type syntoAgentConcept struct {
+	EntityID           string
+	CanonicalArticleID *string
+	ArticlePath        *string
+}
+
+type syntoArticleProofKey struct {
+	ID   string
+	Path string
+}
+
+// enrichSyntoIndexWithAgentConcepts joins the two artifacts produced by one
+// agents pack export. Agent concepts are the only supported proof for an
+// omitted INDEX article entity_id; source names and source-path sets are not
+// identity evidence.
+func enrichSyntoIndexWithAgentConcepts(indexData, conceptsData []byte) ([]byte, error) {
+	index, err := decodeSyntoIndex(indexData)
+	if err != nil {
+		return nil, fmt.Errorf("decode INDEX.json: %w", err)
+	}
+	concepts, err := decodeSyntoAgentConcepts(conceptsData)
+	if err != nil {
+		return nil, fmt.Errorf("decode agent/concepts.json: %w", err)
+	}
+
+	byID := make(map[string]int, len(index.Articles))
+	byPath := make(map[string]int, len(index.Articles))
+	for i, article := range index.Articles {
+		path, err := normalizeSyntoArticlePath(article.Path)
+		if err != nil {
+			return nil, fmt.Errorf("article %q has unsafe path: %w", article.ID, err)
+		}
+		if article.ID != "" {
+			if previous, exists := byID[article.ID]; exists && previous != i {
+				return nil, fmt.Errorf("duplicate INDEX article ID %q", article.ID)
+			}
+			byID[article.ID] = i
+		}
+		if previous, exists := byPath[path]; exists && previous != i {
+			return nil, fmt.Errorf("duplicate INDEX article path %q", article.Path)
+		}
+		byPath[path] = i
+	}
+
+	proofs := make(map[syntoArticleProofKey]string, len(concepts))
+	entityOwners := make(map[string]syntoArticleProofKey, len(concepts))
+	for _, concept := range concepts {
+		if concept.CanonicalArticleID == nil && concept.ArticlePath == nil {
+			continue
+		}
+		if concept.CanonicalArticleID == nil || concept.ArticlePath == nil {
+			return nil, errors.New("agent concept has incomplete canonical article binding")
+		}
+		path, err := normalizeSyntoArticlePath(*concept.ArticlePath)
+		if err != nil {
+			return nil, fmt.Errorf("agent concept article_path: %w", err)
+		}
+		idIndex, idExists := byID[*concept.CanonicalArticleID]
+		pathIndex, pathExists := byPath[path]
+		if !idExists || !pathExists {
+			return nil, fmt.Errorf("agent concept canonical article does not match INDEX: %q/%q", *concept.CanonicalArticleID, *concept.ArticlePath)
+		}
+		if idIndex != pathIndex {
+			return nil, fmt.Errorf("agent concept canonical article ID/path disagreement: %q/%q", *concept.CanonicalArticleID, *concept.ArticlePath)
+		}
+		if concept.EntityID == "" || !annotation.ValidSourceID(concept.EntityID) {
+			return nil, errors.New("agent concept has invalid entity_id")
+		}
+		key := syntoArticleProofKey{ID: *concept.CanonicalArticleID, Path: path}
+		if previous, exists := proofs[key]; exists {
+			if previous == concept.EntityID {
+				return nil, fmt.Errorf("agent concept article has duplicate canonical article proof: %q", key.ID)
+			}
+			return nil, fmt.Errorf("agent concept article has multiple entity_id values: %q", key.ID)
+		}
+		if previous, exists := entityOwners[concept.EntityID]; exists && previous != key {
+			return nil, fmt.Errorf("agent entity_id %q maps to multiple articles", concept.EntityID)
+		}
+		proofs[key] = concept.EntityID
+		entityOwners[concept.EntityID] = key
+		article := index.Articles[idIndex]
+		if article.EntityID != "" && article.EntityID != concept.EntityID {
+			return nil, fmt.Errorf("agent concept entity_id disagrees with INDEX article %q", article.ID)
+		}
+	}
+
+	if len(proofs) == 0 {
+		return indexData, nil
+	}
+	var document map[string]json.RawMessage
+	if err := json.Unmarshal(indexData, &document); err != nil {
+		return nil, fmt.Errorf("decode INDEX document: %w", err)
+	}
+	var articles []map[string]json.RawMessage
+	if err := json.Unmarshal(document["articles"], &articles); err != nil {
+		return nil, fmt.Errorf("decode INDEX articles: %w", err)
+	}
+	for i := range articles {
+		article := index.Articles[i]
+		if article.EntityID != "" {
+			continue
+		}
+		path, err := normalizeSyntoArticlePath(article.Path)
+		if err != nil {
+			return nil, fmt.Errorf("article %q has unsafe path: %w", article.ID, err)
+		}
+		entityID, exists := proofs[syntoArticleProofKey{ID: article.ID, Path: path}]
+		if !exists {
+			continue
+		}
+		encoded, err := json.Marshal(entityID)
+		if err != nil {
+			return nil, err
+		}
+		articles[i]["entity_id"] = encoded
+	}
+	document["articles"], err = json.Marshal(articles)
+	if err != nil {
+		return nil, fmt.Errorf("encode INDEX articles: %w", err)
+	}
+	joined, err := json.Marshal(document)
+	if err != nil {
+		return nil, fmt.Errorf("encode INDEX document: %w", err)
+	}
+	return joined, nil
+}
+
+func decodeSyntoAgentConcepts(data []byte) ([]syntoAgentConcept, error) {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	token, err := dec.Token()
+	if err != nil {
+		return nil, err
+	}
+	if token != json.Delim('{') {
+		return nil, errors.New("agent concepts must be an object")
+	}
+	seen := map[string]bool{}
+	var concepts []syntoAgentConcept
+	for dec.More() {
+		keyToken, err := dec.Token()
+		if err != nil {
+			return nil, err
+		}
+		key, ok := keyToken.(string)
+		if !ok || seen[key] {
+			return nil, errors.New("duplicate or invalid agent concepts key")
+		}
+		seen[key] = true
+		switch key {
+		case "schema_version":
+			var version int
+			if err := dec.Decode(&version); err != nil || version != 1 {
+				return nil, errors.New("agent concepts schema_version must be 1")
+			}
+		case "concepts":
+			concepts, err = decodeSyntoAgentConceptList(dec)
+			if err != nil {
+				return nil, err
+			}
+		default:
+			return nil, fmt.Errorf("unsupported agent concepts field %q", key)
+		}
+	}
+	if _, err := dec.Token(); err != nil {
+		return nil, err
+	}
+	if err := generation.EnsureJSONEOF(dec); err != nil {
+		return nil, err
+	}
+	for _, key := range []string{"schema_version", "concepts"} {
+		if !seen[key] {
+			return nil, fmt.Errorf("missing agent concepts field %q", key)
+		}
+	}
+	return concepts, nil
+}
+
+func decodeSyntoAgentConceptList(dec *json.Decoder) ([]syntoAgentConcept, error) {
+	token, err := dec.Token()
+	if err != nil || token != json.Delim('[') {
+		return nil, errors.New("agent concepts must be an array")
+	}
+	concepts := make([]syntoAgentConcept, 0)
+	for dec.More() {
+		if len(concepts) >= generation.MaxFiles {
+			return nil, generation.ErrLogicalEntryLimit
+		}
+		var concept syntoAgentConcept
+		var canonicalArticleID, articlePath *string
+		var name string
+		seen, err := decodeSyntoObject(dec, map[string]bool{
+			"name": true, "entity_id": true, "aliases": true,
+			"canonical_article_id": true, "article_path": true, "related_names": true,
+		}, func(key string, dec *json.Decoder) error {
+			switch key {
+			case "name":
+				return decodeStringInto(dec, &name, 4096)
+			case "entity_id":
+				return decodeStringInto(dec, &concept.EntityID, 1024)
+			case "aliases", "related_names":
+				_, err := decodeBoundedStringArray(dec, 4096)
+				return err
+			case "canonical_article_id":
+				return decodeNullableStringInto(dec, &canonicalArticleID, 1024)
+			case "article_path":
+				return decodeNullableStringInto(dec, &articlePath, generation.MaxPathBytes)
+			}
+			return nil
+		})
+		if err != nil {
+			return nil, err
+		}
+		for _, key := range []string{"name", "entity_id", "aliases", "canonical_article_id", "article_path", "related_names"} {
+			if !seen[key] {
+				return nil, fmt.Errorf("missing agent concept field %q", key)
+			}
+		}
+		if name == "" {
+			return nil, errors.New("agent concept name is empty")
+		}
+		if concept.EntityID != "" && !annotation.ValidSourceID(concept.EntityID) {
+			return nil, errors.New("agent concept entity_id is unsafe")
+		}
+		if canonicalArticleID != nil && !annotation.ValidSourceID(*canonicalArticleID) {
+			return nil, errors.New("agent concept canonical_article_id is unsafe")
+		}
+		if articlePath != nil {
+			if _, err := normalizeSyntoArticlePath(*articlePath); err != nil {
+				return nil, fmt.Errorf("agent concept article_path is unsafe: %w", err)
+			}
+		}
+		concept.CanonicalArticleID = canonicalArticleID
+		concept.ArticlePath = articlePath
+		concepts = append(concepts, concept)
+	}
+	if _, err := dec.Token(); err != nil {
+		return nil, err
+	}
+	return concepts, nil
+}
+
+func decodeNullableStringInto(dec *json.Decoder, target **string, max int) error {
+	token, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	if token == nil {
+		*target = nil
+		return nil
+	}
+	value, ok := token.(string)
+	if !ok || len(value) > max {
+		return errors.New("invalid bounded nullable string")
+	}
+	*target = &value
 	return nil
 }
 
@@ -991,9 +1263,6 @@ func mapSyntoEntityIDsFromIndexTruth(index syntoIndexTruth, concepts map[string]
 		if article.EntityID != "" && len(byNameEntities[article.Name]) > 0 && !byNameEntities[article.Name][article.EntityID] {
 			return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingArticleSourceDisagreement, cause: fmt.Errorf("Synto INDEX.json article/source disagreement for %q", slug)}
 		}
-		if entityID == "" && sourceEntity != "" {
-			entityID = sourceEntity
-		}
 		articleEntityOmitted := article.EntityID == ""
 		priorByArticleID, priorIDPresent := priorByID[article.ID]
 		priorByArticlePath, priorPathPresent := priorBySlug[slug]
@@ -1022,6 +1291,9 @@ func mapSyntoEntityIDsFromIndexTruth(index syntoIndexTruth, concepts map[string]
 		priorEvidence := 0
 		if priorIdentityPresent && priorIdentity.EntityID != "" {
 			priorEvidence = countPriorOwnedSourceEdges(index.SourceConcepts, priorIdentity, "")
+		}
+		if articleEntityOmitted && priorIdentityPresent && priorIdentity.EntityID != "" && priorEvidence == 0 && sourceEntity != "" {
+			return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingConceptIDPathDisagreement, cause: fmt.Errorf("prior article identity lacks current source evidence for %q", slug)}
 		}
 		if articleEntityOmitted && entityID == "" && priorIdentityPresent {
 			// Pack export may omit article.entity_id. The prior LWC-owned

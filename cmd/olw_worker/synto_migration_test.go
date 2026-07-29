@@ -493,6 +493,83 @@ func TestSyntoMigrationMissingPipelineReachesRunAfterNormalization(t *testing.T)
 	}
 }
 
+func TestRunWorkerBatchLegacyFullTransactionPreservesIdentityAndSourceLifecycle(t *testing.T) {
+	old := execOLW
+	t.Cleanup(func() { execOLW = old })
+
+	vault := t.TempDir()
+	workspaceDir := t.TempDir()
+	const rawBody = "legacy source body"
+	contentHash := sha256Text(rawBody)
+	mustWriteFile(t, filepath.Join(vault, "wiki.toml"), []byte("name = \"legacy\"\n"))
+	writeValidSQLiteState(t, filepath.Join(vault, ".olw", "state.db"))
+	mustWriteFile(t, filepath.Join(vault, "raw", "source.md"), []byte(rawBody))
+	mustWriteFile(t, filepath.Join(vault, "wiki", "alpha.md"), []byte("---\nid: stable-alpha\nsources:\n  - stable-source\n---\nlegacy article\n"))
+	mustWriteFile(t, filepath.Join(vault, "wiki", "sources", "source.md"), []byte("---\nid: legacy-source\nsource_file: raw/source.md\n---\nlegacy source\n"))
+	mustWriteFile(t, filepath.Join(vault, "cache", "id_map.json"), []byte(`{"concept":{"stable-alpha":"alpha"},"source":{"stable-source":"source"},"redirects":{}}`))
+	mustWriteFile(t, filepath.Join(vault, "cache", "concepts.jsonl"), []byte(`{"slug":"alpha","frontmatter":{"id":"stable-alpha","sources":["stable-source"]}}`+"\n"))
+	rawBefore := []byte(rawBody)
+
+	postRunIndex := `{"schema_version":1,"pack":{"id":"fixture","name":"fixture","version":"0","language":["en"],"capabilities":["articles","concepts"]},"articles":[{"id":"generated-alpha","name":"Drifted Alpha","path":"articles/alpha.md","summary":null,"tags":[],"aliases":[],"confidence":"high"}],"terms":[],"papers":[],"sources":[],"source_concepts":[{"source_path":"raw/source.md","content_hash":"` + contentHash + `","concepts":[{"name":"Unrelated source label","entity_id":"entity-alpha"}]}],"synthesis":[],"stats":{"article_count":1,"draft_count":0,"concept_count":1,"alias_count":0,"knowledge_item_count":0,"source_count":1,"source_segment_count":0,"failed_note_count":0,"failed_concept_count":0}}`
+	conceptsExport := `{"schema_version":1,"concepts":[{"name":"Drifted Alpha","entity_id":"entity-alpha","aliases":[],"canonical_article_id":"generated-alpha","article_path":"articles/alpha.md","related_names":[]}]}`
+	var commands []string
+	execOLW = func(_ context.Context, work string, command []string, _ []string, _, _ io.Writer) error {
+		commands = append(commands, strings.Join(command, " "))
+		switch command[0] {
+		case "migrate-olw":
+			if len(command) != 3 || command[1] != "--vault" || command[2] != work {
+				return fmt.Errorf("unexpected migration command %v", command)
+			}
+			mustWriteFile(t, filepath.Join(work, "synto.toml"), []byte("[models]\nfast = \"offline\"\n"))
+			writeValidSQLiteState(t, filepath.Join(work, ".synto", "state.db"))
+		case "run":
+			if len(command) != 2 || command[1] != "--auto-approve" {
+				return fmt.Errorf("unexpected run command %v", command)
+			}
+			mustWriteFile(t, filepath.Join(work, "wiki", "alpha.md"), []byte("---\nid: generated-alpha\nsources:\n  - transient-source\n---\nDrifted Alpha\n"))
+			mustWriteFile(t, filepath.Join(work, "wiki", "sources", "source.md"), []byte("---\nid: transient-source\nsource_file: raw/source.md\n---\ngenerated source\n"))
+			mustWriteFile(t, filepath.Join(work, "cache", "id_map.json"), []byte(`{"concept":{"generated-alpha":"alpha"},"source":{"transient-source":"source"},"redirects":{}}`))
+			mustWriteFile(t, filepath.Join(work, "cache", "concepts.jsonl"), []byte(`{"slug":"alpha","frontmatter":{"id":"generated-alpha","sources":["transient-source"]}}`+"\n"))
+			writeValidSQLiteState(t, filepath.Join(work, ".synto", "state.db"))
+		case "pack":
+			if len(command) != 6 || command[1] != "export" || command[2] != "--target" || command[3] != "agents" || command[4] != "--out" {
+				return fmt.Errorf("unexpected export command %v", command)
+			}
+			mustWriteFile(t, filepath.Join(command[5], "index", "INDEX.json"), []byte(postRunIndex))
+			mustWriteFile(t, filepath.Join(command[5], "agent", "concepts.json"), []byte(conceptsExport))
+		default:
+			return fmt.Errorf("unexpected Synto command %v", command)
+		}
+		return nil
+	}
+
+	cfg := workerConfig{VaultPath: vault, APIKey: "offline", Workspace: true, WorkspaceDir: workspaceDir, Postprocess: true, StopOnError: true}
+	if err := runWorkerBatch(context.Background(), cfg, `[["run","--auto-approve"]]`); err != nil {
+		t.Fatalf("full legacy transaction failed: %v", err)
+	}
+	if len(commands) != 3 || !strings.HasPrefix(commands[0], "migrate-olw --vault ") || commands[1] != "run --auto-approve" || !strings.HasPrefix(commands[2], "pack export --target agents --out ") {
+		t.Fatalf("Synto command sequence = %#v, want migrate -> run -> one pack export", commands)
+	}
+	ids := mustSnapshotIDMap(t, vault)
+	if ids.Concept["stable-alpha"] != "alpha" || ids.ConceptEntityID["stable-alpha"] != "entity-alpha" {
+		t.Fatalf("published concept identity = %#v, want stable-alpha -> alpha/entity-alpha", ids)
+	}
+	if _, exists := ids.Concept["generated-alpha"]; exists {
+		t.Fatalf("transient generated concept ID remained: %#v", ids.Concept)
+	}
+	if ids.Source["stable-source"] != "source" || ids.Source["transient-source"] != "" {
+		t.Fatalf("published source identity = %#v, want stable-source -> source", ids.Source)
+	}
+	sourcePage, err := os.ReadFile(filepath.Join(vault, "wiki", "sources", "source.md"))
+	if err != nil || !strings.Contains(string(sourcePage), "id: stable-source\n") {
+		t.Fatalf("published source page = %q, err=%v", sourcePage, err)
+	}
+	rawAfter, err := os.ReadFile(filepath.Join(vault, "raw", "source.md"))
+	if err != nil || !bytes.Equal(rawAfter, rawBefore) {
+		t.Fatalf("original raw source changed: %q, err=%v", rawAfter, err)
+	}
+}
+
 func TestNormalizeMigratedSyntoConfigPreservesSemantics(t *testing.T) {
 	input := []byte(`title = "migrated"
 numbers = [1, 2, 3]
@@ -1029,6 +1106,7 @@ func TestWorkerProductionSequenceInstallsPackExportIndexBeforePostprocess(t *tes
 			return fmt.Errorf("unexpected offline command %v", command)
 		}
 		mustWriteFile(t, filepath.Join(command[5], "index", "INDEX.json"), generatedIndex)
+		mustWriteFile(t, filepath.Join(command[5], "agent", "concepts.json"), []byte(`{"schema_version":1,"concepts":[{"name":"Alpha","entity_id":"entity-alpha","aliases":[],"canonical_article_id":null,"article_path":null,"related_names":[]}]}`))
 		return nil
 	}
 	if err := runWorkerBatch(context.Background(), workerConfig{VaultPath: vault, APIKey: "offline", Workspace: true, WorkspaceDir: workspaceDir, Postprocess: true}, `[["run","--auto-approve"]]`); err != nil {
@@ -1040,6 +1118,121 @@ func TestWorkerProductionSequenceInstallsPackExportIndexBeforePostprocess(t *tes
 	if _, err := os.Stat(filepath.Join(vault, ".synto", "INDEX.json")); err != nil {
 		t.Fatalf("authoritative INDEX was not published: %v", err)
 	}
+}
+
+func TestSyntoOfflineExportJoinsAgentConceptIdentity(t *testing.T) {
+	old := execOLW
+	t.Cleanup(func() { execOLW = old })
+	vault := t.TempDir()
+	index := strings.Replace(syntoIndexFixture("article", "entity-alpha", "alpha", false), `"entity_id":"entity-alpha",`, "", 1)
+	concepts := `{"schema_version":1,"concepts":[{"name":"Alpha","entity_id":"entity-alpha","aliases":[],"canonical_article_id":"article","article_path":"articles/alpha.md","related_names":[]}]}`
+	execOLW = func(_ context.Context, _ string, command []string, _ []string, _, _ io.Writer) error {
+		if len(command) != 6 || command[0] != "pack" || command[1] != "export" {
+			return fmt.Errorf("unexpected command %v", command)
+		}
+		mustWriteFile(t, filepath.Join(command[5], "index", "INDEX.json"), []byte(index))
+		mustWriteFile(t, filepath.Join(command[5], "agent", "concepts.json"), []byte(concepts))
+		return nil
+	}
+	joined, err := exportSyntoIndex(context.Background(), vault, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	truth, err := decodeSyntoIndex(joined)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(truth.Articles) != 1 || truth.Articles[0].EntityID != "entity-alpha" {
+		t.Fatalf("joined INDEX articles = %#v, want authoritative entity", truth.Articles)
+	}
+}
+
+func TestSyntoAgentConceptJoinFailsClosed(t *testing.T) {
+	base := strings.Replace(syntoIndexFixture("article-a", "entity-a", "alpha", false), `"entity_id":"entity-a",`, "", 1)
+	tests := []struct {
+		name     string
+		index    string
+		concepts string
+		want     string
+	}{
+		{name: "ID-only match", index: base, concepts: agentConceptsFixture(`"canonical_article_id":"article-a","article_path":null`, `"entity_id":"entity-a"`), want: "incomplete canonical article binding"},
+		{name: "path-only match", index: base, concepts: agentConceptsFixture(`"canonical_article_id":null,"article_path":"articles/alpha.md"`, `"entity_id":"entity-a"`), want: "incomplete canonical article binding"},
+		{name: "ID/path point to different articles", index: strings.Replace(strings.Replace(syntoIndexFixtureWithEntitiesHash([]string{"article-a:entity-a:alpha", "article-b:entity-b:beta"}, nil, strings.Repeat("0", 64)), `"entity_id":"entity-a",`, "", 1), `"entity_id":"entity-b",`, "", 1), concepts: agentConceptsFixture(`"canonical_article_id":"article-a","article_path":"articles/beta.md"`, `"entity_id":"entity-a"`), want: "ID/path disagreement"},
+		{name: "same article multiple entities", index: base, concepts: `{"schema_version":1,"concepts":[{"name":"Alpha","entity_id":"entity-a","aliases":[],"canonical_article_id":"article-a","article_path":"articles/alpha.md","related_names":[]},{"name":"Alpha alias","entity_id":"entity-b","aliases":[],"canonical_article_id":"article-a","article_path":"articles/alpha.md","related_names":[]}]}`, want: "multiple entity_id"},
+		{name: "same article duplicate proof", index: base, concepts: `{"schema_version":1,"concepts":[{"name":"Alpha","entity_id":"entity-a","aliases":[],"canonical_article_id":"article-a","article_path":"articles/alpha.md","related_names":[]},{"name":"Alpha duplicate","entity_id":"entity-a","aliases":[],"canonical_article_id":"article-a","article_path":"articles/alpha.md","related_names":[]}]}`, want: "duplicate canonical article proof"},
+		{name: "unsafe entity", index: base, concepts: agentConceptsFixture(`"canonical_article_id":"article-a","article_path":"articles/alpha.md"`, `"entity_id":"../escape"`), want: "entity_id is unsafe"},
+		{name: "unsafe ID", index: base, concepts: agentConceptsFixture(`"canonical_article_id":"../escape","article_path":"articles/alpha.md"`, `"entity_id":"entity-a"`), want: "canonical_article_id is unsafe"},
+		{name: "unsafe path", index: base, concepts: agentConceptsFixture(`"canonical_article_id":"article-a","article_path":"../alpha.md"`, `"entity_id":"entity-a"`), want: "article_path is unsafe"},
+		{name: "linked entry without entity", index: base, concepts: agentConceptsFixture(`"canonical_article_id":"article-a","article_path":"articles/alpha.md"`, `"entity_id":""`), want: "invalid entity_id"},
+		{name: "malformed trailing JSON", index: base, concepts: agentConceptsFixture(`"canonical_article_id":"article-a","article_path":"articles/alpha.md"`, `"entity_id":"entity-a"`) + ` {}`, want: "unexpected trailing JSON"},
+		{name: "schema mismatch", index: base, concepts: strings.Replace(agentConceptsFixture(`"canonical_article_id":"article-a","article_path":"articles/alpha.md"`, `"entity_id":"entity-a"`), `"schema_version":1`, `"schema_version":2`, 1), want: "schema_version must be 1"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := enrichSyntoIndexWithAgentConcepts([]byte(tc.index), []byte(tc.concepts)); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("join error=%v, want substring %q", err, tc.want)
+			}
+		})
+	}
+
+	joined, err := enrichSyntoIndexWithAgentConcepts([]byte(base), []byte(`{"schema_version":1,"concepts":[{"name":"Other","entity_id":"entity-other","aliases":[],"canonical_article_id":null,"article_path":null,"related_names":[]}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	truth, err := decodeSyntoIndex(joined)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mapSyntoEntityIDsFromIndexTruth(truth, map[string]string{"article-a": "alpha"}); err == nil || !strings.Contains(err.Error(), "no source_concepts entity_id") {
+		t.Fatalf("ordinary article without proof error=%v, want fail-closed missing-source proof", err)
+	}
+}
+
+func TestSyntoOmittedArticleDoesNotUseExactSourceNameAsIdentity(t *testing.T) {
+	base := strings.Replace(syntoIndexFixture("article-a", "entity-a", "alpha", true), `"entity_id":"entity-a",`, "", 1)
+	concepts := agentConceptsFixture(`"canonical_article_id":null,"article_path":null`, `"entity_id":"entity-a"`)
+	joined, err := enrichSyntoIndexWithAgentConcepts([]byte(base), []byte(concepts))
+	if err != nil {
+		t.Fatalf("enrichment with unbound exact-name concept failed: %v", err)
+	}
+	truth, err := decodeSyntoIndex(joined)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if truth.Articles[0].EntityID != "" {
+		t.Fatalf("enrichment assigned omitted article entity=%q", truth.Articles[0].EntityID)
+	}
+	var reconciliationErr *conceptReconciliationFailure
+	if got, err := mapSyntoEntityIDsFromIndexTruth(truth, map[string]string{"article-a": "alpha"}); err == nil || got != nil || !errors.As(err, &reconciliationErr) || reconciliationErr.detail != conceptDetailEntityMappingArticleSourceMissing {
+		t.Fatalf("exact source-name identity result=%#v error=%v, want typed article-source missing failure", got, err)
+	}
+}
+
+func TestSyntoDirectAgentProofAcceptsTitleDriftWithConsistentSourceEdge(t *testing.T) {
+	base := syntoIndexFixture("article-a", "entity-a", "alpha", true)
+	base = strings.Replace(base, `"entity_id":"entity-a",`, "", 1)
+	base = strings.ReplaceAll(base, `"path":"wiki/alpha.md"`, `"path":"articles/alpha.md"`)
+	base = strings.ReplaceAll(base, `"name":"alpha"`, `"name":"INDEX Title Drift"`)
+	concepts := agentConceptsFixture(`"canonical_article_id":"article-a","article_path":"articles/alpha.md"`, `"entity_id":"entity-a"`)
+	joined, err := enrichSyntoIndexWithAgentConcepts([]byte(base), []byte(concepts))
+	if err != nil {
+		t.Fatal(err)
+	}
+	truth, err := decodeSyntoIndex(joined)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := mapSyntoEntityIDsFromIndexTruth(truth, map[string]string{"article-a": "alpha"})
+	if err != nil {
+		t.Fatalf("direct agent proof with title drift was rejected: %v", err)
+	}
+	if got["article-a"] != "entity-a" {
+		t.Fatalf("entity mapping=%#v, want article-a -> entity-a", got)
+	}
+}
+
+func agentConceptsFixture(binding, entity string) string {
+	return `{"schema_version":1,"concepts":[{"name":"Alpha",` + entity + `,"aliases":[],` + binding + `,"related_names":[]}]}`
 }
 
 func TestSyntoMigrationStateMatrixFailsClosedBeforeChild(t *testing.T) {
