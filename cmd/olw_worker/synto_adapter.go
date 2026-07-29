@@ -949,6 +949,9 @@ func mapSyntoEntityIDsFromIndexTruth(index syntoIndexTruth, concepts map[string]
 		if err != nil {
 			return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingArticlePath, cause: err}
 		}
+		if wikiindex.IsSyntoRootPage(article.Path) {
+			continue
+		}
 		entityID := article.EntityID
 		if entityID == "" {
 			if ambiguousNames[article.Name] {

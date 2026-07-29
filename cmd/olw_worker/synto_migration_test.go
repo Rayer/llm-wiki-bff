@@ -1846,6 +1846,26 @@ func TestSyntoIdentityLogRejectsMergeAndSplitLineage(t *testing.T) {
 	}
 }
 
+func TestMapSyntoEntityIDsFromIndexTruthIgnoresReservedRootPages(t *testing.T) {
+	index := syntoIndexTruthForEntityMapping(
+		[]syntoIndexEntry{
+			{ID: "article-alpha", EntityID: "entity-alpha", Name: "Alpha", Path: "wiki/alpha.md"},
+			{ID: "article-index", Name: "Index", Path: "wiki/index.md"},
+			{ID: "article-log", Name: "Log", Path: "wiki/log.md"},
+		},
+		[]syntoSourceConcept{{Name: "Alpha", EntityID: "entity-alpha"}},
+		nil,
+	)
+
+	got, err := mapSyntoEntityIDsFromIndexTruth(index, map[string]string{"article-alpha": "alpha"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got["article-alpha"] != "entity-alpha" {
+		t.Fatalf("entity mapping = %#v, want article-alpha -> entity-alpha only", got)
+	}
+}
+
 func TestMapSyntoEntityIDsFromIndexTruthConceptIterationIsDeterministic(t *testing.T) {
 	index := syntoIndexTruthForEntityMapping(
 		[]syntoIndexEntry{
