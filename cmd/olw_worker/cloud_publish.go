@@ -335,7 +335,8 @@ func runCloudWorkerBatch(ctx context.Context, cfg workerConfig, commands [][]str
 	cfg.VaultPath = workspace
 	cfg.Workspace = false
 	cfg.SuppressOutput = true
-	if err := runWorkerBatchAtVault(ctx, cfg, commands, workspace); err != nil {
+	err = runWorkerBatchAtVault(ctx, cfg, commands, workspace)
+	if err != nil {
 		failure := preserveWorkerFailure(err, failureStageSyntoRun, failureClassUnknown)
 		primary := errCloudPipelineExecution
 		if recordErr := writeCloudFailureReceipts(ctx, objects, prefix, workspace, cfg, snapshots, failure); recordErr != nil {

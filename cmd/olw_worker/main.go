@@ -242,6 +242,7 @@ func configFromEnvironment(cfg workerConfig) workerConfig {
 }
 
 func runWorkerBatchAtVault(ctx context.Context, cfg workerConfig, commands [][]string, vault string) error {
+	var err error
 	if err := cleanStaleLock(vault, 5*time.Minute); err != nil {
 		return preserveWorkerFailure(err, failureStageLeaseCleanup, failureClassStateInvalid)
 	}
@@ -328,7 +329,8 @@ func runWorkerBatchWorkspace(ctx context.Context, cfg workerConfig, commands [][
 	if err := materializeSnapshots(workspace, snapshots); err != nil {
 		return err
 	}
-	if err := runWorkerBatchAtVault(ctx, cfg, commands, workspace); err != nil {
+	err = runWorkerBatchAtVault(ctx, cfg, commands, workspace)
+	if err != nil {
 		logErr := publishWorkspaceFailureLog(workspace, vault, cfg)
 		var recordErr error
 		recordErr = recordFailure(vault, snapshots, err)
@@ -1167,28 +1169,31 @@ func snapshotSources(vault string) ([]sourceSnapshot, error) {
 		return nil, fmt.Errorf("decode source map: %w", err)
 	}
 
-	snapshots := make([]sourceSnapshot, 0, len(ids.SourceMeta))
-	mappedRawPaths := make(map[string]string, len(ids.SourceMeta))
-	for sourceID, meta := range ids.SourceMeta {
-		rawPath := strings.TrimSpace(meta.SourceFile)
+	capacity := len(ids.SourceMeta)
+	if len(ids.Source) > capacity {
+		capacity = len(ids.Source)
+	}
+	snapshots := make([]sourceSnapshot, 0, capacity)
+	mappedRawPaths := make(map[string]string, capacity)
+	addSnapshot := func(sourceID, rawPath string) error {
 		if !annotation.ValidSourceID(sourceID) || !safeMappedRawPath(rawPath) {
-			return nil, fmt.Errorf("unsafe source mapping %q -> %q", sourceID, rawPath)
+			return fmt.Errorf("unsafe source mapping %q -> %q", sourceID, rawPath)
 		}
 		if prior, exists := mappedRawPaths[rawPath]; exists {
-			return nil, fmt.Errorf("duplicate source mapping %q and %q -> %q", prior, sourceID, rawPath)
+			return fmt.Errorf("duplicate source mapping %q and %q -> %q", prior, sourceID, rawPath)
 		}
 		mappedRawPaths[rawPath] = sourceID
 		raw, err := readRegularFileWithin(vault, rawPath)
 		if errors.Is(err, os.ErrNotExist) {
 			snapshots = append(snapshots, sourceSnapshot{SourceID: sourceID, RawPath: rawPath, Tombstone: true})
-			continue
+			return nil
 		}
 		if err != nil {
-			return nil, fmt.Errorf("read source raw %q: %w", rawPath, err)
+			return fmt.Errorf("read source raw %q: %w", rawPath, err)
 		}
 		ann, err := readAnnotation(vault, sourceID, rawPath)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		rawSum := sha256.Sum256(raw)
 		rawSHA := fmt.Sprintf("%x", rawSum[:])
@@ -1201,6 +1206,69 @@ func snapshotSources(vault string) ([]sourceSnapshot, error) {
 		}
 		snapshot.SyntoContentHash = syntoSourceContentHash(snapshot)
 		snapshots = append(snapshots, snapshot)
+		return nil
+	}
+
+	if len(ids.Source) == 0 {
+		for sourceID, meta := range ids.SourceMeta {
+			if err := addSnapshot(sourceID, strings.TrimSpace(meta.SourceFile)); err != nil {
+				return nil, err
+			}
+		}
+	} else {
+		for sourceID := range ids.SourceMeta {
+			if _, exists := ids.Source[sourceID]; !exists {
+				return nil, fmt.Errorf("source metadata %q has no source mapping", sourceID)
+			}
+		}
+		sourceIDs := make([]string, 0, len(ids.Source))
+		for sourceID := range ids.Source {
+			sourceIDs = append(sourceIDs, sourceID)
+		}
+		sort.Strings(sourceIDs)
+		mappedSlugs := make(map[string]string, len(ids.Source))
+		for _, sourceID := range sourceIDs {
+			if !annotation.ValidSourceID(sourceID) {
+				return nil, fmt.Errorf("unsafe source mapping %q -> %q", sourceID, ids.Source[sourceID])
+			}
+			slug := ids.Source[sourceID]
+			pagePath, err := safeSourcePagePath(slug)
+			if err != nil || strings.TrimSpace(slug) != slug {
+				return nil, fmt.Errorf("unsafe source mapping %q -> %q", sourceID, slug)
+			}
+			if prior, exists := mappedSlugs[slug]; exists {
+				return nil, fmt.Errorf("duplicate legacy source slug %q for %q and %q", slug, prior, sourceID)
+			}
+			mappedSlugs[slug] = sourceID
+
+			meta, hasMeta := ids.SourceMeta[sourceID]
+			rawPath := strings.TrimSpace(meta.SourceFile)
+			if hasMeta {
+				if meta.Slug != "" && meta.Slug != slug {
+					return nil, fmt.Errorf("source metadata slug disagrees for %q: %q != %q", sourceID, meta.Slug, slug)
+				}
+			} else {
+				page, readErr := readBoundedRegularFileWithin(vault, pagePath)
+				if errors.Is(readErr, os.ErrNotExist) {
+					return nil, fmt.Errorf("missing legacy source page %q: %w", pagePath, readErr)
+				}
+				if readErr != nil {
+					return nil, fmt.Errorf("read legacy source page %q: %w", pagePath, readErr)
+				}
+				parsed, parseErr := parseSyntoSourcePage(page)
+				if parseErr != nil {
+					return nil, fmt.Errorf("parse legacy source page %q: %w", pagePath, parseErr)
+				}
+				value, ok := parsed.fields["source_file"].(string)
+				rawPath = strings.TrimSpace(value)
+				if !ok || !safeMappedRawPath(rawPath) {
+					return nil, fmt.Errorf("missing or unsafe legacy source_file for %q", pagePath)
+				}
+			}
+			if err := addSnapshot(sourceID, rawPath); err != nil {
+				return nil, err
+			}
+		}
 	}
 	sort.Slice(snapshots, func(i, j int) bool { return snapshots[i].SourceID < snapshots[j].SourceID })
 	return snapshots, nil
