@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path"
 	"sort"
@@ -374,6 +375,28 @@ func (c *Client) ReadFileLimited(ctx context.Context, relPath string, limit int6
 	path, expected, err := c.resolveReadPath(relPath, view)
 	if err != nil {
 		return nil, err
+	}
+	if c.backend == nil && view.manifest == nil {
+		object := c.bucket.Object(path)
+		if expected > 0 {
+			object = object.Generation(expected)
+		}
+		r, err := object.NewReader(ctx)
+		if err != nil {
+			if objectNotFound(err) {
+				return nil, store.ErrObjectNotExist
+			}
+			return nil, fmt.Errorf("read %s: %w", path, err)
+		}
+		data, readErr := io.ReadAll(io.LimitReader(r, limit))
+		closeErr := r.Close()
+		if readErr != nil {
+			return nil, readErr
+		}
+		if closeErr != nil {
+			return nil, closeErr
+		}
+		return data, nil
 	}
 	object, err := c.readObject(ctx, path, expected, limit)
 	if err != nil {
