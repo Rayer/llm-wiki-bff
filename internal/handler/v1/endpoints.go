@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"cloud.google.com/go/firestore"
 	"cloud.google.com/go/storage"
@@ -23,6 +24,7 @@ import (
 	"github.com/rayer/llm-wiki-bff/internal/gcs"
 	"github.com/rayer/llm-wiki-bff/internal/handler"
 	"github.com/rayer/llm-wiki-bff/internal/llm"
+	"github.com/rayer/llm-wiki-bff/internal/pipelinediagnostic"
 	"github.com/rayer/llm-wiki-bff/internal/pipelinequota"
 	"github.com/rayer/llm-wiki-bff/internal/search"
 	store "github.com/rayer/llm-wiki-bff/internal/storage"
@@ -52,37 +54,10 @@ const (
 	pipelineLogStateUnavailable = "unavailable"
 	maxPipelineDiagnosticBytes  = 4 << 10
 	maxPipelineLogBytes         = 64 << 10
+	maxPipelineLogReadBytes     = pipelinediagnostic.MaxPipelineLogBytes
 )
 
 const pipelineLogResponseTruncationMarker = "\n[output truncated by API at 65536 bytes]\n"
-
-var pipelineDiagnosticStages = map[string]struct{}{
-	"input_materialization": {}, "synto_migration": {}, "synto_config_normalization": {},
-	"synto_config_validation": {}, "synto_run": {}, "synto_index_export": {},
-	"source_reconciliation": {}, "concept_reconciliation": {}, "postprocess": {},
-	"generation_publish": {}, "receipt_recording": {}, "lease_cleanup": {}, "unknown": {},
-}
-
-var pipelineDiagnosticClasses = map[string]struct{}{
-	"validation": {}, "child_exit": {}, "timeout": {}, "cancellation": {}, "io": {},
-	"invalid_state": {}, "publication_conflict": {}, "recording_failure": {}, "unknown": {},
-}
-
-var pipelineDiagnosticDetails = map[string]struct{}{
-	"generated_map_read_decode": {}, "synto_index_truth": {}, "entity_mapping": {},
-	"entity_mapping_index_truth": {}, "entity_mapping_source_concept_identity": {},
-	"entity_mapping_article_identity": {}, "entity_mapping_article_path": {},
-	"entity_mapping_article_source_ambiguity": {}, "entity_mapping_article_source_missing": {},
-	"entity_mapping_article_source_disagreement": {}, "entity_mapping_duplicate_article_id": {},
-	"entity_mapping_duplicate_article_path": {}, "entity_mapping_duplicate_entity_id": {},
-	"entity_mapping_active_entity_unknown": {}, "entity_mapping_concept_slug_case": {},
-	"entity_mapping_concept_id_path_disagreement": {}, "entity_mapping_concept_missing_mapping": {},
-	"entity_mapping_concept_entity_collision": {}, "entity_merge": {}, "identity_reconciliation": {},
-	"lifecycle_planning": {}, "concept_page_rewrite": {}, "link_rewrite": {}, "cache_rewrite": {},
-	"artifact_write": {}, "artifact_remove": {},
-}
-
-var pipelineDiagnosticChildren = map[string]struct{}{"migrate_olw": {}, "run": {}, "pack_export": {}}
 
 // Health handles GET /api/v1/health.
 //
@@ -1364,8 +1339,8 @@ func (h *Handler) attachPipelineDiagnostic(ctx context.Context, response *handle
 		_ = logData
 		response.LogState = pipelineLogStateAvailable
 	} else if errors.Is(logErr, storage.ErrObjectNotExist) {
-		response.LogState = pipelineLogStatePending
-		response.LogStateReason = "log_pending"
+		response.LogState = pipelineLogStateUnavailable
+		response.LogStateReason = "log_unavailable"
 	} else {
 		response.LogState = pipelineLogStateUnavailable
 		response.LogStateReason = "log_unavailable"
@@ -1390,7 +1365,7 @@ func readPipelineLog(ctx context.Context, projectStore store.Store, executionNam
 	if !ok {
 		return nil, errors.New("bounded pipeline log reader unavailable")
 	}
-	data, err := reader.ReadFileLimited(ctx, "cache/pipeline-"+executionID+".log", maxPipelineLogBytes+1)
+	data, err := reader.ReadFileLimited(ctx, "cache/pipeline-"+executionID+".log", maxPipelineLogReadBytes+1)
 	if err != nil {
 		return nil, err
 	}
@@ -1402,8 +1377,22 @@ func boundedPipelineLogResponse(data []byte) []byte {
 	if len(text) <= maxPipelineLogBytes {
 		return []byte(text)
 	}
-	limit := maxPipelineLogBytes - len(pipelineLogResponseTruncationMarker)
-	return []byte(text[:limit] + pipelineLogResponseTruncationMarker)
+	available := maxPipelineLogBytes - len(pipelineLogResponseTruncationMarker)
+	headLimit := available / 2
+	tailLimit := available - headLimit
+	headEnd := headLimit
+	for headEnd > 0 && !utf8.RuneStart(text[headEnd]) {
+		headEnd--
+	}
+	tailStart := len(text) - tailLimit
+	for tailStart < len(text) && !utf8.RuneStart(text[tailStart]) {
+		tailStart++
+	}
+	result := make([]byte, 0, maxPipelineLogBytes)
+	result = append(result, text[:headEnd]...)
+	result = append(result, pipelineLogResponseTruncationMarker...)
+	result = append(result, text[tailStart:]...)
+	return result
 }
 
 func readPipelineFailureDiagnostic(ctx context.Context, projectStore store.Store, executionName string) (*handler.PipelineFailureDiagnostic, error) {
@@ -1431,22 +1420,22 @@ func readPipelineFailureDiagnostic(ctx context.Context, projectStore store.Store
 	if diagnostic.Version != 1 || diagnostic.Status != "failed" {
 		return nil, errors.New("unsupported diagnostic")
 	}
-	if _, ok := pipelineDiagnosticStages[diagnostic.Stage]; !ok {
+	if _, ok := pipelinediagnostic.ValidStages[pipelinediagnostic.Stage(diagnostic.Stage)]; !ok {
 		return nil, errors.New("invalid diagnostic stage")
 	}
-	if _, ok := pipelineDiagnosticClasses[diagnostic.ErrorClass]; !ok {
+	if _, ok := pipelinediagnostic.ValidErrorClasses[pipelinediagnostic.ErrorClass(diagnostic.ErrorClass)]; !ok {
 		return nil, errors.New("invalid diagnostic class")
 	}
 	if diagnostic.DetailCode != "" {
 		if diagnostic.Stage != "concept_reconciliation" {
 			return nil, errors.New("invalid diagnostic detail")
 		}
-		if _, ok := pipelineDiagnosticDetails[diagnostic.DetailCode]; !ok {
+		if _, ok := pipelinediagnostic.ValidDetailCodes[pipelinediagnostic.DetailCode(diagnostic.DetailCode)]; !ok {
 			return nil, errors.New("invalid diagnostic detail")
 		}
 	}
 	if diagnostic.Child != "" {
-		if _, ok := pipelineDiagnosticChildren[diagnostic.Child]; !ok {
+		if _, ok := pipelinediagnostic.ValidChildCommands[pipelinediagnostic.ChildCommand(diagnostic.Child)]; !ok {
 			return nil, errors.New("invalid diagnostic child")
 		}
 	} else if diagnostic.ExitCode != nil {

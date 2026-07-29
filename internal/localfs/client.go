@@ -751,6 +751,17 @@ func ensureWithinExistingParent(root, target string) error {
 	if err != nil {
 		return err
 	}
+	if _, err := os.Lstat(absTarget); err == nil {
+		resolvedTarget, err := filepath.EvalSymlinks(absTarget)
+		if err != nil {
+			return err
+		}
+		if !within(resolvedRoot, resolvedTarget) {
+			return fmt.Errorf("path escapes project root through symlink")
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
 
 	parent := filepath.Dir(absTarget)
 	for {

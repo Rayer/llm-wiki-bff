@@ -17,6 +17,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"cloud.google.com/go/storage"
 	"github.com/gin-gonic/gin"
@@ -24,6 +25,7 @@ import (
 	conceptcache "github.com/rayer/llm-wiki-bff/internal/cache"
 	"github.com/rayer/llm-wiki-bff/internal/firestore"
 	"github.com/rayer/llm-wiki-bff/internal/gcs"
+	"github.com/rayer/llm-wiki-bff/internal/handler"
 	"github.com/rayer/llm-wiki-bff/internal/localfs"
 	"github.com/rayer/llm-wiki-bff/internal/pipelinequota"
 	"github.com/rayer/llm-wiki-bff/internal/search"
@@ -2041,8 +2043,63 @@ func TestPipelineLogReturnsOwnedArbitraryOperationalOutput(t *testing.T) {
 func TestBoundedPipelineLogResponseUsesValidUTF8AndMarker(t *testing.T) {
 	data := append([]byte("prefix \xff\n"), bytes.Repeat([]byte("x"), maxPipelineLogBytes)...)
 	got := boundedPipelineLogResponse(data)
-	if len(got) > maxPipelineLogBytes || !strings.HasSuffix(string(got), pipelineLogResponseTruncationMarker) || !strings.Contains(string(got), "�") {
-		t.Fatalf("bounded log = len %d suffix=%q", len(got), got[max(0, len(got)-len(pipelineLogResponseTruncationMarker)):])
+	if len(got) > maxPipelineLogBytes || !strings.Contains(string(got), pipelineLogResponseTruncationMarker) || !strings.Contains(string(got), "�") {
+		t.Fatalf("bounded log = len %d, want valid replacement and marker", len(got))
+	}
+}
+
+func TestPipelineLogPreservesTerminalTailAfterHead(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "users", "request-user", "projects", "demo-project", "cache")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	tail := "terminal reject: source missing after ordinary output\n"
+	data := append(bytes.Repeat([]byte("ordinary output\n"), 5000), []byte(tail)...)
+	if err := os.WriteFile(filepath.Join(dir, "pipeline-owned-tail.log"), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	owned := pipelineOwnershipExecution("projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline/executions/owned-tail", "request-user", "demo-project", "pipeline")
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == "/token" {
+			return testHTTPResponse(http.StatusOK, `{"access_token":"test-token"}`), nil
+		}
+		return testHTTPResponse(http.StatusOK, owned), nil
+	})}
+	h := New(localfs.New(root), nil, search.NewIndex(), conceptcache.New(), nil, nil)
+	h.httpClient = client
+	h.metadataTokenURL = "http://metadata.test/token"
+	h.cloudRunJobURL = "https://run.googleapis.com/v2/projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline:run"
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/api/v1/pipeline/log?execution_id=owned-tail", nil)
+	c.Set("userID", "request-user")
+	c.Set("projectID", "demo-project")
+
+	h.PipelineLog(c)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d; body = %s", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), "ordinary output") || !strings.Contains(recorder.Body.String(), tail) {
+		t.Fatalf("body omitted head or terminal tail: %q", recorder.Body.String())
+	}
+	if len(recorder.Body.Bytes()) > maxPipelineLogBytes || !strings.Contains(recorder.Body.String(), pipelineLogResponseTruncationMarker) {
+		t.Fatalf("body len=%d, want bounded head+tail response", recorder.Body.Len())
+	}
+}
+
+func TestBoundedPipelineLogResponseDoesNotSplitUTF8AtAdversarialBoundary(t *testing.T) {
+	limit := maxPipelineLogBytes - len(pipelineLogResponseTruncationMarker)
+	data := append(bytes.Repeat([]byte("a"), limit-1), []byte("€"+strings.Repeat("z", 128)+"terminal reject")...)
+
+	got := boundedPipelineLogResponse(data)
+
+	if !utf8.Valid(got) {
+		t.Fatalf("bounded log is invalid UTF-8: %q", got)
+	}
+	if !strings.Contains(string(got), "terminal reject") || len(got) > maxPipelineLogBytes {
+		t.Fatalf("bounded log = len %d, want valid tail and bound", len(got))
 	}
 }
 
@@ -2188,6 +2245,101 @@ func TestPipelineStatusProjectsOwnedFailureDiagnostic(t *testing.T) {
 	}
 }
 
+func TestPipelineFailureDiagnosticAcceptsEveryWorkerProducedSchemaValue(t *testing.T) {
+	stages := []string{
+		"input_materialization", "synto_migration", "synto_config_normalization",
+		"synto_config_validation", "synto_run", "synto_index_export",
+		"source_reconciliation", "concept_reconciliation", "postprocess",
+		"generation_publish", "receipt_recording", "lease_cleanup", "unknown",
+	}
+	classes := []string{
+		"validation", "child_exit", "timeout", "cancelled", "io", "state_invalid",
+		"publish_conflict", "recording_failure", "unknown",
+	}
+	details := []string{
+		"generated_map_read_decode", "synto_index_truth", "entity_mapping",
+		"entity_mapping_index_truth", "entity_mapping_source_concept_identity",
+		"entity_mapping_article_identity", "entity_mapping_article_path",
+		"entity_mapping_article_source_ambiguity", "entity_mapping_article_source_missing",
+		"entity_mapping_article_source_disagreement", "entity_mapping_duplicate_article_id",
+		"entity_mapping_duplicate_article_path", "entity_mapping_duplicate_entity_id",
+		"entity_mapping_active_entity_unknown", "entity_mapping_concept_slug_case",
+		"entity_mapping_concept_id_path_disagreement", "entity_mapping_concept_missing_mapping",
+		"entity_mapping_concept_entity_collision", "entity_merge", "identity_reconciliation",
+		"lifecycle_planning", "concept_page_rewrite", "link_rewrite", "cache_rewrite",
+		"artifact_write", "artifact_remove",
+	}
+	children := []string{"migrate-olw", "run", "pack-export"}
+
+	tests := make([]struct {
+		name       string
+		stage      string
+		class      string
+		detailCode string
+		child      string
+	}, 0, len(stages)+len(classes)+len(details)+len(children))
+	for _, stage := range stages {
+		tests = append(tests, struct {
+			name       string
+			stage      string
+			class      string
+			detailCode string
+			child      string
+		}{"stage/" + stage, stage, "unknown", "", ""})
+	}
+	for _, class := range classes {
+		tests = append(tests, struct {
+			name       string
+			stage      string
+			class      string
+			detailCode string
+			child      string
+		}{"class/" + class, "unknown", class, "", ""})
+	}
+	for _, detail := range details {
+		tests = append(tests, struct {
+			name       string
+			stage      string
+			class      string
+			detailCode string
+			child      string
+		}{"detail/" + detail, "concept_reconciliation", "unknown", detail, ""})
+	}
+	for _, child := range children {
+		tests = append(tests, struct {
+			name       string
+			stage      string
+			class      string
+			detailCode string
+			child      string
+		}{"child/" + child, "synto_run", "child_exit", "", child})
+	}
+
+	root := t.TempDir()
+	project := localfs.New(root).WithScope("u", "p")
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			data, err := json.Marshal(handler.PipelineFailureDiagnostic{
+				Version: 1, Status: "failed", Stage: tc.stage, ErrorClass: tc.class,
+				DetailCode: tc.detailCode, Child: tc.child,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(root, "users", "u", "projects", "p", "cache", "pipeline-schema.failure.json")
+			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, data, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := readPipelineFailureDiagnostic(context.Background(), project, "projects/p/locations/l/jobs/j/executions/schema"); err != nil {
+				t.Fatalf("worker-produced value rejected: %s: %v", string(data), err)
+			}
+		})
+	}
+}
+
 func TestPipelineStatusDiagnosticStates(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -2199,7 +2351,9 @@ func TestPipelineStatusDiagnosticStates(t *testing.T) {
 	}{
 		{name: "running pending", statusBody: pipelineRunningOwnershipExecution("projects/p/locations/l/jobs/j/executions/running", "u", "p"), wantState: "pending"},
 		{name: "success available", statusBody: pipelineOwnershipExecution("projects/p/locations/l/jobs/j/executions/success", "u", "p", "pipeline"), raw: "success output\n", wantState: "available"},
-		{name: "failed delayed", statusBody: strings.Replace(pipelineOwnershipExecution("projects/p/locations/l/jobs/j/executions/delayed", "u", "p", "pipeline"), "EXECUTION_SUCCEEDED", "EXECUTION_FAILED", 1), wantState: "pending", wantReason: "log_pending"},
+		{name: "succeeded missing", statusBody: pipelineOwnershipExecution("projects/p/locations/l/jobs/j/executions/succeeded-missing", "u", "p", "pipeline"), wantState: "unavailable", wantReason: "log_unavailable"},
+		{name: "failed delayed", statusBody: strings.Replace(pipelineOwnershipExecution("projects/p/locations/l/jobs/j/executions/delayed", "u", "p", "pipeline"), "EXECUTION_SUCCEEDED", "EXECUTION_FAILED", 1), wantState: "unavailable", wantReason: "log_unavailable"},
+		{name: "cancelled missing", statusBody: strings.Replace(pipelineOwnershipExecution("projects/p/locations/l/jobs/j/executions/cancelled-missing", "u", "p", "pipeline"), "EXECUTION_SUCCEEDED", "EXECUTION_CANCELLED", 1), wantState: "unavailable", wantReason: "log_unavailable"},
 		{name: "failed malformed", statusBody: strings.Replace(pipelineOwnershipExecution("projects/p/locations/l/jobs/j/executions/malformed", "u", "p", "pipeline"), "EXECUTION_SUCCEEDED", "EXECUTION_FAILED", 1), diagnostic: `{"version":1,"status":"failed","stage":"unknown","error_class":"unknown","unknown":"nope"}`, raw: "raw survives malformed diagnostic\n", wantState: "available"},
 		{name: "failed oversized", statusBody: strings.Replace(pipelineOwnershipExecution("projects/p/locations/l/jobs/j/executions/oversized", "u", "p", "pipeline"), "EXECUTION_SUCCEEDED", "EXECUTION_FAILED", 1), diagnostic: strings.Repeat("x", maxPipelineDiagnosticBytes+1), raw: "raw survives oversized diagnostic\n", wantState: "available"},
 	}
@@ -2258,6 +2412,50 @@ func TestPipelineStatusDiagnosticStates(t *testing.T) {
 			}
 			if body.LastExecution == nil || body.LastExecution.LogState != tt.wantState || body.LastExecution.LogStateReason != tt.wantReason {
 				t.Fatalf("last_execution = %#v, want state=%q reason=%q", body.LastExecution, tt.wantState, tt.wantReason)
+			}
+		})
+	}
+}
+
+func TestAttachPipelineDiagnosticTerminalUnavailableStoreIsFinite(t *testing.T) {
+	for _, status := range []string{"FAILED", "SUCCEEDED", "CANCELLED"} {
+		t.Run(status, func(t *testing.T) {
+			h := New(nil, nil, search.NewIndex(), conceptcache.New(), nil, nil)
+			response := &handler.PipelineExecutionResponse{Status: status}
+			h.attachPipelineDiagnostic(context.Background(), response, &pipelineExecutionOwner{userID: "u", projectID: "p"})
+			if response.LogState != pipelineLogStateUnavailable || response.LogStateReason != "storage_unavailable" {
+				t.Fatalf("response=%+v, want finite unavailable storage state", response)
+			}
+		})
+	}
+}
+
+type pipelineLogErrorRoot struct {
+	store.RootStore
+	err error
+}
+
+func (r pipelineLogErrorRoot) Scope(userID, projectID string) store.Store {
+	return pipelineLogErrorStore{Store: r.RootStore.Scope(userID, projectID), err: r.err}
+}
+
+type pipelineLogErrorStore struct {
+	store.Store
+	err error
+}
+
+func (s pipelineLogErrorStore) ReadFileLimited(context.Context, string, int64) ([]byte, error) {
+	return nil, s.err
+}
+
+func TestAttachPipelineDiagnosticTerminalMalformedStoreIsFinite(t *testing.T) {
+	h := New(pipelineLogErrorRoot{RootStore: localfs.New(t.TempDir()), err: errors.New("malformed provider response")}, nil, search.NewIndex(), conceptcache.New(), nil, nil)
+	for _, status := range []string{"FAILED", "SUCCEEDED", "CANCELLED"} {
+		t.Run(status, func(t *testing.T) {
+			response := &handler.PipelineExecutionResponse{Status: status}
+			h.attachPipelineDiagnostic(context.Background(), response, &pipelineExecutionOwner{userID: "u", projectID: "p"})
+			if response.LogState != pipelineLogStateUnavailable || response.LogStateReason != "log_unavailable" {
+				t.Fatalf("response=%+v, want finite unavailable log state", response)
 			}
 		})
 	}

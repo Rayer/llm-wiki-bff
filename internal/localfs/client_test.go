@@ -175,6 +175,27 @@ func TestMissingFileUsesStorageNotFound(t *testing.T) {
 	}
 }
 
+func TestReadFileLimitedRejectsFinalSymlinkOutsideProject(t *testing.T) {
+	root := t.TempDir()
+	outside := filepath.Join(t.TempDir(), "outside.log")
+	if err := os.WriteFile(outside, []byte("tenant-secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	project := filepath.Join(root, "users", "u", "projects", "p")
+	if err := os.MkdirAll(filepath.Join(project, "cache"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(project, "cache", "pipeline-escape.log")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Fatal(err)
+	}
+
+	client := New(root).WithScope("u", "p")
+	if _, err := client.ReadFileLimited(context.Background(), "cache/pipeline-escape.log", 1024); err == nil {
+		t.Fatal("ReadFileLimited followed final symlink outside project")
+	}
+}
+
 func TestConditionalAnnotationWrites(t *testing.T) {
 	client := New(t.TempDir()).WithScope("u", "p")
 	ctx := context.Background()

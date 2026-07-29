@@ -353,6 +353,12 @@ func runCloudWorkerBatch(ctx context.Context, cfg workerConfig, commands [][]str
 	}
 	if _, _, err := publishCloudGenerationFromStart(ctx, objects, prefix, workspace, snapshots, manifestData, manifestAttrs, manifestAttrs.Generation > 0); err != nil {
 		if errors.Is(err, errManifestCommitOutcomeUnknown) {
+			recordingCtx, cancel := cloudFailureRecordingContext(ctx)
+			logErr := writeCloudPipelineLog(recordingCtx, objects, prefix, workspace, cfg)
+			cancel()
+			if logErr != nil {
+				return errors.Join(errManifestCommitOutcomeUnknown, errCloudPipelineLogRecording)
+			}
 			return errManifestCommitOutcomeUnknown
 		}
 		primary := errCloudPipelinePublish

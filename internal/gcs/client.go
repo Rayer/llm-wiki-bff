@@ -575,6 +575,10 @@ func canonicalReadPath(relPath string) bool {
 		executionID := strings.TrimSuffix(strings.TrimPrefix(relPath, "cache/pipeline-"), ".log")
 		return executionID != "" && executionID != "." && executionID != ".." && path.Clean(relPath) == relPath && !strings.ContainsAny(executionID, `/\\`) && !strings.Contains(executionID, "..")
 	}
+	if strings.HasPrefix(relPath, "cache/pipeline-") && strings.HasSuffix(relPath, ".failure.json") {
+		executionID := strings.TrimSuffix(strings.TrimPrefix(relPath, "cache/pipeline-"), ".failure.json")
+		return executionID != "" && executionID != "." && executionID != ".." && path.Clean(relPath) == relPath && !strings.ContainsAny(executionID, `/\\`) && !strings.Contains(executionID, "..")
+	}
 	return false
 }
 

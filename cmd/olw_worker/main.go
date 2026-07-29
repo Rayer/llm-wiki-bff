@@ -22,6 +22,7 @@ import (
 	conceptcache "github.com/rayer/llm-wiki-bff/internal/cache"
 	"github.com/rayer/llm-wiki-bff/internal/generation"
 	"github.com/rayer/llm-wiki-bff/internal/llm"
+	"github.com/rayer/llm-wiki-bff/internal/pipelinediagnostic"
 	"github.com/rayer/llm-wiki-bff/internal/rawstatus"
 	"github.com/rayer/llm-wiki-bff/internal/sourcestatus"
 	"github.com/rayer/llm-wiki-bff/internal/storage"
@@ -73,7 +74,7 @@ const (
 	suggestedQueryModel             = "deepseek-chat"
 )
 
-const pipelineLogTruncationMarker = "\n[output truncated at 4194304 bytes]\n"
+const pipelineLogTruncationMarker = pipelinediagnostic.PipelineLogTruncationMarker
 
 func main() {
 	if err := executeWorkerCommand(newRootCommand()); err != nil {

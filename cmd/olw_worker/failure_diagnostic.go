@@ -7,93 +7,82 @@ import (
 	"errors"
 	"io"
 	"os/exec"
+
+	"github.com/rayer/llm-wiki-bff/internal/pipelinediagnostic"
 )
 
-type failureStage string
+type failureStage = pipelinediagnostic.Stage
 
 const (
-	failureStageInputMaterialization     failureStage = "input_materialization"
-	failureStageSyntoMigration           failureStage = "synto_migration"
-	failureStageSyntoConfigNormalization failureStage = "synto_config_normalization"
-	failureStageSyntoConfigValidation    failureStage = "synto_config_validation"
-	failureStageSyntoRun                 failureStage = "synto_run"
-	failureStageSyntoIndexExport         failureStage = "synto_index_export"
-	failureStageSourceReconciliation     failureStage = "source_reconciliation"
-	failureStageConceptReconciliation    failureStage = "concept_reconciliation"
-	failureStagePostprocess              failureStage = "postprocess"
-	failureStageGenerationPublish        failureStage = "generation_publish"
-	failureStageReceiptRecording         failureStage = "receipt_recording"
-	failureStageLeaseCleanup             failureStage = "lease_cleanup"
-	failureStageUnknown                  failureStage = "unknown"
+	failureStageInputMaterialization     = pipelinediagnostic.StageInputMaterialization
+	failureStageSyntoMigration           = pipelinediagnostic.StageSyntoMigration
+	failureStageSyntoConfigNormalization = pipelinediagnostic.StageSyntoConfigNormalization
+	failureStageSyntoConfigValidation    = pipelinediagnostic.StageSyntoConfigValidation
+	failureStageSyntoRun                 = pipelinediagnostic.StageSyntoRun
+	failureStageSyntoIndexExport         = pipelinediagnostic.StageSyntoIndexExport
+	failureStageSourceReconciliation     = pipelinediagnostic.StageSourceReconciliation
+	failureStageConceptReconciliation    = pipelinediagnostic.StageConceptReconciliation
+	failureStagePostprocess              = pipelinediagnostic.StagePostprocess
+	failureStageGenerationPublish        = pipelinediagnostic.StageGenerationPublish
+	failureStageReceiptRecording         = pipelinediagnostic.StageReceiptRecording
+	failureStageLeaseCleanup             = pipelinediagnostic.StageLeaseCleanup
+	failureStageUnknown                  = pipelinediagnostic.StageUnknown
 )
 
-type failureErrorClass string
+type failureErrorClass = pipelinediagnostic.ErrorClass
 
 const (
-	failureClassValidation       failureErrorClass = "validation"
-	failureClassChildExit        failureErrorClass = "child_exit"
-	failureClassTimeout          failureErrorClass = "timeout"
-	failureClassCancelled        failureErrorClass = "cancelled"
-	failureClassIO               failureErrorClass = "io"
-	failureClassStateInvalid     failureErrorClass = "state_invalid"
-	failureClassPublishConflict  failureErrorClass = "publish_conflict"
-	failureClassRecordingFailure failureErrorClass = "recording_failure"
-	failureClassUnknown          failureErrorClass = "unknown"
+	failureClassValidation       = pipelinediagnostic.ErrorClassValidation
+	failureClassChildExit        = pipelinediagnostic.ErrorClassChildExit
+	failureClassTimeout          = pipelinediagnostic.ErrorClassTimeout
+	failureClassCancelled        = pipelinediagnostic.ErrorClassCancellation
+	failureClassIO               = pipelinediagnostic.ErrorClassIO
+	failureClassStateInvalid     = pipelinediagnostic.ErrorClassStateInvalid
+	failureClassPublishConflict  = pipelinediagnostic.ErrorClassPublishConflict
+	failureClassRecordingFailure = pipelinediagnostic.ErrorClassRecordingFailure
+	failureClassUnknown          = pipelinediagnostic.ErrorClassUnknown
 )
 
-type failureChildCommand string
+type failureChildCommand = pipelinediagnostic.ChildCommand
 
 const (
-	failureChildMigrateOLW failureChildCommand = "migrate-olw"
-	failureChildRun        failureChildCommand = "run"
-	failureChildPackExport failureChildCommand = "pack-export"
+	failureChildMigrateOLW = pipelinediagnostic.ChildCommandMigrateOLW
+	failureChildRun        = pipelinediagnostic.ChildCommandRun
+	failureChildPackExport = pipelinediagnostic.ChildCommandPackExport
 )
 
-type conceptReconcileDetailCode string
+type conceptReconcileDetailCode = pipelinediagnostic.DetailCode
 
 const (
-	conceptDetailGeneratedMapReadDecode                 conceptReconcileDetailCode = "generated_map_read_decode"
-	conceptDetailSyntoIndexTruth                        conceptReconcileDetailCode = "synto_index_truth"
-	conceptDetailEntityMapping                          conceptReconcileDetailCode = "entity_mapping"
-	conceptDetailEntityMappingIndexTruth                conceptReconcileDetailCode = "entity_mapping_index_truth"
-	conceptDetailEntityMappingSourceConceptIdentity     conceptReconcileDetailCode = "entity_mapping_source_concept_identity"
-	conceptDetailEntityMappingArticleIdentity           conceptReconcileDetailCode = "entity_mapping_article_identity"
-	conceptDetailEntityMappingArticlePath               conceptReconcileDetailCode = "entity_mapping_article_path"
-	conceptDetailEntityMappingArticleSourceAmbiguity    conceptReconcileDetailCode = "entity_mapping_article_source_ambiguity"
-	conceptDetailEntityMappingArticleSourceMissing      conceptReconcileDetailCode = "entity_mapping_article_source_missing"
-	conceptDetailEntityMappingArticleSourceDisagreement conceptReconcileDetailCode = "entity_mapping_article_source_disagreement"
-	conceptDetailEntityMappingDuplicateArticleID        conceptReconcileDetailCode = "entity_mapping_duplicate_article_id"
-	conceptDetailEntityMappingDuplicateArticlePath      conceptReconcileDetailCode = "entity_mapping_duplicate_article_path"
-	conceptDetailEntityMappingDuplicateEntityID         conceptReconcileDetailCode = "entity_mapping_duplicate_entity_id"
-	conceptDetailEntityMappingActiveEntityUnknown       conceptReconcileDetailCode = "entity_mapping_active_entity_unknown"
-	conceptDetailEntityMappingConceptSlugCase           conceptReconcileDetailCode = "entity_mapping_concept_slug_case"
-	conceptDetailEntityMappingConceptIDPathDisagreement conceptReconcileDetailCode = "entity_mapping_concept_id_path_disagreement"
-	conceptDetailEntityMappingConceptMissingMapping     conceptReconcileDetailCode = "entity_mapping_concept_missing_mapping"
-	conceptDetailEntityMappingConceptEntityCollision    conceptReconcileDetailCode = "entity_mapping_concept_entity_collision"
-	conceptDetailEntityMerge                            conceptReconcileDetailCode = "entity_merge"
-	conceptDetailIdentityReconciliation                 conceptReconcileDetailCode = "identity_reconciliation"
-	conceptDetailLifecyclePlanning                      conceptReconcileDetailCode = "lifecycle_planning"
-	conceptDetailConceptPageRewrite                     conceptReconcileDetailCode = "concept_page_rewrite"
-	conceptDetailLinkRewrite                            conceptReconcileDetailCode = "link_rewrite"
-	conceptDetailCacheRewrite                           conceptReconcileDetailCode = "cache_rewrite"
-	conceptDetailArtifactWrite                          conceptReconcileDetailCode = "artifact_write"
-	conceptDetailArtifactRemove                         conceptReconcileDetailCode = "artifact_remove"
+	conceptDetailGeneratedMapReadDecode                 = pipelinediagnostic.DetailGeneratedMapReadDecode
+	conceptDetailSyntoIndexTruth                        = pipelinediagnostic.DetailSyntoIndexTruth
+	conceptDetailEntityMapping                          = pipelinediagnostic.DetailEntityMapping
+	conceptDetailEntityMappingIndexTruth                = pipelinediagnostic.DetailEntityMappingIndexTruth
+	conceptDetailEntityMappingSourceConceptIdentity     = pipelinediagnostic.DetailEntityMappingSourceConceptIdentity
+	conceptDetailEntityMappingArticleIdentity           = pipelinediagnostic.DetailEntityMappingArticleIdentity
+	conceptDetailEntityMappingArticlePath               = pipelinediagnostic.DetailEntityMappingArticlePath
+	conceptDetailEntityMappingArticleSourceAmbiguity    = pipelinediagnostic.DetailEntityMappingArticleSourceAmbiguity
+	conceptDetailEntityMappingArticleSourceMissing      = pipelinediagnostic.DetailEntityMappingArticleSourceMissing
+	conceptDetailEntityMappingArticleSourceDisagreement = pipelinediagnostic.DetailEntityMappingArticleSourceDisagreement
+	conceptDetailEntityMappingDuplicateArticleID        = pipelinediagnostic.DetailEntityMappingDuplicateArticleID
+	conceptDetailEntityMappingDuplicateArticlePath      = pipelinediagnostic.DetailEntityMappingDuplicateArticlePath
+	conceptDetailEntityMappingDuplicateEntityID         = pipelinediagnostic.DetailEntityMappingDuplicateEntityID
+	conceptDetailEntityMappingActiveEntityUnknown       = pipelinediagnostic.DetailEntityMappingActiveEntityUnknown
+	conceptDetailEntityMappingConceptSlugCase           = pipelinediagnostic.DetailEntityMappingConceptSlugCase
+	conceptDetailEntityMappingConceptIDPathDisagreement = pipelinediagnostic.DetailEntityMappingConceptIDPathDisagreement
+	conceptDetailEntityMappingConceptMissingMapping     = pipelinediagnostic.DetailEntityMappingConceptMissingMapping
+	conceptDetailEntityMappingConceptEntityCollision    = pipelinediagnostic.DetailEntityMappingConceptEntityCollision
+	conceptDetailEntityMerge                            = pipelinediagnostic.DetailEntityMerge
+	conceptDetailIdentityReconciliation                 = pipelinediagnostic.DetailIdentityReconciliation
+	conceptDetailLifecyclePlanning                      = pipelinediagnostic.DetailLifecyclePlanning
+	conceptDetailConceptPageRewrite                     = pipelinediagnostic.DetailConceptPageRewrite
+	conceptDetailLinkRewrite                            = pipelinediagnostic.DetailLinkRewrite
+	conceptDetailCacheRewrite                           = pipelinediagnostic.DetailCacheRewrite
+	conceptDetailArtifactWrite                          = pipelinediagnostic.DetailArtifactWrite
+	conceptDetailArtifactRemove                         = pipelinediagnostic.DetailArtifactRemove
 )
 
-var knownConceptDetailCodes = map[conceptReconcileDetailCode]struct{}{
-	conceptDetailGeneratedMapReadDecode: {}, conceptDetailSyntoIndexTruth: {},
-	conceptDetailEntityMapping: {}, conceptDetailEntityMappingIndexTruth: {},
-	conceptDetailEntityMappingSourceConceptIdentity: {}, conceptDetailEntityMappingArticleIdentity: {},
-	conceptDetailEntityMappingArticlePath: {}, conceptDetailEntityMappingArticleSourceAmbiguity: {}, conceptDetailEntityMappingArticleSourceMissing: {},
-	conceptDetailEntityMappingArticleSourceDisagreement: {}, conceptDetailEntityMappingDuplicateArticleID: {},
-	conceptDetailEntityMappingDuplicateArticlePath: {}, conceptDetailEntityMappingDuplicateEntityID: {},
-	conceptDetailEntityMappingActiveEntityUnknown: {}, conceptDetailEntityMappingConceptSlugCase: {},
-	conceptDetailEntityMappingConceptIDPathDisagreement: {}, conceptDetailEntityMappingConceptMissingMapping: {},
-	conceptDetailEntityMappingConceptEntityCollision: {}, conceptDetailEntityMerge: {}, conceptDetailIdentityReconciliation: {},
-	conceptDetailLifecyclePlanning: {}, conceptDetailConceptPageRewrite: {},
-	conceptDetailLinkRewrite: {}, conceptDetailCacheRewrite: {},
-	conceptDetailArtifactWrite: {}, conceptDetailArtifactRemove: {},
-}
+var knownConceptDetailCodes = pipelinediagnostic.ValidDetailCodes
 
 type conceptReconciliationDetail interface {
 	ConceptReconciliationDetail() conceptReconcileDetailCode
@@ -141,24 +130,9 @@ func wrapConceptReconciliationError(detail conceptReconcileDetailCode, err error
 }
 
 var (
-	knownFailureStages = map[failureStage]struct{}{
-		failureStageInputMaterialization: {}, failureStageSyntoMigration: {},
-		failureStageSyntoConfigNormalization: {}, failureStageSyntoConfigValidation: {},
-		failureStageSyntoRun: {}, failureStageSyntoIndexExport: {},
-		failureStageSourceReconciliation: {}, failureStageConceptReconciliation: {},
-		failureStagePostprocess:       {},
-		failureStageGenerationPublish: {}, failureStageReceiptRecording: {},
-		failureStageLeaseCleanup: {}, failureStageUnknown: {},
-	}
-	knownFailureClasses = map[failureErrorClass]struct{}{
-		failureClassValidation: {}, failureClassChildExit: {}, failureClassTimeout: {},
-		failureClassCancelled: {}, failureClassIO: {}, failureClassStateInvalid: {},
-		failureClassPublishConflict: {}, failureClassRecordingFailure: {},
-		failureClassUnknown: {},
-	}
-	knownFailureChildren = map[failureChildCommand]struct{}{
-		failureChildMigrateOLW: {}, failureChildRun: {}, failureChildPackExport: {},
-	}
+	knownFailureStages   = pipelinediagnostic.ValidStages
+	knownFailureClasses  = pipelinediagnostic.ValidErrorClasses
+	knownFailureChildren = pipelinediagnostic.ValidChildCommands
 )
 
 // workerFailure keeps the production boundary's finite diagnostic facts while

@@ -63,6 +63,27 @@ func TestObjectNotFoundPreservesStorageSentinel(t *testing.T) {
 	}
 }
 
+func TestReadFileAcceptsWorkerFailureDiagnosticFromMemoryGCS(t *testing.T) {
+	client, backend := newMemoryClient()
+	path := "cache/pipeline-run.failure.json"
+	want := []byte(`{"version":1,"status":"failed","stage":"synto_run","error_class":"child_exit","child_command":"run"}`)
+	backend.put(projectObject(path), want, 11, nil)
+
+	got, err := client.ReadFile(context.Background(), path)
+	if err != nil {
+		t.Fatalf("ReadFileLimited() error = %v, want worker diagnostic object", err)
+	}
+	if string(got) != string(want) {
+		t.Fatalf("diagnostic = %q, want %q", got, want)
+	}
+	if _, err := client.WithScope("other-user", "project").ReadFile(context.Background(), path); err == nil {
+		t.Fatal("cross-tenant diagnostic read unexpectedly succeeded")
+	}
+	if _, err := client.ReadFile(context.Background(), "cache/pipeline-run.failure.json/../secret"); err == nil {
+		t.Fatal("unsafe diagnostic path was accepted")
+	}
+}
+
 func TestTemporaryObjectCleanupUsesExactGeneration(t *testing.T) {
 	conditions := temporaryObjectDeleteConditions(42)
 	if conditions.GenerationMatch != 42 || conditions.DoesNotExist {

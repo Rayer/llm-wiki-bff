@@ -485,9 +485,11 @@ func TestCloudManifestCommitTimeoutReadbackControlsReceipts(t *testing.T) {
 	t.Run("matching pointer is committed", func(t *testing.T) {
 		m := newMemoryObjects()
 		seedCloudSource(t, m, prefix, "raw", "", priorCloudReceipt())
-		execOLW = func(_ context.Context, vault string, _ []string, _ []string, _, _ io.Writer) error {
+		execOLW = func(_ context.Context, vault string, _ []string, _ []string, stdout, stderr io.Writer) error {
 			mustWriteFile(t, filepath.Join(vault, "wiki", "new.md"), []byte("new"))
 			writeCloudRequiredOutputs(t, vault)
+			_, _ = io.WriteString(stdout, "ordinary stdout\n")
+			_, _ = io.WriteString(stderr, "ordinary stderr\n")
 			return nil
 		}
 		store := &commitThenErrorStore{objectStore: m, manifest: prefix + generation.ManifestPath}
@@ -510,9 +512,11 @@ func TestCloudManifestCommitTimeoutReadbackControlsReceipts(t *testing.T) {
 		m := newMemoryObjects()
 		prior := priorCloudReceipt()
 		seedCloudSource(t, m, prefix, "raw", "", prior)
-		execOLW = func(_ context.Context, vault string, _ []string, _ []string, _, _ io.Writer) error {
+		execOLW = func(_ context.Context, vault string, _ []string, _ []string, stdout, stderr io.Writer) error {
 			mustWriteFile(t, filepath.Join(vault, "wiki", "new.md"), []byte("new"))
 			writeCloudRequiredOutputs(t, vault)
+			_, _ = io.WriteString(stdout, "ordinary stdout\n")
+			_, _ = io.WriteString(stderr, "ordinary stderr\n")
 			return nil
 		}
 		store := &commitThenErrorStore{objectStore: m, manifest: prefix + generation.ManifestPath, unknown: true}
@@ -525,6 +529,13 @@ func TestCloudManifestCommitTimeoutReadbackControlsReceipts(t *testing.T) {
 		}
 		if _, _, err := m.Read(context.Background(), prefix+generation.ManifestPath, 0, generation.MaxManifestBytes); err != nil {
 			t.Fatalf("ambiguous timeout removed committed manifest: %v", err)
+		}
+		logData, _, err := m.Read(context.Background(), prefix+"cache/pipeline-execution-secret.log", 0, generation.MaxFileBytes)
+		if err != nil || string(logData) != "ordinary stdout\nordinary stderr\n" {
+			t.Fatalf("ambiguous timeout raw log=%q err=%v, want exact child output", logData, err)
+		}
+		if _, _, err := m.Read(context.Background(), prefix+"cache/pipeline-execution-secret.failure.json", 0, generation.MaxFileBytes); !errors.Is(err, cloudstorage.ErrObjectNotExist) {
+			t.Fatalf("ambiguous timeout wrote failure diagnostic: %v", err)
 		}
 	})
 }
