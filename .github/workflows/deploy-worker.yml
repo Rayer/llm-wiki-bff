@@ -104,10 +104,23 @@ jobs:
       - name: Configure Artifact Registry Docker auth
         run: gcloud auth configure-docker asia-east1-docker.pkg.dev --quiet
 
+      - name: Generate worker build nonce
+        id: nonce
+        run: |
+          set -euo pipefail
+          BUILD_NONCE=$(openssl rand -hex 16)
+          if [[ ! "$BUILD_NONCE" =~ ^[0-9a-f]{32}$ ]]; then
+            echo "generated worker build nonce is invalid"
+            exit 1
+          fi
+          echo "build_nonce=$BUILD_NONCE" >> "$GITHUB_OUTPUT"
+          echo "Generated worker build nonce $BUILD_NONCE"
+
       - name: Build and push immutable worker image
         id: image
         env:
           AR_REPO: asia-east1-docker.pkg.dev/llm-wiki-cloud/cloud-run-images
+          BUILD_NONCE: ${{ steps.nonce.outputs.build_nonce }}
         run: |
           set -euo pipefail
           SHA="${{ steps.source.outputs.candidate_sha }}"
@@ -117,7 +130,7 @@ jobs:
           fi
           TAG="${SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           IMAGE="${AR_REPO}/olw-pipeline:${TAG}"
-          docker build --target worker -f cmd/olw_worker/Dockerfile -t "$IMAGE" .
+          docker build --build-arg BUILD_NONCE="$BUILD_NONCE" --target worker -f cmd/olw_worker/Dockerfile -t "$IMAGE" .
           docker push "$IMAGE"
           DIGEST=$(gcloud artifacts docker images describe "$IMAGE" --format='value(image_summary.digest)' --quiet)
           if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
