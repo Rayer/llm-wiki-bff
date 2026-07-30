@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"cloud.google.com/go/storage"
@@ -172,6 +173,312 @@ func TestMissingFileUsesStorageNotFound(t *testing.T) {
 	_, err := New(t.TempDir()).WithScope("u", "p").ReadFile(context.Background(), "wiki/missing.md")
 	if !errors.Is(err, storage.ErrObjectNotExist) {
 		t.Fatalf("ReadFile() error = %v, want storage.ErrObjectNotExist", err)
+	}
+}
+
+func TestReadFileLimitedRejectsFinalSymlinkOutsideProject(t *testing.T) {
+	root := t.TempDir()
+	outside := filepath.Join(t.TempDir(), "outside.log")
+	if err := os.WriteFile(outside, []byte("tenant-secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	project := filepath.Join(root, "users", "u", "projects", "p")
+	if err := os.MkdirAll(filepath.Join(project, "cache"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(project, "cache", "pipeline-escape.log")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Fatal(err)
+	}
+
+	client := New(root).WithScope("u", "p")
+	if _, err := client.ReadFileLimited(context.Background(), "cache/pipeline-escape.log", 1024); err == nil {
+		t.Fatal("ReadFileLimited followed final symlink outside project")
+	}
+}
+
+func TestReadFileLimitedAndStatFileRejectScopeAncestorSymlinks(t *testing.T) {
+	tests := []struct {
+		name string
+	}{
+		{name: "user"},
+		{name: "projects"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			outside := t.TempDir()
+			outsideProject := filepath.Join(outside, "projects", "p")
+			outsideLog := filepath.Join(outsideProject, "cache", "pipeline-run.log")
+			if err := os.MkdirAll(filepath.Dir(outsideLog), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(outsideLog, []byte("outside-ancestor-sentinel"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			users := filepath.Join(root, "users")
+			if err := os.MkdirAll(users, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			link := filepath.Join(users, "u")
+			target := outside
+			if test.name == "projects" {
+				if err := os.Mkdir(link, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				link = filepath.Join(link, "projects")
+				target = filepath.Join(outside, "projects")
+			}
+			if err := os.Symlink(target, link); err != nil {
+				t.Fatal(err)
+			}
+
+			client := New(root).WithScope("u", "p")
+			data, readErr := client.ReadFileLimited(context.Background(), "cache/pipeline-run.log", 1024)
+			if readErr == nil || string(data) == "outside-ancestor-sentinel" {
+				t.Fatalf("ReadFileLimited() data=%q err=%v; want fail closed", data, readErr)
+			}
+			size, statErr := client.StatFile(context.Background(), "cache/pipeline-run.log")
+			if statErr == nil || size == int64(len("outside-ancestor-sentinel")) {
+				t.Fatalf("StatFile() size=%d err=%v; want fail closed", size, statErr)
+			}
+		})
+	}
+}
+
+func TestReadFileLimitedBoundsFailureDiagnosticRead(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "users", "u", "projects", "p", "cache", "pipeline-run.failure.json")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, make([]byte, 4098), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	data, err := New(root).WithScope("u", "p").ReadFileLimited(context.Background(), "cache/pipeline-run.failure.json", 4097)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(data) != 4097 {
+		t.Fatalf("ReadFileLimited() bytes=%d, want exactly 4097", len(data))
+	}
+}
+
+func TestAuditReadFileLimitedAndStatFileConcurrentSwapCannotEscape(t *testing.T) {
+	root := t.TempDir()
+	outside := filepath.Join(t.TempDir(), "outside.log")
+	if err := os.WriteFile(outside, []byte("outside-secret-sentinel"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	project := filepath.Join(root, "users", "u", "projects", "p")
+	if err := os.MkdirAll(filepath.Join(project, "cache"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(project, "cache", "pipeline-swap.log")
+	regularSource := target + ".regular-source"
+	symlinkSource := target + ".symlink-source"
+	inside := []byte("inside")
+	if err := os.WriteFile(target, inside, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	client := New(root).WithScope("u", "p")
+	stop := make(chan struct{})
+	swapErrs := make(chan error, 1)
+	swapDone := make(chan struct{})
+	go func() {
+		defer close(swapDone)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if err := os.Symlink(outside, symlinkSource); err != nil {
+				swapErrs <- err
+				return
+			}
+			if err := os.Rename(symlinkSource, target); err != nil {
+				swapErrs <- err
+				return
+			}
+			if err := os.WriteFile(regularSource, inside, 0o600); err != nil {
+				swapErrs <- err
+				return
+			}
+			if err := os.Rename(regularSource, target); err != nil {
+				swapErrs <- err
+				return
+			}
+		}
+	}()
+
+	const readers = 8
+	const iterations = 5000
+	outsideFound := make(chan string, 1)
+	var wg sync.WaitGroup
+	wg.Add(readers)
+	for i := 0; i < readers; i++ {
+		go func() {
+			defer wg.Done()
+			for j := 0; j < iterations; j++ {
+				data, err := client.ReadFileLimited(context.Background(), "cache/pipeline-swap.log", 1024)
+				if err == nil && string(data) == "outside-secret-sentinel" {
+					select {
+					case outsideFound <- "ReadFileLimited returned outside sentinel content":
+					default:
+					}
+					return
+				}
+				size, err := client.StatFile(context.Background(), "cache/pipeline-swap.log")
+				if err == nil && size == int64(len("outside-secret-sentinel")) {
+					select {
+					case outsideFound <- "StatFile returned outside sentinel size":
+					default:
+					}
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(stop)
+	<-swapDone
+	select {
+	case err := <-swapErrs:
+		t.Fatal(err)
+	default:
+	}
+	select {
+	case finding := <-outsideFound:
+		t.Fatal(finding)
+	default:
+	}
+}
+
+func TestAuditReadFileLimitedAndStatFileConcurrentScopeSwapCannotEscape(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	outsideLog := filepath.Join(outside, "projects", "p", "cache", "pipeline-scope-swap.log")
+	if err := os.MkdirAll(filepath.Dir(outsideLog), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(outsideLog, []byte("outside-scope-sentinel"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	scopeRoot := filepath.Join(root, "users", "u")
+	if err := os.MkdirAll(scopeRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	regularSource := filepath.Join(scopeRoot, "projects-regular")
+	regularLog := filepath.Join(regularSource, "p", "cache", "pipeline-scope-swap.log")
+	if err := os.MkdirAll(filepath.Dir(regularLog), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(regularLog, []byte("inside-scope"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	symlinkSource := filepath.Join(scopeRoot, "projects-symlink")
+	if err := os.Symlink(filepath.Join(outside, "projects"), symlinkSource); err != nil {
+		t.Fatal(err)
+	}
+	projects := filepath.Join(scopeRoot, "projects")
+	if err := os.Rename(regularSource, projects); err != nil {
+		t.Fatal(err)
+	}
+
+	client := New(root).WithScope("u", "p")
+	stop := make(chan struct{})
+	swapErrs := make(chan error, 1)
+	swapDone := make(chan struct{})
+	go func() {
+		defer close(swapDone)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if err := os.Rename(projects, regularSource); err != nil {
+				swapErrs <- err
+				return
+			}
+			if err := os.Rename(symlinkSource, projects); err != nil {
+				swapErrs <- err
+				return
+			}
+			if err := os.Rename(projects, symlinkSource); err != nil {
+				swapErrs <- err
+				return
+			}
+			if err := os.Rename(regularSource, projects); err != nil {
+				swapErrs <- err
+				return
+			}
+		}
+	}()
+
+	const readers = 4
+	const iterations = 1000
+	outsideFound := make(chan string, 1)
+	var wg sync.WaitGroup
+	wg.Add(readers)
+	for i := 0; i < readers; i++ {
+		go func() {
+			defer wg.Done()
+			for j := 0; j < iterations; j++ {
+				data, err := client.ReadFileLimited(context.Background(), "cache/pipeline-scope-swap.log", 1024)
+				if err == nil && string(data) == "outside-scope-sentinel" {
+					select {
+					case outsideFound <- "ReadFileLimited returned outside scope sentinel content":
+					default:
+					}
+					return
+				}
+				size, err := client.StatFile(context.Background(), "cache/pipeline-scope-swap.log")
+				if err == nil && size == int64(len("outside-scope-sentinel")) {
+					select {
+					case outsideFound <- "StatFile returned outside scope sentinel size":
+					default:
+					}
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(stop)
+	<-swapDone
+	select {
+	case err := <-swapErrs:
+		t.Fatal(err)
+	default:
+	}
+	select {
+	case finding := <-outsideFound:
+		t.Fatal(finding)
+	default:
+	}
+}
+
+func TestStatFileIsScopedAndMetadataOnly(t *testing.T) {
+	root := t.TempDir()
+	project := New(root).WithScope("u", "p")
+	path := filepath.Join(root, "users", "u", "projects", "p", "cache", "pipeline-run.log")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("log"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if size, err := project.StatFile(context.Background(), "cache/pipeline-run.log"); err != nil || size != 3 {
+		t.Fatalf("StatFile() = %d, %v; want size 3", size, err)
+	}
+	if _, err := New(root).WithScope("u", "other").StatFile(context.Background(), "cache/pipeline-run.log"); !errors.Is(err, storage.ErrObjectNotExist) {
+		t.Fatalf("foreign StatFile error = %v, want object not exist", err)
 	}
 }
 

@@ -485,9 +485,11 @@ func TestCloudManifestCommitTimeoutReadbackControlsReceipts(t *testing.T) {
 	t.Run("matching pointer is committed", func(t *testing.T) {
 		m := newMemoryObjects()
 		seedCloudSource(t, m, prefix, "raw", "", priorCloudReceipt())
-		execOLW = func(_ context.Context, vault string, _ []string, _ []string, _, _ io.Writer) error {
+		execOLW = func(_ context.Context, vault string, _ []string, _ []string, stdout, stderr io.Writer) error {
 			mustWriteFile(t, filepath.Join(vault, "wiki", "new.md"), []byte("new"))
 			writeCloudRequiredOutputs(t, vault)
+			_, _ = io.WriteString(stdout, "ordinary stdout\n")
+			_, _ = io.WriteString(stderr, "ordinary stderr\n")
 			return nil
 		}
 		store := &commitThenErrorStore{objectStore: m, manifest: prefix + generation.ManifestPath}
@@ -510,9 +512,11 @@ func TestCloudManifestCommitTimeoutReadbackControlsReceipts(t *testing.T) {
 		m := newMemoryObjects()
 		prior := priorCloudReceipt()
 		seedCloudSource(t, m, prefix, "raw", "", prior)
-		execOLW = func(_ context.Context, vault string, _ []string, _ []string, _, _ io.Writer) error {
+		execOLW = func(_ context.Context, vault string, _ []string, _ []string, stdout, stderr io.Writer) error {
 			mustWriteFile(t, filepath.Join(vault, "wiki", "new.md"), []byte("new"))
 			writeCloudRequiredOutputs(t, vault)
+			_, _ = io.WriteString(stdout, "ordinary stdout\n")
+			_, _ = io.WriteString(stderr, "ordinary stderr\n")
 			return nil
 		}
 		store := &commitThenErrorStore{objectStore: m, manifest: prefix + generation.ManifestPath, unknown: true}
@@ -525,6 +529,13 @@ func TestCloudManifestCommitTimeoutReadbackControlsReceipts(t *testing.T) {
 		}
 		if _, _, err := m.Read(context.Background(), prefix+generation.ManifestPath, 0, generation.MaxManifestBytes); err != nil {
 			t.Fatalf("ambiguous timeout removed committed manifest: %v", err)
+		}
+		logData, _, err := m.Read(context.Background(), prefix+"cache/pipeline-execution-secret.log", 0, generation.MaxFileBytes)
+		if err != nil || string(logData) != "ordinary stdout\nordinary stderr\n" {
+			t.Fatalf("ambiguous timeout raw log=%q err=%v, want exact child output", logData, err)
+		}
+		if _, _, err := m.Read(context.Background(), prefix+"cache/pipeline-execution-secret.failure.json", 0, generation.MaxFileBytes); !errors.Is(err, cloudstorage.ErrObjectNotExist) {
+			t.Fatalf("ambiguous timeout wrote failure diagnostic: %v", err)
 		}
 	})
 }
@@ -588,8 +599,8 @@ func TestCloudWorkspaceCreationFailureRecordsDiagnosticWithoutPublication(t *tes
 		t.Fatalf("error=%v, want sanitized workspace failure", err)
 	}
 	logData, _, err := m.Read(context.Background(), prefix+"cache/pipeline-execution.log", 0, generation.MaxFileBytes)
-	if err != nil || string(logData) != "pipeline failed\n" {
-		t.Fatalf("fixed failure log=%q err=%v", logData, err)
+	if err != nil || len(logData) != 0 {
+		t.Fatalf("failure log=%q err=%v, want empty raw log when child did not start", logData, err)
 	}
 	diagnosticData, _, err := m.Read(context.Background(), prefix+"cache/pipeline-execution.failure.json", 0, generation.MaxFileBytes)
 	if err != nil {
@@ -636,6 +647,113 @@ func TestCloudMigrationPostconditionFailureIsTyped(t *testing.T) {
 	}
 	if diagnostic.Stage != failureStageSyntoMigration || diagnostic.ErrorClass != failureClassStateInvalid {
 		t.Fatalf("diagnostic=%+v", diagnostic)
+	}
+}
+
+func TestCloudSyntoLifecycleOutputIsPublishedForEveryFailurePhase(t *testing.T) {
+	old := execOLW
+	t.Cleanup(func() { execOLW = old })
+
+	tests := []struct {
+		name       string
+		fail       string
+		ambiguous  bool
+		wantOutput []string
+		wantErr    error
+	}{
+		{name: "migration", fail: "migration", wantOutput: []string{"MIGRATION_STDOUT", "MIGRATION_STDERR"}},
+		{name: "run", fail: "run", wantOutput: []string{"MIGRATION_STDOUT", "MIGRATION_STDERR", "RUN_STDOUT", "RUN_STDERR"}},
+		{name: "pack export", fail: "pack", wantOutput: []string{"MIGRATION_STDOUT", "MIGRATION_STDERR", "RUN_STDOUT", "RUN_STDERR", "PACK_EXPORT_STDOUT", "PACK_EXPORT_STDERR"}},
+		{name: "postprocess", fail: "postprocess", wantOutput: []string{"MIGRATION_STDOUT", "MIGRATION_STDERR", "RUN_STDOUT", "RUN_STDERR", "PACK_EXPORT_STDOUT", "PACK_EXPORT_STDERR"}},
+		{name: "ambiguous manifest", ambiguous: true, wantOutput: []string{"MIGRATION_STDOUT", "MIGRATION_STDERR", "RUN_STDOUT", "RUN_STDERR", "PACK_EXPORT_STDOUT", "PACK_EXPORT_STDERR"}, wantErr: errManifestCommitOutcomeUnknown},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newMemoryObjects()
+			prefix := "users/user/projects/" + strings.ReplaceAll(tc.name, " ", "-") + "/"
+			seedCloudSource(t, m, prefix, "raw", "", priorCloudReceipt())
+			writeCloudLegacyState(t, m, prefix)
+			cfg := cloudCfgFor("user", strings.TrimSuffix(strings.TrimPrefix(prefix, "users/user/projects/"), "/"), "execution")
+			cfg.suggestedQueriesProvider = nil
+
+			execOLW = func(_ context.Context, vault string, command []string, _ []string, stdout, stderr io.Writer) error {
+				joined := strings.Join(command, " ")
+				switch {
+				case strings.HasPrefix(joined, "migrate-olw "):
+					_, _ = io.WriteString(stdout, "MIGRATION_STDOUT\n")
+					_, _ = io.WriteString(stderr, "MIGRATION_STDERR\n")
+					if tc.fail == "migration" {
+						return errors.New("migration failed")
+					}
+					mustWriteFile(t, filepath.Join(vault, "synto.toml"), []byte("[pipeline]\nauto_commit = false\nauto_maintain = false\nrelation_extraction = false\n"))
+					writeValidSQLiteState(t, filepath.Join(vault, ".synto", "state.db"))
+					return nil
+				case joined == "run":
+					_, _ = io.WriteString(stdout, "RUN_STDOUT\n")
+					_, _ = io.WriteString(stderr, "RUN_STDERR\n")
+					if tc.fail == "run" {
+						return errors.New("run failed")
+					}
+					if err := os.Remove(filepath.Join(vault, ".olw", "state.db")); err != nil {
+						t.Fatal(err)
+					}
+					writeCloudRequiredOutputs(t, vault)
+					if err := os.Remove(filepath.Join(vault, ".synto", "INDEX.json")); err != nil {
+						t.Fatal(err)
+					}
+					if tc.fail == "postprocess" {
+						path := filepath.Join(vault, "cache", "raw_status.json")
+						if err := os.Remove(path); err != nil {
+							t.Fatal(err)
+						}
+						if err := os.Mkdir(path, 0o755); err != nil {
+							t.Fatal(err)
+						}
+					}
+					return nil
+				case strings.HasPrefix(joined, "pack export "):
+					_, _ = io.WriteString(stdout, "PACK_EXPORT_STDOUT\n")
+					_, _ = io.WriteString(stderr, "PACK_EXPORT_STDERR\n")
+					if tc.fail == "pack" {
+						return errors.New("pack export failed")
+					}
+					mustWriteFile(t, filepath.Join(command[5], "index", "INDEX.json"), []byte(syntoIndexFixtureWithEntities([]string{"article:entity:alpha"}, nil)))
+					mustWriteFile(t, filepath.Join(command[5], "agent", "concepts.json"), []byte(`{"schema_version":1,"concepts":[]}`))
+					return nil
+				default:
+					return fmt.Errorf("unexpected command %v", command)
+				}
+			}
+
+			var runErr error
+			if tc.ambiguous {
+				runErr = runCloudWorkerBatch(context.Background(), cfg, [][]string{{"run"}}, &commitThenErrorStore{objectStore: m, manifest: prefix + generation.ManifestPath, unknown: true})
+			} else {
+				runErr = runCloudWorkerBatch(context.Background(), cfg, [][]string{{"run"}}, m)
+			}
+			if tc.wantErr != nil {
+				if !errors.Is(runErr, tc.wantErr) {
+					t.Fatalf("error=%v, want %v", runErr, tc.wantErr)
+				}
+			} else if runErr == nil {
+				t.Fatal("run unexpectedly succeeded")
+			}
+
+			logData, _, err := m.Read(context.Background(), prefix+"cache/pipeline-execution.log", 0, generation.MaxFileBytes)
+			if err != nil {
+				t.Fatal(err)
+			}
+			logText := string(logData)
+			last := -1
+			for _, marker := range tc.wantOutput {
+				position := strings.Index(logText, marker)
+				if position <= last {
+					t.Fatalf("log=%q missing or reordered marker %q after %d", logText, marker, last)
+				}
+				last = position
+			}
+		})
 	}
 }
 
@@ -1143,7 +1261,7 @@ func TestCloudPublishFailureWithRecordingFailurePreservesPublishCategory(t *test
 	}
 }
 
-func TestCloudDiagnosticSinkDiscardsArbitraryChildOutput(t *testing.T) {
+func TestCloudWorkerPersistsArbitraryChildOutputWithBoundedMarker(t *testing.T) {
 	m := newMemoryObjects()
 	prefix := "users/user-secret/projects/project-secret/"
 	seedCloudSource(t, m, prefix, "raw-start", "", priorCloudReceipt())
@@ -1170,12 +1288,12 @@ func TestCloudDiagnosticSinkDiscardsArbitraryChildOutput(t *testing.T) {
 	if readErr != nil {
 		t.Fatal(readErr)
 	}
-	if string(logData) != "pipeline failed\n" {
-		t.Fatalf("cloud pipeline log was not fixed failure event: len=%d data=%q", len(logData), logData)
+	if len(logData) != maxPipelineLog || !strings.HasSuffix(string(logData), pipelineLogTruncationMarker) {
+		t.Fatalf("cloud pipeline log was not bounded with marker: len=%d", len(logData))
 	}
-	for _, forbidden := range []string{"unknown-provider.invalid", "olw-cloud-sentinel", "tenant-secret", "project-secret", "execution-secret", "command", "object/path", "generation/path"} {
-		if strings.Contains(string(logData), forbidden) {
-			t.Fatalf("cloud pipeline log retained child diagnostic %q: %q", forbidden, logData)
+	for _, preserved := range []string{"unknown-provider.invalid", "olw-cloud-sentinel", "tenant-secret", "project-secret", "execution-secret", "command", "object/path", "generation/path"} {
+		if !strings.Contains(string(logData), preserved) {
+			t.Fatalf("cloud pipeline log lost child output %q", preserved)
 		}
 	}
 }
@@ -1223,8 +1341,8 @@ func TestCloudRunFailureWritesStrictBoundedDiagnosticAndFixedReceipts(t *testing
 		}
 	}
 	logData, _, err := m.Read(context.Background(), prefix+"cache/pipeline-execution-secret.log", 0, generation.MaxFileBytes)
-	if err != nil || string(logData) != "pipeline failed\n" {
-		t.Fatalf("fixed pipeline log=%q err=%v", logData, err)
+	if err != nil || !strings.Contains(string(logData), malicious) {
+		t.Fatalf("raw pipeline log=%q err=%v", logData, err)
 	}
 	if receipt := cloudStatus(t, m, prefix).Sources["s1"]; receipt.Error != "pipeline failed" {
 		t.Fatalf("source receipt=%+v", receipt)
@@ -1237,7 +1355,9 @@ func TestCloudSuccessWritesNoFailureDiagnostic(t *testing.T) {
 	seedCloudSource(t, m, prefix, "raw-start", "", priorCloudReceipt())
 	old := execOLW
 	t.Cleanup(func() { execOLW = old })
-	execOLW = func(_ context.Context, vault string, _ []string, _ []string, _, _ io.Writer) error {
+	execOLW = func(_ context.Context, vault string, _ []string, _ []string, stdout, stderr io.Writer) error {
+		_, _ = io.WriteString(stdout, "success source path\n")
+		_, _ = io.WriteString(stderr, "success warning\n")
 		writeCloudRequiredOutputs(t, vault)
 		return nil
 	}
@@ -1246,6 +1366,10 @@ func TestCloudSuccessWritesNoFailureDiagnostic(t *testing.T) {
 	}
 	if _, _, err := m.Read(context.Background(), prefix+"cache/pipeline-execution.failure.json", 0, generation.MaxFileBytes); !errors.Is(err, cloudstorage.ErrObjectNotExist) {
 		t.Fatalf("success failure diagnostic read error=%v, want object absent", err)
+	}
+	log, _, err := m.Read(context.Background(), prefix+"cache/pipeline-execution.log", 0, generation.MaxFileBytes)
+	if err != nil || string(log) != "success source path\nsuccess warning\n" {
+		t.Fatalf("success raw log=%q err=%v", log, err)
 	}
 }
 
@@ -1389,7 +1513,7 @@ func TestCloudDiagnosticWriteFailureRecordsFixedCategoryBeforePublication(t *tes
 	}
 }
 
-func TestWriteCloudPipelineLogUsesOnlyFixedEvent(t *testing.T) {
+func TestWriteCloudPipelineLogBoundsExistingRawOutput(t *testing.T) {
 	workspace := t.TempDir()
 	mustWriteFile(t, filepath.Join(workspace, "cache", "pipeline-execution-secret.log"), []byte("https://unknown-provider.invalid/resource tenant-secret /tmp/workspace-suffix command --token=secret "+strings.Repeat("untrusted-bytes ", maxPipelineLog+1)))
 	m := newMemoryObjects()
@@ -1401,8 +1525,8 @@ func TestWriteCloudPipelineLogUsesOnlyFixedEvent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(data) != "pipeline completed\n" {
-		t.Fatalf("pipeline log = %q, want fixed event", data)
+	if len(data) != maxPipelineLog || !strings.HasSuffix(string(data), pipelineLogTruncationMarker) {
+		t.Fatalf("pipeline log = len %d, want bounded raw output", len(data))
 	}
 }
 
@@ -1491,8 +1615,8 @@ func TestCloudMaterializationFailureRecordsFixedFailureReceipt(t *testing.T) {
 		t.Fatalf("error=%v, want fixed materialization failure", err)
 	}
 	logData, _, err := m.Read(context.Background(), prefix+"cache/pipeline-execution-secret.log", 0, generation.MaxFileBytes)
-	if err != nil || string(logData) != "pipeline failed\n" {
-		t.Fatalf("failure log=%q err=%v", logData, err)
+	if err != nil || len(logData) != 0 {
+		t.Fatalf("failure log=%q err=%v, want empty raw log when child did not start", logData, err)
 	}
 	receipt := cloudStatus(t, m, prefix).Sources["s1"]
 	if receipt.Error != "pipeline failed" || receipt.FailedFingerprint == "" {
@@ -1812,7 +1936,7 @@ func TestCloudPreCommitFailuresKeepOldManifestAndRecordSanitizedFailure(t *testi
 	if !cloudSnapshotCurrent(context.Background(), m, prefix, sourceSnapshot{SourceID: "s1", RawPath: "raw/source.md", RawSHA256: sha256Text("raw-start"), AnnotationSHA: annotation.Digest("annotation-start")}) {
 		t.Fatal("seed source is unexpectedly not current")
 	}
-	assertCloudFailure(t, m, prefix, "api-secret", "user-secret", "project-secret", "--dangerous-arg")
+	assertCloudFailure(t, m, prefix, "api-secret")
 }
 
 func TestCloudPostCommitReceiptFailureDoesNotRollbackManifest(t *testing.T) {

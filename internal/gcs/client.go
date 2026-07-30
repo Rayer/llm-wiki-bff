@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path"
 	"sort"
@@ -359,6 +360,90 @@ func (c *Client) ReadFile(ctx context.Context, relPath string) ([]byte, error) {
 	return c.readFileWithView(ctx, relPath, view)
 }
 
+func (c *Client) ReadFileLimited(ctx context.Context, relPath string, limit int64) ([]byte, error) {
+	if limit < 0 {
+		return nil, errors.New("invalid read limit")
+	}
+	view := generationView{}
+	var err error
+	if generation.GenerationOwned(relPath) {
+		view, err = c.operationView(ctx)
+		if err != nil {
+			return nil, err
+		}
+	}
+	path, expected, err := c.resolveReadPath(relPath, view)
+	if err != nil {
+		return nil, err
+	}
+	if c.backend == nil && view.manifest == nil {
+		object := c.bucket.Object(path)
+		if expected > 0 {
+			object = object.Generation(expected)
+		}
+		r, err := object.NewReader(ctx)
+		if err != nil {
+			if objectNotFound(err) {
+				return nil, store.ErrObjectNotExist
+			}
+			return nil, fmt.Errorf("read %s: %w", path, err)
+		}
+		data, readErr := io.ReadAll(io.LimitReader(r, limit))
+		closeErr := r.Close()
+		if readErr != nil {
+			return nil, readErr
+		}
+		if closeErr != nil {
+			return nil, closeErr
+		}
+		return data, nil
+	}
+	object, err := c.readObject(ctx, path, expected, limit)
+	if err != nil {
+		if objectNotFound(err) {
+			if view.manifest != nil {
+				return nil, store.ErrDeclaredObjectUnavailable
+			}
+			return nil, store.ErrObjectNotExist
+		}
+		if view.manifest != nil {
+			return nil, store.ErrDeclaredObjectUnavailable
+		}
+		return nil, fmt.Errorf("read %s: %w", path, err)
+	}
+	if err := c.verifyGenerationRead(relPath, view, object); err != nil {
+		return nil, err
+	}
+	return object.Data, nil
+}
+
+// StatFile returns object metadata without reading its contents.
+func (c *Client) StatFile(ctx context.Context, relPath string) (int64, error) {
+	view := generationView{}
+	var err error
+	if generation.GenerationOwned(relPath) {
+		view, err = c.operationView(ctx)
+		if err != nil {
+			return 0, err
+		}
+	}
+	path, expected, err := c.resolveReadPath(relPath, view)
+	if err != nil {
+		return 0, err
+	}
+	attrs, err := c.objectAttrs(ctx, path, expected)
+	if err != nil {
+		if objectNotFound(err) {
+			return 0, store.ErrObjectNotExist
+		}
+		return 0, fmt.Errorf("attrs %s: %w", path, err)
+	}
+	if attrs.Size < 0 {
+		return 0, errors.New("object has invalid size")
+	}
+	return attrs.Size, nil
+}
+
 func (c *Client) readFileWithView(ctx context.Context, relPath string, view generationView) ([]byte, error) {
 	path, expected, err := c.resolveReadPath(relPath, view)
 	if err != nil {
@@ -515,6 +600,10 @@ func canonicalReadPath(relPath string) bool {
 	}
 	if strings.HasPrefix(relPath, "cache/pipeline-") && strings.HasSuffix(relPath, ".log") {
 		executionID := strings.TrimSuffix(strings.TrimPrefix(relPath, "cache/pipeline-"), ".log")
+		return executionID != "" && executionID != "." && executionID != ".." && path.Clean(relPath) == relPath && !strings.ContainsAny(executionID, `/\\`) && !strings.Contains(executionID, "..")
+	}
+	if strings.HasPrefix(relPath, "cache/pipeline-") && strings.HasSuffix(relPath, ".failure.json") {
+		executionID := strings.TrimSuffix(strings.TrimPrefix(relPath, "cache/pipeline-"), ".failure.json")
 		return executionID != "" && executionID != "." && executionID != ".." && path.Clean(relPath) == relPath && !strings.ContainsAny(executionID, `/\\`) && !strings.Contains(executionID, "..")
 	}
 	return false

@@ -78,12 +78,6 @@ var cloudMkdirTemp = os.MkdirTemp
 var cloudReconcileSources = reconcileWorkspaceSources
 var cloudReconcileConcepts = reconcileWorkspaceConcepts
 
-const (
-	cloudPipelineCompletedEvent        = "pipeline completed\n"
-	cloudPipelineFailedEvent           = "pipeline failed\n"
-	cloudPipelineCommittedCleanupEvent = "pipeline committed cleanup failed\n"
-)
-
 type cloudFailureRecordingError struct {
 	pipelineLog       bool
 	sourceStatus      bool
@@ -278,7 +272,6 @@ func runCloudWorkerBatch(ctx context.Context, cfg workerConfig, commands [][]str
 		if cleanupErr := lease.Release(ctx); cleanupErr != nil {
 			recordingCtx, cancel := cloudFailureRecordingContext(ctx)
 			defer cancel()
-			_ = writeCloudPipelineEvent(recordingCtx, objects, prefix, cfg, cloudPipelineCommittedCleanupEvent)
 			if result == nil {
 				if committed {
 					failure := newWorkerFailure(nil, failureStageLeaseCleanup, failureClassIO, "", cleanupErr)
@@ -360,6 +353,12 @@ func runCloudWorkerBatch(ctx context.Context, cfg workerConfig, commands [][]str
 	}
 	if _, _, err := publishCloudGenerationFromStart(ctx, objects, prefix, workspace, snapshots, manifestData, manifestAttrs, manifestAttrs.Generation > 0); err != nil {
 		if errors.Is(err, errManifestCommitOutcomeUnknown) {
+			recordingCtx, cancel := cloudFailureRecordingContext(ctx)
+			logErr := writeCloudPipelineLog(recordingCtx, objects, prefix, workspace, cfg)
+			cancel()
+			if logErr != nil {
+				return errors.Join(errManifestCommitOutcomeUnknown, errCloudPipelineLogRecording)
+			}
 			return errManifestCommitOutcomeUnknown
 		}
 		primary := errCloudPipelinePublish
@@ -890,7 +889,7 @@ func writeCloudReceipts(ctx context.Context, objects objectStore, prefix, worksp
 func writeCloudFailureReceipts(ctx context.Context, objects objectStore, prefix, workspace string, cfg workerConfig, snapshots []sourceSnapshot, failure error) error {
 	recordingCtx, cancel := cloudFailureRecordingContext(ctx)
 	defer cancel()
-	logErr := writeCloudPipelineEvent(recordingCtx, objects, prefix, cfg, cloudPipelineFailedEvent)
+	logErr := writeCloudPipelineLog(recordingCtx, objects, prefix, workspace, cfg)
 	statusErr := mergeCloudFailure(recordingCtx, objects, prefix, snapshots)
 	diagnosticErr := writeCloudFailureDiagnosticWithContext(recordingCtx, objects, prefix, cfg, failure)
 	if logErr == nil && statusErr == nil && diagnosticErr == nil {
@@ -899,18 +898,41 @@ func writeCloudFailureReceipts(ctx context.Context, objects objectStore, prefix,
 	return cloudFailureRecordingError{pipelineLog: logErr != nil, sourceStatus: statusErr != nil, failureDiagnostic: diagnosticErr != nil}
 }
 func writeCloudPipelineLog(ctx context.Context, objects objectStore, prefix, workspace string, cfg workerConfig) error {
-	return writeCloudPipelineEvent(ctx, objects, prefix, cfg, cloudPipelineCompletedEvent)
-}
-
-func writeCloudPipelineEvent(ctx context.Context, objects objectStore, prefix string, cfg workerConfig, event string) error {
 	if !validPipelineExecutionID(cfg.ExecutionID) {
 		return nil
 	}
-	if event != cloudPipelineCompletedEvent && event != cloudPipelineFailedEvent && event != cloudPipelineCommittedCleanupEvent {
-		return errors.New("invalid pipeline event")
+	data := []byte{}
+	if workspace != "" {
+		path, err := pipelineLogPath(workspace, cfg.ExecutionID)
+		if err != nil {
+			return err
+		}
+		file, err := os.Open(path)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		if err == nil {
+			data, err = io.ReadAll(io.LimitReader(file, int64(maxPipelineLog)+1))
+			closeErr := file.Close()
+			if err != nil {
+				return err
+			}
+			if closeErr != nil {
+				return closeErr
+			}
+			data = boundedPipelineLogData(data)
+		}
 	}
-	_, err := objects.Write(ctx, prefix+"cache/pipeline-"+cfg.ExecutionID+".log", []byte(event), nil, objectConditions{})
+	_, err := objects.Write(ctx, prefix+"cache/pipeline-"+cfg.ExecutionID+".log", data, nil, objectConditions{})
 	return err
+}
+
+func boundedPipelineLogData(data []byte) []byte {
+	if len(data) <= maxPipelineLog {
+		return data
+	}
+	limit := maxPipelineLog - len(pipelineLogTruncationMarker)
+	return append(append([]byte(nil), data[:limit]...), []byte(pipelineLogTruncationMarker)...)
 }
 
 func writeCloudFailureDiagnostic(ctx context.Context, objects objectStore, prefix string, cfg workerConfig, failure error) error {

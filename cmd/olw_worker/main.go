@@ -22,6 +22,7 @@ import (
 	conceptcache "github.com/rayer/llm-wiki-bff/internal/cache"
 	"github.com/rayer/llm-wiki-bff/internal/generation"
 	"github.com/rayer/llm-wiki-bff/internal/llm"
+	"github.com/rayer/llm-wiki-bff/internal/pipelinediagnostic"
 	"github.com/rayer/llm-wiki-bff/internal/rawstatus"
 	"github.com/rayer/llm-wiki-bff/internal/sourcestatus"
 	"github.com/rayer/llm-wiki-bff/internal/storage"
@@ -72,6 +73,8 @@ const (
 	maxWorkerCommandCumulativeBytes = 256 << 10
 	suggestedQueryModel             = "deepseek-chat"
 )
+
+const pipelineLogTruncationMarker = pipelinediagnostic.PipelineLogTruncationMarker
 
 func main() {
 	if err := executeWorkerCommand(newRootCommand()); err != nil {
@@ -241,7 +244,7 @@ func configFromEnvironment(cfg workerConfig) workerConfig {
 	return cfg
 }
 
-func runWorkerBatchAtVault(ctx context.Context, cfg workerConfig, commands [][]string, vault string) error {
+func runWorkerBatchAtVault(ctx context.Context, cfg workerConfig, commands [][]string, vault string) (runErr error) {
 	var err error
 	if err := cleanStaleLock(vault, 5*time.Minute); err != nil {
 		return preserveWorkerFailure(err, failureStageLeaseCleanup, failureClassStateInvalid)
@@ -251,23 +254,30 @@ func runWorkerBatchAtVault(ctx context.Context, cfg workerConfig, commands [][]s
 		return preserveWorkerFailure(err, failureStageSyntoConfigValidation, failureClassIO)
 	}
 	defer cleanupOLWEnvironment(olwEnv)
-	if err := ensureSyntoVault(ctx, vault, cfg, olwEnv); err != nil {
-		return preserveWorkerFailure(err, failureStageSyntoConfigValidation, failureClassUnknown)
-	}
-
 	stdout, stderr, closeLog, err := pipelineLogWriters(vault, cfg, commands, cfg.SuppressOutput)
 	if err != nil {
 		return preserveWorkerFailure(err, failureStageReceiptRecording, failureClassIO)
 	}
-	runErr := runOLWBatch(ctx, vault, commands, cfg.StopOnError, olwEnv, stdout, stderr)
-	if err := closeLog(); err != nil {
-		return preserveWorkerFailure(fmt.Errorf("close pipeline log: %w", err), failureStageReceiptRecording, failureClassIO)
+	defer func() {
+		if err := closeLog(); err != nil {
+			closeFailure := preserveWorkerFailure(fmt.Errorf("close pipeline log: %w", err), failureStageReceiptRecording, failureClassIO)
+			if runErr == nil {
+				runErr = closeFailure
+			} else {
+				runErr = errors.Join(runErr, closeFailure)
+			}
+		}
+	}()
+	if err := ensureSyntoVault(ctx, vault, cfg, olwEnv, stdout, stderr); err != nil {
+		return preserveWorkerFailure(err, failureStageSyntoConfigValidation, failureClassUnknown)
 	}
+
+	runErr = runOLWBatch(ctx, vault, commands, cfg.StopOnError, olwEnv, stdout, stderr)
 	if runErr != nil {
 		return preserveWorkerFailure(runErr, failureStageSyntoRun, failureClassUnknown)
 	}
 	if cfg.Postprocess {
-		if err := ensureSyntoIndex(ctx, vault, olwEnv); err != nil {
+		if err := ensureSyntoIndex(ctx, vault, olwEnv, stdout, stderr); err != nil {
 			return preserveWorkerFailure(err, failureStageSyntoIndexExport, failureClassStateInvalid)
 		}
 	}
@@ -582,11 +592,8 @@ func allowlistedSyntoEnvironment(extra []string) []string {
 }
 
 func pipelineLogWriters(vault string, cfg workerConfig, commands [][]string, suppressOutput bool) (io.Writer, io.Writer, func() error, error) {
-	if cfg.cloudMode {
-		return io.Discard, io.Discard, func() error { return nil }, nil
-	}
 	if strings.TrimSpace(cfg.ExecutionID) == "" {
-		sink := newDiagnosticSink([]io.Writer{os.Stdout, os.Stderr}, diagnosticSecrets(cfg, commands))
+		sink := newDiagnosticSink([]io.Writer{os.Stdout, os.Stderr}, logSecrets(cfg))
 		return sink, sink, sink.Close, nil
 	}
 	path, err := pipelineLogPath(vault, cfg.ExecutionID)
@@ -604,7 +611,7 @@ func pipelineLogWriters(vault string, cfg workerConfig, commands [][]string, sup
 	if !suppressOutput {
 		destinations = append(destinations, os.Stdout, os.Stderr)
 	}
-	sink := newDiagnosticSink(destinations, diagnosticSecrets(cfg, commands))
+	sink := newDiagnosticSink(destinations, logSecrets(cfg))
 	return sink, sink, func() error {
 		if err := sink.Close(); err != nil {
 			_ = file.Close()
@@ -615,12 +622,13 @@ func pipelineLogWriters(vault string, cfg workerConfig, commands [][]string, sup
 }
 
 type diagnosticSink struct {
-	writers []io.Writer
-	secrets []string
-	pending []byte
-	written int
-	mu      sync.Mutex
-	closed  bool
+	writers   []io.Writer
+	secrets   []string
+	pending   []byte
+	output    []byte
+	mu        sync.Mutex
+	closed    bool
+	truncated bool
 }
 
 func newDiagnosticSink(writers []io.Writer, secrets []string) *diagnosticSink {
@@ -633,6 +641,9 @@ func (w *diagnosticSink) Write(data []byte) (int, error) {
 		return 0, errors.New("diagnostic sink closed")
 	}
 	original := len(data)
+	if w.truncated {
+		return original, nil
+	}
 	for len(data) > 0 {
 		n := maxDiagnosticPending
 		if room := maxDiagnosticBuffered - len(w.pending); room < n {
@@ -670,23 +681,25 @@ func (w *diagnosticSink) Close() error {
 	return w.emitLocked(w.pending, true)
 }
 func (w *diagnosticSink) emitLocked(data []byte, final bool) error {
-	if len(data) == 0 {
-		return nil
+	if len(data) > 0 && !w.truncated {
+		// Retain the full bounded output until close so an overflow can replace
+		// the final marker-sized suffix without changing the total size.
+		text := redactDiagnosticBytes(data, w.secrets)
+		remaining := maxPipelineLog - len(w.output)
+		if len(text) > remaining {
+			w.output = append(w.output, text[:remaining]...)
+			w.truncated = true
+			copy(w.output[maxPipelineLog-len(pipelineLogTruncationMarker):], pipelineLogTruncationMarker)
+		} else {
+			w.output = append(w.output, text...)
+		}
 	}
-	// Retain the fixed-size tail until close so a secret split across writes or
-	// stdout/stderr cannot reach any destination before redaction.
-	text := string(redactDiagnosticBytes(data, w.secrets))
-	if w.written < maxPipelineLog {
-		remaining := maxPipelineLog - w.written
-		text = truncateDiagnostic(text, remaining)
+	if final {
 		for _, dst := range w.writers {
-			if _, err := io.WriteString(dst, text); err != nil {
+			if _, err := dst.Write(w.output); err != nil {
 				return err
 			}
 		}
-		w.written += len(text)
-	}
-	if final {
 		w.pending = nil
 	} else {
 		w.pending = append(w.pending[:0], w.pending[len(data):]...)
@@ -779,19 +792,15 @@ func (w *cappedRedactingWriter) Write(data []byte) (int, error) {
 }
 
 func logSecrets(cfg workerConfig) []string {
-	values := []string{cfg.APIKey, os.Getenv("LLM_API_KEY"), os.Getenv("DEEPSEEK_API_KEY")}
+	values := []string{cfg.APIKey}
+	if !cfg.apiKeySet {
+		values = append(values, os.Getenv("LLM_API_KEY"), os.Getenv("DEEPSEEK_API_KEY"))
+	}
 	return values
 }
 
 func diagnosticSecrets(cfg workerConfig, commands [][]string) []string {
-	values := []string{cfg.APIKey, cfg.UserID, cfg.ProjectID, cfg.ExecutionID, cfg.VaultPath, cfg.WorkspaceDir, cfg.DataDir, cfg.Bucket}
-	if !cfg.apiKeySet {
-		values = append(values, os.Getenv("LLM_API_KEY"), os.Getenv("DEEPSEEK_API_KEY"))
-	}
-	for _, command := range commands {
-		values = append(values, command...)
-	}
-	return values
+	return logSecrets(cfg)
 }
 
 func validateWorkerInput(cfg workerConfig, commands [][]string) error {

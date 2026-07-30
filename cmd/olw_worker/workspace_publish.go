@@ -10,13 +10,15 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/rayer/llm-wiki-bff/internal/pipelinediagnostic"
 )
 
 const (
 	leasePath      = ".olw/lwc-worker-lease.json"
 	publishJournal = ".lwc-worker-publish-journal.json"
 	leaseMaxAge    = 36 * time.Hour
-	maxPipelineLog = 4 << 20
+	maxPipelineLog = pipelinediagnostic.MaxPipelineLogBytes
 )
 
 type vaultLease struct {

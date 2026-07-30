@@ -27,6 +27,7 @@ type memoryBackend struct {
 	mu                      sync.Mutex
 	objects                 map[string]backendObject
 	requests                []backendObject
+	requestedLimits         []int64
 	manifestReads           int
 	listVisits              int
 	switchManifestOnRead    string
@@ -74,6 +75,7 @@ func (m *memoryBackend) Read(_ context.Context, name string, generation, limit i
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.requests = append(m.requests, backendObject{Name: name, Generation: generation})
+	m.requestedLimits = append(m.requestedLimits, limit)
 	object, ok := m.objects[name]
 	if name == projectObject(generationManifestPath) {
 		m.manifestReads++

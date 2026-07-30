@@ -286,6 +286,74 @@ func (c *Client) ReadFile(ctx context.Context, relPath string) ([]byte, error) {
 	return data, nil
 }
 
+func (c *Client) ReadFileLimited(ctx context.Context, relPath string, limit int64) ([]byte, error) {
+	if limit < 0 {
+		return nil, errors.New("invalid read limit")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if !safeSegment(c.userID) || !safeSegment(c.projectID) {
+		return nil, fmt.Errorf("localfs scope is incomplete")
+	}
+	cleanRel, err := cleanRelativePath(relPath)
+	if err != nil {
+		return nil, err
+	}
+	file, err := openScopedRegularFile(c.root, c.userID, c.projectID, cleanRel)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, storage.ErrObjectNotExist
+		}
+		return nil, fmt.Errorf("read %s: %w", relPath, err)
+	}
+	data, readErr := io.ReadAll(io.LimitReader(file, limit))
+	closeErr := file.Close()
+	if readErr != nil {
+		return nil, readErr
+	}
+	if closeErr != nil {
+		return nil, closeErr
+	}
+	return data, nil
+}
+
+// StatFile returns file metadata without reading its contents.
+func (c *Client) StatFile(ctx context.Context, relPath string) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if !safeSegment(c.userID) || !safeSegment(c.projectID) {
+		return 0, fmt.Errorf("localfs scope is incomplete")
+	}
+	cleanRel, err := cleanRelativePath(relPath)
+	if err != nil {
+		return 0, err
+	}
+	file, err := openScopedRegularFile(c.root, c.userID, c.projectID, cleanRel)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return 0, storage.ErrObjectNotExist
+		}
+		if errors.Is(err, errSecureNotRegular) {
+			return 0, fmt.Errorf("stat %s: not a regular file", relPath)
+		}
+		return 0, fmt.Errorf("stat %s: %w", relPath, err)
+	}
+	info, statErr := file.Stat()
+	closeErr := file.Close()
+	if statErr != nil {
+		return 0, statErr
+	}
+	if closeErr != nil {
+		return 0, closeErr
+	}
+	if !info.Mode().IsRegular() {
+		return 0, fmt.Errorf("stat %s: not a regular file", relPath)
+	}
+	return info.Size(), nil
+}
+
 func (c *Client) WriteBytes(ctx context.Context, data []byte, relPath string) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
@@ -677,15 +745,23 @@ func (c *Client) fullPath(relPath string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	cleanRel := filepath.Clean(filepath.FromSlash(relPath))
-	if cleanRel == "." || filepath.IsAbs(cleanRel) || strings.HasPrefix(cleanRel, ".."+string(filepath.Separator)) || cleanRel == ".." {
-		return "", fmt.Errorf("unsafe relative path: %s", relPath)
+	cleanRel, err := cleanRelativePath(relPath)
+	if err != nil {
+		return "", err
 	}
 	target := filepath.Join(root, cleanRel)
 	if err := ensureWithinExistingParent(root, target); err != nil {
 		return "", err
 	}
 	return target, nil
+}
+
+func cleanRelativePath(relPath string) (string, error) {
+	cleanRel := filepath.Clean(filepath.FromSlash(relPath))
+	if cleanRel == "." || filepath.IsAbs(cleanRel) || strings.HasPrefix(cleanRel, ".."+string(filepath.Separator)) || cleanRel == ".." {
+		return "", fmt.Errorf("unsafe relative path: %s", relPath)
+	}
+	return cleanRel, nil
 }
 
 func (c *Client) projectRoot() (string, error) {
@@ -720,6 +796,17 @@ func ensureWithinExistingParent(root, target string) error {
 	}
 	resolvedRoot, err := filepath.EvalSymlinks(absRoot)
 	if err != nil {
+		return err
+	}
+	if _, err := os.Lstat(absTarget); err == nil {
+		resolvedTarget, err := filepath.EvalSymlinks(absTarget)
+		if err != nil {
+			return err
+		}
+		if !within(resolvedRoot, resolvedTarget) {
+			return fmt.Errorf("path escapes project root through symlink")
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 

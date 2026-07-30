@@ -29,7 +29,8 @@ import (
 // ensureSyntoVault is the only worker-owned Synto migration seam. It runs in
 // the private workspace before execution, and verifies that migration did not
 // alter the source or generated page byte streams.
-func ensureSyntoVault(ctx context.Context, vault string, cfg workerConfig, env []string) error {
+func ensureSyntoVault(ctx context.Context, vault string, cfg workerConfig, env []string, output ...io.Writer) error {
+	stdout, stderr := syntoOutputWriters(output...)
 	if err := validateSyntoVaultLayout(vault); err != nil {
 		return newWorkerFailure(ctx, failureStageSyntoConfigValidation, failureClassStateInvalid, "", err)
 	}
@@ -126,7 +127,7 @@ func ensureSyntoVault(ctx context.Context, vault string, cfg workerConfig, env [
 		if err != nil {
 			return newWorkerFailure(ctx, failureStageSyntoMigration, failureClassStateInvalid, "", err)
 		}
-		if err := execOLW(ctx, vault, []string{"migrate-olw", "--vault", vault}, env, io.Discard, io.Discard); err != nil {
+		if err := execOLW(ctx, vault, []string{"migrate-olw", "--vault", vault}, env, stdout, stderr); err != nil {
 			return fmt.Errorf("Synto OLW migration failed: %w", newWorkerFailure(ctx, failureStageSyntoMigration, failureClassChildExit, failureChildMigrateOLW, err))
 		}
 		after, err := snapshotMigrationInputs(vault)
@@ -856,7 +857,7 @@ func readSyntoIndexTruth(workspace string) (syntoIndexTruth, error) {
 // surface. The orchestrator's generate_index() only writes wiki/index.md;
 // pack export is the release-supported path that serializes the authoritative
 // schema-v1 INDEX.json without another provider call.
-func ensureSyntoIndex(ctx context.Context, vault string, env []string) error {
+func ensureSyntoIndex(ctx context.Context, vault string, env []string, output ...io.Writer) error {
 	if !isDefaultSyntoExecutor() {
 		// Existing reconciliation fixtures install an already validated INDEX
 		// from their fake Synto run. They do not model the external pack exporter;
@@ -868,7 +869,7 @@ func ensureSyntoIndex(ctx context.Context, vault string, env []string) error {
 			}
 		}
 	}
-	data, err := exportSyntoIndex(ctx, vault, env)
+	data, err := exportSyntoIndex(ctx, vault, env, output...)
 	if err != nil {
 		return err
 	}
@@ -881,14 +882,15 @@ func ensureSyntoIndex(ctx context.Context, vault string, env []string) error {
 	return nil
 }
 
-func exportSyntoIndex(ctx context.Context, vault string, env []string) ([]byte, error) {
+func exportSyntoIndex(ctx context.Context, vault string, env []string, output ...io.Writer) ([]byte, error) {
 	exportDir, err := os.MkdirTemp("", "lwc-synto-index-")
 	if err != nil {
 		return nil, newWorkerFailure(ctx, failureStageSyntoIndexExport, failureClassIO, "", fmt.Errorf("create Synto INDEX export directory: %w", err))
 	}
 	defer os.RemoveAll(exportDir)
 	command := []string{"pack", "export", "--target", "agents", "--out", exportDir}
-	if err := execOLW(ctx, vault, command, env, io.Discard, io.Discard); err != nil {
+	stdout, stderr := syntoOutputWriters(output...)
+	if err := execOLW(ctx, vault, command, env, stdout, stderr); err != nil {
 		return nil, fmt.Errorf("Synto offline INDEX export failed: %w", newWorkerFailure(ctx, failureStageSyntoIndexExport, failureClassChildExit, failureChildPackExport, err))
 	}
 	data, err := readBoundedRegularFileWithin(exportDir, "index/INDEX.json")
@@ -907,6 +909,13 @@ func exportSyntoIndex(ctx context.Context, vault string, env []string) ([]byte, 
 		return nil, newWorkerFailure(ctx, failureStageSyntoIndexExport, failureClassStateInvalid, "", fmt.Errorf("Synto offline INDEX export is invalid: %w", err))
 	}
 	return data, nil
+}
+
+func syntoOutputWriters(output ...io.Writer) (io.Writer, io.Writer) {
+	if len(output) >= 2 && output[0] != nil && output[1] != nil {
+		return output[0], output[1]
+	}
+	return os.Stdout, os.Stderr
 }
 
 type syntoAgentConcept struct {

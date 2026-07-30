@@ -224,9 +224,15 @@ definitions:
     type: object
   handler.PipelineExecutionResponse:
     properties:
+      diagnostic:
+        $ref: '#/definitions/handler.PipelineFailureDiagnostic'
       duration:
         type: string
       end_time:
+        type: string
+      log_state:
+        type: string
+      log_state_reason:
         type: string
       log_url:
         type: string
@@ -236,6 +242,23 @@ definitions:
         type: string
       status:
         type: string
+    type: object
+  handler.PipelineFailureDiagnostic:
+    properties:
+      child_command:
+        type: string
+      detail_code:
+        type: string
+      error_class:
+        type: string
+      exit_code:
+        type: integer
+      stage:
+        type: string
+      status:
+        type: string
+      version:
+        type: integer
     type: object
   handler.ProjectResponse:
     properties:
@@ -352,6 +375,10 @@ definitions:
         type: integer
       sources_count:
         type: integer
+      suggested_queries:
+        items:
+          type: string
+        type: array
     type: object
   llm.ExpandResult:
     properties:
@@ -1214,8 +1241,8 @@ paths:
       - metrics
   /api/v1/pipeline/log:
     get:
-      description: Returns the stdout and stderr log captured by the pipeline worker
-        for the current project execution.
+      description: Returns bounded raw pipeline stdout/stderr for the authenticated
+        owning project execution.
       parameters:
       - description: Cloud Run execution ID
         in: query
@@ -1254,8 +1281,9 @@ paths:
   /api/v1/pipeline/status:
     get:
       description: Returns the latest Cloud Run pipeline execution for the current
-        project. Pass execution_id to fetch a specific execution. When an execution
-        is available, last_execution.log_url points to the authenticated log endpoint.
+        project, including a bounded typed failure diagnostic when available. Pass
+        execution_id to fetch a specific execution. When an execution is available,
+        last_execution.log_url points to the authenticated log endpoint.
       parameters:
       - description: Cloud Run execution ID
         in: query

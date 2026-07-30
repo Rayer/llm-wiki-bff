@@ -23,6 +23,7 @@ import (
 	"github.com/rayer/llm-wiki-bff/internal/gcs"
 	"github.com/rayer/llm-wiki-bff/internal/handler"
 	"github.com/rayer/llm-wiki-bff/internal/llm"
+	"github.com/rayer/llm-wiki-bff/internal/pipelinediagnostic"
 	"github.com/rayer/llm-wiki-bff/internal/pipelinequota"
 	"github.com/rayer/llm-wiki-bff/internal/search"
 	store "github.com/rayer/llm-wiki-bff/internal/storage"
@@ -44,6 +45,13 @@ var (
 	errFirestoreNotConfigured    = errors.New("Firestore client is not configured")
 	errPipelineExecutionNotFound = errors.New("pipeline execution not found")
 	errWikiStorageNotConfigured  = errors.New("wiki storage is not configured")
+)
+
+const (
+	pipelineLogStatePending     = "pending"
+	pipelineLogStateAvailable   = "available"
+	pipelineLogStateUnavailable = "unavailable"
+	maxPipelineDiagnosticBytes  = 4 << 10
 )
 
 // Health handles GET /api/v1/health.
@@ -957,7 +965,7 @@ type cloudRunCondition struct {
 // PipelineStatus handles GET /api/v1/pipeline/status.
 //
 //	@Summary		Pipeline execution status
-//	@Description	Returns the latest Cloud Run pipeline execution for the current project. Pass execution_id to fetch a specific execution. When an execution is available, last_execution.log_url points to the authenticated log endpoint.
+//	@Description	Returns the latest Cloud Run pipeline execution for the current project, including a bounded typed failure diagnostic when available. Pass execution_id to fetch a specific execution. When an execution is available, last_execution.log_url points to the authenticated log endpoint.
 //	@Tags			pipeline
 //	@Produce		json
 //	@Param			execution_id	query		string	false	"Cloud Run execution ID"
@@ -1259,10 +1267,17 @@ func (h *Handler) pipelineExecutionStatusWithOwner(ctx context.Context, executio
 		if err != nil {
 			return nil, err
 		}
+		if shortCloudRunExecutionName(execution.Name, true) != executionID {
+			return nil, errPipelineExecutionNotFound
+		}
 		if owner != nil && !cloudRunExecutionOwnedBy(execution, owner.userID, owner.projectID) {
 			return nil, errPipelineExecutionNotFound
 		}
-		return newPipelineExecutionResponse(execution), nil
+		response := newPipelineExecutionResponse(execution)
+		if owner != nil {
+			h.attachPipelineDiagnostic(ctx, response, owner)
+		}
+		return response, nil
 	}
 
 	pageToken := ""
@@ -1279,7 +1294,9 @@ func (h *Handler) pipelineExecutionStatusWithOwner(ctx context.Context, executio
 		}
 		for _, execution := range executions.Executions {
 			if cloudRunExecutionOwnedBy(execution, owner.userID, owner.projectID) {
-				return newPipelineExecutionResponse(execution), nil
+				response := newPipelineExecutionResponse(execution)
+				h.attachPipelineDiagnostic(ctx, response, owner)
+				return response, nil
 			}
 		}
 		if executions.NextPageToken == "" {
@@ -1287,6 +1304,143 @@ func (h *Handler) pipelineExecutionStatusWithOwner(ctx context.Context, executio
 		}
 		pageToken = executions.NextPageToken
 	}
+}
+
+func (h *Handler) attachPipelineDiagnostic(ctx context.Context, response *handler.PipelineExecutionResponse, owner *pipelineExecutionOwner) {
+	if response == nil || owner == nil {
+		return
+	}
+	switch response.Status {
+	case "RUNNING", "UNKNOWN":
+		response.LogState = pipelineLogStatePending
+		return
+	case "SUCCEEDED", "CANCELLED", "FAILED":
+		// Raw log availability is independent from the typed diagnostic.
+	default:
+		response.LogState = pipelineLogStateUnavailable
+		response.LogStateReason = "unsupported_execution_status"
+		return
+	}
+
+	projectStore := h.store
+	if projectStore == nil {
+		response.LogState = pipelineLogStateUnavailable
+		response.LogStateReason = "storage_unavailable"
+		return
+	}
+	project := projectStore.Scope(owner.userID, owner.projectID)
+	stat, ok := project.(pipelineLogStatter)
+	if !ok {
+		response.LogState = pipelineLogStateUnavailable
+		response.LogStateReason = "storage_unavailable"
+	} else {
+		executionID := shortCloudRunExecutionName(response.Name, true)
+		size, err := stat.StatFile(ctx, "cache/pipeline-"+executionID+".log")
+		switch {
+		case errors.Is(err, store.ErrObjectNotExist), errors.Is(err, storage.ErrObjectNotExist):
+			response.LogState = pipelineLogStateUnavailable
+			response.LogStateReason = "log_unavailable"
+		case err != nil:
+			response.LogState = pipelineLogStateUnavailable
+			response.LogStateReason = "storage_unavailable"
+		case size < 0 || size > pipelinediagnostic.MaxPipelineLogBytes:
+			response.LogState = pipelineLogStateUnavailable
+			response.LogStateReason = "log_too_large"
+		default:
+			response.LogState = pipelineLogStateAvailable
+		}
+	}
+	if response.Status == "FAILED" {
+		if diagnostic, err := readPipelineFailureDiagnostic(ctx, project, response.Name); err == nil {
+			response.Diagnostic = diagnostic
+		}
+	}
+}
+
+// pipelineLogStatter is intentionally optional so the main storage contract
+// remains stable. Implementations must return metadata only; status polling
+// must never fetch the raw log body.
+type pipelineLogStatter interface {
+	StatFile(context.Context, string) (int64, error)
+}
+
+type limitedPipelineLogReader interface {
+	ReadFileLimited(context.Context, string, int64) ([]byte, error)
+}
+
+func readPipelineLog(ctx context.Context, projectStore store.Store, executionName string) ([]byte, error) {
+	executionID := shortCloudRunExecutionName(executionName, true)
+	if executionID == "" {
+		return nil, errors.New("invalid execution name")
+	}
+	reader, ok := projectStore.(limitedPipelineLogReader)
+	if !ok {
+		return nil, errors.New("bounded pipeline log reader unavailable")
+	}
+	data, err := reader.ReadFileLimited(ctx, "cache/pipeline-"+executionID+".log", pipelinediagnostic.MaxPipelineLogBytes+1)
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > pipelinediagnostic.MaxPipelineLogBytes {
+		return nil, errors.New("pipeline log exceeds worker contract")
+	}
+	return []byte(strings.ToValidUTF8(string(data), "?")), nil
+}
+
+func readPipelineFailureDiagnostic(ctx context.Context, projectStore store.Store, executionName string) (*handler.PipelineFailureDiagnostic, error) {
+	executionID := shortCloudRunExecutionName(executionName, true)
+	if executionID == "" {
+		return nil, errors.New("invalid execution name")
+	}
+	reader, ok := projectStore.(limitedPipelineLogReader)
+	if !ok {
+		return nil, errors.New("bounded pipeline diagnostic reader unavailable")
+	}
+	data, err := reader.ReadFileLimited(ctx, "cache/pipeline-"+executionID+".failure.json", maxPipelineDiagnosticBytes+1)
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > maxPipelineDiagnosticBytes {
+		return nil, errors.New("diagnostic too large")
+	}
+	var diagnostic handler.PipelineFailureDiagnostic
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&diagnostic); err != nil {
+		return nil, err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		return nil, errors.New("diagnostic has trailing data")
+	}
+	if diagnostic.Version != 1 || diagnostic.Status != "failed" {
+		return nil, errors.New("unsupported diagnostic")
+	}
+	if _, ok := pipelinediagnostic.ValidStages[pipelinediagnostic.Stage(diagnostic.Stage)]; !ok {
+		return nil, errors.New("invalid diagnostic stage")
+	}
+	if _, ok := pipelinediagnostic.ValidErrorClasses[pipelinediagnostic.ErrorClass(diagnostic.ErrorClass)]; !ok {
+		return nil, errors.New("invalid diagnostic class")
+	}
+	if diagnostic.DetailCode != "" {
+		if diagnostic.Stage != "concept_reconciliation" {
+			return nil, errors.New("invalid diagnostic detail")
+		}
+		if _, ok := pipelinediagnostic.ValidDetailCodes[pipelinediagnostic.DetailCode(diagnostic.DetailCode)]; !ok {
+			return nil, errors.New("invalid diagnostic detail")
+		}
+	}
+	if diagnostic.Child != "" {
+		if _, ok := pipelinediagnostic.ValidChildCommands[pipelinediagnostic.ChildCommand(diagnostic.Child)]; !ok {
+			return nil, errors.New("invalid diagnostic child")
+		}
+	} else if diagnostic.ExitCode != nil {
+		return nil, errors.New("diagnostic exit code without child")
+	}
+	if diagnostic.ExitCode != nil && (*diagnostic.ExitCode < 0 || *diagnostic.ExitCode > 255) {
+		return nil, errors.New("invalid diagnostic exit code")
+	}
+	return &diagnostic, nil
 }
 
 func (h *Handler) fetchCloudRunExecution(ctx context.Context, token, executionID string) (cloudRunExecution, error) {
@@ -1395,7 +1549,7 @@ func pipelineLogURLForExecution(execution cloudRunExecution) string {
 // PipelineLog handles GET /api/v1/pipeline/log.
 //
 //	@Summary		Read pipeline log
-//	@Description	Returns the stdout and stderr log captured by the pipeline worker for the current project execution.
+//	@Description	Returns bounded raw pipeline stdout/stderr for the authenticated owning project execution.
 //	@Tags			pipeline
 //	@Produce		plain
 //	@Param			execution_id	query		string	true	"Cloud Run execution ID"
@@ -1420,12 +1574,13 @@ func (h *Handler) PipelineLog(c *gin.Context) {
 	}
 
 	executionID := strings.TrimSpace(c.Query("execution_id"))
-	logPath, err := pipelineLogPath(executionID)
+	_, err := pipelineLogPath(executionID)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, handler.ErrorResponse{Error: err.Error()})
 		return
 	}
-	if _, err := h.pipelineExecutionStatusForOwner(c.Request.Context(), executionID, userID, projectID); err != nil {
+	execution, err := h.pipelineExecutionStatusForOwner(c.Request.Context(), executionID, userID, projectID)
+	if err != nil {
 		if errors.Is(err, errPipelineExecutionNotFound) {
 			c.JSON(http.StatusNotFound, handler.ErrorResponse{Error: errPipelineExecutionNotFound.Error()})
 			return
@@ -1439,7 +1594,7 @@ func (h *Handler) PipelineLog(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: generatedDataUnavailableMessage})
 		return
 	}
-	data, err := wikiStore.ReadFile(c.Request.Context(), logPath)
+	data, err := readPipelineLog(c.Request.Context(), wikiStore, execution.Name)
 	if err != nil {
 		if errors.Is(err, storage.ErrObjectNotExist) {
 			c.JSON(http.StatusNotFound, handler.ErrorResponse{Error: "pipeline log not found"})
