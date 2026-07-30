@@ -625,7 +625,7 @@ type diagnosticSink struct {
 	writers   []io.Writer
 	secrets   []string
 	pending   []byte
-	written   int
+	output    []byte
 	mu        sync.Mutex
 	closed    bool
 	truncated bool
@@ -641,6 +641,9 @@ func (w *diagnosticSink) Write(data []byte) (int, error) {
 		return 0, errors.New("diagnostic sink closed")
 	}
 	original := len(data)
+	if w.truncated {
+		return original, nil
+	}
 	for len(data) > 0 {
 		n := maxDiagnosticPending
 		if room := maxDiagnosticBuffered - len(w.pending); room < n {
@@ -678,34 +681,23 @@ func (w *diagnosticSink) Close() error {
 	return w.emitLocked(w.pending, true)
 }
 func (w *diagnosticSink) emitLocked(data []byte, final bool) error {
-	if len(data) == 0 {
-		return nil
-	}
-	// Retain the fixed-size tail until close so a secret split across writes or
-	// stdout/stderr cannot reach any destination before redaction.
-	text := string(redactDiagnosticBytes(data, w.secrets))
-	contentLimit := maxPipelineLog - len(pipelineLogTruncationMarker)
-	if w.written < contentLimit {
-		remaining := contentLimit - w.written
+	if len(data) > 0 && !w.truncated {
+		// Retain the full bounded output until close so an overflow can replace
+		// the final marker-sized suffix without changing the total size.
+		text := redactDiagnosticBytes(data, w.secrets)
+		remaining := maxPipelineLog - len(w.output)
 		if len(text) > remaining {
-			text = text[:remaining]
+			w.output = append(w.output, text[:remaining]...)
 			w.truncated = true
+			copy(w.output[maxPipelineLog-len(pipelineLogTruncationMarker):], pipelineLogTruncationMarker)
+		} else {
+			w.output = append(w.output, text...)
 		}
-		for _, dst := range w.writers {
-			if _, err := io.WriteString(dst, text); err != nil {
-				return err
-			}
-		}
-		w.written += len(text)
-	} else if len(text) > 0 {
-		w.truncated = true
 	}
 	if final {
-		if w.truncated {
-			for _, dst := range w.writers {
-				if _, err := io.WriteString(dst, pipelineLogTruncationMarker); err != nil {
-					return err
-				}
+		for _, dst := range w.writers {
+			if _, err := dst.Write(w.output); err != nil {
+				return err
 			}
 		}
 		w.pending = nil

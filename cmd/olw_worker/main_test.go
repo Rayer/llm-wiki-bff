@@ -1141,6 +1141,120 @@ func TestDiagnosticSinkRedactsSplitAlternatingOutputAndArguments(t *testing.T) {
 	}
 }
 
+func TestDiagnosticSinkRetainsFullCapUntilOverflow(t *testing.T) {
+	const capBytes = maxPipelineLog
+	marker := []byte(pipelineLogTruncationMarker)
+
+	makeInput := func(size int) []byte {
+		data := bytes.Repeat([]byte{'x'}, size)
+		copy(data, []byte("BEGIN-unique-diagnostic-sentinel"))
+		middle := size / 2
+		copy(data[middle:], []byte("MIDDLE-unique-diagnostic-sentinel"))
+		copy(data[size-len("END-unique-diagnostic-sentinel"):], []byte("END-unique-diagnostic-sentinel"))
+		return data
+	}
+
+	tests := []struct {
+		name       string
+		write      func(*testing.T, *diagnosticSink)
+		want       []byte
+		wantMarker bool
+	}{
+		{
+			name: "exact cap",
+			write: func(t *testing.T, sink *diagnosticSink) {
+				t.Helper()
+				if n, err := sink.Write(makeInput(capBytes)); err != nil || n != capBytes {
+					t.Fatalf("Write() = %d, %v; want %d, nil", n, err, capBytes)
+				}
+			},
+			want: makeInput(capBytes),
+		},
+		{
+			name: "cap plus one",
+			write: func(t *testing.T, sink *diagnosticSink) {
+				t.Helper()
+				if n, err := sink.Write(makeInput(capBytes + 1)); err != nil || n != capBytes+1 {
+					t.Fatalf("Write() = %d, %v; want %d, nil", n, err, capBytes+1)
+				}
+			},
+			want:       append(append([]byte(nil), makeInput(capBytes)[:capBytes-len(marker)]...), marker...),
+			wantMarker: true,
+		},
+		{
+			name: "late multi-write overflow",
+			write: func(t *testing.T, sink *diagnosticSink) {
+				t.Helper()
+				input := makeInput(capBytes)
+				for len(input) > 0 {
+					n := 7777
+					if n > len(input) {
+						n = len(input)
+					}
+					if written, err := sink.Write(input[:n]); err != nil || written != n {
+						t.Fatalf("Write() = %d, %v; want %d, nil", written, err, n)
+					}
+					input = input[n:]
+				}
+				if _, err := sink.Write([]byte("late-overflow")); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := sink.Write([]byte("subsequent-output-must-not-change")); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want:       append(append([]byte(nil), makeInput(capBytes)[:capBytes-len(marker)]...), marker...),
+			wantMarker: true,
+		},
+		{
+			name: "far oversized",
+			write: func(t *testing.T, sink *diagnosticSink) {
+				t.Helper()
+				if n, err := sink.Write(makeInput(capBytes + 100000)); err != nil || n != capBytes+100000 {
+					t.Fatalf("Write() = %d, %v; want %d, nil", n, err, capBytes+100000)
+				}
+			},
+			want:       append(append([]byte(nil), makeInput(capBytes + 100000)[:capBytes-len(marker)]...), marker...),
+			wantMarker: true,
+		},
+		{
+			name:  "empty",
+			write: func(t *testing.T, _ *diagnosticSink) { t.Helper() },
+			want:  []byte{},
+		},
+		{
+			name: "ordinary",
+			write: func(t *testing.T, sink *diagnosticSink) {
+				t.Helper()
+				if _, err := sink.Write([]byte("ordinary diagnostic output")); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: []byte("ordinary diagnostic output"),
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var output bytes.Buffer
+			sink := newDiagnosticSink([]io.Writer{&output}, nil)
+			test.write(t, sink)
+			if err := sink.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(output.Bytes(), test.want) {
+				t.Fatalf("output length=%d, want=%d; marker=%v, want marker=%v", output.Len(), len(test.want), bytes.Contains(output.Bytes(), marker), test.wantMarker)
+			}
+			if output.Len() != len(test.want) {
+				t.Fatalf("output length=%d, want=%d", output.Len(), len(test.want))
+			}
+			if bytes.Contains(output.Bytes(), marker) != test.wantMarker {
+				t.Fatalf("marker presence=%v, want %v", bytes.Contains(output.Bytes(), marker), test.wantMarker)
+			}
+		})
+	}
+}
+
 func TestWorkerCommandErrorsAreFixedAndSilent(t *testing.T) {
 	for _, args := range [][]string{{"run"}, {"run", `[["run"]]`, "payload-secret"}, {"--stop-on-error=not-a-bool", "run", `[["run"]]`}, {"unknown-secret-command"}} {
 		cmd := newRootCommand()
