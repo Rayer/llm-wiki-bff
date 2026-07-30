@@ -28,6 +28,7 @@ type conceptSnapshot struct {
 	Page        []byte
 	CacheRow    []byte
 	SourcePaths []string
+	IDRedirects map[string]string
 }
 
 type reconciledConcept struct {
@@ -76,6 +77,10 @@ func snapshotConcepts(vault string, priorSources ...[]sourceSnapshot) ([]concept
 	if ids.DormantConcept == nil {
 		ids.DormantConcept = map[string]string{}
 	}
+	priorIDRedirects := make(map[string]string, len(ids.IDRedirects))
+	for source, target := range ids.IDRedirects {
+		priorIDRedirects[source] = target
+	}
 	conceptIDs := make([]string, 0, len(ids.Concept)+len(ids.DormantConcept))
 	for conceptID := range ids.Concept {
 		conceptIDs = append(conceptIDs, conceptID)
@@ -119,7 +124,7 @@ func snapshotConcepts(vault string, priorSources ...[]sourceSnapshot) ([]concept
 		if len(priorSources) > 0 {
 			sourcePaths = exactConceptSourcePaths(page, priorSources[0])
 		}
-		out = append(out, conceptSnapshot{ConceptID: conceptID, Slug: slug, EntityID: ids.ConceptEntityID[conceptID], Dormant: dormant, Page: page, CacheRow: row, SourcePaths: sourcePaths})
+		out = append(out, conceptSnapshot{ConceptID: conceptID, Slug: slug, EntityID: ids.ConceptEntityID[conceptID], Dormant: dormant, Page: page, CacheRow: row, SourcePaths: sourcePaths, IDRedirects: priorIDRedirects})
 	}
 	return out, nil
 }
@@ -808,6 +813,19 @@ func reconcileWorkspaceConcepts(workspace string, prior []conceptSnapshot, curre
 		if err := validateSyntoDerivedArtifacts(workspace, generated, plan); err != nil {
 			return wrapConceptReconciliationError(conceptDetailEntityMerge, err)
 		}
+		if err := planSyntoDirectEntityIDRedirects(&generated, prior); err != nil {
+			return wrapConceptReconciliationError(conceptDetailIdentityReconciliation, err)
+		}
+		if err := validateSyntoDerivedArtifacts(workspace, generated, plan); err != nil {
+			return wrapConceptReconciliationError(conceptDetailEntityMerge, err)
+		}
+		generatedData, err := wikiindex.EncodeIDMap(generated)
+		if err != nil {
+			return wrapConceptReconciliationError(conceptDetailEntityMerge, err)
+		}
+		if err := writeFileAtomicWithin(workspace, "cache/id_map.json", generatedData); err != nil {
+			return wrapConceptReconciliationError(conceptDetailArtifactWrite, err)
+		}
 		return nil
 	}
 	generated, omittedSlugs, err := filterUnmappedLegacyConcepts(workspace, generated, indexTruth, prior)
@@ -950,6 +968,81 @@ func isSyntoDirectEntityCandidate(generated wikiindex.IDMap, index syntoIndexTru
 		}
 	}
 	return false
+}
+
+func planSyntoDirectEntityIDRedirects(generated *wikiindex.IDMap, prior []conceptSnapshot) error {
+	currentBySlug := make(map[string]string, len(generated.Concept))
+	for entityID, slug := range generated.Concept {
+		if !annotation.ValidSourceID(entityID) || !safeConceptSlug(slug) {
+			return fmt.Errorf("unsafe Synto direct concept mapping %q -> %q", entityID, slug)
+		}
+		normalizedSlug := strings.ToLower(strings.TrimSpace(slug))
+		if previous, exists := currentBySlug[normalizedSlug]; exists && previous != entityID {
+			return fmt.Errorf("duplicate Synto direct concept slug %q", slug)
+		}
+		currentBySlug[normalizedSlug] = entityID
+	}
+
+	redirects := make(map[string]string, len(generated.IDRedirects)+len(prior))
+	targetOwners := make(map[string]string, len(generated.IDRedirects)+len(prior))
+	addRedirect := func(source, target string) error {
+		if !annotation.ValidSourceID(source) {
+			return fmt.Errorf("unsafe ID redirect source %q", source)
+		}
+		target = strings.TrimSpace(target)
+		if !annotation.ValidSourceID(target) {
+			return fmt.Errorf("unsafe ID redirect target %q for %q", target, source)
+		}
+		if _, current := generated.Concept[source]; current {
+			return fmt.Errorf("ID redirect source %q is an active concept", source)
+		}
+		if previous, exists := redirects[source]; exists && previous != target {
+			return fmt.Errorf("ID redirect conflict for %q", source)
+		}
+		if previous, exists := targetOwners[target]; exists && previous != source {
+			return fmt.Errorf("ID redirect target collision %q", target)
+		}
+		redirects[source] = target
+		targetOwners[target] = source
+		return nil
+	}
+	for source, target := range generated.IDRedirects {
+		if err := addRedirect(source, target); err != nil {
+			return err
+		}
+	}
+	for _, old := range prior {
+		if old.Dormant {
+			continue
+		}
+		if !annotation.ValidSourceID(old.ConceptID) || !safeConceptSlug(old.Slug) {
+			return errors.New("unsafe prior concept mapping")
+		}
+		for source, target := range old.IDRedirects {
+			if err := addRedirect(source, target); err != nil {
+				return err
+			}
+		}
+		target, exists := currentBySlug[strings.ToLower(strings.TrimSpace(old.Slug))]
+		if !exists || old.ConceptID == target {
+			continue
+		}
+		if err := addRedirect(old.ConceptID, target); err != nil {
+			return err
+		}
+	}
+
+	for source, target := range redirects {
+		if _, chain := redirects[target]; chain {
+			return fmt.Errorf("ID redirect chain detected for %q", source)
+		}
+		if _, current := generated.Concept[target]; !current {
+			return fmt.Errorf("ID redirect target %q not found", target)
+		}
+	}
+
+	generated.IDRedirects = redirects
+	return nil
 }
 
 func validateSyntoDerivedArtifacts(workspace string, generated wikiindex.IDMap, plan wikiindex.SyntoIdentityPlan) error {

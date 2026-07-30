@@ -2922,6 +2922,143 @@ func TestSyntoWorkerDirectEntityPathExcludesEntitylessPageWithoutChangingBytes(t
 	}
 }
 
+func TestReconcileWorkspaceConceptsDirectEntityMigratesOldIDRedirect(t *testing.T) {
+	workspace := t.TempDir()
+	const entityID = "01JAZ5N7Y3K8M2Q4R6T9VWXABC"
+	prior := []conceptSnapshot{{ConceptID: "a3f7b2c01d9d", Slug: "alpha"}}
+	mustWriteFile(t, filepath.Join(workspace, "cache", "id_map.json"), []byte(`{"concept":{"`+entityID+`":"alpha"},"source":{},"redirects":{}}`))
+	mustWriteFile(t, filepath.Join(workspace, "wiki", "alpha.md"), []byte("---\nid: "+entityID+"\n---\nAlpha\n"))
+	mustWriteFile(t, filepath.Join(workspace, "cache", "concepts.jsonl"), []byte(`{"slug":"alpha","frontmatter":{"id":"`+entityID+`"}}`+"\n"))
+	mustWriteFile(t, filepath.Join(workspace, ".synto", "INDEX.json"), []byte(syntoIndexFixture("article-alpha", entityID, "alpha", false)))
+
+	if err := reconcileWorkspaceConcepts(workspace, prior); err != nil {
+		t.Fatalf("reconcileWorkspaceConcepts() error = %v", err)
+	}
+	ids := mustSnapshotIDMap(t, workspace)
+	if len(ids.Concept) != 1 || ids.Concept[entityID] != "alpha" {
+		t.Fatalf("concept map = %#v, want only %s -> alpha", ids.Concept, entityID)
+	}
+	if got := ids.IDRedirects["a3f7b2c01d9d"]; got != entityID {
+		t.Fatalf("old ID redirect = %q, want %q", got, entityID)
+	}
+}
+
+func TestSyntoWorkerDirectEntityMigratesOldIDRedirectIdempotently(t *testing.T) {
+	old := execOLW
+	t.Cleanup(func() { execOLW = old })
+	vault := t.TempDir()
+	workspaceDir := t.TempDir()
+	const entityID = "01JAZ5N7Y3K8M2Q4R6T9VWXABC"
+	mustWriteFile(t, filepath.Join(vault, "cache", "id_map.json"), []byte(`{"concept":{"a3f7b2c01d9d":"alpha"},"source":{},"redirects":{}}`))
+	mustWriteFile(t, filepath.Join(vault, "wiki", "alpha.md"), []byte("---\nid: a3f7b2c01d9d\n---\nAlpha\n"))
+	mustWriteFile(t, filepath.Join(vault, "cache", "concepts.jsonl"), []byte(`{"slug":"alpha","frontmatter":{"id":"a3f7b2c01d9d"}}`+"\n"))
+
+	execOLW = func(_ context.Context, work string, command []string, _ []string, _, _ io.Writer) error {
+		if strings.Join(command, " ") != "run --auto-approve" {
+			return fmt.Errorf("unexpected Synto command %v", command)
+		}
+		mustWriteFile(t, filepath.Join(work, "wiki", "alpha.md"), []byte("---\nid: synto-transient-alpha\n---\nAlpha regenerated\n"))
+		mustWriteFile(t, filepath.Join(work, "cache", "id_map.json"), []byte(`{"concept":{"synto-transient-alpha":"alpha"},"source":{},"redirects":{}}`))
+		mustWriteFile(t, filepath.Join(work, "cache", "concepts.jsonl"), []byte(`{"slug":"alpha","frontmatter":{"id":"synto-transient-alpha"}}`+"\n"))
+		mustWriteFile(t, filepath.Join(work, "cache", "raw_status.json"), []byte("{}"))
+		mustWriteFile(t, filepath.Join(work, "cache", "suggested_queries.json"), []byte("{}"))
+		mustWriteFile(t, filepath.Join(work, ".synto", "INDEX.json"), []byte(syntoIndexFixture("article-alpha", entityID, "alpha", false)))
+		writeValidSQLiteState(t, filepath.Join(work, ".synto", "state.db"))
+		return nil
+	}
+	cfg := workerConfig{VaultPath: vault, APIKey: "fake", Workspace: true, WorkspaceDir: workspaceDir, Postprocess: true, StopOnError: true}
+	var first []byte
+	for run := 1; run <= 2; run++ {
+		if err := runWorkerBatch(context.Background(), cfg, `[["run","--auto-approve"]]`); err != nil {
+			t.Fatalf("runWorkerBatch() run %d error = %v", run, err)
+		}
+		data, err := os.ReadFile(filepath.Join(vault, "cache", "id_map.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids, err := wikiindex.DecodeIDMap(data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(ids.Concept) != 1 || ids.Concept[entityID] != "alpha" || len(ids.ConceptEntityID) != 0 {
+			t.Fatalf("run %d direct map = %#v", run, ids)
+		}
+		if got := ids.IDRedirects["a3f7b2c01d9d"]; got != entityID {
+			t.Fatalf("run %d old ID redirect = %q, want %q", run, got, entityID)
+		}
+		if run == 1 {
+			first = append([]byte(nil), data...)
+		} else if !bytes.Equal(first, data) {
+			t.Fatalf("second run changed id_map.json:\nfirst=%s\nsecond=%s", first, data)
+		}
+	}
+}
+
+func TestReconcileWorkspaceConceptsDirectEntityRejectsInvalidIDRedirectsAtomically(t *testing.T) {
+	tests := []struct {
+		name       string
+		concepts   string
+		redirects  string
+		wantDetail string
+	}{
+		{
+			name:       "conflicting existing redirect",
+			concepts:   `"entity-alpha":"alpha","entity-beta":"beta"`,
+			redirects:  `"a3f7b2c01d9d":"entity-beta"`,
+			wantDetail: "ID redirect conflict",
+		},
+		{
+			name:       "redirect chain",
+			concepts:   `"entity-alpha":"alpha"`,
+			redirects:  `"legacy-a":"legacy-b","legacy-b":"entity-alpha"`,
+			wantDetail: "ID redirect chain",
+		},
+		{
+			name:       "missing target",
+			concepts:   `"entity-alpha":"alpha"`,
+			redirects:  `"legacy-a":"missing"`,
+			wantDetail: "ID redirect target",
+		},
+		{
+			name:       "current ID source",
+			concepts:   `"entity-alpha":"alpha"`,
+			redirects:  `"entity-alpha":"entity-alpha"`,
+			wantDetail: "active concept",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			workspace := t.TempDir()
+			mustWriteFile(t, filepath.Join(workspace, "cache", "id_map.json"), []byte(`{"concept":{`+test.concepts+`},"source":{},"redirects":{},"id_redirects":{`+test.redirects+`}}`))
+			mustWriteFile(t, filepath.Join(workspace, "wiki", "alpha.md"), []byte("---\nid: entity-alpha\n---\nAlpha\n"))
+			cache := []byte(`{"slug":"alpha","frontmatter":{"id":"entity-alpha"}}` + "\n")
+			articles := []string{"article-alpha:entity-alpha:alpha"}
+			if strings.Contains(test.concepts, "entity-beta") {
+				mustWriteFile(t, filepath.Join(workspace, "wiki", "beta.md"), []byte("---\nid: entity-beta\n---\nBeta\n"))
+				cache = append(cache, []byte(`{"slug":"beta","frontmatter":{"id":"entity-beta"}}`+"\n")...)
+				articles = append(articles, "article-beta:entity-beta:beta")
+			}
+			mustWriteFile(t, filepath.Join(workspace, "cache", "concepts.jsonl"), cache)
+			mustWriteFile(t, filepath.Join(workspace, ".synto", "INDEX.json"), []byte(syntoIndexFixtureWithEntities(articles, nil)))
+			relevant := []string{"cache/id_map.json", "cache/concepts.jsonl", "wiki/alpha.md", ".synto/INDEX.json"}
+			if strings.Contains(test.concepts, "entity-beta") {
+				relevant = append(relevant, "wiki/beta.md")
+			}
+			before := snapshotRelevantVaultBytes(t, workspace, relevant...)
+
+			priorID := "a3f7b2c01d9d"
+			if test.name == "redirect chain" {
+				priorID = "entity-alpha"
+			}
+			err := reconcileWorkspaceConcepts(workspace, []conceptSnapshot{{ConceptID: priorID, Slug: "alpha"}})
+			if err == nil || !strings.Contains(err.Error(), test.wantDetail) {
+				t.Fatalf("error = %v, want %q", err, test.wantDetail)
+			}
+			assertVaultBytesUnchanged(t, workspace, before)
+		})
+	}
+}
+
 func TestFreshSyntoRunInitializesAndPublishesWithoutLegacyArtifacts(t *testing.T) {
 	old := execOLW
 	defer func() { execOLW = old }()
