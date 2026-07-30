@@ -196,6 +196,24 @@ func TestReadFileLimitedRejectsFinalSymlinkOutsideProject(t *testing.T) {
 	}
 }
 
+func TestReadFileLimitedBoundsFailureDiagnosticRead(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "users", "u", "projects", "p", "cache", "pipeline-run.failure.json")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, make([]byte, 4098), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	data, err := New(root).WithScope("u", "p").ReadFileLimited(context.Background(), "cache/pipeline-run.failure.json", 4097)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(data) != 4097 {
+		t.Fatalf("ReadFileLimited() bytes=%d, want exactly 4097", len(data))
+	}
+}
+
 func TestStatFileIsScopedAndMetadataOnly(t *testing.T) {
 	root := t.TempDir()
 	project := New(root).WithScope("u", "p")

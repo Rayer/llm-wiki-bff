@@ -650,6 +650,113 @@ func TestCloudMigrationPostconditionFailureIsTyped(t *testing.T) {
 	}
 }
 
+func TestCloudSyntoLifecycleOutputIsPublishedForEveryFailurePhase(t *testing.T) {
+	old := execOLW
+	t.Cleanup(func() { execOLW = old })
+
+	tests := []struct {
+		name       string
+		fail       string
+		ambiguous  bool
+		wantOutput []string
+		wantErr    error
+	}{
+		{name: "migration", fail: "migration", wantOutput: []string{"MIGRATION_STDOUT", "MIGRATION_STDERR"}},
+		{name: "run", fail: "run", wantOutput: []string{"MIGRATION_STDOUT", "MIGRATION_STDERR", "RUN_STDOUT", "RUN_STDERR"}},
+		{name: "pack export", fail: "pack", wantOutput: []string{"MIGRATION_STDOUT", "MIGRATION_STDERR", "RUN_STDOUT", "RUN_STDERR", "PACK_EXPORT_STDOUT", "PACK_EXPORT_STDERR"}},
+		{name: "postprocess", fail: "postprocess", wantOutput: []string{"MIGRATION_STDOUT", "MIGRATION_STDERR", "RUN_STDOUT", "RUN_STDERR", "PACK_EXPORT_STDOUT", "PACK_EXPORT_STDERR"}},
+		{name: "ambiguous manifest", ambiguous: true, wantOutput: []string{"MIGRATION_STDOUT", "MIGRATION_STDERR", "RUN_STDOUT", "RUN_STDERR", "PACK_EXPORT_STDOUT", "PACK_EXPORT_STDERR"}, wantErr: errManifestCommitOutcomeUnknown},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newMemoryObjects()
+			prefix := "users/user/projects/" + strings.ReplaceAll(tc.name, " ", "-") + "/"
+			seedCloudSource(t, m, prefix, "raw", "", priorCloudReceipt())
+			writeCloudLegacyState(t, m, prefix)
+			cfg := cloudCfgFor("user", strings.TrimSuffix(strings.TrimPrefix(prefix, "users/user/projects/"), "/"), "execution")
+			cfg.suggestedQueriesProvider = nil
+
+			execOLW = func(_ context.Context, vault string, command []string, _ []string, stdout, stderr io.Writer) error {
+				joined := strings.Join(command, " ")
+				switch {
+				case strings.HasPrefix(joined, "migrate-olw "):
+					_, _ = io.WriteString(stdout, "MIGRATION_STDOUT\n")
+					_, _ = io.WriteString(stderr, "MIGRATION_STDERR\n")
+					if tc.fail == "migration" {
+						return errors.New("migration failed")
+					}
+					mustWriteFile(t, filepath.Join(vault, "synto.toml"), []byte("[pipeline]\nauto_commit = false\nauto_maintain = false\nrelation_extraction = false\n"))
+					writeValidSQLiteState(t, filepath.Join(vault, ".synto", "state.db"))
+					return nil
+				case joined == "run":
+					_, _ = io.WriteString(stdout, "RUN_STDOUT\n")
+					_, _ = io.WriteString(stderr, "RUN_STDERR\n")
+					if tc.fail == "run" {
+						return errors.New("run failed")
+					}
+					if err := os.Remove(filepath.Join(vault, ".olw", "state.db")); err != nil {
+						t.Fatal(err)
+					}
+					writeCloudRequiredOutputs(t, vault)
+					if err := os.Remove(filepath.Join(vault, ".synto", "INDEX.json")); err != nil {
+						t.Fatal(err)
+					}
+					if tc.fail == "postprocess" {
+						path := filepath.Join(vault, "cache", "raw_status.json")
+						if err := os.Remove(path); err != nil {
+							t.Fatal(err)
+						}
+						if err := os.Mkdir(path, 0o755); err != nil {
+							t.Fatal(err)
+						}
+					}
+					return nil
+				case strings.HasPrefix(joined, "pack export "):
+					_, _ = io.WriteString(stdout, "PACK_EXPORT_STDOUT\n")
+					_, _ = io.WriteString(stderr, "PACK_EXPORT_STDERR\n")
+					if tc.fail == "pack" {
+						return errors.New("pack export failed")
+					}
+					mustWriteFile(t, filepath.Join(command[5], "index", "INDEX.json"), []byte(syntoIndexFixtureWithEntities([]string{"article:entity:alpha"}, nil)))
+					mustWriteFile(t, filepath.Join(command[5], "agent", "concepts.json"), []byte(`{"schema_version":1,"concepts":[]}`))
+					return nil
+				default:
+					return fmt.Errorf("unexpected command %v", command)
+				}
+			}
+
+			var runErr error
+			if tc.ambiguous {
+				runErr = runCloudWorkerBatch(context.Background(), cfg, [][]string{{"run"}}, &commitThenErrorStore{objectStore: m, manifest: prefix + generation.ManifestPath, unknown: true})
+			} else {
+				runErr = runCloudWorkerBatch(context.Background(), cfg, [][]string{{"run"}}, m)
+			}
+			if tc.wantErr != nil {
+				if !errors.Is(runErr, tc.wantErr) {
+					t.Fatalf("error=%v, want %v", runErr, tc.wantErr)
+				}
+			} else if runErr == nil {
+				t.Fatal("run unexpectedly succeeded")
+			}
+
+			logData, _, err := m.Read(context.Background(), prefix+"cache/pipeline-execution.log", 0, generation.MaxFileBytes)
+			if err != nil {
+				t.Fatal(err)
+			}
+			logText := string(logData)
+			last := -1
+			for _, marker := range tc.wantOutput {
+				position := strings.Index(logText, marker)
+				if position <= last {
+					t.Fatalf("log=%q missing or reordered marker %q after %d", logText, marker, last)
+				}
+				last = position
+			}
+		})
+	}
+}
+
 func TestCloudMigrationNormalizationFailureIsTyped(t *testing.T) {
 	old := execOLW
 	t.Cleanup(func() { execOLW = old })

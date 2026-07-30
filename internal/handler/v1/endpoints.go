@@ -1384,7 +1384,7 @@ func readPipelineLog(ctx context.Context, projectStore store.Store, executionNam
 	if len(data) > pipelinediagnostic.MaxPipelineLogBytes {
 		return nil, errors.New("pipeline log exceeds worker contract")
 	}
-	return []byte(strings.ToValidUTF8(string(data), "�")), nil
+	return []byte(strings.ToValidUTF8(string(data), "?")), nil
 }
 
 func readPipelineFailureDiagnostic(ctx context.Context, projectStore store.Store, executionName string) (*handler.PipelineFailureDiagnostic, error) {
@@ -1392,7 +1392,11 @@ func readPipelineFailureDiagnostic(ctx context.Context, projectStore store.Store
 	if executionID == "" {
 		return nil, errors.New("invalid execution name")
 	}
-	data, err := projectStore.ReadFile(ctx, "cache/pipeline-"+executionID+".failure.json")
+	reader, ok := projectStore.(limitedPipelineLogReader)
+	if !ok {
+		return nil, errors.New("bounded pipeline diagnostic reader unavailable")
+	}
+	data, err := reader.ReadFileLimited(ctx, "cache/pipeline-"+executionID+".failure.json", maxPipelineDiagnosticBytes+1)
 	if err != nil {
 		return nil, err
 	}

@@ -244,7 +244,7 @@ func configFromEnvironment(cfg workerConfig) workerConfig {
 	return cfg
 }
 
-func runWorkerBatchAtVault(ctx context.Context, cfg workerConfig, commands [][]string, vault string) error {
+func runWorkerBatchAtVault(ctx context.Context, cfg workerConfig, commands [][]string, vault string) (runErr error) {
 	var err error
 	if err := cleanStaleLock(vault, 5*time.Minute); err != nil {
 		return preserveWorkerFailure(err, failureStageLeaseCleanup, failureClassStateInvalid)
@@ -254,23 +254,30 @@ func runWorkerBatchAtVault(ctx context.Context, cfg workerConfig, commands [][]s
 		return preserveWorkerFailure(err, failureStageSyntoConfigValidation, failureClassIO)
 	}
 	defer cleanupOLWEnvironment(olwEnv)
-	if err := ensureSyntoVault(ctx, vault, cfg, olwEnv); err != nil {
-		return preserveWorkerFailure(err, failureStageSyntoConfigValidation, failureClassUnknown)
-	}
-
 	stdout, stderr, closeLog, err := pipelineLogWriters(vault, cfg, commands, cfg.SuppressOutput)
 	if err != nil {
 		return preserveWorkerFailure(err, failureStageReceiptRecording, failureClassIO)
 	}
-	runErr := runOLWBatch(ctx, vault, commands, cfg.StopOnError, olwEnv, stdout, stderr)
-	if err := closeLog(); err != nil {
-		return preserveWorkerFailure(fmt.Errorf("close pipeline log: %w", err), failureStageReceiptRecording, failureClassIO)
+	defer func() {
+		if err := closeLog(); err != nil {
+			closeFailure := preserveWorkerFailure(fmt.Errorf("close pipeline log: %w", err), failureStageReceiptRecording, failureClassIO)
+			if runErr == nil {
+				runErr = closeFailure
+			} else {
+				runErr = errors.Join(runErr, closeFailure)
+			}
+		}
+	}()
+	if err := ensureSyntoVault(ctx, vault, cfg, olwEnv, stdout, stderr); err != nil {
+		return preserveWorkerFailure(err, failureStageSyntoConfigValidation, failureClassUnknown)
 	}
+
+	runErr = runOLWBatch(ctx, vault, commands, cfg.StopOnError, olwEnv, stdout, stderr)
 	if runErr != nil {
 		return preserveWorkerFailure(runErr, failureStageSyntoRun, failureClassUnknown)
 	}
 	if cfg.Postprocess {
-		if err := ensureSyntoIndex(ctx, vault, olwEnv); err != nil {
+		if err := ensureSyntoIndex(ctx, vault, olwEnv, stdout, stderr); err != nil {
 			return preserveWorkerFailure(err, failureStageSyntoIndexExport, failureClassStateInvalid)
 		}
 	}

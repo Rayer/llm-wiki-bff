@@ -103,6 +103,19 @@ func TestReadFileAcceptsWorkerFailureDiagnosticFromMemoryGCS(t *testing.T) {
 	}
 }
 
+func TestReadFileLimitedRequestsExactFailureDiagnosticBound(t *testing.T) {
+	client, backend := newMemoryClient()
+	backend.put(projectObject("cache/pipeline-run.failure.json"), []byte("diagnostic"), 11, nil)
+	if _, err := client.ReadFileLimited(context.Background(), "cache/pipeline-run.failure.json", 4097); err != nil {
+		t.Fatal(err)
+	}
+	backend.mu.Lock()
+	defer backend.mu.Unlock()
+	if len(backend.requestedLimits) == 0 || backend.requestedLimits[len(backend.requestedLimits)-1] != 4097 {
+		t.Fatalf("requested limits=%v, want final request 4097", backend.requestedLimits)
+	}
+}
+
 func TestTemporaryObjectCleanupUsesExactGeneration(t *testing.T) {
 	conditions := temporaryObjectDeleteConditions(42)
 	if conditions.GenerationMatch != 42 || conditions.DoesNotExist {

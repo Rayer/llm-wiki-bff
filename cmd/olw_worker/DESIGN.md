@@ -151,11 +151,12 @@ HTTP status, URLs, paths, arguments, provider bodies, model responses, source
 or article text, credentials, tokens, tenant/user/project/execution IDs, or
 timestamps. The raw log deliberately preserves ordinary operational output;
 only known application API-key values are prevented from reaching the log.
-The BFF reads only the exact owner/project/execution object, bounds its read to
-64 KiB, normalizes invalid UTF-8, and appends
-`\n[output truncated by API at 65536 bytes]\n` when returning an oversized
-response. Raw text is never parsed as a stage contract; the typed diagnostic
-remains the stable status/timeline/automation contract.
+The worker is the only producer-side cap: it publishes one complete bounded
+execution artifact of at most 4 MiB. The explicit PipelineLog fetch returns
+that artifact without head/tail sampling or a second API truncation marker.
+Status polling fetches execution metadata only; it does not fetch or proxy
+Cloud Logging output. Raw text is never parsed as a stage contract; the typed
+diagnostic remains the stable status/timeline/automation contract.
 
 The one deliberate exception is `errManifestCommitOutcomeUnknown`: when the
 manifest CAS/readback outcome is ambiguous, the worker writes no failed

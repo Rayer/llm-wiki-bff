@@ -2054,8 +2054,37 @@ func TestReadPipelineLogNormalizesInvalidUTF8(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(got) != "prefix �\n" || !utf8.Valid(got) {
+	if string(got) != "prefix ?\n" || !utf8.Valid(got) {
 		t.Fatalf("normalized log = %q, want valid replacement", got)
+	}
+}
+
+func TestReadPipelineLogNormalizesInvalidUTF8WithoutExpandingBound(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "users", "u", "projects", "p", "cache")
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	data := make([]byte, pipelinediagnostic.MaxPipelineLogBytes)
+	for i := range data {
+		if i%2 == 0 {
+			data[i] = 0xff
+		} else {
+			data[i] = 'A'
+		}
+	}
+	if err := os.WriteFile(filepath.Join(path, "pipeline-run.log"), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := readPipelineLog(context.Background(), localfs.New(root).Scope("u", "p"), "projects/p/locations/l/jobs/j/executions/run")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) > pipelinediagnostic.MaxPipelineLogBytes || !utf8.Valid(got) {
+		t.Fatalf("normalized log len=%d valid=%v, want valid <= %d", len(got), utf8.Valid(got), pipelinediagnostic.MaxPipelineLogBytes)
+	}
+	if len(got) != len(data) || got[0] != '?' || got[1] != 'A' || got[len(got)-2] != '?' || got[len(got)-1] != 'A' {
+		t.Fatalf("normalized log boundary/content = %q...%q, len=%d", got[:2], got[len(got)-2:], len(got))
 	}
 }
 
@@ -2491,6 +2520,87 @@ func (s *pipelineLogMetadataSpyStore) StatFile(context.Context, string) (int64, 
 func (s *pipelineLogMetadataSpyStore) ReadFileLimited(context.Context, string, int64) ([]byte, error) {
 	s.root.readCalls++
 	return nil, errors.New("body read must not occur during status")
+}
+
+type pipelineFailureDiagnosticSpyRoot struct {
+	store.RootStore
+	data         []byte
+	genericReads int
+	limitedReads int
+	limit        int64
+}
+
+func (r *pipelineFailureDiagnosticSpyRoot) Scope(userID, projectID string) store.Store {
+	return &pipelineFailureDiagnosticSpyStore{Store: r.RootStore.Scope(userID, projectID), root: r}
+}
+
+type pipelineFailureDiagnosticSpyStore struct {
+	store.Store
+	root *pipelineFailureDiagnosticSpyRoot
+}
+
+func (s *pipelineFailureDiagnosticSpyStore) ReadFile(context.Context, string) ([]byte, error) {
+	s.root.genericReads++
+	return append([]byte(nil), s.root.data...), nil
+}
+
+func (s *pipelineFailureDiagnosticSpyStore) ReadFileLimited(_ context.Context, _ string, limit int64) ([]byte, error) {
+	s.root.limitedReads++
+	s.root.limit = limit
+	data := s.root.data
+	if int64(len(data)) > limit {
+		data = data[:limit]
+	}
+	return append([]byte(nil), data...), nil
+}
+
+func TestReadPipelineFailureDiagnosticUsesExactBoundedReader(t *testing.T) {
+	root := &pipelineFailureDiagnosticSpyRoot{
+		RootStore: localfs.New(t.TempDir()),
+		data:      []byte(`{"version":1,"status":"failed","stage":"synto_run","error_class":"child_exit","child_command":"run"}`),
+	}
+	if _, err := readPipelineFailureDiagnostic(context.Background(), root.Scope("u", "p"), "projects/p/locations/l/jobs/j/executions/run"); err != nil {
+		t.Fatal(err)
+	}
+	if root.genericReads != 0 || root.limitedReads != 1 || root.limit != maxPipelineDiagnosticBytes+1 {
+		t.Fatalf("generic reads=%d limited reads=%d limit=%d, want 0/1/%d", root.genericReads, root.limitedReads, root.limit, maxPipelineDiagnosticBytes+1)
+	}
+}
+
+func TestReadPipelineFailureDiagnosticRejectsOversizedObjectAfterBoundedRead(t *testing.T) {
+	root := &pipelineFailureDiagnosticSpyRoot{
+		RootStore: localfs.New(t.TempDir()),
+		data:      append([]byte(`{"version":1,"status":"failed","stage":"synto_run","error_class":"child_exit","child_command":"run"}`), bytes.Repeat([]byte{'x'}, maxPipelineDiagnosticBytes)...),
+	}
+	if _, err := readPipelineFailureDiagnostic(context.Background(), root.Scope("u", "p"), "projects/p/locations/l/jobs/j/executions/run"); err == nil {
+		t.Fatal("oversized diagnostic was accepted")
+	}
+	if root.genericReads != 0 || root.limitedReads != 1 || root.limit != maxPipelineDiagnosticBytes+1 || len(root.data) <= int(root.limit) {
+		t.Fatalf("generic reads=%d limited reads=%d limit=%d object bytes=%d, want bounded 4097-byte request", root.genericReads, root.limitedReads, root.limit, len(root.data))
+	}
+}
+
+type pipelineFailureDiagnosticGenericOnlyRoot struct {
+	store.RootStore
+}
+
+func (r pipelineFailureDiagnosticGenericOnlyRoot) Scope(userID, projectID string) store.Store {
+	return pipelineFailureDiagnosticGenericOnlyStore{Store: r.RootStore.Scope(userID, projectID)}
+}
+
+type pipelineFailureDiagnosticGenericOnlyStore struct {
+	store.Store
+}
+
+func (pipelineFailureDiagnosticGenericOnlyStore) ReadFile(context.Context, string) ([]byte, error) {
+	return []byte(`{"version":1,"status":"failed","stage":"synto_run","error_class":"child_exit","child_command":"run"}`), nil
+}
+
+func TestReadPipelineFailureDiagnosticFailsClosedWithoutLimitedReader(t *testing.T) {
+	root := pipelineFailureDiagnosticGenericOnlyRoot{RootStore: localfs.New(t.TempDir())}
+	if _, err := readPipelineFailureDiagnostic(context.Background(), root.Scope("u", "p"), "projects/p/locations/l/jobs/j/executions/run"); err == nil {
+		t.Fatal("diagnostic reader fell back to generic ReadFile")
+	}
 }
 
 func TestAttachPipelineDiagnosticUsesMetadataWithoutReadingLog(t *testing.T) {
