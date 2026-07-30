@@ -261,6 +261,7 @@ func (h *Handler) handleIDRoutedPage(c *gin.Context, gcsClient store.Store, curr
 	}
 
 	c.JSON(http.StatusOK, handler.ConceptDetailResponse{
+		ID:          entry.ID,
 		Slug:        entry.Slug,
 		Title:       entry.Slug,
 		Type:        "concept",

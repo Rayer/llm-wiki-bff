@@ -2,6 +2,7 @@ package v1
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +13,7 @@ import (
 	"cloud.google.com/go/storage"
 	"github.com/gin-gonic/gin"
 	"github.com/rayer/llm-wiki-bff/internal/gcs"
+	"github.com/rayer/llm-wiki-bff/internal/handler"
 	"github.com/rayer/llm-wiki-bff/internal/localfs"
 	"github.com/rayer/llm-wiki-bff/internal/search"
 )
@@ -190,8 +192,9 @@ func TestGetConceptServesCanonicalSyntoULIDAndRedirectsLegacyID(t *testing.T) {
 		path       string
 		wantStatus int
 		wantHeader string
+		wantID     string
 	}{
-		{name: "canonical ULID", path: "/api/v1/concepts/" + testSyntoConceptULID + "-alpha", wantStatus: http.StatusOK},
+		{name: "canonical ULID", path: "/api/v1/concepts/" + testSyntoConceptULID + "-alpha", wantStatus: http.StatusOK, wantID: testSyntoConceptULID},
 		{name: "legacy ID redirect", path: "/api/v1/concepts/a3f7b2c01d9d-old-alpha", wantStatus: http.StatusFound, wantHeader: "/api/v1/concepts/" + testSyntoConceptULID + "-alpha"},
 	}
 	for _, tt := range tests {
@@ -208,6 +211,15 @@ func TestGetConceptServesCanonicalSyntoULIDAndRedirectsLegacyID(t *testing.T) {
 			}
 			if tt.wantHeader != "" && recorder.Header().Get("Location") != tt.wantHeader {
 				t.Fatalf("Location = %q, want %q", recorder.Header().Get("Location"), tt.wantHeader)
+			}
+			if tt.wantID != "" {
+				var response handler.ConceptDetailResponse
+				if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+					t.Fatalf("decode response: %v", err)
+				}
+				if response.ID != tt.wantID {
+					t.Fatalf("response ID = %q, want %q", response.ID, tt.wantID)
+				}
 			}
 		})
 	}
