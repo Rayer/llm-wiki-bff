@@ -1,10 +1,13 @@
 package search
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestParseCitationsResolvesDeterministicReferenceAndNormalizesTitle(t *testing.T) {
 	results := []Result{{
-		Slug:  "parks/yu-yi-zhi-qiu",
+		Slug:  "yu-yi-zhi-qiu",
 		Title: "中和員山公園/遊逸之丘",
 		Type:  "source",
 	}}
@@ -22,7 +25,7 @@ func TestParseCitationsResolvesDeterministicReferenceAndNormalizesTitle(t *testi
 }
 
 func TestResolveCitationsPreservesExactCompatibilityAndConceptIdentity(t *testing.T) {
-	results := []Result{{Slug: "coffee/shops", Title: "Coffee Shops", Type: "concept"}}
+	results := []Result{{Slug: "coffee-shops", Title: "Coffee Shops", Type: "concept"}}
 
 	normalized, citations, filtered := ResolveCitations("See [Coffee Shops] and [CITATION_REF_0].", results)
 	if normalized != "See [Coffee Shops] and [Coffee Shops]." {
@@ -43,7 +46,7 @@ func TestResolveCitationsFailsClosedAndPreservesResults(t *testing.T) {
 	}
 
 	normalized, citations, filtered := ResolveCitations("Unknown [not-ranked] [CITATION_REF_9] [Shared Title]", results)
-	if normalized != "Unknown [not-ranked] [CITATION_REF_9] [Shared Title]" {
+	if normalized != "Unknown [not-ranked]  [Shared Title]" {
 		t.Fatalf("unknown or ambiguous text was changed: %q", normalized)
 	}
 	if len(citations) != 0 {
@@ -54,11 +57,54 @@ func TestResolveCitationsFailsClosedAndPreservesResults(t *testing.T) {
 	}
 }
 
-func TestResolveCitationsEscapesCanonicalRoute(t *testing.T) {
-	results := []Result{{Slug: "parks/a/b !", Title: "A Park", Type: "source"}}
+func TestResolveCitationsAcceptsOnlyCanonicalReferences(t *testing.T) {
+	results := []Result{{Slug: "park", Title: "Park", Type: "concept"}}
+	for _, token := range []string{
+		"[CITATION_REF_00]", "[CITATION_REF_+0]", "[CITATION_REF_-0]",
+		"[CITATION_REF_ 0]", "[CITATION_REF_0x0]", "[CITATION_REF_999999999999999999999999]",
+	} {
+		normalized, citations, _ := ResolveCitations(token, results)
+		if normalized != "" || len(citations) != 0 {
+			t.Fatalf("invalid reference was not stripped: %q -> %q, %#v", token, normalized, citations)
+		}
+	}
+}
 
-	_, citations, _ := ResolveCitations("[CITATION_REF_0]", results)
-	if len(citations) != 1 || citations[0].Path != "/sources/parks%2Fa%2Fb%20%21" {
-		t.Fatalf("unexpected escaped citation path: %#v", citations)
+func TestResolveCitationsStripsMalformedReservedReferences(t *testing.T) {
+	for _, answer := range []string{
+		"before [CITATION_REF_1 after",
+		"before [CITATION_REF_0] and [CITATION_REF_",
+		"before [CITATION_REF_0 trailing] after",
+		"before [CITATION_REF_0]suffix",
+	} {
+		normalized, _, _ := ResolveCitations(answer, nil)
+		if strings.Contains(normalized, "CITATION_REF_") {
+			t.Fatalf("reserved reference leaked from %q: %q", answer, normalized)
+		}
+	}
+}
+
+func TestResolveCitationsRejectsUnsafeResultIdentity(t *testing.T) {
+	unsafe := []Result{
+		{Slug: "parks/a", Title: "A", Type: "source"},
+		{Slug: "parks%2Fa", Title: "B", Type: "source"},
+		{Slug: "..", Title: "C", Type: "concept"},
+		{Slug: "park", Title: "D", Type: "unknown"},
+	}
+	for i, result := range unsafe {
+		normalized, citations, filtered := ResolveCitations(CitationReference(i), []Result{result})
+		if normalized != "" || len(citations) != 0 || len(filtered) != 1 {
+			t.Fatalf("unsafe result was cited: %#v -> %q, %#v, %#v", result, normalized, citations, filtered)
+		}
+	}
+}
+
+func TestCitationContextNeutralizesUntrustedReferences(t *testing.T) {
+	context := BuildCitationContext(3, "Title [CITATION_REF_8]", "slug [CITATION_REF_7]", "body [CITATION_REF_6]")
+	if strings.Contains(context, "[CITATION_REF_8]") || strings.Contains(context, "[CITATION_REF_7]") || strings.Contains(context, "[CITATION_REF_6]") {
+		t.Fatalf("untrusted context can counterfeit a reference: %q", context)
+	}
+	if !strings.Contains(context, "[CITATION_REF_3]") {
+		t.Fatalf("generated reference missing: %q", context)
 	}
 }

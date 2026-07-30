@@ -425,6 +425,86 @@ func CitationReference(rank int) string {
 	return "[CITATION_REF_" + strconv.Itoa(rank) + "]"
 }
 
+// BuildCitationContext formats a ranked wiki block. Untrusted fields are
+// neutralized so they cannot counterfeit a server-issued citation reference.
+func BuildCitationContext(rank int, title, slug, body string) string {
+	return fmt.Sprintf("[%s] %s %s\n\n%s", neutralizeCitationReferences(title), CitationReference(rank), neutralizeCitationReferences(slug), neutralizeCitationReferences(body))
+}
+
+func neutralizeCitationReferences(text string) string {
+	return strings.ReplaceAll(text, "CITATION_REF_", "CITATION-REF_")
+}
+
+func citationRank(text string, resultCount int) (int, bool) {
+	const prefix = "CITATION_REF_"
+	if resultCount <= 0 || !strings.HasPrefix(text, prefix) {
+		return 0, false
+	}
+	suffix := text[len(prefix):]
+	if suffix == "" || (len(suffix) > 1 && suffix[0] == '0') {
+		return 0, false
+	}
+	rank := 0
+	for _, digit := range suffix {
+		if digit < '0' || digit > '9' {
+			return 0, false
+		}
+		if rank > (resultCount-1-int(digit-'0'))/10 {
+			return 0, false
+		}
+		rank = rank*10 + int(digit-'0')
+		if rank >= resultCount {
+			return 0, false
+		}
+	}
+	return rank, CitationReference(rank) == "["+text+"]"
+}
+
+func safeCitationResult(result Result) bool {
+	if result.Type != "source" && result.Type != "concept" {
+		return false
+	}
+	if result.Slug == "" || strings.TrimSpace(result.Slug) != result.Slug || result.Slug == "." || result.Slug == ".." {
+		return false
+	}
+	if strings.ContainsAny(result.Slug, "/\\%?#") || strings.HasPrefix(result.Slug, "//") {
+		return false
+	}
+	for _, r := range result.Slug {
+		if r < 0x20 || r == 0x7f {
+			return false
+		}
+	}
+	parsed, err := url.Parse(result.Slug)
+	if err != nil || parsed.IsAbs() || parsed.Host != "" {
+		return false
+	}
+	escaped := url.PathEscape(result.Slug)
+	unescaped, err := url.PathUnescape(escaped)
+	return escaped != "" && escaped != "." && escaped != ".." && err == nil && unescaped == result.Slug && !strings.Contains(escaped, "/")
+}
+
+func stripReservedCitationFragments(text string) string {
+	const prefix = "CITATION_REF_"
+	for {
+		idx := strings.Index(text, prefix)
+		if idx < 0 {
+			return text
+		}
+		start := idx
+		if start > 0 && text[start-1] == '[' {
+			start--
+		}
+		end := strings.IndexByte(text[idx:], ']')
+		if end >= 0 {
+			end += idx + 1
+		} else {
+			end = len(text)
+		}
+		text = text[:start] + text[end:]
+	}
+}
+
 // ResolveCitations validates citations against the bounded ranked result set,
 // normalizes valid references to canonical titles, and preserves ranked results
 // when no citation validates.
@@ -449,12 +529,12 @@ func ResolveCitations(aiSynth string, results []Result) (string, []Citation, []R
 	for {
 		start := strings.Index(remaining, "[")
 		if start < 0 {
-			normalized.WriteString(remaining)
+			normalized.WriteString(stripReservedCitationFragments(remaining))
 			break
 		}
 		end := strings.Index(remaining[start:], "]")
 		if end < 0 {
-			normalized.WriteString(remaining)
+			normalized.WriteString(stripReservedCitationFragments(remaining))
 			break
 		}
 		normalized.WriteString(remaining[:start])
@@ -463,19 +543,19 @@ func ResolveCitations(aiSynth string, results []Result) (string, []Citation, []R
 
 		// Skip URLs and other bracket content
 		if strings.Contains(text, "http") || strings.Contains(text, "wiki") || strings.Contains(text, "general") {
-			normalized.WriteString("[")
-			normalized.WriteString(text)
-			normalized.WriteString("]")
+			normalized.WriteString(stripReservedCitationFragments("[" + text + "]"))
 			continue
 		}
 
 		var matched *Result
 		if strings.HasPrefix(text, "CITATION_REF_") {
-			if rank, err := strconv.Atoi(strings.TrimPrefix(text, "CITATION_REF_")); err == nil && rank >= 0 && rank < len(results) {
+			if rank, ok := citationRank(text, len(results)); ok && safeCitationResult(results[rank]) {
 				matched = &results[rank]
 			}
 		} else if matches := byTitle[strings.ToLower(text)]; len(matches) == 1 {
-			matched = &matches[0]
+			if safeCitationResult(matches[0]) {
+				matched = &matches[0]
+			}
 		}
 
 		if matched != nil {
@@ -491,9 +571,11 @@ func ResolveCitations(aiSynth string, results []Result) (string, []Citation, []R
 			normalized.WriteString("]")
 			cited[r.Type+"\x00"+r.Slug] = true
 		} else {
-			normalized.WriteString("[")
-			normalized.WriteString(text)
-			normalized.WriteString("]")
+			if !strings.Contains(text, "CITATION_REF_") {
+				normalized.WriteString("[")
+				normalized.WriteString(text)
+				normalized.WriteString("]")
+			}
 		}
 	}
 

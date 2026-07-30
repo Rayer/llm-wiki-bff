@@ -418,14 +418,7 @@ func cachedContexts(ctx context.Context, conceptCache *conceptcache.Cache, reade
 		if len(entry.Sources) > 0 {
 			sourceContext = "Sources: [" + strings.Join(entry.Sources, ", ") + "]"
 		}
-		contexts = append(contexts, fmt.Sprintf(
-			"[%s] %s %s\n%s\n\n%s",
-			entry.Title,
-			search.CitationReference(rank),
-			entry.Slug,
-			sourceContext,
-			entry.Body,
-		))
+		contexts = append(contexts, search.BuildCitationContext(rank, entry.Title, entry.Slug, sourceContext+"\n\n"+entry.Body))
 	}
 	return contexts
 }

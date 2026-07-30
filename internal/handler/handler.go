@@ -2,7 +2,6 @@ package handler
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"net/http"
 	"net/url"
@@ -87,7 +86,7 @@ func (h *Handler) Query(c *gin.Context) {
 			if err != nil {
 				continue
 			}
-			contexts = append(contexts, fmt.Sprintf("[%s] %s %s\n\n%s", r.Title, search.CitationReference(rank), r.Slug, string(data)))
+			contexts = append(contexts, search.BuildCitationContext(rank, r.Title, r.Slug, string(data)))
 		}
 
 		if len(contexts) > 0 {
