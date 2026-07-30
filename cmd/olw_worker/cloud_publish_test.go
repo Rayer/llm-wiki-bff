@@ -1135,6 +1135,288 @@ func TestCloudPersistsNestedEntityMappingDetailAndReplaysIdempotently(t *testing
 	}
 }
 
+func TestCloudInternalConceptFailureAppendsWorkerFailureToPipelineLog(t *testing.T) {
+	oldExec := execOLW
+	oldConcepts := cloudReconcileConcepts
+	t.Cleanup(func() {
+		execOLW = oldExec
+		cloudReconcileConcepts = oldConcepts
+	})
+	m := newMemoryObjects()
+	prefix := "users/user/projects/project/"
+	seedCloudSource(t, m, prefix, "raw", "", priorCloudReceipt())
+	execOLW = func(_ context.Context, vault string, _ []string, _ []string, stdout, _ io.Writer) error {
+		_, _ = io.WriteString(stdout, "child output completed\n")
+		writeCloudRequiredOutputs(t, vault)
+		return nil
+	}
+	cloudReconcileConcepts = func(string, []conceptSnapshot, ...[]sourceSnapshot) error {
+		return wrapConceptReconciliationError(
+			conceptDetailEntityMappingArticleSourceMissing,
+			errors.New(`Synto INDEX.json article "ordinary-slug" has no source_concepts entity_id or authoritative prior identity`),
+		)
+	}
+	cfg := cloudCfgFor("user", "project", "execution")
+	if err := runCloudWorkerBatch(context.Background(), cfg, [][]string{{"run"}}, m); err == nil {
+		t.Fatal("cloud reconciliation unexpectedly succeeded")
+	}
+	data, _, err := m.Read(context.Background(), prefix+"cache/pipeline-execution.log", 0, generation.MaxFileBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var record struct {
+		Event      string `json:"event"`
+		Stage      string `json:"stage"`
+		ErrorClass string `json:"error_class"`
+		DetailCode string `json:"detail_code"`
+		Cause      string `json:"cause"`
+	}
+	for _, line := range bytes.Split(data, []byte("\n")) {
+		if json.Unmarshal(line, &record) == nil && record.Event == "worker_failure" {
+			if record.Stage != string(failureStageConceptReconciliation) || record.ErrorClass != string(failureClassUnknown) || record.DetailCode != string(conceptDetailEntityMappingArticleSourceMissing) || !strings.Contains(record.Cause, "ordinary-slug") {
+				t.Fatalf("worker failure record=%+v", record)
+			}
+			return
+		}
+	}
+	t.Fatalf("uploaded pipeline log lacks worker_failure record: %q", data)
+}
+
+func TestCloudInternalSourceFailureAppendsWorkerFailureToPipelineLog(t *testing.T) {
+	oldExec := execOLW
+	oldSources := cloudReconcileSources
+	oldConcepts := cloudReconcileConcepts
+	t.Cleanup(func() {
+		execOLW = oldExec
+		cloudReconcileSources = oldSources
+		cloudReconcileConcepts = oldConcepts
+	})
+	m := newMemoryObjects()
+	prefix := "users/user/projects/project/"
+	seedCloudSource(t, m, prefix, "raw", "", priorCloudReceipt())
+	execOLW = func(_ context.Context, vault string, _ []string, _ []string, stdout, _ io.Writer) error {
+		_, _ = io.WriteString(stdout, "child output completed\n")
+		writeCloudRequiredOutputs(t, vault)
+		return nil
+	}
+	const safeCause = "source reconciliation structural failure: source metadata shape is invalid"
+	cloudReconcileSources = func(string, []sourceSnapshot) error {
+		return errors.New(safeCause)
+	}
+	conceptsReached := false
+	cloudReconcileConcepts = func(string, []conceptSnapshot, ...[]sourceSnapshot) error {
+		conceptsReached = true
+		return errors.New("concept reconciliation should not be reached")
+	}
+	cfg := cloudCfgFor("user", "project", "execution")
+	if err := runCloudWorkerBatch(context.Background(), cfg, [][]string{{"run"}}, m); err == nil {
+		t.Fatal("source reconciliation unexpectedly succeeded")
+	}
+	if conceptsReached {
+		t.Fatal("concept reconciliation was reached after source reconciliation failed")
+	}
+	data, _, err := m.Read(context.Background(), prefix+"cache/pipeline-execution.log", 0, generation.MaxFileBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var record workerFailureLogRecord
+	for _, line := range bytes.Split(data, []byte("\n")) {
+		if json.Unmarshal(line, &record) == nil && record.Event == "worker_failure" {
+			if record.Stage != failureStageSourceReconciliation || record.ErrorClass != failureClassUnknown || record.DetailCode != "" || record.Cause != safeCause {
+				t.Fatalf("worker failure record=%+v", record)
+			}
+			return
+		}
+	}
+	t.Fatalf("uploaded pipeline log lacks complete source worker_failure record: %q", data)
+}
+
+func TestAppendWorkerFailurePipelineLogBoundsAndRedactsSecrets(t *testing.T) {
+	vault := t.TempDir()
+	mustWriteFile(t, filepath.Join(vault, "cache", "pipeline-execution.log"), []byte("child output\n"))
+	cfg := workerConfig{
+		ExecutionID: "execution",
+		APIKey:      "api-secret",
+		UserID:      "user-secret",
+		ProjectID:   "project-secret",
+		VaultPath:   "/private/workspace-secret",
+	}
+	failure := preserveWorkerFailure(
+		wrapConceptReconciliationError(conceptDetailEntityMappingArticleSourceMissing, errors.New("api-secret user-secret project-secret /private/workspace-secret argument-secret")),
+		failureStageConceptReconciliation,
+		failureClassUnknown,
+	)
+	if err := appendWorkerFailurePipelineLog(vault, cfg, failure, []string{"argument-secret"}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(vault, "cache", "pipeline-execution.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(data) >= maxPipelineLog || !bytes.HasPrefix(data, []byte("child output\n")) || bytes.Contains(data, []byte(pipelineLogTruncationMarker)) || bytes.Contains(data, []byte("api-secret")) || bytes.Contains(data, []byte("user-secret")) || bytes.Contains(data, []byte("project-secret")) || bytes.Contains(data, []byte("workspace-secret")) || bytes.Contains(data, []byte("argument-secret")) {
+		t.Fatalf("appended record was not bounded/redacted: len=%d data=%q", len(data), data)
+	}
+	if !bytes.Contains(data, []byte(`"event":"worker_failure"`)) || !bytes.Contains(data, []byte(string(conceptDetailEntityMappingArticleSourceMissing))) {
+		t.Fatalf("appended record missing structural fields: %q", data)
+	}
+	assertRecord := func(name string, got, childPrefix []byte) {
+		t.Helper()
+		marker := []byte(pipelineLogTruncationMarker)
+		if len(got) != maxPipelineLog || !bytes.HasPrefix(got, childPrefix) || !bytes.HasSuffix(got, marker) || bytes.Count(got, marker) != 1 {
+			t.Fatalf("%s artifact len=%d prefix=%v markerCount=%d suffix=%v", name, len(got), bytes.HasPrefix(got, childPrefix), bytes.Count(got, marker), bytes.HasSuffix(got, marker))
+		}
+		body := got[:len(got)-len(marker)]
+		var record workerFailureLogRecord
+		for _, line := range bytes.Split(body, []byte{'\n'}) {
+			if json.Unmarshal(line, &record) == nil && record.Event == "worker_failure" {
+				if record.DetailCode != conceptDetailEntityMappingArticleSourceMissing || record.Cause == "" {
+					t.Fatalf("%s worker_failure record=%+v", name, record)
+				}
+				return
+			}
+		}
+		t.Fatalf("%s artifact lacks complete worker_failure record before marker", name)
+	}
+
+	exact := bytes.Repeat([]byte{'x'}, maxPipelineLog)
+	mustWriteFile(t, filepath.Join(vault, "cache", "pipeline-exact.log"), exact)
+	exactCfg := cfg
+	exactCfg.ExecutionID = "exact"
+	if err := appendWorkerFailurePipelineLog(vault, exactCfg, failure, nil); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(filepath.Join(vault, "cache", "pipeline-exact.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertRecord("exact", got, []byte("x"))
+
+	marked := append(bytes.Repeat([]byte{'y'}, maxPipelineLog-len(pipelineLogTruncationMarker)), []byte(pipelineLogTruncationMarker)...)
+	mustWriteFile(t, filepath.Join(vault, "cache", "pipeline-marked.log"), marked)
+	markedCfg := cfg
+	markedCfg.ExecutionID = "marked"
+	if err := appendWorkerFailurePipelineLog(vault, markedCfg, failure, nil); err != nil {
+		t.Fatal(err)
+	}
+	got, err = os.ReadFile(filepath.Join(vault, "cache", "pipeline-marked.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertRecord("marked", got, []byte("y"))
+}
+
+func TestAppendWorkerFailurePipelineLogNearCapRetainsCompleteRecord(t *testing.T) {
+	vault := t.TempDir()
+	const childTail = "child-tail-must-be-evicted"
+	childPrefix := []byte("child-prefix\n")
+	childLen := maxPipelineLog - 16
+	child := append(append(append([]byte(nil), childPrefix...), bytes.Repeat([]byte{'c'}, childLen-len(childPrefix)-len(childTail))...), []byte(childTail)...)
+	mustWriteFile(t, filepath.Join(vault, "cache", "pipeline-execution.log"), child)
+	cfg := workerConfig{ExecutionID: "execution"}
+	failure := preserveWorkerFailure(
+		wrapConceptReconciliationError(conceptDetailEntityMappingArticleSourceMissing, errors.New("near-cap child failed")),
+		failureStageConceptReconciliation,
+		failureClassUnknown,
+	)
+
+	if err := appendWorkerFailurePipelineLog(vault, cfg, failure, nil); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(vault, "cache", "pipeline-execution.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := []byte(pipelineLogTruncationMarker)
+	if len(data) != maxPipelineLog || !bytes.HasSuffix(data, marker) || bytes.Count(data, marker) != 1 {
+		t.Fatalf("near-cap artifact len=%d markerCount=%d suffix=%v, want exactly one final marker at cap", len(data), bytes.Count(data, marker), bytes.HasSuffix(data, marker))
+	}
+	if !bytes.HasPrefix(data, childPrefix) || bytes.Contains(data, []byte(childTail)) {
+		t.Fatalf("near-cap artifact did not retain child prefix and evict child tail: len=%d prefix=%v tail=%v", len(data), bytes.HasPrefix(data, childPrefix), bytes.Contains(data, []byte(childTail)))
+	}
+	body := data[:len(data)-len(marker)]
+	var record workerFailureLogRecord
+	found := false
+	for _, line := range bytes.Split(body, []byte{'\n'}) {
+		if err := json.Unmarshal(line, &record); err == nil && record.Event == "worker_failure" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("near-cap artifact lacks complete parseable worker_failure record before marker: len=%d bodyLines=%d", len(data), len(bytes.Split(body, []byte{'\n'})))
+	}
+	if record.Stage != failureStageConceptReconciliation || record.ErrorClass != failureClassUnknown || record.DetailCode != conceptDetailEntityMappingArticleSourceMissing || record.Cause != "near-cap child failed" {
+		t.Fatalf("near-cap worker_failure record=%+v", record)
+	}
+}
+
+func TestAppendWorkerFailurePipelineLogDelimitsChildOutputWithoutTrailingNewline(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		childOutput []byte
+	}{
+		{name: "without trailing newline", childOutput: []byte("child output")},
+		{name: "empty", childOutput: nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			vault := t.TempDir()
+			mustWriteFile(t, filepath.Join(vault, "cache", "pipeline-execution.log"), tc.childOutput)
+			cfg := workerConfig{ExecutionID: "execution"}
+			failure := preserveWorkerFailure(
+				wrapConceptReconciliationError(conceptDetailEntityMappingArticleSourceMissing, errors.New("child failed")),
+				failureStageConceptReconciliation,
+				failureClassUnknown,
+			)
+
+			if err := appendWorkerFailurePipelineLog(vault, cfg, failure, nil); err != nil {
+				t.Fatal(err)
+			}
+			data, err := os.ReadFile(filepath.Join(vault, "cache", "pipeline-execution.log"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantPrefix := append([]byte(nil), tc.childOutput...)
+			if len(wantPrefix) > 0 {
+				wantPrefix = append(wantPrefix, '\n')
+			}
+			if !bytes.HasPrefix(data, wantPrefix) {
+				t.Fatalf("child output bytes were not preserved with delimiter: %q", data)
+			}
+			var record workerFailureLogRecord
+			for _, line := range bytes.Split(data, []byte{'\n'}) {
+				if json.Unmarshal(line, &record) == nil && record.Event == "worker_failure" {
+					return
+				}
+			}
+			t.Fatalf("worker failure line is not parseable JSON: %q", data)
+		})
+	}
+}
+
+func TestAppendWorkerFailurePipelineLogRedactsSecretBeforeCauseTruncation(t *testing.T) {
+	vault := t.TempDir()
+	mustWriteFile(t, filepath.Join(vault, "cache", "pipeline-execution.log"), []byte("child output\n"))
+	cfg := workerConfig{ExecutionID: "execution"}
+	secret := "boundary-secret-0123456789"
+	cause := strings.Repeat("x", maxWorkerArgBytes-4) + secret
+	failure := preserveWorkerFailure(
+		wrapConceptReconciliationError(conceptDetailEntityMappingArticleSourceMissing, errors.New(cause)),
+		failureStageConceptReconciliation,
+		failureClassUnknown,
+	)
+
+	if err := appendWorkerFailurePipelineLog(vault, cfg, failure, []string{secret}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(vault, "cache", "pipeline-execution.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(data, []byte(secret[:4])) {
+		t.Fatalf("persisted pipeline log leaked secret prefix across cause truncation boundary: %q", data)
+	}
+}
+
 func TestCloudRejectsUnsafeCommandContractBeforeLeaseStorageOrChild(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
