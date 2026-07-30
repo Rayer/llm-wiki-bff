@@ -60,6 +60,8 @@ type execOLWFunc func(ctx context.Context, vault string, command []string, env [
 
 var execOLW execOLWFunc = execOLWCommand
 
+var buildNonce = "local"
+
 const (
 	maxDiagnosticPending            = 8192
 	maxDiagnosticBuffered           = maxDiagnosticPending + maxWorkerArgBytes
@@ -77,10 +79,15 @@ const (
 const pipelineLogTruncationMarker = pipelinediagnostic.PipelineLogTruncationMarker
 
 func main() {
+	printBuildNonce(os.Stdout)
 	if err := executeWorkerCommand(newRootCommand()); err != nil {
 		log.Printf("worker: %v", err)
 		os.Exit(1)
 	}
+}
+
+func printBuildNonce(w io.Writer) {
+	fmt.Fprintf(w, "worker build_nonce=%s\n", buildNonce)
 }
 
 func executeWorkerCommand(cmd *cobra.Command) error {
