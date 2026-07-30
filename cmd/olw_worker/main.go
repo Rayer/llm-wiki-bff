@@ -800,7 +800,11 @@ func logSecrets(cfg workerConfig) []string {
 }
 
 func diagnosticSecrets(cfg workerConfig, commands [][]string) []string {
-	return logSecrets(cfg)
+	values := logSecrets(cfg)
+	for _, command := range commands {
+		values = append(values, command...)
+	}
+	return values
 }
 
 func validateWorkerInput(cfg workerConfig, commands [][]string) error {
