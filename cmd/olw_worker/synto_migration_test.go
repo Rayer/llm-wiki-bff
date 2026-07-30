@@ -1948,6 +1948,26 @@ func TestSyntoEntityMappingReservedRootsPreservesAgentIdentityJoin(t *testing.T)
 	}
 }
 
+func TestSyntoEntityMappingReservedRootsStillValidateIdentity(t *testing.T) {
+	tests := []struct {
+		name    string
+		article syntoIndexEntry
+	}{
+		{name: "unsafe article ID", article: syntoIndexEntry{ID: "../root", Name: "Index", Path: "wiki/index.md"}},
+		{name: "unsafe entity ID", article: syntoIndexEntry{ID: "root-log", EntityID: "../entity", Name: "Log", Path: "wiki/log.md"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			index := syntoIndexTruthForEntityMapping([]syntoIndexEntry{tt.article}, nil, nil)
+			_, err := mapSyntoEntityIDsFromIndexTruth(index, map[string]string{})
+			if err == nil {
+				t.Fatal("unsafe reserved-root identity was skipped")
+			}
+			testEntityMappingErrorDetail(t, err, conceptDetailEntityMappingArticleIdentity)
+		})
+	}
+}
+
 func TestSyntoEntityMappingReservedRootPathMatrixFailsClosed(t *testing.T) {
 	tests := []struct {
 		name string
