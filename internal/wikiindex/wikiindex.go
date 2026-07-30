@@ -335,7 +335,7 @@ func RewriteSyntoConceptPage(data []byte, entityID string) ([]byte, error) {
 		return nil, fmt.Errorf("invalid Synto entity ID %q", entityID)
 	}
 	lineEnding := []byte("\n")
-	if bytes.Contains(data, []byte("\r\n")) {
+	if newline := bytes.IndexByte(data, '\n'); newline > 0 && data[newline-1] == '\r' {
 		lineEnding = []byte("\r\n")
 	}
 	if !bytes.HasPrefix(data, []byte("---")) {
@@ -343,12 +343,12 @@ func RewriteSyntoConceptPage(data []byte, entityID string) ([]byte, error) {
 		return append(prefix, data...), nil
 	}
 	lines := bytes.SplitAfter(data, []byte("\n"))
-	if len(lines) == 0 || strings.TrimSpace(string(lines[0])) != "---" {
+	if len(lines) == 0 || !syntoFrontmatterFence(lines[0]) {
 		return nil, errors.New("concept frontmatter is malformed")
 	}
 	end := -1
 	for i := 1; i < len(lines); i++ {
-		if strings.TrimSpace(string(lines[i])) == "---" {
+		if syntoFrontmatterFence(lines[i]) {
 			end = i
 			break
 		}
@@ -410,6 +410,13 @@ func RewriteSyntoConceptPage(data []byte, entityID string) ([]byte, error) {
 		lines[end] = []byte("id: " + entityID + ending)
 	}
 	return bytes.Join(lines, nil), nil
+}
+
+func syntoFrontmatterFence(line []byte) bool {
+	line = bytes.TrimSuffix(line, []byte("\n"))
+	line = bytes.TrimSuffix(line, []byte("\r"))
+	line = bytes.TrimRight(line, " \t")
+	return bytes.Equal(line, []byte("---"))
 }
 
 func validateSyntoFrontmatterYAML(data []byte) (*yaml.Node, error) {

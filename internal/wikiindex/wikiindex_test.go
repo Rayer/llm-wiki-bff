@@ -159,6 +159,15 @@ func TestRewriteSyntoConceptPageValidatesCompleteYAMLBeforeMutation(t *testing.T
 	if !bytes.Equal(empty, wantEmpty) {
 		t.Fatalf("empty frontmatter rewrite = %q, want %q", empty, wantEmpty)
 	}
+	blockScalar := []byte("---\ntitle: Alpha\ndescription: |\n  Before\n  ---\n  After\n---\nBody\n")
+	blockScalarRewritten, err := RewriteSyntoConceptPage(blockScalar, testEntityULID)
+	if err != nil {
+		t.Fatalf("indented block-scalar rule rejected: %v", err)
+	}
+	wantBlockScalar := []byte("---\ntitle: Alpha\ndescription: |\n  Before\n  ---\n  After\nid: " + testEntityULID + "\n---\nBody\n")
+	if !bytes.Equal(blockScalarRewritten, wantBlockScalar) {
+		t.Fatalf("block scalar changed: got %q want %q", blockScalarRewritten, wantBlockScalar)
+	}
 }
 
 func TestRebuildWithSyntoIdentityUsesEntityIDsAndExcludesEntitylessPages(t *testing.T) {
