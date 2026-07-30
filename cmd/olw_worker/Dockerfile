@@ -5,10 +5,7 @@ COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 RUN : "${BUILD_NONCE:?BUILD_NONCE is required}" \
-    && case "$BUILD_NONCE" in \
-      [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;; \
-      *) echo "BUILD_NONCE must be 32 lowercase hexadecimal characters" >&2; exit 1 ;; \
-    esac \
+    && sh ./cmd/olw_worker/validate_build_nonce.sh "${BUILD_NONCE}" \
     && CGO_ENABLED=0 GOOS=linux go build -ldflags "-X main.buildNonce=${BUILD_NONCE}" -o /out/worker ./cmd/olw_worker
 
 FROM python:3.12-slim AS worker

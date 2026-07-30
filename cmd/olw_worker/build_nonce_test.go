@@ -40,7 +40,7 @@ func TestWorkerDockerfileBuildNonceContract(t *testing.T) {
 	for _, want := range []string{
 		"ARG BUILD_NONCE",
 		"BUILD_NONCE:?BUILD_NONCE is required",
-		"[0-9a-f][0-9a-f][0-9a-f][0-9a-f]",
+		"sh ./cmd/olw_worker/validate_build_nonce.sh \"${BUILD_NONCE}\"",
 		"-X main.buildNonce=${BUILD_NONCE}",
 		"io.llm-wiki.build.nonce=\"${BUILD_NONCE}\"",
 	} {
@@ -48,7 +48,12 @@ func TestWorkerDockerfileBuildNonceContract(t *testing.T) {
 			t.Fatalf("Dockerfile missing nonce contract %q", want)
 		}
 	}
-	if strings.Index(dockerfile, "BUILD_NONCE=\"${BUILD_NONCE}\"") > strings.Index(dockerfile, "go build") {
+	if strings.Contains(dockerfile, "[0-9a-f][0-9a-f][0-9a-f][0-9a-f]") {
+		t.Fatal("Dockerfile must not use enumerated hex glob length checks")
+	}
+	validateAt := strings.Index(dockerfile, "sh ./cmd/olw_worker/validate_build_nonce.sh \"${BUILD_NONCE}\"")
+	goBuildAt := strings.Index(dockerfile, "go build")
+	if validateAt < 0 || goBuildAt < 0 || validateAt > goBuildAt {
 		t.Fatal("Dockerfile must validate BUILD_NONCE before go build")
 	}
 }
