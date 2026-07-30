@@ -537,6 +537,7 @@ func TestGenerationProjectsRejectManualRebuildWithoutCallingWriter(t *testing.T)
 type adminGenerationRebuilderStore struct {
 	*adminStatsProjectStore
 	result store.GenerationRebuildResult
+	err    error
 	called bool
 }
 
@@ -548,6 +549,9 @@ func (s *adminGenerationRootStore) Scope(string, string) store.Store {
 
 func (s *adminGenerationRebuilderStore) RebuildIndexGeneration(context.Context, store.GenerationRebuildPlanner) (store.GenerationRebuildResult, error) {
 	s.called = true
+	if s.err != nil {
+		return store.GenerationRebuildResult{}, s.err
+	}
 	return s.result, nil
 }
 
@@ -578,6 +582,32 @@ func TestAdminRebuildIndexUsesGenerationRebuilderAfterAuthorization(t *testing.T
 	}
 	if response.NewGeneration != "g_new" || response.ConceptCount != 2 {
 		t.Fatalf("response=%+v", response)
+	}
+}
+
+func TestAdminRebuildIndexClassifiesOnlyGenerationMismatchAsConflict(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		err        error
+		wantStatus int
+	}{
+		{name: "provider error containing cas label", err: errors.New("cas_conflict: permission denied"), wantStatus: http.StatusInternalServerError},
+		{name: "generation mismatch", err: store.ErrGenerationMismatch, wantStatus: http.StatusConflict},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			project := &adminGenerationRebuilderStore{
+				adminStatsProjectStore: &adminStatsProjectStore{prefix: "users/user/project", hasManifest: true},
+				err:                    tc.err,
+			}
+			root := &adminGenerationRootStore{adminGenerationRebuilderStore: project}
+			h := &Handler{store: root, adminProjectRecordLoader: func(context.Context, string) (adminProjectRecord, error) {
+				return adminProjectRecord{id: "user-account_project-account", userID: "user-account", projectID: "project-account"}, nil
+			}}
+			recorder := invokeHandlerWithParams(h.AdminRebuildIndex, http.MethodPost, "/admin/projects/user-account_project-account/rebuild-index", gin.Params{{Key: "id", Value: "user-account_project-account"}})
+			if recorder.Code != tc.wantStatus {
+				t.Fatalf("status=%d body=%s, want %d", recorder.Code, recorder.Body.String(), tc.wantStatus)
+			}
+		})
 	}
 }
 

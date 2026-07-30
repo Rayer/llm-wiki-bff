@@ -104,6 +104,10 @@ func (c *Client) RebuildIndexGeneration(ctx context.Context, planner store.Gener
 		if err != nil || a.Generation <= 0 || a.Size != file.Size {
 			return store.GenerationRebuildResult{}, errors.New("generation_upload")
 		}
+		uploaded, err := c.readObject(ctx, c.prefix()+"/"+generation.Prefix+id+"/"+file.Path, a.Generation, file.Size)
+		if err != nil || uploaded.Generation != a.Generation || uploaded.Size != file.Size || int64(len(uploaded.Data)) != file.Size || digestBytes(uploaded.Data) != file.SHA256 {
+			return store.GenerationRebuildResult{}, errors.New("manifest_stage")
+		}
 		manifest.Files = append(manifest.Files, generation.File{Path: file.Path, Size: file.Size, SHA256: file.SHA256, Generation: a.Generation})
 	}
 	sort.Slice(manifest.Files, func(i, j int) bool { return manifest.Files[i].Path < manifest.Files[j].Path })
@@ -116,7 +120,10 @@ func (c *Client) RebuildIndexGeneration(ctx context.Context, planner store.Gener
 	}
 	_, err = c.writeObject(ctx, c.prefix()+"/"+generation.ManifestPath, manifestData, "application/json; charset=utf-8", map[string]string{"sha256": digestBytes(manifestData)}, writeCondition{GenerationMatch: &oldObjectGeneration})
 	if err != nil {
-		return store.GenerationRebuildResult{}, errors.New("cas_conflict")
+		if errors.Is(err, store.ErrGenerationMismatch) {
+			return store.GenerationRebuildResult{}, fmt.Errorf("cas_conflict: %w", err)
+		}
+		return store.GenerationRebuildResult{}, fmt.Errorf("manifest_commit: %w", err)
 	}
 	return store.GenerationRebuildResult{
 		Status:          "ok",

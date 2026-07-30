@@ -1,7 +1,9 @@
 package gcs
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -57,6 +59,103 @@ func TestGenerationRebuildStagesDerivedArtifactsAndCASAdvancesPointer(t *testing
 	newMap, err := backend.Read(context.Background(), projectObject(generation.Prefix+result.NewGeneration+"/cache/id_map.json"), 0, generation.MaxFileBytes)
 	if err != nil || string(newMap.Data) != `{"concept":{"entity-alpha":"alpha"}}` {
 		t.Fatalf("new derived map=%q err=%v", newMap.Data, err)
+	}
+}
+
+func TestGenerationRebuildReadsBackImmutableUploadAtReturnedGeneration(t *testing.T) {
+	client, backend := newMemoryClient()
+	seedManifest(t, backend, "old-generation", generationRebuildTestFiles())
+	oldCurrent, err := backend.Read(context.Background(), projectObject(generation.ManifestPath), 0, generation.MaxManifestBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend.corruptGeneratedUploads = true
+
+	_, err = client.RebuildIndexGeneration(context.Background(), func(_ context.Context, _ string) (store.GenerationRebuildPlan, error) {
+		return store.GenerationRebuildPlan{}, nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "manifest_stage") {
+		t.Fatalf("corrupt upload error = %v, want manifest_stage", err)
+	}
+	current, err := backend.Read(context.Background(), projectObject(generation.ManifestPath), 0, generation.MaxManifestBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(current.Data, oldCurrent.Data) {
+		t.Fatal("corrupt immutable upload advanced or changed current pointer")
+	}
+
+	backend.mu.Lock()
+	defer backend.mu.Unlock()
+	var uploaded backendObject
+	for name, object := range backend.objects {
+		if strings.Contains(name, "/"+generation.Prefix) {
+			uploaded = object
+			break
+		}
+	}
+	if uploaded.Name == "" {
+		t.Fatal("no immutable upload recorded")
+	}
+	foundReadback := false
+	for i, request := range backend.requests {
+		if request.Name == uploaded.Name {
+			foundReadback = true
+			if request.Generation != uploaded.Generation || backend.requestedLimits[i] != uploaded.Size {
+				t.Fatalf("immutable readback request=%+v limit=%d, want generation=%d limit=%d", request, backend.requestedLimits[i], uploaded.Generation, uploaded.Size)
+			}
+		}
+	}
+	if !foundReadback {
+		t.Fatalf("no exact-generation readback for %q", uploaded.Name)
+	}
+}
+
+func TestGenerationRebuildPointerWritePreservesGenerationCAS(t *testing.T) {
+	client, backend := newMemoryClient()
+	seedManifest(t, backend, "old-generation", generationRebuildTestFiles())
+	oldCurrent, err := backend.Read(context.Background(), projectObject(generation.ManifestPath), 0, generation.MaxManifestBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend.interfereCurrentWrite = true
+
+	_, err = client.RebuildIndexGeneration(context.Background(), func(_ context.Context, _ string) (store.GenerationRebuildPlan, error) {
+		return store.GenerationRebuildPlan{}, nil
+	})
+	if !errors.Is(err, store.ErrGenerationMismatch) {
+		t.Fatalf("pointer interference error = %v, want ErrGenerationMismatch", err)
+	}
+	current, err := backend.Read(context.Background(), projectObject(generation.ManifestPath), 0, generation.MaxManifestBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(current.Data, oldCurrent.Data) {
+		t.Fatal("pointer write overwrote the concurrent current manifest")
+	}
+}
+
+func TestGenerationRebuildPointerWriteClassifiesOnlyGenerationMismatchAsCASConflict(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		err     error
+		wantCAS bool
+	}{
+		{name: "cancellation", err: context.Canceled},
+		{name: "provider error", err: errors.New("permission denied")},
+		{name: "generation mismatch", err: store.ErrGenerationMismatch, wantCAS: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client, backend := newMemoryClient()
+			seedManifest(t, backend, "old-generation", generationRebuildTestFiles())
+			backend.manifestWriteErr = tc.err
+			_, err := client.RebuildIndexGeneration(context.Background(), func(_ context.Context, _ string) (store.GenerationRebuildPlan, error) {
+				return store.GenerationRebuildPlan{}, nil
+			})
+			if err == nil || errors.Is(err, store.ErrGenerationMismatch) != tc.wantCAS || strings.Contains(err.Error(), "cas_conflict") != tc.wantCAS {
+				t.Fatalf("pointer error = %v, wantCAS=%v", err, tc.wantCAS)
+			}
+		})
 	}
 }
 
@@ -131,7 +230,7 @@ func TestGenerationRebuildRejectsPostPreflightMutationBeforeCAS(t *testing.T) {
 	previousHook := generationRebuildAfterPreflight
 	defer func() { generationRebuildAfterPreflight = previousHook }()
 	generationRebuildAfterPreflight = func(workspace string) {
-		if err := os.WriteFile(filepath.Join(workspace, "cache", "id_map.json"), []byte(`{"concept":{"changed":"alpha"}}`), 0o600); err != nil {
+		if err := os.WriteFile(filepath.Join(workspace, "cache", "id_map.json"), []byte(`{"concept":{"new":"alpha"}}`), 0o600); err != nil {
 			t.Fatalf("mutate staged output: %v", err)
 		}
 	}

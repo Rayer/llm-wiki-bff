@@ -785,7 +785,7 @@ func (e *syntoIndexDecodeError) SyntoIndexDecodeReason() syntoIndexDecodeReason 
 	return e.reason
 }
 
-const maxSyntoIndexBytes = 8 << 20
+const maxSyntoIndexBytes = generation.MaxFileBytes
 
 const sqliteHeader = "SQLite format 3\x00"
 

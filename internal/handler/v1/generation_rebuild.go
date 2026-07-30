@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 
+	"github.com/rayer/llm-wiki-bff/internal/generation"
 	store "github.com/rayer/llm-wiki-bff/internal/storage"
 	"github.com/rayer/llm-wiki-bff/internal/wikiindex"
 	"github.com/rayer/llm-wiki-bff/internal/wikiindex/fsstore"
@@ -25,7 +27,7 @@ func planSyntoGeneration(ctx context.Context, workspace string) (store.Generatio
 	} else if !errors.Is(priorErr, wikiindex.ErrNotFound) {
 		return store.GenerationRebuildPlan{}, errors.New("prior_id_map_read")
 	}
-	indexData, err := os.ReadFile(filepath.Join(workspace, ".synto", "INDEX.json"))
+	indexData, err := readBoundedSyntoIndex(workspace)
 	if err != nil {
 		return store.GenerationRebuildPlan{}, errors.New("synto_index_read")
 	}
@@ -55,4 +57,34 @@ func planSyntoGeneration(ctx context.Context, workspace string) (store.Generatio
 		MigratedOldIDs: migrated,
 		RedirectCount:  redirects,
 	}, nil
+}
+
+func readBoundedSyntoIndex(workspace string) ([]byte, error) {
+	root, err := os.OpenRoot(workspace)
+	if err != nil {
+		return nil, err
+	}
+	defer root.Close()
+	const rel = ".synto/INDEX.json"
+	info, err := root.Lstat(filepath.FromSlash(rel))
+	if err != nil {
+		return nil, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Size() < 0 || info.Size() > generation.MaxFileBytes {
+		return nil, errors.New("Synto INDEX exceeds generation size limit")
+	}
+	file, err := root.Open(filepath.FromSlash(rel))
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	openedInfo, err := file.Stat()
+	if err != nil || !openedInfo.Mode().IsRegular() || openedInfo.Size() != info.Size() || !os.SameFile(info, openedInfo) {
+		return nil, errors.New("Synto INDEX changed while reading")
+	}
+	data, err := io.ReadAll(io.LimitReader(file, generation.MaxFileBytes+1))
+	if err != nil || int64(len(data)) != info.Size() || int64(len(data)) > generation.MaxFileBytes {
+		return nil, errors.New("Synto INDEX exceeds generation size limit")
+	}
+	return data, nil
 }

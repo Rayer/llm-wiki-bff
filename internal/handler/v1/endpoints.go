@@ -2354,7 +2354,7 @@ func (h *Handler) handleGenerationRebuild(c *gin.Context, uid, pid string, rebui
 	if err != nil {
 		statusCode := http.StatusInternalServerError
 		failure := "generation_rebuild_failed"
-		if strings.Contains(err.Error(), "cas_conflict") {
+		if errors.Is(err, store.ErrGenerationMismatch) {
 			statusCode = http.StatusConflict
 			failure = "cas_conflict"
 		}

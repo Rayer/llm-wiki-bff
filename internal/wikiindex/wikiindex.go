@@ -514,6 +514,11 @@ func planSyntoIDRedirects(next *IDMap, old IDMap) (int, error) {
 			if target == "" || oldID == target {
 				continue
 			}
+			if ValidSyntoEntityID(oldID) {
+				// A prior different released ULID is not migration evidence.
+				// The current explicit article.entity_id remains authoritative.
+				continue
+			}
 			if !ValidLegacyConceptID(oldID) {
 				return 0, fmt.Errorf("non-legacy prior concept ID %q cannot be migrated", oldID)
 			}

@@ -1,6 +1,7 @@
 package v1
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"os"
@@ -8,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/rayer/llm-wiki-bff/internal/generation"
 	"github.com/rayer/llm-wiki-bff/internal/wikiindex"
 )
 
@@ -69,6 +71,31 @@ func TestPlanSyntoGenerationRejectsMalformedIndexBeforeWrites(t *testing.T) {
 	after := snapshotGenerationRebuildBytes(t, workspace)
 	if string(before) != string(after) {
 		t.Fatalf("malformed INDEX changed generation bytes: before=%q after=%q", before, after)
+	}
+}
+
+func TestPlanSyntoGenerationAcceptsIndexAboveFormerWorkerLimit(t *testing.T) {
+	workspace := t.TempDir()
+	for _, rel := range []string{"wiki", "wiki/sources", "cache", ".synto"} {
+		if err := os.MkdirAll(filepath.Join(workspace, rel), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeGenerationRebuildTestFile(t, workspace, "wiki/alpha.md", []byte("---\nid: a3f7b2c01d9d\n---\nalpha\n"))
+	writeGenerationRebuildTestFile(t, workspace, "cache/id_map.json", []byte(`{"concept":{"a3f7b2c01d9d":"alpha"},"source":{},"redirects":{}}`))
+	writeGenerationRebuildTestFile(t, workspace, "cache/concepts.jsonl", []byte(`{"slug":"alpha","frontmatter":{"id":"a3f7b2c01d9d"}}`+"\n"))
+	base := []byte(`{"schema_version":1,"pack":{"id":"fixture","name":"fixture","version":"0","language":["en"],"capabilities":["articles","concepts"]},"articles":[{"id":"generated","entity_id":"01JAZ5N7Y3K8M2Q4R6T9VWXABC","name":"alpha","path":"wiki/alpha.md","summary":null,"tags":[],"aliases":[],"confidence":"high"}],"terms":[],"papers":[],"sources":[],"source_concepts":[{"source_path":"raw/source.md","content_hash":"0000000000000000000000000000000000000000000000000000000000000000","concepts":[{"name":"alpha","entity_id":"01JAZ5N7Y3K8M2Q4R6T9VWXABC"}]}],"synthesis":[],"stats":{"article_count":1,"draft_count":0,"concept_count":1,"alias_count":0,"knowledge_item_count":0,"source_count":0,"source_segment_count":0,"failed_note_count":0,"failed_concept_count":0}}`)
+	large := append(append([]byte(nil), base...), bytes.Repeat([]byte(" "), (8<<20)+1-len(base))...)
+	writeGenerationRebuildTestFile(t, workspace, ".synto/INDEX.json", large)
+	if _, err := planSyntoGeneration(context.Background(), workspace); err != nil {
+		t.Fatalf("admin rejected valid INDEX just above former worker limit: %v", err)
+	}
+
+	if err := os.Truncate(filepath.Join(workspace, ".synto", "INDEX.json"), generation.MaxFileBytes+1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := planSyntoGeneration(context.Background(), workspace); err == nil {
+		t.Fatal("admin accepted INDEX above shared generation limit")
 	}
 }
 

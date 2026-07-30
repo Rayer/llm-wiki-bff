@@ -1842,6 +1842,33 @@ func TestSyntoIndexDecoderRejectsAdversarialJSON(t *testing.T) {
 	}
 }
 
+func TestSyntoIndexLimitMatchesSharedGenerationMaximum(t *testing.T) {
+	if maxSyntoIndexBytes != generation.MaxFileBytes {
+		t.Fatalf("worker INDEX limit=%d, shared generation limit=%d", maxSyntoIndexBytes, generation.MaxFileBytes)
+	}
+	base := []byte(syntoIndexFixture("article", "01JAZ5N7Y3K8M2Q4R6T9VWXAC8", "alpha", true))
+	justAboveFormerLimit := append(append([]byte(nil), base...), bytes.Repeat([]byte(" "), (8<<20)+1-len(base))...)
+	workspace := t.TempDir()
+	mustWriteFile(t, filepath.Join(workspace, ".synto", "INDEX.json"), justAboveFormerLimit)
+	if _, err := readSyntoIndexTruth(workspace); err != nil {
+		t.Fatalf("valid INDEX just above former worker limit rejected: %v", err)
+	}
+
+	tooLarge := filepath.Join(t.TempDir(), ".synto", "INDEX.json")
+	if err := os.MkdirAll(filepath.Dir(tooLarge), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(tooLarge, base, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Truncate(tooLarge, generation.MaxFileBytes+1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readSyntoIndexTruth(filepath.Dir(filepath.Dir(tooLarge))); err == nil {
+		t.Fatal("INDEX above shared generation limit accepted")
+	}
+}
+
 func TestStrictJSONNestingDepthBoundary(t *testing.T) {
 	nested := func(depth int) string {
 		return strings.Repeat("[", depth) + "null" + strings.Repeat("]", depth)

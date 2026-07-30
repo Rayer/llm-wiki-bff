@@ -94,6 +94,56 @@ func TestRebuildWithSyntoIdentityRewritesCanonicalPageAndFailsBeforeWrites(t *te
 	}
 }
 
+func TestRebuildWithSyntoIdentityIgnoresPriorDifferentULIDAtSameSlug(t *testing.T) {
+	const priorEntity = "01JAZ5N7Y3K8M2Q4R6T9VWXABD"
+	const currentEntity = "01JAZ5N7Y3K8M2Q4R6T9VWXABE"
+	oldJSON := []byte(`{"concept":{"` + priorEntity + `":"alpha"},"source":{},"redirects":{}}`)
+
+	newStore := func(page []byte) *fakeStore {
+		return &fakeStore{
+			files: map[string][]MarkdownFile{
+				"wiki/":         {{Slug: "alpha", Path: "wiki/alpha.md", Data: page}},
+				"wiki/sources/": {},
+			},
+			reads: map[string][]byte{IDMapPath: oldJSON},
+		}
+	}
+
+	t.Run("distinct entities with identical article bytes use current authority only", func(t *testing.T) {
+		store := newStore([]byte("---\nid: " + priorEntity + "\ntitle: Alpha\n---\nidentical bytes\n"))
+		next, err := RebuildWithSyntoIdentity(context.Background(), store, SyntoIdentityPlan{
+			ByPath:         map[string]string{"wiki/alpha.md": currentEntity},
+			ActiveEntities: map[string]bool{currentEntity: true},
+		})
+		if err != nil {
+			t.Fatalf("rebuild: %v", err)
+		}
+		if len(next.Concept) != 1 || next.Concept[currentEntity] != "alpha" {
+			t.Fatalf("concept map = %#v, want only current entity", next.Concept)
+		}
+		if _, ok := next.Concept[priorEntity]; ok {
+			t.Fatalf("prior entity remained authoritative: %#v", next.Concept)
+		}
+		if _, ok := next.IDRedirects[priorEntity]; ok {
+			t.Fatalf("different prior ULID became a redirect: %#v", next.IDRedirects)
+		}
+	})
+
+	t.Run("same entity with changed article content remains valid", func(t *testing.T) {
+		store := newStore([]byte("---\nid: " + priorEntity + "\ntitle: Alpha\n---\nchanged content\n"))
+		next, err := RebuildWithSyntoIdentity(context.Background(), store, SyntoIdentityPlan{
+			ByPath:         map[string]string{"wiki/alpha.md": priorEntity},
+			ActiveEntities: map[string]bool{priorEntity: true},
+		})
+		if err != nil {
+			t.Fatalf("rebuild: %v", err)
+		}
+		if len(next.Concept) != 1 || next.Concept[priorEntity] != "alpha" || len(next.IDRedirects) != 0 {
+			t.Fatalf("same-entity rebuild = %#v redirects=%#v", next.Concept, next.IDRedirects)
+		}
+	})
+}
+
 func TestRewriteSyntoConceptPageInsertsIDBeforeClosingDelimiter(t *testing.T) {
 	got, err := RewriteSyntoConceptPage([]byte("---\ntitle: Alpha\n---\nBody"), testEntityULID)
 	if err != nil {
@@ -774,6 +824,36 @@ func TestRebuildPlansAllArtifactsBeforeWritingOnNonStringNestedKey(t *testing.T)
 	}
 	if len(store.writes) != 0 {
 		t.Fatalf("Rebuild() writes = %#v, want zero writes", store.writes)
+	}
+}
+
+func TestRebuildWithSyntoIdentityRejectsNestedUnsafeYAMLBeforeWrites(t *testing.T) {
+	const frontmatter = "---\nid: " + testEntityULID + "\nmetadata:\n"
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{name: "nested duplicate", body: "  key: one\n  key: two\n"},
+		{name: "nested complex key", body: "  ? [one, two]\n  : value\n"},
+		{name: "nested non-string key", body: "  7: value\n"},
+		{name: "nested malformed", body: "  - [unterminated\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &fakeStore{
+				files: map[string][]MarkdownFile{
+					"wiki/":         {{Slug: "alpha", Path: "wiki/alpha.md", Data: []byte(frontmatter + tc.body + "---\nbody\n")}},
+					"wiki/sources/": {},
+				},
+				reads: map[string][]byte{},
+			}
+			_, err := RebuildWithSyntoIdentity(context.Background(), store, SyntoIdentityPlan{
+				ByPath:         map[string]string{"wiki/alpha.md": testEntityULID},
+				ActiveEntities: map[string]bool{testEntityULID: true},
+			})
+			if err == nil || len(store.writes) != 0 {
+				t.Fatalf("rebuild error=%v writes=%#v, want nested validation failure before writes", err, store.writes)
+			}
+		})
 	}
 }
 
