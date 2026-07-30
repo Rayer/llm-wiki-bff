@@ -288,6 +288,43 @@ func TestDecodeSyntoIdentityPlanReleasedEntityShapes(t *testing.T) {
 	}
 }
 
+func TestDecodeSyntoIdentityPlanDoesNotVetoExplicitEntityBySourceConceptName(t *testing.T) {
+	entityID := testEntityULID
+	entityConcept := "01JAZ5N7Y3K8M2Q4R6T9VWXAC0"
+	alternateConcept := "01JAZ5N7Y3K8M2Q4R6T9VWXAC1"
+	hash := strings.Repeat("0", 64)
+	tests := []struct {
+		name    string
+		group   string
+		wantLen int
+	}{
+		{
+			name:    "single conflicting source concept",
+			group:   `[{"source_path":"raw/source.md","content_hash":"` + hash + `","concepts":[{"name":"Ordinary","entity_id":"` + entityConcept + `"}]}]`,
+			wantLen: 1,
+		},
+		{
+			name:    "ambiguous conflicting source concept",
+			group:   `[{"source_path":"raw/source.md","content_hash":"` + hash + `","concepts":[{"name":"Ordinary","entity_id":"` + entityConcept + `"},{"name":"Ordinary","entity_id":"` + alternateConcept + `"}]}]`,
+			wantLen: 2,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			plan, err := DecodeSyntoIdentityPlan(syntoIdentityReleasedFixtureWithSourceConcepts(fmt.Sprintf(`%q`, entityID), tc.group))
+			if err != nil {
+				t.Fatalf("DecodeSyntoIdentityPlan() error = %v", err)
+			}
+			if got := plan.ByPath["wiki/ordinary.md"]; got != entityID {
+				t.Fatalf("ByPath[wiki/ordinary.md] = %q, want %q", got, entityID)
+			}
+			if len(plan.ActiveEntities) != tc.wantLen {
+				t.Fatalf("len(plan.ActiveEntities) = %d, want %d", len(plan.ActiveEntities), tc.wantLen)
+			}
+		})
+	}
+}
+
 func TestDecodeSyntoIdentityPlanEntitylessRowsParticipateInValidation(t *testing.T) {
 	entityBound := `{"id":"bound","entity_id":"01JAZ5N7Y3K8M2Q4R6T9VWXABE","name":"Bound","path":"wiki/bound.md","summary":null,"tags":[],"aliases":[],"confidence":"high"}`
 	testCases := []struct {
@@ -388,6 +425,17 @@ func syntoIdentityReleasedFixture(entityJSON string) []byte {
 		entity = `,"entity_id":` + entityJSON
 	}
 	return []byte(`{"schema_version":1,"pack":{"id":"fixture","name":"fixture","version":"0","language":["en"],"capabilities":["articles","concepts"]},"articles":[{"id":"` + testArticleULID + `"` + entity + `,"name":"Ordinary","path":"wiki/ordinary.md","summary":null,"tags":[],"aliases":[],"confidence":"high"}],"terms":[],"papers":[],"sources":[],"source_concepts":[],"synthesis":[],"stats":{"article_count":1,"draft_count":0,"concept_count":0,"alias_count":0,"knowledge_item_count":0,"source_count":0,"source_segment_count":0,"failed_note_count":0,"failed_concept_count":0}}`)
+}
+
+func syntoIdentityReleasedFixtureWithSourceConcepts(entityJSON string, sourceConcepts string) []byte {
+	entity := ""
+	if entityJSON != "" {
+		entity = `,"entity_id":` + entityJSON
+	}
+	if sourceConcepts == "" {
+		sourceConcepts = "[]"
+	}
+	return []byte(`{"schema_version":1,"pack":{"id":"fixture","name":"fixture","version":"0","language":["en"],"capabilities":["articles","concepts"]},"articles":[{"id":"` + testArticleULID + `"` + entity + `,"name":"Ordinary","path":"wiki/ordinary.md","summary":null,"tags":[],"aliases":[],"confidence":"high"}],"terms":[],"papers":[],"sources":[],"source_concepts":` + sourceConcepts + `,"synthesis":[],"stats":{"article_count":1,"draft_count":0,"concept_count":1,"alias_count":0,"knowledge_item_count":0,"source_count":1,"source_segment_count":0,"failed_note_count":0,"failed_concept_count":0}}`)
 }
 
 func syntoIdentityFixtureFromArticles(articles []string) []byte {

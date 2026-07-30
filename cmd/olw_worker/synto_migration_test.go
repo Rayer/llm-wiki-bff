@@ -2087,7 +2087,7 @@ func TestReadSyntoEntityIDsReturnsReasonedDetailCodes(t *testing.T) {
 				[]syntoIndexEntry{{ID: "article-a", EntityID: "01JAZ5N7Y3K8M2Q4R6T9VWXAC0", Name: "Alpha", Path: "wiki/alpha.md"}},
 				[]syntoSourceConcept{{Name: "Alpha", EntityID: "01JAZ5N7Y3K8M2Q4R6T9VWXAC1"}}, nil),
 			concepts: map[string]string{"article-a": "alpha"},
-			want:     conceptDetailEntityMappingArticleSourceDisagreement,
+			want:     conceptDetailEntityMappingActiveEntityUnknown,
 		},
 		{
 			name:     "duplicate article ID",
@@ -2301,14 +2301,16 @@ func TestSyntoArticleEntityMustMatchCurrentTitleCandidates(t *testing.T) {
 	}
 	index := syntoIndexTruthForEntityMapping(articles, baseEdges, nil)
 
-	if _, err := mapSyntoEntityIDsFromIndexTruth(index, map[string]string{
+	got, err := mapSyntoEntityIDsFromIndexTruth(index, map[string]string{
 		"generated-alpha": "alpha",
 		"generated-old":   "old",
 		"generated-other": "other",
-	}, nil); err == nil {
-		t.Fatal("direct entity outside ambiguous title candidates was accepted")
-	} else {
-		testEntityMappingErrorDetail(t, err, conceptDetailEntityMappingArticleSourceDisagreement)
+	}, nil)
+	if err != nil {
+		t.Fatalf("direct entity outside ambiguous title candidates was rejected: %v", err)
+	}
+	if got["generated-alpha"] != "01JAZ5N7Y3K8M2Q4R6T9VWXAC4" {
+		t.Fatalf("generated-alpha mapped to %q", got["generated-alpha"])
 	}
 
 	omitted := syntoIndexTruthForEntityMapping(
@@ -2364,7 +2366,7 @@ func TestSyntoOmittedArticleIdentityRejectsUnprovenSourceOwnership(t *testing.T)
 			index: syntoIndexTruthForEntityMapping(
 				[]syntoIndexEntry{{ID: "generated-alpha", EntityID: "01JAZ5N7Y3K8M2Q4R6T9VWXABE", Name: "Alpha", Path: "articles/alpha.md"}},
 				[]syntoSourceConcept{{Name: "Alpha", EntityID: "01JAZ5N7Y3K8M2Q4R6T9VWXABF", SourcePath: "raw/alpha.md"}}, nil),
-			want: conceptDetailEntityMappingArticleSourceDisagreement,
+			want: conceptDetailEntityMappingActiveEntityUnknown,
 		},
 	}
 	for _, tc := range tests {
@@ -2851,6 +2853,87 @@ func TestSyntoIdentityPlanValidatesReservedRootEntityUniquenessBeforeExclusion(t
 	}
 	if _, err := syntoIdentityPlanFromIndex(index); err == nil {
 		t.Fatal("reserved root duplicate entity identity was accepted")
+	}
+}
+
+func TestSyntoIdentityPlanFromIndexDoesNotVetoExplicitEntityBySourceConceptName(t *testing.T) {
+	const explicitEntity = "01JAZ5N7Y3K8M2Q4R6T9VWXABC"
+	cases := []struct {
+		name     string
+		sources  []syntoSourceConcept
+		wantSize int
+	}{
+		{
+			name: "single conflicting source concept",
+			sources: []syntoSourceConcept{
+				{Name: "Ordinary", EntityID: "01JAZ5N7Y3K8M2Q4R6T9VWXAC0", SourcePath: "raw/source.md", ContentHash: strings.Repeat("0", 64)},
+			},
+			wantSize: 1,
+		},
+		{
+			name: "ambiguous source concepts",
+			sources: []syntoSourceConcept{
+				{Name: "Ordinary", EntityID: "01JAZ5N7Y3K8M2Q4R6T9VWXAC0", SourcePath: "raw/source.md", ContentHash: strings.Repeat("0", 64)},
+				{Name: "Ordinary", EntityID: "01JAZ5N7Y3K8M2Q4R6T9VWXAC1", SourcePath: "raw/source.md", ContentHash: strings.Repeat("1", 64)},
+			},
+			wantSize: 2,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			index := syntoIndexTruth{
+				Articles: []syntoIndexEntry{
+					{ID: "article-ordinary", Name: "Ordinary", Path: "wiki/ordinary.md", EntityID: explicitEntity},
+				},
+				SourceConcepts: tc.sources,
+			}
+			plan, err := syntoIdentityPlanFromIndex(index)
+			if err != nil {
+				t.Fatalf("syntoIdentityPlanFromIndex() error = %v", err)
+			}
+			if got := plan.ByPath["wiki/ordinary.md"]; got != explicitEntity {
+				t.Fatalf("ByPath[wiki/ordinary.md] = %q, want %q", got, explicitEntity)
+			}
+			if len(plan.ActiveEntities) != tc.wantSize {
+				t.Fatalf("len(plan.ActiveEntities) = %d, want %d", len(plan.ActiveEntities), tc.wantSize)
+			}
+		})
+	}
+}
+
+func TestSyntoIdentityPlanFromIndexEntitylessRowsParticipateInValidation(t *testing.T) {
+	type testCase struct {
+		name     string
+		articles []syntoIndexEntry
+		needle   string
+	}
+	cases := []testCase{
+		{
+			name: "duplicate id with null and omitted",
+			articles: []syntoIndexEntry{
+				{ID: "dup", Name: "Duplicate", Path: "wiki/first.md"},
+				{ID: "dup", Name: "Duplicate", Path: "wiki/second.md"},
+			},
+			needle: "duplicate Synto article ID",
+		},
+		{
+			name: "duplicate slug with null and omitted",
+			articles: []syntoIndexEntry{
+				{ID: "slug-a", Name: "Alpha", Path: "wiki/A.md", EntityID: "01JAZ5N7Y3K8M2Q4R6T9VWXABE"},
+				{ID: "slug-b", Name: "Alpha", Path: "wiki/a.md"},
+			},
+			needle: "duplicate Synto article slug",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			index := syntoIndexTruth{
+				Articles: tc.articles,
+			}
+			if _, err := syntoIdentityPlanFromIndex(index); err == nil || !strings.Contains(err.Error(), tc.needle) {
+				t.Fatalf("error=%v, want substring %q", err, tc.needle)
+			}
+		})
 	}
 }
 

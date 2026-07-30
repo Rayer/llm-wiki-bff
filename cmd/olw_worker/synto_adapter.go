@@ -872,15 +872,11 @@ func syntoIdentityPlanFromIndex(index syntoIndexTruth) (wikiindex.SyntoIdentityP
 	seenIDs := make(map[string]string, len(index.Articles))
 	seenSlugs := make(map[string]string, len(index.Articles))
 	seenEntities := make(map[string]string, len(index.Articles))
-	byName := make(map[string]map[string]bool)
 	for _, edge := range index.SourceConcepts {
 		if edge.Name == "" || !wikiindex.ValidSyntoEntityID(edge.EntityID) {
 			return wikiindex.SyntoIdentityPlan{}, errors.New("invalid Synto source concept identity")
 		}
-		if byName[edge.Name] == nil {
-			byName[edge.Name] = make(map[string]bool)
-		}
-		byName[edge.Name][edge.EntityID] = true
+		plan.ActiveEntities[edge.EntityID] = true
 	}
 	for _, article := range index.Articles {
 		slug, err := normalizeSyntoArticlePath(article.Path)
@@ -911,9 +907,6 @@ func syntoIdentityPlanFromIndex(index syntoIndexTruth) (wikiindex.SyntoIdentityP
 		seenEntities[article.EntityID] = canonicalPath
 		if wikiindex.IsSyntoRootPage(canonicalPath) {
 			continue
-		}
-		if entities := byName[article.Name]; len(entities) > 0 && (len(entities) != 1 || !entities[article.EntityID]) {
-			return wikiindex.SyntoIdentityPlan{}, fmt.Errorf("Synto article/source entity disagreement for %q", slug)
 		}
 		path := canonicalPath
 		plan.ByPath[path] = article.EntityID
@@ -1276,7 +1269,6 @@ func mapSyntoEntityIDsFromIndexTruth(index syntoIndexTruth, concepts map[string]
 	bySlug := make(map[string]string, len(index.Articles))
 	byEntity := make(map[string]string, len(index.Articles))
 	byName := make(map[string]string, len(index.SourceConcepts))
-	byNameEntities := make(map[string]map[string]bool)
 	ambiguousNames := make(map[string]bool)
 	priorByID := make(map[string]conceptSnapshot)
 	priorBySlug := make(map[string]conceptSnapshot)
@@ -1311,10 +1303,6 @@ func mapSyntoEntityIDsFromIndexTruth(index syntoIndexTruth, concepts map[string]
 		if edge.Name == "" || !wikiindex.ValidSyntoEntityID(edge.EntityID) {
 			return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingSourceConceptIdentity, cause: errors.New("invalid Synto INDEX.json source concept identity")}
 		}
-		if byNameEntities[edge.Name] == nil {
-			byNameEntities[edge.Name] = make(map[string]bool)
-		}
-		byNameEntities[edge.Name][edge.EntityID] = true
 		if old, exists := byName[edge.Name]; exists && old != edge.EntityID {
 			ambiguousNames[edge.Name] = true
 			delete(byName, edge.Name)
@@ -1339,9 +1327,6 @@ func mapSyntoEntityIDsFromIndexTruth(index syntoIndexTruth, concepts map[string]
 		sourceEntity := ""
 		if !ambiguousNames[article.Name] {
 			sourceEntity = byName[article.Name]
-		}
-		if article.EntityID != "" && len(byNameEntities[article.Name]) > 0 && !byNameEntities[article.Name][article.EntityID] {
-			return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingArticleSourceDisagreement, cause: fmt.Errorf("Synto INDEX.json article/source disagreement for %q", slug)}
 		}
 		articleEntityOmitted := article.EntityID == ""
 		priorByArticleID, priorIDPresent := priorByID[article.ID]
@@ -1386,7 +1371,7 @@ func mapSyntoEntityIDsFromIndexTruth(index syntoIndexTruth, concepts map[string]
 		if articleEntityOmitted && priorIdentityPresent && priorIdentity.EntityID != "" && entityID == priorIdentity.EntityID && priorEvidence == 0 {
 			return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingConceptIDPathDisagreement, cause: fmt.Errorf("prior article identity lacks current source evidence for %q", slug)}
 		}
-		if sourceEntity != "" && entityID != "" && sourceEntity != entityID {
+		if articleEntityOmitted && sourceEntity != "" && entityID != "" && sourceEntity != entityID {
 			return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingArticleSourceDisagreement, cause: fmt.Errorf("Synto INDEX.json article/source disagreement for %q", slug)}
 		}
 		if entityID == "" {

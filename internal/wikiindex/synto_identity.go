@@ -55,7 +55,7 @@ func DecodeSyntoIdentityPlan(data []byte) (SyntoIdentityPlan, error) {
 	if err != nil {
 		return SyntoIdentityPlan{}, err
 	}
-	active, names, err := decodeSyntoIdentitySourceConcepts(document["source_concepts"])
+	active, err := decodeSyntoIdentitySourceConcepts(document["source_concepts"])
 	if err != nil {
 		return SyntoIdentityPlan{}, err
 	}
@@ -96,11 +96,6 @@ func DecodeSyntoIdentityPlan(data []byte) (SyntoIdentityPlan, error) {
 		}
 		if article.EntityID == "" {
 			continue
-		}
-		if owners := names[article.Name]; len(owners) > 0 {
-			if len(owners) != 1 || !owners[article.EntityID] {
-				return SyntoIdentityPlan{}, fmt.Errorf("Synto article/source entity disagreement for %q", slug)
-			}
 		}
 		path := canonicalPath
 		plan.ByPath[path] = article.EntityID
@@ -562,54 +557,49 @@ func decodeSyntoIdentityArticles(data []byte) ([]syntoIdentityArticle, error) {
 	return out, nil
 }
 
-func decodeSyntoIdentitySourceConcepts(data []byte) (map[string]bool, map[string]map[string]bool, error) {
+func decodeSyntoIdentitySourceConcepts(data []byte) (map[string]bool, error) {
 	if !jsonContainer(data, '[') {
-		return nil, nil, errors.New("Synto source_concepts must be a bounded array")
+		return nil, errors.New("Synto source_concepts must be a bounded array")
 	}
 	var groups []json.RawMessage
 	if err := json.Unmarshal(data, &groups); err != nil || len(groups) > generation.MaxFiles {
-		return nil, nil, errors.New("Synto source_concepts must be a bounded array")
+		return nil, errors.New("Synto source_concepts must be a bounded array")
 	}
 	active := make(map[string]bool)
-	names := make(map[string]map[string]bool)
 	for _, groupData := range groups {
 		group, err := decodeStrictObject(groupData, map[string]bool{"source_path": true, "content_hash": true, "concepts": true})
 		if err != nil {
-			return nil, nil, fmt.Errorf("decode Synto source_concepts: %w", err)
+			return nil, fmt.Errorf("decode Synto source_concepts: %w", err)
 		}
 		for _, key := range []string{"source_path", "content_hash", "concepts"} {
 			if _, ok := group[key]; !ok {
-				return nil, nil, fmt.Errorf("missing Synto source_concepts field %q", key)
+				return nil, fmt.Errorf("missing Synto source_concepts field %q", key)
 			}
 		}
 		var sourcePath, contentHash string
 		if json.Unmarshal(group["source_path"], &sourcePath) != nil || !safeSyntoSourcePath(sourcePath) || json.Unmarshal(group["content_hash"], &contentHash) != nil || !validSyntoHash(contentHash) {
-			return nil, nil, errors.New("invalid Synto source concept provenance")
+			return nil, errors.New("invalid Synto source concept provenance")
 		}
 		if !jsonContainer(group["concepts"], '[') {
-			return nil, nil, errors.New("Synto source concepts must be a bounded array")
+			return nil, errors.New("Synto source concepts must be a bounded array")
 		}
 		var items []json.RawMessage
 		if err := json.Unmarshal(group["concepts"], &items); err != nil || len(items) > generation.MaxFiles {
-			return nil, nil, errors.New("Synto source concepts must be a bounded array")
+			return nil, errors.New("Synto source concepts must be a bounded array")
 		}
 		for _, itemData := range items {
 			item, err := decodeStrictObject(itemData, map[string]bool{"name": true, "entity_id": true})
 			if err != nil {
-				return nil, nil, fmt.Errorf("decode Synto source concept: %w", err)
+				return nil, fmt.Errorf("decode Synto source concept: %w", err)
 			}
 			var name, entityID string
 			if err := json.Unmarshal(item["name"], &name); err != nil || name == "" || json.Unmarshal(item["entity_id"], &entityID) != nil || !ValidSyntoEntityID(entityID) {
-				return nil, nil, errors.New("invalid Synto source concept identity")
+				return nil, errors.New("invalid Synto source concept identity")
 			}
 			active[entityID] = true
-			if names[name] == nil {
-				names[name] = make(map[string]bool)
-			}
-			names[name][entityID] = true
 		}
 	}
-	return active, names, nil
+	return active, nil
 }
 
 func jsonContainer(data []byte, opening byte) bool {
