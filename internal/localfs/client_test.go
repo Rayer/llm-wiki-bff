@@ -223,13 +223,15 @@ func TestReadFileLimitedAndStatFileRejectScopeAncestorSymlinks(t *testing.T) {
 				t.Fatal(err)
 			}
 			link := filepath.Join(users, "u")
+			target := outside
 			if test.name == "projects" {
 				if err := os.Mkdir(link, 0o755); err != nil {
 					t.Fatal(err)
 				}
 				link = filepath.Join(link, "projects")
+				target = filepath.Join(outside, "projects")
 			}
-			if err := os.Symlink(outside, link); err != nil {
+			if err := os.Symlink(target, link); err != nil {
 				t.Fatal(err)
 			}
 
@@ -380,7 +382,7 @@ func TestAuditReadFileLimitedAndStatFileConcurrentScopeSwapCannotEscape(t *testi
 		t.Fatal(err)
 	}
 	symlinkSource := filepath.Join(scopeRoot, "projects-symlink")
-	if err := os.Symlink(outside, symlinkSource); err != nil {
+	if err := os.Symlink(filepath.Join(outside, "projects"), symlinkSource); err != nil {
 		t.Fatal(err)
 	}
 	projects := filepath.Join(scopeRoot, "projects")
