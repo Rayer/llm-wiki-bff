@@ -1660,9 +1660,9 @@ func TestCloudSuggestedQueriesGenerateInsidePrivateWorkspaceBeforeManifestPublis
 	prefix := "users/user/projects/project/"
 	seedCloudSource(t, m, prefix, "raw-start", "", priorCloudReceipt())
 	provider := &testSuggestedQueryProvider{raw: `{"candidates":[
-{"question":"哪些概念值得一起比較？","intent/use_case":"comparison","corpus_anchor_concept_ids":["149603e6c035"]},
-{"question":"如何探索這個主題的不同面向？","intent/use_case":"exploration","corpus_anchor_concept_ids":["149603e6c035"]},
-{"question":"哪些選擇適合進一步查找？","intent/use_case":"retrieval","corpus_anchor_concept_ids":["149603e6c035"]}
+{"question":"哪些概念值得一起比較？","intent/use_case":"comparison","corpus_anchor_concept_ids":["entity-old"]},
+{"question":"如何探索這個主題的不同面向？","intent/use_case":"exploration","corpus_anchor_concept_ids":["entity-old"]},
+{"question":"哪些選擇適合進一步查找？","intent/use_case":"retrieval","corpus_anchor_concept_ids":["entity-old"]}
 ]}`}
 	cfg := cloudCfgFor("user", "project", "execution")
 	cfg.SuggestedQueries = true
@@ -1979,7 +1979,7 @@ func TestPublishCloudGenerationUsesImmutableFilesAndManifestCAS(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got.Files) != 11 {
+	if len(got.Files) != 13 {
 		t.Fatalf("files=%d", len(got.Files))
 	}
 	if _, _, err := publishCloudGeneration(context.Background(), m, "p/", root, nil); err != nil {
@@ -3058,6 +3058,8 @@ func cloudCfgFor(user, project, execution string) workerConfig {
 }
 func writeCloudRequiredOutputs(t *testing.T, root string) {
 	t.Helper()
+	mustWriteFile(t, filepath.Join(root, "wiki", "old.md"), []byte("---\nid: legacy-old\n---\nOld\n"))
+	mustWriteFile(t, filepath.Join(root, "wiki", "new.md"), []byte("---\nid: legacy-new\n---\nNew\n"))
 	for path, data := range map[string]string{
 		"wiki.toml":                    "name = \"test\"\n",
 		"synto.toml":                   "[pipeline]\nauto_commit = false\nauto_maintain = false\nrelation_extraction = false\n",
@@ -3087,6 +3089,7 @@ func writeCloudRequiredOutputs(t *testing.T, root string) {
 
 func writeFreshSyntoRequiredOutputs(t *testing.T, root string) {
 	t.Helper()
+	mustWriteFile(t, filepath.Join(root, "wiki", "alpha.md"), []byte("---\nid: legacy-alpha\n---\nAlpha\n"))
 	for path, data := range map[string]string{
 		"synto.toml":                   "[pipeline]\nauto_commit = false\nauto_maintain = false\nrelation_extraction = false\n",
 		"cache/id_map.json":            `{"concept":{},"source":{},"redirects":{}}`,

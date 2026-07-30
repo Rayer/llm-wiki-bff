@@ -929,7 +929,19 @@ func suggestedQueryProvider(cfg workerConfig) suggestedqueries.Provider {
 
 func runPostprocessWithProvider(ctx context.Context, vault string, provider suggestedqueries.Provider) error {
 	store := fsstore.New(vault)
-	if _, err := wikiindex.Rebuild(ctx, store); err != nil {
+	index, err := readSyntoIndexTruth(vault)
+	if err != nil {
+		return fmt.Errorf("read Synto identity authority: %w", err)
+	}
+	if index.Present {
+		plan, err := syntoIdentityPlanFromIndex(index)
+		if err != nil {
+			return fmt.Errorf("build Synto identity authority: %w", err)
+		}
+		if _, err := wikiindex.RebuildWithSyntoIdentity(ctx, store, plan); err != nil {
+			return fmt.Errorf("postprocess Synto index: %w", err)
+		}
+	} else if _, err := wikiindex.Rebuild(ctx, store); err != nil {
 		return fmt.Errorf("postprocess: %w", err)
 	}
 	if err := ensureDormantConceptCache(vault); err != nil {

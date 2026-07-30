@@ -496,11 +496,11 @@ func TestWorkerPostprocessDirectPreservesDormantConceptAndEntityMappings(t *test
 		t.Fatalf("runPostprocessCommand() error = %v", err)
 	}
 	ids := mustSnapshotIDMap(t, vault)
-	if ids.Concept["stable-alpha"] != "alpha" || ids.DormantConcept["stable-beta"] != "beta" {
-		t.Fatalf("postprocess lifecycle maps = %#v", ids)
+	if ids.Concept["entity-alpha"] != "alpha" || len(ids.Concept) != 1 || len(ids.DormantConcept) != 0 {
+		t.Fatalf("postprocess direct entity maps = %#v", ids)
 	}
-	if ids.ConceptEntityID["stable-alpha"] != "entity-alpha" || ids.ConceptEntityID["stable-beta"] != "entity-beta" {
-		t.Fatalf("postprocess entity maps = %#v", ids.ConceptEntityID)
+	if len(ids.ConceptEntityID) != 0 {
+		t.Fatalf("postprocess retained legacy entity map = %#v", ids.ConceptEntityID)
 	}
 	if _, ok := ids.ConceptEntityID["orphan"]; ok {
 		t.Fatalf("postprocess retained orphan entity mapping: %#v", ids.ConceptEntityID)
@@ -520,11 +520,11 @@ func TestWorkerPostprocessWorkspacePreservesDormantConceptAndEntityMappings(t *t
 		t.Fatalf("runPostprocessCommand(workspace) error = %v", err)
 	}
 	ids := mustSnapshotIDMap(t, vault)
-	if ids.Concept["stable-alpha"] != "alpha" || ids.DormantConcept["stable-beta"] != "beta" {
-		t.Fatalf("workspace postprocess lifecycle maps = %#v", ids)
+	if ids.Concept["entity-alpha"] != "alpha" || len(ids.Concept) != 1 || len(ids.DormantConcept) != 0 {
+		t.Fatalf("workspace postprocess direct entity maps = %#v", ids)
 	}
-	if ids.ConceptEntityID["stable-alpha"] != "entity-alpha" || ids.ConceptEntityID["stable-beta"] != "entity-beta" {
-		t.Fatalf("workspace postprocess entity maps = %#v", ids.ConceptEntityID)
+	if len(ids.ConceptEntityID) != 0 {
+		t.Fatalf("workspace postprocess retained legacy entity map = %#v", ids.ConceptEntityID)
 	}
 	if _, ok := ids.ConceptEntityID["orphan"]; ok {
 		t.Fatalf("workspace postprocess retained orphan entity mapping: %#v", ids.ConceptEntityID)

@@ -1046,13 +1046,18 @@ func (h *Handler) RebuildIndex(c *gin.Context) {
 		return
 	}
 	if h.store != nil {
-		if guarded, ok := h.store.Scope(userID, projectID).(store.GenerationAware); ok {
+		projectStore := h.store.Scope(userID, projectID)
+		if guarded, ok := projectStore.(store.GenerationAware); ok {
 			exists, err := guarded.HasCurrentManifest(c.Request.Context())
 			if err != nil {
 				c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "generated output unavailable"})
 				return
 			}
 			if exists {
+				if rebuilder, ok := projectStore.(store.GenerationRebuilder); ok {
+					h.handleGenerationRebuild(c, userID, projectID, rebuilder)
+					return
+				}
 				c.JSON(http.StatusConflict, handler.ErrorResponse{Error: "generated output is managed by the pipeline; run the pipeline"})
 				return
 			}
@@ -2228,13 +2233,18 @@ func (h *Handler) AdminRebuildIndex(c *gin.Context) {
 		}
 	}
 	if h.store != nil {
-		if guarded, ok := h.store.Scope(uid, pid).(store.GenerationAware); ok {
+		projectStore := h.store.Scope(uid, pid)
+		if guarded, ok := projectStore.(store.GenerationAware); ok {
 			exists, err := guarded.HasCurrentManifest(ctx)
 			if err != nil {
 				c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "generated output unavailable"})
 				return
 			}
 			if exists {
+				if rebuilder, ok := projectStore.(store.GenerationRebuilder); ok {
+					h.handleGenerationRebuild(c, uid, pid, rebuilder)
+					return
+				}
 				c.JSON(http.StatusConflict, handler.ErrorResponse{Error: "generated output is managed by the pipeline; run the pipeline"})
 				return
 			}
@@ -2312,6 +2322,22 @@ func (h *Handler) AdminRebuildIndex(c *gin.Context) {
 			"source":  len(next.Source),
 		},
 	})
+}
+
+func (h *Handler) handleGenerationRebuild(c *gin.Context, uid, pid string, rebuilder store.GenerationRebuilder) {
+	result, err := rebuilder.RebuildIndexGeneration(c.Request.Context(), planSyntoGeneration)
+	if err != nil {
+		statusCode := http.StatusInternalServerError
+		failure := "generation_rebuild_failed"
+		if strings.Contains(err.Error(), "cas_conflict") {
+			statusCode = http.StatusConflict
+			failure = "cas_conflict"
+		}
+		c.JSON(statusCode, gin.H{"status": failure, "error": "generated data unavailable"})
+		return
+	}
+	h.invalidateCachesAfterRebuild(uid, pid)
+	c.JSON(http.StatusOK, result)
 }
 
 // AdminPipelineTrigger handles POST /admin/projects/{id}/pipeline.

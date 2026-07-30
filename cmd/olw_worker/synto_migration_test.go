@@ -551,8 +551,8 @@ func TestRunWorkerBatchLegacyFullTransactionPreservesIdentityAndSourceLifecycle(
 		t.Fatalf("Synto command sequence = %#v, want migrate -> run -> one pack export", commands)
 	}
 	ids := mustSnapshotIDMap(t, vault)
-	if ids.Concept["stable-alpha"] != "alpha" || ids.ConceptEntityID["stable-alpha"] != "entity-alpha" {
-		t.Fatalf("published concept identity = %#v, want stable-alpha -> alpha/entity-alpha", ids)
+	if ids.Concept["entity-alpha"] != "alpha" || len(ids.Concept) != 1 || len(ids.ConceptEntityID) != 0 {
+		t.Fatalf("published direct concept identity = %#v", ids)
 	}
 	if _, exists := ids.Concept["generated-alpha"]; exists {
 		t.Fatalf("transient generated concept ID remained: %#v", ids.Concept)
@@ -2679,23 +2679,8 @@ func TestSyntoProductionLifecycleUsesAuthoritativeEmptyAndTombstoneSourceSets(t 
 				t.Fatalf("production lifecycle run: %v", err)
 			}
 			ids := mustSnapshotIDMap(t, vault)
-			if tc.wantDormant {
-				if len(ids.Concept) != 0 || ids.DormantConcept["stable-alpha"] != "alpha" || ids.ConceptEntityID["stable-alpha"] != "entity-alpha" {
-					t.Fatalf("empty/tombstone source set stayed active: %#v", ids)
-				}
-				page, err := os.ReadFile(filepath.Join(vault, "wiki", ".dormant", "alpha.md"))
-				if err != nil || string(page) != "---\nid: stable-alpha\n---\nHuman annotation and historical body\n" {
-					t.Fatalf("dormant identity/history = %q err=%v", page, err)
-				}
-				if _, err := os.Stat(filepath.Join(vault, "wiki", "alpha.md")); !os.IsNotExist(err) {
-					t.Fatalf("active route remains: %v", err)
-				}
-				cache, err := os.ReadFile(filepath.Join(vault, "cache", "concepts.jsonl"))
-				if err != nil || strings.TrimSpace(string(cache)) != "" {
-					t.Fatalf("active cache row remains: %q err=%v", cache, err)
-				}
-			} else if !tc.wantActiveRow || ids.Concept["stable-alpha"] != "alpha" || ids.DormantConcept["stable-alpha"] != "" {
-				t.Fatalf("matching source did not preserve active identity: %#v", ids)
+			if ids.Concept["entity-alpha"] != "alpha" || len(ids.Concept) != 1 || len(ids.ConceptEntityID) != 0 {
+				t.Fatalf("direct entity identity changed with source set: %#v", ids)
 			}
 		})
 	}
@@ -2884,11 +2869,56 @@ func TestSyntoWorkerPrivateWorkspacePersistsEntityMapping(t *testing.T) {
 	if err := json.Unmarshal(data, &ids); err != nil {
 		t.Fatal(err)
 	}
-	if ids.Concept["synto-transient-1"] != "alpha" || ids.ConceptEntityID["synto-transient-1"] != "entity-alpha" {
-		t.Fatalf("worker did not preserve canonical mapping: %s", data)
+	if ids.Concept["entity-alpha"] != "alpha" || len(ids.ConceptEntityID) != 0 {
+		t.Fatalf("worker did not emit direct canonical mapping: %s", data)
 	}
 	if _, err := os.Stat(filepath.Join(vault, "synto.toml")); err != nil {
 		t.Fatalf("private workspace did not publish synto.toml: %v", err)
+	}
+}
+
+func TestSyntoWorkerDirectEntityPathExcludesEntitylessPageWithoutChangingBytes(t *testing.T) {
+	old := execOLW
+	defer func() { execOLW = old }()
+	vault := t.TempDir()
+	workspaceDir := t.TempDir()
+	execOLW = func(_ context.Context, work string, command []string, _ []string, _, _ io.Writer) error {
+		if strings.Join(command, " ") != "run --auto-approve" {
+			return fmt.Errorf("unexpected Synto command %v", command)
+		}
+		mustWriteFile(t, filepath.Join(work, "wiki", "alpha.md"), []byte("---\nid: transient-alpha\n---\nalpha generated\n"))
+		mustWriteFile(t, filepath.Join(work, "wiki", "ordinary.md"), []byte("---\nid: transient-ordinary\n---\nordinary generated\n"))
+		mustWriteFile(t, filepath.Join(work, "cache", "id_map.json"), []byte(`{"concept":{"transient-alpha":"alpha","transient-ordinary":"ordinary"},"source":{},"redirects":{}}`))
+		mustWriteFile(t, filepath.Join(work, "cache", "concepts.jsonl"), []byte(""))
+		mustWriteFile(t, filepath.Join(work, "cache", "raw_status.json"), []byte("{}"))
+		mustWriteFile(t, filepath.Join(work, "cache", "suggested_queries.json"), []byte("{}"))
+		mustWriteFile(t, filepath.Join(work, ".synto", "INDEX.json"), []byte(syntoIndexFixtureWithEntities([]string{"article:entity-alpha:alpha", "ordinary::ordinary"}, nil)))
+		writeValidSQLiteState(t, filepath.Join(work, ".synto", "state.db"))
+		return nil
+	}
+	ordinary := []byte("---\nid: transient-ordinary\n---\nordinary generated\n")
+	cfg := workerConfig{VaultPath: vault, APIKey: "fake", Workspace: true, WorkspaceDir: workspaceDir, Postprocess: true, StopOnError: true}
+	if err := runWorkerBatch(context.Background(), cfg, `[["run","--auto-approve"]]`); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(vault, "cache", "id_map.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids, err := wikiindex.DecodeIDMap(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ids.Concept["entity-alpha"] != "alpha" || len(ids.Concept) != 1 || len(ids.ConceptEntityID) != 0 {
+		t.Fatalf("direct Synto map = %#v", ids)
+	}
+	page, err := os.ReadFile(filepath.Join(vault, "wiki", "ordinary.md"))
+	if err != nil || !bytes.Equal(page, ordinary) {
+		t.Fatalf("entity-less page bytes=%q err=%v", page, err)
+	}
+	cache, err := os.ReadFile(filepath.Join(vault, "cache", "concepts.jsonl"))
+	if err != nil || strings.Contains(string(cache), "ordinary") || !strings.Contains(string(cache), `"id":"entity-alpha"`) {
+		t.Fatalf("direct concept cache=%q err=%v", cache, err)
 	}
 }
 

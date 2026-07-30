@@ -45,6 +45,16 @@ type IDMap struct {
 	Source          map[string]string     `json:"source"`
 	SourceMeta      map[string]SourceMeta `json:"source_meta,omitempty"`
 	Redirects       map[string][]string   `json:"redirects"`
+	IDRedirects     map[string]string     `json:"id_redirects,omitempty"`
+}
+
+// SyntoIdentityPlan is the validated identity authority for one Synto
+// INDEX.json. ByPath contains only explicit entity-bound article rows; pages
+// absent from the plan are intentionally not Concepts. ActiveEntities is the
+// source-concept coverage set and every member must have one bound article.
+type SyntoIdentityPlan struct {
+	ByPath         map[string]string
+	ActiveEntities map[string]bool
 }
 
 type SourceMeta struct {
@@ -106,7 +116,7 @@ func (m *SourceMeta) UnmarshalJSON(data []byte) error {
 // DecodeIDMap bounds every collection while it is being decoded. Generated
 // cache byte limits alone do not bound the number of map and slice entries.
 func DecodeIDMap(data []byte) (IDMap, error) {
-	result := IDMap{Concept: map[string]string{}, DormantConcept: map[string]string{}, ConceptEntityID: map[string]string{}, Source: map[string]string{}, SourceMeta: map[string]SourceMeta{}, Redirects: map[string][]string{}}
+	result := IDMap{Concept: map[string]string{}, DormantConcept: map[string]string{}, ConceptEntityID: map[string]string{}, Source: map[string]string{}, SourceMeta: map[string]SourceMeta{}, Redirects: map[string][]string{}, IDRedirects: map[string]string{}}
 	dec := json.NewDecoder(bytes.NewReader(data))
 	token, err := dec.Token()
 	if err != nil {
@@ -142,6 +152,8 @@ func DecodeIDMap(data []byte) (IDMap, error) {
 			result.SourceMeta, err = generation.DecodeBoundedMap[SourceMeta](dec)
 		case "redirects":
 			result.Redirects, err = generation.DecodeBoundedStringLists(dec)
+		case "id_redirects":
+			result.IDRedirects, err = generation.DecodeBoundedMap[string](dec)
 		default:
 			var ignored json.RawMessage
 			err = dec.Decode(&ignored)
@@ -222,6 +234,128 @@ func BuildIDMap(ctx context.Context, store Store) (IDMap, error) {
 	appendChangedRedirects(next.Redirects, old.Source, next.Source)
 
 	return next, nil
+}
+
+// RebuildWithSyntoIdentity builds the derived artifacts for a Synto
+// generation. It is deliberately separate from Rebuild: legacy projects keep
+// frontmatter/content-derived ID behavior, while Synto uses entity_id as the
+// Concept ID authority without changing article bytes.
+func RebuildWithSyntoIdentity(ctx context.Context, store Store, plan SyntoIdentityPlan) (IDMap, error) {
+	files, err := store.ListMarkdownFiles(ctx, "wiki/")
+	if err != nil {
+		return IDMap{}, fmt.Errorf("list wiki/: %w", err)
+	}
+	if err := validateSyntoIdentityPlan(files, plan); err != nil {
+		return IDMap{}, err
+	}
+	plan = syntoPlanForAvailableFiles(files, plan)
+
+	next := IDMap{
+		Concept:         map[string]string{},
+		DormantConcept:  map[string]string{},
+		ConceptEntityID: map[string]string{},
+		Source:          map[string]string{},
+		SourceMeta:      map[string]SourceMeta{},
+		Redirects:       map[string][]string{},
+	}
+	for _, file := range files {
+		if IsSyntoRootPage(file.Path) {
+			continue
+		}
+		if entityID := plan.ByPath[file.Path]; entityID != "" {
+			next.Concept[entityID] = file.Slug
+		}
+	}
+	if err := addSourceEntries(ctx, store, next.Source, next.SourceMeta); err != nil {
+		return next, err
+	}
+	old, err := readOldIDMap(ctx, store)
+	if err != nil {
+		return next, err
+	}
+	for sourceID, redirects := range old.Redirects {
+		if _, isSource := old.Source[sourceID]; isSource {
+			next.Redirects[sourceID] = append([]string(nil), redirects...)
+		}
+	}
+	next.IDRedirects = cloneStringMap(old.IDRedirects)
+	appendChangedRedirects(next.Redirects, old.Source, next.Source)
+
+	idMapData, err := encodeIDMap(next)
+	if err != nil {
+		return next, err
+	}
+	conceptsData, err := buildSyntoConceptsJSONL(files, plan)
+	if err != nil {
+		return next, err
+	}
+	if err := writeIDMap(ctx, store, idMapData); err != nil {
+		return next, err
+	}
+	if err := writeConceptsJSONL(ctx, store, conceptsData); err != nil {
+		return next, err
+	}
+	return next, nil
+}
+
+func validateSyntoIdentityPlan(files []MarkdownFile, plan SyntoIdentityPlan) error {
+	fileByPath := make(map[string]MarkdownFile, len(files))
+	for _, file := range files {
+		if IsSyntoRootPage(file.Path) {
+			continue
+		}
+		if !validSyntoArticlePath(file.Path) || !validConceptSlug(file.Slug) {
+			return fmt.Errorf("unsafe Synto article path %q", file.Path)
+		}
+		if _, exists := fileByPath[file.Path]; exists {
+			return fmt.Errorf("duplicate Synto article path %q", file.Path)
+		}
+		fileByPath[file.Path] = file
+	}
+	entityPaths := make(map[string]string, len(plan.ByPath))
+	for path, entityID := range plan.ByPath {
+		if !validSyntoArticlePath(path) || !annotation.ValidSourceID(entityID) || entityID != strings.TrimSpace(entityID) {
+			return fmt.Errorf("unsafe Synto identity mapping %q -> %q", path, entityID)
+		}
+		if _, exists := fileByPath[path]; !exists && plan.ActiveEntities[entityID] {
+			return fmt.Errorf("Synto identity path %q is absent from wiki", path)
+		}
+		if previous, exists := entityPaths[entityID]; exists {
+			return fmt.Errorf("Synto entity_id %q maps to multiple articles %q and %q", entityID, previous, path)
+		}
+		entityPaths[entityID] = path
+	}
+	for entityID := range plan.ActiveEntities {
+		if !annotation.ValidSourceID(entityID) || entityID != strings.TrimSpace(entityID) {
+			return fmt.Errorf("unsafe active Synto entity_id %q", entityID)
+		}
+		if _, exists := entityPaths[entityID]; !exists {
+			return fmt.Errorf("active Synto entity_id %q has no entity-bound article", entityID)
+		}
+	}
+	return nil
+}
+
+func syntoPlanForAvailableFiles(files []MarkdownFile, plan SyntoIdentityPlan) SyntoIdentityPlan {
+	available := make(map[string]bool, len(files))
+	for _, file := range files {
+		available[file.Path] = true
+	}
+	filtered := SyntoIdentityPlan{ByPath: make(map[string]string), ActiveEntities: plan.ActiveEntities}
+	for path, entityID := range plan.ByPath {
+		if available[path] {
+			filtered.ByPath[path] = entityID
+		}
+	}
+	return filtered
+}
+
+func validSyntoArticlePath(path string) bool {
+	if !strings.HasPrefix(path, "wiki/") || strings.ContainsAny(path, "\\") || strings.Contains(path, "//") || strings.Contains(path, "..") || strings.Contains(path, "/./") {
+		return false
+	}
+	rel := strings.TrimPrefix(path, "wiki/")
+	return strings.HasSuffix(rel, ".md") && !strings.Contains(rel, "/") && validConceptSlug(strings.TrimSuffix(rel, ".md"))
 }
 
 // addSourceEntries intentionally parses the source collection once: the index
@@ -413,6 +547,10 @@ func encodeIDMap(next IDMap) ([]byte, error) {
 	return data, nil
 }
 
+// EncodeIDMap exposes the bounded ID-map encoding for generation-aware
+// planners that add one-time compatibility redirects after derivation.
+func EncodeIDMap(next IDMap) ([]byte, error) { return encodeIDMap(next) }
+
 func writeIDMap(ctx context.Context, store Store, data []byte) error {
 	if _, err := store.WriteBytesAtomic(ctx, data, IDMapTempPath, IDMapPath); err != nil {
 		return fmt.Errorf("write id map: %w", err)
@@ -445,6 +583,33 @@ func buildConceptsJSONL(ctx context.Context, store Store) ([]byte, error) {
 		builder.WriteByte('\n')
 	}
 
+	return []byte(builder.String()), nil
+}
+
+func buildSyntoConceptsJSONL(files []MarkdownFile, plan SyntoIdentityPlan) ([]byte, error) {
+	var builder strings.Builder
+	for _, file := range files {
+		entityID := plan.ByPath[file.Path]
+		if entityID == "" || IsSyntoRootPage(file.Path) {
+			continue
+		}
+		entry := parseCacheEntry(file.Slug, string(file.Data))
+		if entry.Frontmatter == nil {
+			entry.Frontmatter = make(map[string]interface{})
+		}
+		entry.Frontmatter["id"] = entityID
+		normalizedFrontmatter, err := normalizeJSONValue(entry.Frontmatter, 0)
+		if err != nil {
+			return nil, fmt.Errorf("normalize concepts jsonl %s: %w", file.Path, err)
+		}
+		entry.Frontmatter = normalizedFrontmatter.(map[string]interface{})
+		data, err := json.Marshal(entry)
+		if err != nil {
+			return nil, fmt.Errorf("encode concepts jsonl %s: %w", file.Path, err)
+		}
+		builder.Write(data)
+		builder.WriteByte('\n')
+	}
 	return []byte(builder.String()), nil
 }
 
@@ -558,6 +723,14 @@ func cloneRedirects(src map[string][]string) map[string][]string {
 	dst := make(map[string][]string, len(src))
 	for id, redirects := range src {
 		dst[id] = append([]string(nil), redirects...)
+	}
+	return dst
+}
+
+func cloneStringMap(src map[string]string) map[string]string {
+	dst := make(map[string]string, len(src))
+	for key, value := range src {
+		dst[key] = value
 	}
 	return dst
 }

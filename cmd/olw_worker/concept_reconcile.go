@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,6 +17,7 @@ import (
 	"github.com/rayer/llm-wiki-bff/internal/annotation"
 	"github.com/rayer/llm-wiki-bff/internal/generation"
 	"github.com/rayer/llm-wiki-bff/internal/wikiindex"
+	"github.com/rayer/llm-wiki-bff/internal/wikiindex/fsstore"
 )
 
 type conceptSnapshot struct {
@@ -747,6 +749,16 @@ func reconcileWorkspaceConcepts(workspace string, prior []conceptSnapshot, curre
 	if indexTruth.AmbiguousLineage {
 		return wrapConceptReconciliationError(conceptDetailSyntoIndexTruth, errors.New("Synto merge/split lineage requires an owner-approved identity mapping"))
 	}
+	if indexTruth.Present && len(generated.ConceptEntityID) == 0 && isSyntoDirectEntityCandidate(generated, indexTruth) {
+		plan, err := syntoIdentityPlanFromIndex(indexTruth)
+		if err != nil {
+			return wrapConceptReconciliationError(conceptDetailEntityMapping, err)
+		}
+		if err := validateSyntoDerivedArtifacts(workspace, generated, plan); err != nil {
+			return wrapConceptReconciliationError(conceptDetailEntityMerge, err)
+		}
+		return nil
+	}
 	generated, omittedSlugs, err := filterUnmappedLegacyConcepts(workspace, generated, indexTruth, prior)
 	if err != nil {
 		return wrapConceptReconciliationError(conceptDetailEntityMapping, err)
@@ -870,6 +882,101 @@ func reconcileWorkspaceConcepts(workspace string, prior []conceptSnapshot, curre
 		}
 	}
 	return nil
+}
+
+func isSyntoDirectEntityCandidate(generated wikiindex.IDMap, index syntoIndexTruth) bool {
+	if len(generated.Concept) == 0 {
+		return true
+	}
+	for entityID := range generated.Concept {
+		if _, ok := index.ActiveEntities[entityID]; ok {
+			return true
+		}
+		for _, article := range index.Articles {
+			if article.EntityID == entityID {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func validateSyntoDerivedArtifacts(workspace string, generated wikiindex.IDMap, plan wikiindex.SyntoIdentityPlan) error {
+	expected := make(map[string]string, len(plan.ByPath))
+	files, err := fsstore.New(workspace).ListMarkdownFiles(context.Background(), "wiki/")
+	if err != nil {
+		return fmt.Errorf("list Synto pages: %w", err)
+	}
+	available := make(map[string]bool, len(files))
+	for _, file := range files {
+		available[file.Path] = true
+	}
+	for path, entityID := range plan.ByPath {
+		if !available[path] {
+			continue
+		}
+		slug := strings.TrimSuffix(strings.TrimPrefix(path, "wiki/"), ".md")
+		expected[entityID] = slug
+	}
+	if !equalStringMap(generated.Concept, expected) || len(generated.DormantConcept) != 0 || len(generated.ConceptEntityID) != 0 {
+		return errors.New("Synto direct entity map disagrees with INDEX.json")
+	}
+	data, err := readBoundedRegularFileWithin(workspace, "cache/concepts.jsonl")
+	if err != nil {
+		return fmt.Errorf("read Synto concept cache: %w", err)
+	}
+	seen := make(map[string]bool, len(expected))
+	for _, line := range bytes.Split(data, []byte{'\n'}) {
+		line = bytes.TrimSpace(line)
+		if len(line) == 0 {
+			continue
+		}
+		row, err := decodeStrictConceptCacheRow(line)
+		if err != nil {
+			return fmt.Errorf("decode Synto concept cache: %w", err)
+		}
+		slug, ok := row["slug"].(string)
+		if !ok || !safeConceptSlug(slug) {
+			return errors.New("Synto concept cache row has unsafe slug")
+		}
+		entityID, ok := expectedEntityForSlug(expected, slug)
+		if !ok {
+			return fmt.Errorf("entity-less or unknown page %q entered Synto concept cache", slug)
+		}
+		if seen[slug] {
+			return fmt.Errorf("duplicate Synto concept cache row %q", slug)
+		}
+		seen[slug] = true
+		frontmatter, ok := row["frontmatter"].(map[string]interface{})
+		if !ok || frontmatter["id"] != entityID {
+			return fmt.Errorf("Synto concept cache identity disagrees for %q", slug)
+		}
+	}
+	if len(seen) != len(expected) {
+		return errors.New("Synto concept cache is missing an entity-bound article")
+	}
+	return nil
+}
+
+func equalStringMap(left, right map[string]string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for key, value := range left {
+		if right[key] != value {
+			return false
+		}
+	}
+	return true
+}
+
+func expectedEntityForSlug(expected map[string]string, slug string) (string, bool) {
+	for entityID, candidate := range expected {
+		if candidate == slug {
+			return entityID, true
+		}
+	}
+	return "", false
 }
 
 func activeSyntoEntities(edges []syntoSourceConcept, sources []sourceSnapshot) map[string]bool {

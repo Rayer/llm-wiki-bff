@@ -1,11 +1,89 @@
 package wikiindex
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"strings"
 	"testing"
 )
+
+func TestRebuildWithSyntoIdentityUsesEntityIDsAndExcludesEntitylessPages(t *testing.T) {
+	page := []byte("---\nid: old-content-id\ntitle: Alpha\n---\nAlpha body")
+	store := &fakeStore{
+		files: map[string][]MarkdownFile{
+			"wiki/": {
+				{Slug: "alpha", Path: "wiki/alpha.md", Data: page},
+				{Slug: "draft", Path: "wiki/draft.md", Data: []byte("---\nid: old-draft-id\n---\nDraft body")},
+			},
+			"wiki/sources/": {},
+		},
+		reads: map[string][]byte{},
+	}
+
+	next, err := RebuildWithSyntoIdentity(context.Background(), store, SyntoIdentityPlan{
+		ByPath:         map[string]string{"wiki/alpha.md": "entity-alpha"},
+		ActiveEntities: map[string]bool{"entity-alpha": true},
+	})
+	if err != nil {
+		t.Fatalf("RebuildWithSyntoIdentity() error = %v", err)
+	}
+	if got := next.Concept["entity-alpha"]; got != "alpha" {
+		t.Fatalf("concept entity map = %#v, want entity-alpha -> alpha", next.Concept)
+	}
+	if _, ok := next.Concept["old-content-id"]; ok {
+		t.Fatalf("content-derived/frontmatter ID remained authoritative: %#v", next.Concept)
+	}
+	if len(next.ConceptEntityID) != 0 {
+		t.Fatalf("legacy concept_entity_id map = %#v, want empty", next.ConceptEntityID)
+	}
+	if !bytes.Equal(store.files["wiki/"][0].Data, page) {
+		t.Fatal("Synto-aware rebuild modified article bytes")
+	}
+
+	var entry struct {
+		Slug        string                 `json:"slug"`
+		Frontmatter map[string]interface{} `json:"frontmatter"`
+	}
+	if err := json.Unmarshal(bytes.TrimSpace(store.writes[ConceptsJSONLPath]), &entry); err != nil {
+		t.Fatalf("concept cache row is not valid JSON: %v", err)
+	}
+	if entry.Slug != "alpha" || entry.Frontmatter["id"] != "entity-alpha" {
+		t.Fatalf("Synto concept cache row = %+v, want entity-bound id", entry)
+	}
+	if strings.Contains(string(store.writes[ConceptsJSONLPath]), "draft") {
+		t.Fatalf("entity-less page entered Synto concept cache: %s", store.writes[ConceptsJSONLPath])
+	}
+
+	store.files["wiki/"][0].Data = []byte("---\nid: a-different-old-id\ntitle: Alpha\n---\nEdited body")
+	second, err := RebuildWithSyntoIdentity(context.Background(), store, SyntoIdentityPlan{
+		ByPath:         map[string]string{"wiki/alpha.md": "entity-alpha"},
+		ActiveEntities: map[string]bool{"entity-alpha": true},
+	})
+	if err != nil {
+		t.Fatalf("body-edit rebuild error = %v", err)
+	}
+	if got := second.Concept["entity-alpha"]; got != "alpha" || len(second.Concept) != 1 {
+		t.Fatalf("body edit changed entity identity = %#v", second.Concept)
+	}
+}
+
+func TestRebuildWithSyntoIdentityFailsClosedOnMissingActiveEntityArticle(t *testing.T) {
+	store := &fakeStore{files: map[string][]MarkdownFile{
+		"wiki/":         {{Slug: "alpha", Path: "wiki/alpha.md", Data: []byte("alpha")}},
+		"wiki/sources/": {},
+	}, reads: map[string][]byte{}}
+
+	if _, err := RebuildWithSyntoIdentity(context.Background(), store, SyntoIdentityPlan{
+		ByPath:         map[string]string{},
+		ActiveEntities: map[string]bool{"entity-missing": true},
+	}); err == nil || !strings.Contains(err.Error(), "no entity-bound article") {
+		t.Fatalf("missing active entity error = %v", err)
+	}
+	if len(store.writes) != 0 {
+		t.Fatalf("missing active entity caused writes: %#v", store.writes)
+	}
+}
 
 type fakeStore struct {
 	files     map[string][]MarkdownFile

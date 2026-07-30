@@ -429,8 +429,8 @@ func TestDefaultInPlacePathReconcilesConceptIDs(t *testing.T) {
 	if err := json.Unmarshal(mapData, &ids); err != nil {
 		t.Fatal(err)
 	}
-	if ids.Concept["stable-a"] != "alpha" {
-		t.Fatalf("stable concept missing from id_map: %#v (%s)", ids.Concept, mapData)
+	if ids.Concept["entity"] != "alpha" || len(ids.Concept) != 1 {
+		t.Fatalf("entity concept missing from id_map: %#v (%s)", ids.Concept, mapData)
 	}
 	if _, exists := ids.Concept["transient-a"]; exists {
 		t.Fatalf("transient concept retained in id_map: %#v", ids.Concept)
@@ -439,8 +439,8 @@ func TestDefaultInPlacePathReconcilesConceptIDs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(page), "id: stable-a\n") || strings.Contains(string(page), "id: transient-a") {
-		t.Fatalf("page identity not stabilized on default path: %s", page)
+	if !strings.Contains(string(page), "id: transient-a\n") || strings.Contains(string(page), "id: stable-a") {
+		t.Fatalf("article bytes changed on direct entity path: %s", page)
 	}
 }
 
@@ -965,22 +965,22 @@ func TestExactSlugStabilityThroughWorkspaceAndCloudCompose(t *testing.T) {
 		if err := json.Unmarshal(mapData, &ids); err != nil {
 			t.Fatal(err)
 		}
-		if ids.Concept["c-stable"] != "alpha" || ids.Source["s-stable"] != "source" {
+		if ids.Concept["entity-c"] != "alpha" || ids.Source["s-stable"] != "source" {
 			t.Fatalf("workspace gen %d lost exact-slug stability: %s", i+1, mapData)
 		}
 		if strings.Contains(string(mapData), "transient") {
 			t.Fatalf("workspace gen %d retained transient IDs: %s", i+1, mapData)
 		}
 		page, _ := os.ReadFile(filepath.Join(vault, "wiki", "alpha.md"))
-		if !strings.Contains(string(page), "id: c-stable\n") || !strings.Contains(string(page), "[[concepts/c-stable-alpha|Alpha]]") {
+		if !strings.Contains(string(page), "id: c-transient-") || strings.Contains(string(page), "id: c-stable\n") {
 			t.Fatalf("workspace gen %d page=%s", i+1, page)
 		}
 		src, _ := os.ReadFile(filepath.Join(vault, "wiki", "sources", "source.md"))
-		if !strings.Contains(string(src), "id: s-stable\n") || !strings.Contains(string(src), "[[concepts/c-stable-alpha|Alpha]]") {
+		if !strings.Contains(string(src), "id: s-stable\n") || !strings.Contains(string(src), "[[concepts/c-transient-") {
 			t.Fatalf("workspace gen %d source=%s", i+1, src)
 		}
 		cache, _ := os.ReadFile(filepath.Join(vault, "cache", "concepts.jsonl"))
-		if !strings.Contains(string(cache), `"c-stable"`) || !strings.Contains(string(cache), `"s-stable"`) {
+		if !strings.Contains(string(cache), `"entity-c"`) || !strings.Contains(string(cache), `"s-stable"`) {
 			t.Fatalf("workspace gen %d cache=%s", i+1, cache)
 		}
 	}
@@ -1035,11 +1035,8 @@ func TestExactSlugStabilityThroughWorkspaceAndCloudCompose(t *testing.T) {
 		currentPage := mustCloudGenerationFile(t, m, prefix, manifest, "wiki/alpha.md")
 		currentSrc := mustCloudGenerationFile(t, m, prefix, manifest, "wiki/sources/source.md")
 		currentCache := mustCloudGenerationFile(t, m, prefix, manifest, "cache/concepts.jsonl")
-		if !strings.Contains(string(currentMap), `"c-stable": "alpha"`) && !strings.Contains(string(currentMap), `"c-stable":"alpha"`) {
-			// MarshalIndent uses spaces after colons.
-			if !strings.Contains(string(currentMap), "c-stable") || !strings.Contains(string(currentMap), "alpha") {
-				t.Fatalf("cloud gen %d concept map lost stable id: %s", i+1, currentMap)
-			}
+		if !strings.Contains(string(currentMap), `"entity-c": "alpha"`) && !strings.Contains(string(currentMap), `"entity-c":"alpha"`) {
+			t.Fatalf("cloud gen %d concept map lost direct entity id: %s", i+1, currentMap)
 		}
 		if strings.Contains(string(currentMap), "c-cloud-") || strings.Contains(string(currentMap), "s-cloud-") {
 			t.Fatalf("cloud gen %d retained transient IDs: %s", i+1, currentMap)
@@ -1047,13 +1044,13 @@ func TestExactSlugStabilityThroughWorkspaceAndCloudCompose(t *testing.T) {
 		if !strings.Contains(string(currentMap), `"s1"`) {
 			t.Fatalf("cloud gen %d lost stable source id s1: %s", i+1, currentMap)
 		}
-		if !strings.Contains(string(currentPage), "id: c-stable\n") || !strings.Contains(string(currentPage), "[[concepts/c-stable-alpha|Alpha]]") {
+		if !strings.Contains(string(currentPage), "id: c-cloud-") || !strings.Contains(string(currentPage), "[[concepts/c-cloud-") {
 			t.Fatalf("cloud gen %d page=%s", i+1, currentPage)
 		}
-		if !strings.Contains(string(currentSrc), "id: s1\n") || !strings.Contains(string(currentSrc), "[[concepts/c-stable-alpha|Alpha]]") {
+		if !strings.Contains(string(currentSrc), "id: s1\n") || !strings.Contains(string(currentSrc), "[[concepts/c-cloud-") {
 			t.Fatalf("cloud gen %d source=%s", i+1, currentSrc)
 		}
-		if !strings.Contains(string(currentCache), "c-stable") || !strings.Contains(string(currentCache), `"s1"`) {
+		if !strings.Contains(string(currentCache), "entity-c") || !strings.Contains(string(currentCache), `"s1"`) {
 			t.Fatalf("cloud gen %d cache=%s", i+1, currentCache)
 		}
 	}
@@ -1451,11 +1448,11 @@ func TestRunWorkerBatchWorkspacePublishesStableConceptIDFromSourceProvenance(t *
 	}
 
 	ids := mustSnapshotIDMap(t, vault)
-	if len(ids.Concept) != 1 || ids.Concept["stable-old"] != "new" {
+	if len(ids.Concept) != 1 || ids.Concept["entity-stable"] != "new" {
 		t.Fatalf("unexpected concept map: %#v", ids.Concept)
 	}
-	if ids.ConceptEntityID["stable-old"] != "entity-stable" || len(ids.ConceptEntityID) != 1 {
-		t.Fatalf("unexpected concept entity map: %#v", ids.ConceptEntityID)
+	if len(ids.ConceptEntityID) != 0 {
+		t.Fatalf("legacy concept entity map retained: %#v", ids.ConceptEntityID)
 	}
 	if _, ok := ids.Concept["transient-new"]; ok {
 		t.Fatalf("transient concept remained active: %#v", ids.Concept)
@@ -1463,11 +1460,11 @@ func TestRunWorkerBatchWorkspacePublishesStableConceptIDFromSourceProvenance(t *
 	if _, ok := ids.Concept["current-article"]; ok {
 		t.Fatalf("transient current mapping remained active: %#v", ids.Concept)
 	}
-	if _, err := os.Stat(filepath.Join(vault, "wiki", "old.md")); !os.IsNotExist(err) {
-		t.Fatalf("legacy active page remained: %v", err)
+	if _, err := os.Stat(filepath.Join(vault, "wiki", "old.md")); err != nil {
+		t.Fatalf("entity-less legacy page was deleted: %v", err)
 	}
 	page, err := os.ReadFile(filepath.Join(vault, "wiki", "new.md"))
-	if err != nil || !bytes.Contains(page, []byte("id: stable-old\n")) {
+	if err != nil || !bytes.Contains(page, []byte("id: transient-new\n")) {
 		t.Fatalf("new page identity=%q err=%v", page, err)
 	}
 	rawAfter, err := os.ReadFile(filepath.Join(vault, "raw", "source.md"))

@@ -103,6 +103,32 @@ type GenerationAware interface {
 	HasCurrentManifest(context.Context) (bool, error)
 }
 
+// GenerationRebuilder performs a complete derived-artifact rebuild into a
+// new immutable generation and advances the current pointer with CAS.
+type GenerationRebuilder interface {
+	RebuildIndexGeneration(context.Context, GenerationRebuildPlanner) (GenerationRebuildResult, error)
+}
+
+type GenerationRebuildPlanner func(context.Context, string) (GenerationRebuildPlan, error)
+
+type GenerationRebuildPlan struct {
+	ConceptCount   int
+	SourceCount    int
+	MigratedOldIDs int
+	RedirectCount  int
+}
+
+type GenerationRebuildResult struct {
+	Status          string `json:"status"`
+	OldGeneration   string `json:"old_generation"`
+	NewGeneration   string `json:"new_generation"`
+	ConceptCount    int    `json:"concept_count"`
+	SourceCount     int    `json:"source_count"`
+	MigratedOldIDs  int    `json:"migrated_old_id_count"`
+	RedirectCount   int    `json:"redirect_count"`
+	AnnotationCount int    `json:"annotation_count"`
+}
+
 // LegacyGenerationWriteSession is a narrow migration capability. It is used
 // only while rebuilding a pre-manifest project so generated paths cannot race
 // the worker's manifest commit.

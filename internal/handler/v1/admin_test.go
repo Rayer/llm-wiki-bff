@@ -523,6 +523,51 @@ func TestGenerationProjectsRejectManualRebuildWithoutCallingWriter(t *testing.T)
 	}
 }
 
+type adminGenerationRebuilderStore struct {
+	*adminStatsProjectStore
+	result store.GenerationRebuildResult
+	called bool
+}
+
+type adminGenerationRootStore struct{ *adminGenerationRebuilderStore }
+
+func (s *adminGenerationRootStore) Scope(string, string) store.Store {
+	return s.adminGenerationRebuilderStore
+}
+
+func (s *adminGenerationRebuilderStore) RebuildIndexGeneration(context.Context, store.GenerationRebuildPlanner) (store.GenerationRebuildResult, error) {
+	s.called = true
+	return s.result, nil
+}
+
+func TestAdminRebuildIndexUsesGenerationRebuilderAfterAuthorization(t *testing.T) {
+	project := &adminGenerationRebuilderStore{
+		adminStatsProjectStore: &adminStatsProjectStore{prefix: "users/user/project", hasManifest: true},
+		result: store.GenerationRebuildResult{
+			Status: "ok", OldGeneration: "g_old", NewGeneration: "g_new", ConceptCount: 2, SourceCount: 1,
+		},
+	}
+	root := &adminGenerationRootStore{adminGenerationRebuilderStore: project}
+	h := &Handler{store: root, projectExists: func(context.Context, string) error { return nil }}
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/admin/projects/user-account_project-account/rebuild-index", nil)
+	c.Params = gin.Params{{Key: "id", Value: "user-account_project-account"}}
+	h.AdminRebuildIndex(c)
+
+	if recorder.Code != http.StatusOK || !project.called {
+		t.Fatalf("generation rebuild status=%d called=%v body=%s", recorder.Code, project.called, recorder.Body.String())
+	}
+	var response store.GenerationRebuildResult
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.NewGeneration != "g_new" || response.ConceptCount != 2 {
+		t.Fatalf("response=%+v", response)
+	}
+}
+
 func TestRebuildIndexAuthenticatesBeforeGenerationProbeAndSanitizesProbeErrors(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	project := &adminStatsProjectStore{manifestErr: errors.New("sentinel-provider-path/users/tenant")}

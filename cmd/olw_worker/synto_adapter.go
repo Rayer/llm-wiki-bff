@@ -853,6 +853,74 @@ func readSyntoIndexTruth(workspace string) (syntoIndexTruth, error) {
 	return index, nil
 }
 
+// syntoIdentityPlanFromIndex converts the already validated INDEX artifact
+// into the direct Concept identity authority. It never matches by title,
+// source name, path history or content; only an explicit article.entity_id is
+// eligible. Entity-less articles remain ordinary page bytes.
+func syntoIdentityPlanFromIndex(index syntoIndexTruth) (wikiindex.SyntoIdentityPlan, error) {
+	plan := wikiindex.SyntoIdentityPlan{
+		ByPath:         make(map[string]string),
+		ActiveEntities: make(map[string]bool, len(index.ActiveEntities)),
+	}
+	for entityID := range index.ActiveEntities {
+		if !annotation.ValidSourceID(entityID) {
+			return wikiindex.SyntoIdentityPlan{}, fmt.Errorf("unsafe active Synto entity_id %q", entityID)
+		}
+		plan.ActiveEntities[entityID] = true
+	}
+
+	seenIDs := make(map[string]string, len(index.Articles))
+	seenSlugs := make(map[string]string, len(index.Articles))
+	seenEntities := make(map[string]string, len(index.Articles))
+	byName := make(map[string]map[string]bool)
+	for _, edge := range index.SourceConcepts {
+		if edge.Name == "" || !annotation.ValidSourceID(edge.EntityID) {
+			return wikiindex.SyntoIdentityPlan{}, errors.New("invalid Synto source concept identity")
+		}
+		if byName[edge.Name] == nil {
+			byName[edge.Name] = make(map[string]bool)
+		}
+		byName[edge.Name][edge.EntityID] = true
+	}
+	for _, article := range index.Articles {
+		slug, err := normalizeSyntoArticlePath(article.Path)
+		if err != nil {
+			return wikiindex.SyntoIdentityPlan{}, err
+		}
+		canonicalPath := filepath.ToSlash(filepath.Join("wiki", slug+".md"))
+		if wikiindex.IsSyntoRootPage(canonicalPath) {
+			continue
+		}
+		if article.ID == "" || !annotation.ValidSourceID(article.ID) {
+			return wikiindex.SyntoIdentityPlan{}, fmt.Errorf("invalid Synto article ID for %q", slug)
+		}
+		if previous, exists := seenIDs[article.ID]; exists {
+			return wikiindex.SyntoIdentityPlan{}, fmt.Errorf("duplicate Synto article ID %q for %q and %q", article.ID, previous, slug)
+		}
+		seenIDs[article.ID] = slug
+		if previous, exists := seenSlugs[strings.ToLower(slug)]; exists {
+			return wikiindex.SyntoIdentityPlan{}, fmt.Errorf("duplicate Synto article slug %q for %q and %q", slug, previous, slug)
+		}
+		seenSlugs[strings.ToLower(slug)] = slug
+		if article.EntityID == "" {
+			continue
+		}
+		if !annotation.ValidSourceID(article.EntityID) {
+			return wikiindex.SyntoIdentityPlan{}, fmt.Errorf("unsafe Synto article entity_id %q", article.EntityID)
+		}
+		if entities := byName[article.Name]; len(entities) > 0 && (len(entities) != 1 || !entities[article.EntityID]) {
+			return wikiindex.SyntoIdentityPlan{}, fmt.Errorf("Synto article/source entity disagreement for %q", slug)
+		}
+		if previous, exists := seenEntities[article.EntityID]; exists {
+			return wikiindex.SyntoIdentityPlan{}, fmt.Errorf("Synto entity_id %q maps to multiple articles %q and %q", article.EntityID, previous, slug)
+		}
+		path := canonicalPath
+		seenEntities[article.EntityID] = path
+		plan.ByPath[path] = article.EntityID
+	}
+	return plan, nil
+}
+
 // ensureSyntoIndex uses the exact 0.7.0 documented offline pack-export
 // surface. The orchestrator's generate_index() only writes wiki/index.md;
 // pack export is the release-supported path that serializes the authoritative

@@ -31,8 +31,9 @@ type idRouteEntry struct {
 }
 
 type dualIDMap struct {
-	byID   map[string]idRouteEntry
-	bySlug map[string][]idRouteEntry
+	byID       map[string]idRouteEntry
+	bySlug     map[string][]idRouteEntry
+	idRedirect map[string]string
 }
 
 func loadDualIDMap(ctx context.Context, store idMapStore) (dualIDMap, error) {
@@ -53,11 +54,17 @@ func loadDualIDMap(ctx context.Context, store idMapStore) (dualIDMap, error) {
 
 func buildDualIDMap(source idMap) dualIDMap {
 	dual := dualIDMap{
-		byID:   map[string]idRouteEntry{},
-		bySlug: map[string][]idRouteEntry{},
+		byID:       map[string]idRouteEntry{},
+		bySlug:     map[string][]idRouteEntry{},
+		idRedirect: map[string]string{},
 	}
 	addDualIDMapEntries(dual, source.Concept, "concept")
 	addDualIDMapEntries(dual, source.Source, "source")
+	for oldID, newID := range source.IDRedirects {
+		if strings.TrimSpace(oldID) != "" && strings.TrimSpace(newID) != "" {
+			dual.idRedirect[oldID] = newID
+		}
+	}
 	return dual
 }
 
@@ -137,6 +144,11 @@ func canonicalIDRoute(currentType, idSlug string, dual dualIDMap) (string, bool)
 	}
 	entry, ok := dual.byID[id]
 	if !ok {
+		if targetID, redirected := dual.idRedirect[id]; redirected {
+			if target, targetExists := dual.byID[targetID]; targetExists {
+				return "/" + routePrefix(target.Type) + "/" + entryIDSlug(target), true
+			}
+		}
 		return "", false
 	}
 	if entry.Type == currentType && slug == entry.Slug {
@@ -211,6 +223,12 @@ func (h *Handler) handleIDRoutedPage(c *gin.Context, gcsClient store.Store, curr
 	id, _, _ := idFromPathValue(idSlug)
 	entry, ok := dual.byID[id]
 	if !ok {
+		if targetID, redirected := dual.idRedirect[id]; redirected {
+			if target, targetExists := dual.byID[targetID]; targetExists {
+				c.Redirect(idRouteRedirectStatus, requestRelativeIDRoute(c, "/"+routePrefix(target.Type)+"/"+entryIDSlug(target)))
+				return true
+			}
+		}
 		c.JSON(http.StatusNotFound, handler.ErrorResponse{Error: "id not found: " + id})
 		return true
 	}
