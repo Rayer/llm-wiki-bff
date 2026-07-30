@@ -2818,6 +2818,42 @@ func syntoIndexFixtureWithSourceGroups(articles []string, groups string) string 
 	return `{"schema_version":1,"pack":{"id":"fixture","name":"fixture","version":"0","language":["en"],"capabilities":["articles","concepts"]},"articles":[` + strings.Join(articleJSON, ",") + `],"terms":[],"papers":[],"sources":[],"source_concepts":` + groups + `,"synthesis":[],"stats":{"article_count":3,"draft_count":0,"concept_count":3,"alias_count":0,"knowledge_item_count":0,"source_count":3,"source_segment_count":0,"failed_note_count":0,"failed_concept_count":0}}`
 }
 
+func TestWorkerDecodeSyntoIndexRejectsDuplicateSourceConceptGroupsAndRows(t *testing.T) {
+	tests := []struct {
+		name   string
+		groups string
+	}{
+		{
+			name:   "duplicate source path",
+			groups: `[{"source_path":"raw/source.md","content_hash":"` + strings.Repeat("0", 64) + `","concepts":[]},{"source_path":"raw/source.md","content_hash":"` + strings.Repeat("1", 64) + `","concepts":[]}]`,
+		},
+		{
+			name:   "duplicate source concept row",
+			groups: `[{"source_path":"raw/source.md","content_hash":"` + strings.Repeat("0", 64) + `","concepts":[{"name":"Alpha","entity_id":"01JAZ5N7Y3K8M2Q4R6T9VWXABC"},{"name":"Alpha","entity_id":"01JAZ5N7Y3K8M2Q4R6T9VWXABC"}]}]`,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			data := syntoIndexFixtureWithSourceGroups(nil, test.groups)
+			if _, err := decodeSyntoIndex([]byte(data)); err == nil {
+				t.Fatal("worker decoder accepted duplicate source concept data")
+			}
+		})
+	}
+}
+
+func TestSyntoIdentityPlanValidatesReservedRootEntityUniquenessBeforeExclusion(t *testing.T) {
+	index := syntoIndexTruth{
+		Articles: []syntoIndexEntry{
+			{ID: "article-root", Name: "Index", Path: "wiki/index.md", EntityID: "01JAZ5N7Y3K8M2Q4R6T9VWXABC"},
+			{ID: "article-alpha", Name: "Alpha", Path: "wiki/alpha.md", EntityID: "01JAZ5N7Y3K8M2Q4R6T9VWXABC"},
+		},
+	}
+	if _, err := syntoIdentityPlanFromIndex(index); err == nil {
+		t.Fatal("reserved root duplicate entity identity was accepted")
+	}
+}
+
 func syntoIndexFixtureWithEntitiesHash(articles, active []string, contentHash string) string {
 	articleJSON := make([]string, 0, len(articles))
 	for _, item := range articles {

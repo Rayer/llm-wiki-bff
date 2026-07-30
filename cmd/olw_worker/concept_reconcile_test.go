@@ -1445,6 +1445,28 @@ func TestReconcileConceptIDMapPreservesIDRedirectsInEntityMode(t *testing.T) {
 	}
 }
 
+func TestReconcileConceptIDMapAllowsManyLegacySourcesToOneCurrentULID(t *testing.T) {
+	entityID := "01JAZ5N7Y3K8M2Q4R6T9VWXABC"
+	data := []byte(`{
+	  "concept": {"` + entityID + `":"alpha"},
+	  "concept_entity_id": {"` + entityID + `":"` + entityID + `"},
+	  "source": {},
+	  "source_meta": {},
+	  "id_redirects": {"a3f7b2c01d9d":"` + entityID + `","b7e2c9a4d113":"` + entityID + `"}
+}`)
+	out, _, err := reconcileConceptIDMapWithEntities(data, nil, true)
+	if err != nil {
+		t.Fatalf("many-to-one ID redirects rejected: %v", err)
+	}
+	var ids wikiindex.IDMap
+	if err := json.Unmarshal(out, &ids); err != nil {
+		t.Fatal(err)
+	}
+	if len(ids.IDRedirects) != 2 || ids.IDRedirects["a3f7b2c01d9d"] != entityID || ids.IDRedirects["b7e2c9a4d113"] != entityID {
+		t.Fatalf("ID redirects = %#v", ids.IDRedirects)
+	}
+}
+
 func TestReconcileConceptIDMapRejectsInvalidIDRedirects(t *testing.T) {
 	testCases := []struct {
 		name   string
@@ -1465,11 +1487,6 @@ func TestReconcileConceptIDMapRejectsInvalidIDRedirects(t *testing.T) {
 			name:   "redirect chain",
 			data:   `{"concept":{"01JAZ5N7Y3K8M2Q4R6T9VWXAC0":"alpha","01JAZ5N7Y3K8M2Q4R6T9VWXAC1":"beta"},"concept_entity_id":{"01JAZ5N7Y3K8M2Q4R6T9VWXAC0":"01JAZ5N7Y3K8M2Q4R6T9VWXAC0","01JAZ5N7Y3K8M2Q4R6T9VWXAC1":"01JAZ5N7Y3K8M2Q4R6T9VWXAC1"},"source":{},"source_meta":{},"id_redirects":{"legacy-a":"legacy-b","legacy-b":"legacy-a"}}`,
 			needle: "chain detected",
-		},
-		{
-			name:   "redirect target collision",
-			data:   `{"concept":{"01JAZ5N7Y3K8M2Q4R6T9VWXAC0":"alpha","01JAZ5N7Y3K8M2Q4R6T9VWXAC1":"beta"},"concept_entity_id":{"01JAZ5N7Y3K8M2Q4R6T9VWXAC0":"01JAZ5N7Y3K8M2Q4R6T9VWXAC0","01JAZ5N7Y3K8M2Q4R6T9VWXAC1":"01JAZ5N7Y3K8M2Q4R6T9VWXAC1"},"source":{},"source_meta":{},"id_redirects":{"legacy-a":"01JAZ5N7Y3K8M2Q4R6T9VWXAC0","legacy-b":"01JAZ5N7Y3K8M2Q4R6T9VWXAC0"}}`,
-			needle: "target collision",
 		},
 	}
 	for _, tc := range testCases {

@@ -203,6 +203,67 @@ func TestGenerationRebuildRejectsLstatOpenSwapBeforeCAS(t *testing.T) {
 	}
 }
 
+func TestGenerationRebuildRejectsAncestorDirectorySwapBeforeCAS(t *testing.T) {
+	client, backend := newMemoryClient()
+	seedManifest(t, backend, "old-generation", generationRebuildTestFiles())
+	oldCurrent, err := backend.Read(context.Background(), projectObject(generation.ManifestPath), 0, generation.MaxManifestBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	previousPreflightHook := generationRebuildAfterPreflight
+	previousLstatHook := generationRebuildAfterFileLstat
+	defer func() {
+		generationRebuildAfterPreflight = previousPreflightHook
+		generationRebuildAfterFileLstat = previousLstatHook
+	}()
+	generationRebuildAfterPreflight = func(workspace string) {
+		replacement := filepath.Join(t.TempDir(), "cache")
+		if err := os.MkdirAll(replacement, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		entries, err := os.ReadDir(filepath.Join(workspace, "cache"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, entry := range entries {
+			data, err := os.ReadFile(filepath.Join(workspace, "cache", entry.Name()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(replacement, entry.Name()), data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		cacheDir := filepath.Join(workspace, "cache")
+		if err := os.RemoveAll(cacheDir); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(replacement, cacheDir); err != nil {
+			t.Fatal(err)
+		}
+	}
+	generationRebuildAfterFileLstat = func(filePath string) {
+		if !strings.HasSuffix(filepath.ToSlash(filePath), "cache/id_map.json") {
+			return
+		}
+	}
+
+	_, err = client.RebuildIndexGeneration(context.Background(), func(_ context.Context, _ string) (store.GenerationRebuildPlan, error) {
+		return store.GenerationRebuildPlan{}, nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "manifest_stage") {
+		t.Fatalf("ancestor swap error = %v, want manifest_stage", err)
+	}
+	current, err := backend.Read(context.Background(), projectObject(generation.ManifestPath), 0, generation.MaxManifestBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(current.Data) != string(oldCurrent.Data) {
+		t.Fatal("ancestor swap advanced or changed current manifest")
+	}
+}
+
 func TestGenerationWorkspacePathRejectsAmbiguousPaths(t *testing.T) {
 	root := t.TempDir()
 	for _, rel := range []string{".", "..", "../outside", "/absolute", "wiki/../outside.md", `wiki\\escape.md`} {

@@ -391,7 +391,6 @@ func reconcileConceptIDMapWithEntities(data []byte, prior []conceptSnapshot, req
 	ids.ConceptEntityID = nextEntity
 
 	normalizedIDRedirects := make(map[string]string, len(ids.IDRedirects))
-	idRedirectTargetOwner := make(map[string]string, len(ids.IDRedirects))
 	redirectSources := make([]string, 0, len(ids.IDRedirects))
 	for from := range ids.IDRedirects {
 		redirectSources = append(redirectSources, from)
@@ -416,11 +415,7 @@ func reconcileConceptIDMapWithEntities(data []byte, prior []conceptSnapshot, req
 		if existing, ok := normalizedIDRedirects[newFrom]; ok && existing != newTarget {
 			return nil, nil, fmt.Errorf("ID redirect collision %q", newFrom)
 		}
-		if priorSource, ok := idRedirectTargetOwner[newTarget]; ok && priorSource != newFrom {
-			return nil, nil, fmt.Errorf("ID redirect target collision %q", newTarget)
-		}
 		normalizedIDRedirects[newFrom] = newTarget
-		idRedirectTargetOwner[newTarget] = newFrom
 	}
 	for source, target := range normalizedIDRedirects {
 		if _, exists := ids.Concept[source]; exists {

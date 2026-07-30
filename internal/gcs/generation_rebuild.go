@@ -43,6 +43,11 @@ func (c *Client) RebuildIndexGeneration(ctx context.Context, planner store.Gener
 		return store.GenerationRebuildResult{}, errors.New("stage_create")
 	}
 	defer os.RemoveAll(workspace)
+	workspaceRoot, err := os.OpenRoot(workspace)
+	if err != nil {
+		return store.GenerationRebuildResult{}, errors.New("stage_create")
+	}
+	defer workspaceRoot.Close()
 
 	for _, file := range old.Files {
 		object, err := c.readObject(ctx, c.prefix()+"/"+old.ObjectPath(file), file.Generation, file.Size)
@@ -66,7 +71,7 @@ func (c *Client) RebuildIndexGeneration(ctx context.Context, planner store.Gener
 		return store.GenerationRebuildResult{}, fmt.Errorf("derived_rebuild: %w", err)
 	}
 
-	files, err := generationFilesFromWorkspace(workspace)
+	files, err := generationFilesFromWorkspace(workspace, workspaceRoot)
 	if err != nil {
 		return store.GenerationRebuildResult{}, errors.New("manifest_stage")
 	}
@@ -87,7 +92,11 @@ func (c *Client) RebuildIndexGeneration(ctx context.Context, planner store.Gener
 		if err != nil {
 			return store.GenerationRebuildResult{}, errors.New("manifest_stage")
 		}
-		data, digest, err := readGenerationWorkspaceFile(path, file.Size)
+		rel, err := generationWorkspaceRelativePath(workspace, path)
+		if err != nil {
+			return store.GenerationRebuildResult{}, errors.New("manifest_stage")
+		}
+		data, digest, err := readGenerationWorkspaceFileRoot(workspaceRoot, rel, file.Size)
 		if err != nil || digest != file.SHA256 {
 			return store.GenerationRebuildResult{}, errors.New("manifest_stage")
 		}
@@ -130,7 +139,18 @@ type adminGenerationFile struct {
 var generationRebuildAfterPreflight = func(string) {}
 var generationRebuildAfterFileLstat = func(string) {}
 
-func generationFilesFromWorkspace(root string) ([]adminGenerationFile, error) {
+func generationFilesFromWorkspace(root string, anchored ...*os.Root) ([]adminGenerationFile, error) {
+	workspaceRoot := (*os.Root)(nil)
+	if len(anchored) > 0 {
+		workspaceRoot = anchored[0]
+	} else {
+		var err error
+		workspaceRoot, err = os.OpenRoot(root)
+		if err != nil {
+			return nil, err
+		}
+		defer workspaceRoot.Close()
+	}
 	var files []adminGenerationFile
 	var total int64
 	err := filepath.WalkDir(root, func(filePath string, entry os.DirEntry, err error) error {
@@ -166,7 +186,7 @@ func generationFilesFromWorkspace(root string) ([]adminGenerationFile, error) {
 		if len(files) >= generation.MaxFiles {
 			return errors.New("too many generation files")
 		}
-		data, digest, err := readGenerationWorkspaceFile(filePath, info.Size())
+		data, digest, err := readGenerationWorkspaceFileRoot(workspaceRoot, rel, info.Size())
 		if err != nil {
 			return err
 		}
@@ -233,15 +253,24 @@ func validateGenerationWorkspaceRelative(root, rel string) (string, error) {
 }
 
 func readGenerationWorkspaceFile(filePath string, expectedSize int64) ([]byte, string, error) {
+	root, err := os.OpenRoot(filepath.Dir(filePath))
+	if err != nil {
+		return nil, "", err
+	}
+	defer root.Close()
+	return readGenerationWorkspaceFileRoot(root, filepath.Base(filePath), expectedSize)
+}
+
+func readGenerationWorkspaceFileRoot(root *os.Root, rel string, expectedSize int64) ([]byte, string, error) {
 	if expectedSize < 0 || expectedSize > generation.MaxFileBytes {
 		return nil, "", errors.New("generation output too large")
 	}
-	info, err := os.Lstat(filePath)
+	info, err := root.Lstat(filepath.FromSlash(rel))
 	if err != nil || !info.Mode().IsRegular() || info.Size() != expectedSize {
 		return nil, "", errors.New("generation output changed")
 	}
-	generationRebuildAfterFileLstat(filePath)
-	f, err := os.Open(filePath)
+	generationRebuildAfterFileLstat(filepath.Join(root.Name(), filepath.FromSlash(rel)))
+	f, err := root.Open(filepath.FromSlash(rel))
 	if err != nil {
 		return nil, "", err
 	}

@@ -888,9 +888,6 @@ func syntoIdentityPlanFromIndex(index syntoIndexTruth) (wikiindex.SyntoIdentityP
 			return wikiindex.SyntoIdentityPlan{}, err
 		}
 		canonicalPath := filepath.ToSlash(filepath.Join("wiki", slug+".md"))
-		if wikiindex.IsSyntoRootPage(canonicalPath) {
-			continue
-		}
 		if article.ID == "" || !annotation.ValidSourceID(article.ID) {
 			return wikiindex.SyntoIdentityPlan{}, fmt.Errorf("invalid Synto article ID for %q", slug)
 		}
@@ -908,14 +905,17 @@ func syntoIdentityPlanFromIndex(index syntoIndexTruth) (wikiindex.SyntoIdentityP
 		if !wikiindex.ValidSyntoEntityID(article.EntityID) {
 			return wikiindex.SyntoIdentityPlan{}, fmt.Errorf("unsafe Synto article entity_id %q", article.EntityID)
 		}
-		if entities := byName[article.Name]; len(entities) > 0 && (len(entities) != 1 || !entities[article.EntityID]) {
-			return wikiindex.SyntoIdentityPlan{}, fmt.Errorf("Synto article/source entity disagreement for %q", slug)
-		}
 		if previous, exists := seenEntities[article.EntityID]; exists {
 			return wikiindex.SyntoIdentityPlan{}, fmt.Errorf("Synto entity_id %q maps to multiple articles %q and %q", article.EntityID, previous, slug)
 		}
+		seenEntities[article.EntityID] = canonicalPath
+		if wikiindex.IsSyntoRootPage(canonicalPath) {
+			continue
+		}
+		if entities := byName[article.Name]; len(entities) > 0 && (len(entities) != 1 || !entities[article.EntityID]) {
+			return wikiindex.SyntoIdentityPlan{}, fmt.Errorf("Synto article/source entity disagreement for %q", slug)
+		}
 		path := canonicalPath
-		seenEntities[article.EntityID] = path
 		plan.ByPath[path] = article.EntityID
 	}
 	return plan, nil
@@ -1718,6 +1718,7 @@ func decodeSyntoSourceConcepts(dec *json.Decoder) ([]syntoSourceConcept, error) 
 		return nil, errors.New("source_concepts must be an array")
 	}
 	out := make([]syntoSourceConcept, 0)
+	seenGroups := make(map[string]struct{})
 	for dec.More() {
 		if len(out) >= generation.MaxFiles {
 			return nil, generation.ErrLogicalEntryLimit
@@ -1756,7 +1757,17 @@ func decodeSyntoSourceConcepts(dec *json.Decoder) ([]syntoSourceConcept, error) 
 		if !validSyntoContentHash(contentHash) {
 			return nil, errors.New("source_concepts content_hash must be a lowercase SHA-256 digest")
 		}
+		if _, exists := seenGroups[sourcePath]; exists {
+			return nil, fmt.Errorf("duplicate Synto source_concepts group %q", sourcePath)
+		}
+		seenGroups[sourcePath] = struct{}{}
+		seenItems := make(map[string]struct{}, len(edgeItems))
 		for i := range edgeItems {
+			semantic := edgeItems[i].Name + "\x00" + edgeItems[i].EntityID
+			if _, exists := seenItems[semantic]; exists {
+				return nil, fmt.Errorf("duplicate Synto source concept %q", edgeItems[i].Name)
+			}
+			seenItems[semantic] = struct{}{}
 			edgeItems[i].SourcePath = sourcePath
 			edgeItems[i].ContentHash = contentHash
 		}
