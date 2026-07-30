@@ -155,8 +155,8 @@ func TestAdminProjectCountsByUserUsesActualOwnership(t *testing.T) {
 	assert.Equal(t, 0, got["user-c"])
 }
 
-func TestAdminProjectRecordFromFirestoreDocUsesStoredProjectID(t *testing.T) {
-	project, ok := adminProjectRecordFromFirestoreDoc("user-a_doc-suffix", map[string]interface{}{
+func TestAdminProjectRecordFromFirestoreDocRequiresMatchingStoredProjectID(t *testing.T) {
+	project, ok := adminProjectRecordFromFirestoreDoc("user-a_authoritative-project", map[string]interface{}{
 		"project_id": "authoritative-project",
 		"name":       "Authoritative Project",
 	})
@@ -166,6 +166,15 @@ func TestAdminProjectRecordFromFirestoreDocUsesStoredProjectID(t *testing.T) {
 	assert.Equal(t, "user-a", project.userID)
 	assert.Equal(t, "authoritative-project", project.projectID)
 	assert.Equal(t, "Authoritative Project", project.name)
+}
+
+func TestAdminProjectRecordFromFirestoreDocRejectsMismatchedStoredProjectID(t *testing.T) {
+	if _, ok := adminProjectRecordFromFirestoreDoc("user-a_doc-suffix", map[string]interface{}{
+		"project_id": "authoritative-project",
+		"name":       "Mismatched Project",
+	}); ok {
+		t.Fatal("mismatched project document must not authorize rebuild")
+	}
 }
 
 func TestAdminProjectRecordFromFirestoreDocRejectsMalformedProject(t *testing.T) {
@@ -481,7 +490,9 @@ func TestGenerationProjectsRejectManualRebuildWithoutCallingWriter(t *testing.T)
 	project := &adminStatsProjectStore{hasManifest: true}
 	root := &adminStatsRootStore{adminStatsProjectStore: project, scoped: map[string]*adminStatsProjectStore{"request-user/demo": project}}
 	calls := 0
-	h := &Handler{store: root, rebuildIndex: func(context.Context, string, string) (idMap, error) {
+	h := &Handler{store: root, adminProjectRecordLoader: func(context.Context, string) (adminProjectRecord, error) {
+		return adminProjectRecord{id: "request-user_demo", userID: "request-user", projectID: "demo"}, nil
+	}, rebuildIndex: func(context.Context, string, string) (idMap, error) {
 		calls++
 		return idMap{}, nil
 	}}
@@ -548,7 +559,9 @@ func TestAdminRebuildIndexUsesGenerationRebuilderAfterAuthorization(t *testing.T
 		},
 	}
 	root := &adminGenerationRootStore{adminGenerationRebuilderStore: project}
-	h := &Handler{store: root, projectExists: func(context.Context, string) error { return nil }}
+	h := &Handler{store: root, adminProjectRecordLoader: func(context.Context, string) (adminProjectRecord, error) {
+		return adminProjectRecord{id: "user-account_project-account", userID: "user-account", projectID: "project-account"}, nil
+	}}
 
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
@@ -565,6 +578,34 @@ func TestAdminRebuildIndexUsesGenerationRebuilderAfterAuthorization(t *testing.T
 	}
 	if response.NewGeneration != "g_new" || response.ConceptCount != 2 {
 		t.Fatalf("response=%+v", response)
+	}
+}
+
+func TestAdminRebuildIndexUsesAuthoritativeRecordAndFailsClosedOnMismatch(t *testing.T) {
+	project := &adminGenerationRebuilderStore{
+		adminStatsProjectStore: &adminStatsProjectStore{prefix: "users/authoritative/project", hasManifest: true},
+	}
+	root := &adminGenerationRootStore{adminGenerationRebuilderStore: project}
+	loaderCalls := 0
+	h := &Handler{
+		store: root,
+		adminProjectRecordLoader: func(context.Context, string) (adminProjectRecord, error) {
+			loaderCalls++
+			return adminProjectRecord{id: "caller_user_caller_project", userID: "authoritative-user", projectID: "authoritative-project"}, nil
+		},
+	}
+	recorder := invokeHandlerWithParams(h.AdminRebuildIndex, http.MethodPost, "/admin/projects/caller_user_caller_project/rebuild-index", gin.Params{{Key: "id", Value: "caller_user_caller_project"}})
+	if recorder.Code != http.StatusInternalServerError || loaderCalls != 1 || project.called {
+		t.Fatalf("mismatched admin rebuild status=%d loaderCalls=%d writerCalled=%v body=%s", recorder.Code, loaderCalls, project.called, recorder.Body.String())
+	}
+
+	project.called = false
+	h.adminProjectRecordLoader = func(context.Context, string) (adminProjectRecord, error) {
+		return adminProjectRecord{id: "authoritative-user_authoritative-project", userID: "authoritative-user", projectID: "authoritative-project"}, nil
+	}
+	recorder = invokeHandlerWithParams(h.AdminRebuildIndex, http.MethodPost, "/admin/projects/authoritative-user_authoritative-project/rebuild-index", gin.Params{{Key: "id", Value: "authoritative-user_authoritative-project"}})
+	if recorder.Code != http.StatusOK || !project.called {
+		t.Fatalf("matching admin rebuild status=%d writerCalled=%v body=%s", recorder.Code, project.called, recorder.Body.String())
 	}
 }
 

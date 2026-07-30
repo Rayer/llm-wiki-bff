@@ -43,6 +43,7 @@ const (
 var (
 	errIndexNotFound             = errors.New("index not found")
 	errFirestoreNotConfigured    = errors.New("Firestore client is not configured")
+	errInvalidAdminProjectRecord = errors.New("invalid admin project record")
 	errPipelineExecutionNotFound = errors.New("pipeline execution not found")
 	errWikiStorageNotConfigured  = errors.New("wiki storage is not configured")
 )
@@ -1827,6 +1828,32 @@ func (h *Handler) verifyAdminProjectExists(ctx context.Context, docID string) er
 	return err
 }
 
+func (h *Handler) resolveAdminProjectRecord(ctx context.Context, docID string) (adminProjectRecord, error) {
+	if h.adminProjectRecordLoader != nil {
+		record, err := h.adminProjectRecordLoader(ctx, docID)
+		if err != nil {
+			return adminProjectRecord{}, err
+		}
+		expectedUserID, expectedProjectID := splitProjectDocID(docID)
+		if record.id != docID || record.userID != expectedUserID || record.projectID != expectedProjectID || !auth.ValidPathSegment(record.userID) || !auth.ValidPathSegment(record.projectID) {
+			return adminProjectRecord{}, errInvalidAdminProjectRecord
+		}
+		return record, nil
+	}
+	if h.firestore == nil || h.firestore.Raw() == nil {
+		return adminProjectRecord{}, errFirestoreNotConfigured
+	}
+	doc, err := h.firestore.Raw().Collection("projects").Doc(docID).Get(ctx)
+	if err != nil {
+		return adminProjectRecord{}, err
+	}
+	record, ok := adminProjectRecordFromFirestoreDoc(docID, doc.Data())
+	if !ok {
+		return adminProjectRecord{}, errInvalidAdminProjectRecord
+	}
+	return record, nil
+}
+
 type adminProjectEntry struct {
 	ID           string `json:"id"`
 	Name         string `json:"name"`
@@ -1863,11 +1890,15 @@ func adminProjectRecordFromFirestoreDoc(docID string, data map[string]interface{
 	if !auth.ValidPathSegment(userID) || !auth.ValidPathSegment(docProjectID) || !strings.Contains(docID, "_") {
 		return adminProjectRecord{}, false
 	}
+	storedProjectID, ok := data["project_id"].(string)
+	if !ok || strings.TrimSpace(storedProjectID) == "" {
+		return adminProjectRecord{}, false
+	}
 	project, userID, ok := projectResponseFromFirestoreDoc(docID, data)
 	if !ok {
 		return adminProjectRecord{}, false
 	}
-	if !auth.ValidPathSegment(userID) || !auth.ValidPathSegment(project.ID) {
+	if !auth.ValidPathSegment(userID) || !auth.ValidPathSegment(project.ID) || project.ID != docProjectID {
 		return adminProjectRecord{}, false
 	}
 	return adminProjectRecord{
@@ -2206,28 +2237,26 @@ func (h *Handler) AdminRenameProject(c *gin.Context) {
 //	@Router			/api/v1/admin/projects/{id}/rebuild-index [post]
 func (h *Handler) AdminRebuildIndex(c *gin.Context) {
 	docID := c.Param("id")
-	uid, pid := splitProjectDocID(docID)
-	if pid == "" {
+	parsedUID, parsedPID := splitProjectDocID(docID)
+	if parsedPID == "" || !auth.ValidPathSegment(parsedUID) || !auth.ValidPathSegment(parsedPID) {
 		c.JSON(http.StatusBadRequest, handler.ErrorResponse{Error: "invalid project doc ID"})
 		return
 	}
 	ctx := c.Request.Context()
-	// Production verifies the project before touching storage. The injected
-	// rebuild seam is a local/test-only authorization substitute.
-	if h.rebuildIndex == nil || h.projectExists != nil {
-		if err := h.verifyAdminProjectExists(ctx, docID); err != nil {
-			if errors.Is(err, errFirestoreNotConfigured) {
-				c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "Firestore client is not configured"})
-				return
-			}
-			if status.Code(err) == codes.NotFound {
-				c.JSON(http.StatusNotFound, handler.ErrorResponse{Error: "project not found"})
-				return
-			}
-			c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: generatedDataUnavailableMessage})
+	record, err := h.resolveAdminProjectRecord(ctx, docID)
+	if err != nil {
+		if errors.Is(err, errFirestoreNotConfigured) {
+			c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "Firestore client is not configured"})
 			return
 		}
+		if status.Code(err) == codes.NotFound {
+			c.JSON(http.StatusNotFound, handler.ErrorResponse{Error: "project not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: generatedDataUnavailableMessage})
+		return
 	}
+	uid, pid := record.userID, record.projectID
 	if h.store != nil {
 		projectStore := h.store.Scope(uid, pid)
 		if guarded, ok := projectStore.(store.GenerationAware); ok {

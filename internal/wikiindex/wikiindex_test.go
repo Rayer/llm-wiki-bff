@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/rayer/llm-wiki-bff/internal/generation"
 )
 
 const testEntityULID = "01JAZ5N7Y3K8M2Q4R6T9VWXABC"
@@ -20,6 +22,30 @@ func TestDecodeSyntoIdentityPlanEnforcesReleasedEntityULID(t *testing.T) {
 	}
 	if plan, err := DecodeSyntoIdentityPlan(syntoIdentityReleasedFixture(fmt.Sprintf(`%q`, testEntityULID))); err != nil || plan.ByPath["wiki/ordinary.md"] != testEntityULID {
 		t.Fatalf("valid released entity ID rejected: plan=%#v err=%v", plan, err)
+	}
+}
+
+func TestDecodeSyntoIdentityPlanValidatesReleasedContainerContracts(t *testing.T) {
+	base := string(syntoIdentityReleasedFixture("null"))
+	tooManyTerms := `{"terms":[` + strings.TrimSuffix(strings.Repeat("null,", generation.MaxFiles+1), ",") + `]}`
+	for _, tc := range []struct {
+		name string
+		data string
+	}{
+		{name: "pack field type", data: strings.Replace(base, `"id":"fixture"`, `"id":7`, 1)},
+		{name: "missing pack field", data: strings.Replace(base, `"version":"0",`, "", 1)},
+		{name: "invalid capability", data: strings.Replace(base, `"capabilities":["articles","concepts"]`, `"capabilities":["unknown"]`, 1)},
+		{name: "missing stats field", data: strings.Replace(base, `,"failed_concept_count":0`, "", 1)},
+		{name: "negative stats", data: strings.Replace(base, `"article_count":1`, `"article_count":-1`, 1)},
+		{name: "unbounded logical array", data: strings.Replace(base, `"terms":[]`, tooManyTerms, 1)},
+		{name: "duplicate source group", data: strings.Replace(base, `"source_concepts":[]`, `"source_concepts":[{"source_path":"raw/source.md","content_hash":"`+strings.Repeat("0", 64)+`","concepts":[]},{"source_path":"raw/source.md","content_hash":"`+strings.Repeat("1", 64)+`","concepts":[]}]`, 1)},
+		{name: "duplicate source item", data: strings.Replace(base, `"source_concepts":[]`, `"source_concepts":[{"source_path":"raw/source.md","content_hash":"`+strings.Repeat("0", 64)+`","concepts":[{"name":"Alpha","entity_id":"`+testEntityULID+`"},{"name":"Alpha","entity_id":"`+testEntityULID+`"}]}]`, 1)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := DecodeSyntoIdentityPlan([]byte(tc.data)); err == nil {
+				t.Fatal("malformed released INDEX unexpectedly accepted")
+			}
+		})
 	}
 }
 
@@ -51,6 +77,54 @@ func TestRebuildWithSyntoIdentityRewritesCanonicalPageAndFailsBeforeWrites(t *te
 		ByPath: map[string]string{"wiki/alpha.md": testEntityULID}, ActiveEntities: map[string]bool{testEntityULID: true},
 	}); err == nil || len(bad.writes) != 0 {
 		t.Fatalf("duplicate page ID result err=%v writes=%#v, want error and zero writes", err, bad.writes)
+	}
+}
+
+func TestRewriteSyntoConceptPageInsertsIDBeforeClosingDelimiter(t *testing.T) {
+	got, err := RewriteSyntoConceptPage([]byte("---\ntitle: Alpha\n---\nBody"), testEntityULID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []byte("---\ntitle: Alpha\nid: " + testEntityULID + "\n---\nBody")
+	if !bytes.Equal(got, want) {
+		t.Fatalf("rewritten page = %q, want %q", got, want)
+	}
+
+	got, err = RewriteSyntoConceptPage([]byte("---\r\ntitle: Alpha\r\n---\r\nBody\r\n"), testEntityULID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want = []byte("---\r\ntitle: Alpha\r\nid: " + testEntityULID + "\r\n---\r\nBody\r\n")
+	if !bytes.Equal(got, want) {
+		t.Fatalf("CRLF rewritten page = %q, want %q", got, want)
+	}
+}
+
+func TestRewriteSyntoConceptPageValidatesCompleteYAMLBeforeMutation(t *testing.T) {
+	valid := []byte("---\ntitle: Alpha\nlabels:\n  - one\n---\nBody")
+	for _, tc := range []struct {
+		name string
+		data []byte
+	}{
+		{name: "duplicate title", data: []byte("---\ntitle: Alpha\ntitle: Beta\n---\nBody")},
+		{name: "duplicate id", data: []byte("---\nid: a3f7b2c01d9d\nid: b7e2c9a4d113\n---\nBody")},
+		{name: "complex key", data: []byte("---\n? [title, name]\n: Alpha\n---\nBody")},
+		{name: "non-string id", data: []byte("---\nid: 7\n---\nBody")},
+		{name: "multi-document", data: []byte("---\ntitle: Alpha\n---\ntitle: Beta\n---\nBody")},
+		{name: "unterminated", data: []byte("---\ntitle: Alpha\nBody")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			before := append([]byte(nil), tc.data...)
+			if _, err := RewriteSyntoConceptPage(tc.data, testEntityULID); err == nil {
+				t.Fatal("malformed frontmatter unexpectedly accepted")
+			}
+			if !bytes.Equal(tc.data, before) {
+				t.Fatalf("input bytes changed on validation failure: %q", tc.data)
+			}
+		})
+	}
+	if _, err := RewriteSyntoConceptPage(valid, testEntityULID); err != nil {
+		t.Fatalf("valid YAML rejected: %v", err)
 	}
 }
 

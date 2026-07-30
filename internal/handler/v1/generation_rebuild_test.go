@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/rayer/llm-wiki-bff/internal/wikiindex"
@@ -20,7 +21,7 @@ func TestPlanSyntoGenerationIsIdempotentAndPlansOneTimeRedirect(t *testing.T) {
 	writeGenerationRebuildTestFile(t, workspace, "wiki/alpha.md", []byte("---\nid: a3f7b2c01d9d\n---\nalpha\n"))
 	writeGenerationRebuildTestFile(t, workspace, "cache/id_map.json", []byte(`{"concept":{"a3f7b2c01d9d":"alpha"},"source":{},"redirects":{}}`))
 	writeGenerationRebuildTestFile(t, workspace, "cache/concepts.jsonl", []byte(`{"slug":"alpha","frontmatter":{"id":"a3f7b2c01d9d"}}`+"\n"))
-	writeGenerationRebuildTestFile(t, workspace, ".synto/INDEX.json", []byte(`{"schema_version":1,"pack":{},"articles":[{"id":"generated","entity_id":"01JAZ5N7Y3K8M2Q4R6T9VWXABC","name":"alpha","path":"wiki/alpha.md","summary":null,"tags":[],"aliases":[],"confidence":"high"}],"terms":[],"papers":[],"sources":[],"source_concepts":[{"source_path":"raw/source.md","content_hash":"0000000000000000000000000000000000000000000000000000000000000000","concepts":[{"name":"alpha","entity_id":"01JAZ5N7Y3K8M2Q4R6T9VWXABC"}]}],"synthesis":[],"stats":{}}`))
+	writeGenerationRebuildTestFile(t, workspace, ".synto/INDEX.json", []byte(`{"schema_version":1,"pack":{"id":"fixture","name":"fixture","version":"0","language":["en"],"capabilities":["articles","concepts"]},"articles":[{"id":"generated","entity_id":"01JAZ5N7Y3K8M2Q4R6T9VWXABC","name":"alpha","path":"wiki/alpha.md","summary":null,"tags":[],"aliases":[],"confidence":"high"}],"terms":[],"papers":[],"sources":[],"source_concepts":[{"source_path":"raw/source.md","content_hash":"0000000000000000000000000000000000000000000000000000000000000000","concepts":[{"name":"alpha","entity_id":"01JAZ5N7Y3K8M2Q4R6T9VWXABC"}]}],"synthesis":[],"stats":{"article_count":1,"draft_count":0,"concept_count":1,"alias_count":0,"knowledge_item_count":0,"source_count":0,"source_segment_count":0,"failed_note_count":0,"failed_concept_count":0}}`))
 
 	first, err := planSyntoGeneration(context.Background(), workspace)
 	if err != nil {
@@ -49,6 +50,28 @@ func TestPlanSyntoGenerationIsIdempotentAndPlansOneTimeRedirect(t *testing.T) {
 	}
 }
 
+func TestPlanSyntoGenerationRejectsMalformedIndexBeforeWrites(t *testing.T) {
+	workspace := t.TempDir()
+	for _, rel := range []string{"wiki", "wiki/sources", "cache", ".synto"} {
+		if err := os.MkdirAll(filepath.Join(workspace, rel), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeGenerationRebuildTestFile(t, workspace, "wiki/alpha.md", []byte("---\nid: a3f7b2c01d9d\n---\nalpha\n"))
+	writeGenerationRebuildTestFile(t, workspace, "cache/id_map.json", []byte(`{"concept":{"a3f7b2c01d9d":"alpha"},"source":{},"redirects":{}}`))
+	writeGenerationRebuildTestFile(t, workspace, "cache/concepts.jsonl", []byte(`{"slug":"alpha","frontmatter":{"id":"a3f7b2c01d9d"}}`+"\n"))
+	index := []byte(`{"schema_version":1,"pack":{"id":"fixture","name":"fixture","version":"0","language":["en"],"capabilities":["invalid"]},"articles":[],"terms":[],"papers":[],"sources":[],"source_concepts":[],"synthesis":[],"stats":{"article_count":0,"draft_count":0,"concept_count":0,"alias_count":0,"knowledge_item_count":0,"source_count":0,"source_segment_count":0,"failed_note_count":0,"failed_concept_count":0}}`)
+	writeGenerationRebuildTestFile(t, workspace, ".synto/INDEX.json", index)
+	before := snapshotGenerationRebuildBytes(t, workspace)
+	if _, err := planSyntoGeneration(context.Background(), workspace); err == nil {
+		t.Fatal("malformed INDEX unexpectedly planned")
+	}
+	after := snapshotGenerationRebuildBytes(t, workspace)
+	if string(before) != string(after) {
+		t.Fatalf("malformed INDEX changed generation bytes: before=%q after=%q", before, after)
+	}
+}
+
 func writeGenerationRebuildTestFile(t *testing.T, root, rel string, data []byte) {
 	t.Helper()
 	if err := os.WriteFile(filepath.Join(root, filepath.FromSlash(rel)), data, 0o600); err != nil {
@@ -67,4 +90,20 @@ func readGenerationRebuildTestMap(t *testing.T, root string) wikiindex.IDMap {
 		t.Fatal(err)
 	}
 	return ids
+}
+
+func snapshotGenerationRebuildBytes(t *testing.T, root string) string {
+	t.Helper()
+	var snapshot strings.Builder
+	for _, rel := range []string{"cache/id_map.json", "cache/concepts.jsonl", "wiki/alpha.md", ".synto/INDEX.json"} {
+		data, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(rel)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		snapshot.WriteString(rel)
+		snapshot.WriteByte(0)
+		snapshot.Write(data)
+		snapshot.WriteByte(0)
+	}
+	return snapshot.String()
 }

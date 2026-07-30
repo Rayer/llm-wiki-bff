@@ -19,6 +19,9 @@ func DecodeSyntoIdentityPlan(data []byte) (SyntoIdentityPlan, error) {
 	if len(data) > generation.MaxFileBytes {
 		return SyntoIdentityPlan{}, errors.New("Synto INDEX exceeds limit")
 	}
+	if err := validateReleasedSyntoIndex(data); err != nil {
+		return SyntoIdentityPlan{}, fmt.Errorf("validate Synto INDEX: %w", err)
+	}
 	document, err := decodeStrictObject(data, map[string]bool{
 		"schema_version": true, "pack": true, "articles": true, "terms": true,
 		"papers": true, "sources": true, "source_concepts": true,
@@ -101,6 +104,348 @@ func DecodeSyntoIdentityPlan(data []byte) (SyntoIdentityPlan, error) {
 		plan.ByPath[path] = article.EntityID
 	}
 	return plan, nil
+}
+
+func validateReleasedSyntoIndex(data []byte) error {
+	document, err := decodeStrictObject(data, map[string]bool{
+		"schema_version": true, "pack": true, "articles": true, "terms": true,
+		"papers": true, "sources": true, "source_concepts": true,
+		"synthesis": true, "stats": true, "identity_log": true,
+		"entity_aliases": true, "alias_denials": true,
+	})
+	if err != nil {
+		return err
+	}
+	for _, key := range []string{"schema_version", "pack", "articles", "terms", "papers", "sources", "source_concepts", "synthesis", "stats"} {
+		if _, ok := document[key]; !ok {
+			return fmt.Errorf("missing Synto INDEX field %q", key)
+		}
+	}
+	if string(bytes.TrimSpace(document["schema_version"])) != "1" {
+		return errors.New("Synto INDEX schema_version must be 1")
+	}
+	if err := validateReleasedSyntoPack(document["pack"]); err != nil {
+		return err
+	}
+	if err := validateReleasedSyntoStats(document["stats"]); err != nil {
+		return err
+	}
+	if err := validateReleasedSyntoArticles(document["articles"]); err != nil {
+		return err
+	}
+	for _, key := range []string{"terms", "papers"} {
+		if err := validateReleasedSyntoObjectArray(document[key], key); err != nil {
+			return err
+		}
+	}
+	if err := validateReleasedSyntoSources(document["sources"]); err != nil {
+		return err
+	}
+	if err := validateReleasedSyntoSourceConcepts(document["source_concepts"]); err != nil {
+		return err
+	}
+	if err := validateReleasedSyntoSynthesis(document["synthesis"]); err != nil {
+		return err
+	}
+	for _, key := range []string{"identity_log", "entity_aliases", "alias_denials"} {
+		if raw, ok := document[key]; ok {
+			if _, err := releasedSyntoArray(raw, key); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func validateReleasedSyntoPack(data []byte) error {
+	object, err := decodeStrictObject(data, map[string]bool{"id": true, "name": true, "version": true, "language": true, "capabilities": true})
+	if err != nil {
+		return fmt.Errorf("invalid Synto pack: %w", err)
+	}
+	for _, key := range []string{"id", "name", "version", "language", "capabilities"} {
+		if _, ok := object[key]; !ok {
+			return fmt.Errorf("missing pack field %q", key)
+		}
+	}
+	for _, key := range []string{"id", "name", "version"} {
+		if value, err := releasedSyntoString(object[key], 1024, true); err != nil {
+			return fmt.Errorf("invalid pack field %q: %w", key, err)
+		} else if value == "" {
+			return fmt.Errorf("invalid pack field %q: empty string", key)
+		}
+	}
+	for _, key := range []string{"language", "capabilities"} {
+		values, err := releasedSyntoStringArray(object[key], 1024)
+		if err != nil {
+			return fmt.Errorf("invalid pack field %q: %w", key, err)
+		}
+		if len(values) == 0 {
+			return fmt.Errorf("invalid pack field %q: empty array", key)
+		}
+		if key == "capabilities" {
+			for _, value := range values {
+				switch value {
+				case "articles", "concepts", "segments", "lifecycle":
+				default:
+					return fmt.Errorf("invalid pack capability %q", value)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func validateReleasedSyntoStats(data []byte) error {
+	allowed := map[string]bool{"article_count": true, "draft_count": true, "concept_count": true, "alias_count": true, "knowledge_item_count": true, "source_count": true, "source_segment_count": true, "failed_note_count": true, "failed_concept_count": true}
+	object, err := decodeStrictObject(data, allowed)
+	if err != nil {
+		return fmt.Errorf("invalid Synto stats: %w", err)
+	}
+	for key := range allowed {
+		raw, ok := object[key]
+		if !ok {
+			return fmt.Errorf("missing stats field %q", key)
+		}
+		trimmed := bytes.TrimSpace(raw)
+		if bytes.Equal(trimmed, []byte("null")) {
+			return fmt.Errorf("invalid Synto stats value for %q", key)
+		}
+		var value int64
+		if err := json.Unmarshal(trimmed, &value); err != nil || value < 0 {
+			return fmt.Errorf("invalid Synto stats value for %q", key)
+		}
+	}
+	return nil
+}
+
+func validateReleasedSyntoArticles(data []byte) error {
+	articles, err := releasedSyntoArray(data, "articles")
+	if err != nil {
+		return err
+	}
+	for _, article := range articles {
+		object, err := decodeStrictObject(article, map[string]bool{"id": true, "entity_id": true, "name": true, "path": true, "summary": true, "tags": true, "aliases": true, "confidence": true})
+		if err != nil {
+			return fmt.Errorf("invalid Synto article: %w", err)
+		}
+		for _, key := range []string{"id", "name", "path", "summary", "tags", "aliases", "confidence"} {
+			if _, ok := object[key]; !ok {
+				return fmt.Errorf("missing Synto article field %q", key)
+			}
+		}
+		for _, key := range []string{"id", "name", "path"} {
+			if value, err := releasedSyntoString(object[key], generation.MaxPathBytes, true); err != nil || value == "" {
+				return fmt.Errorf("invalid Synto article %q", key)
+			}
+		}
+		if raw, ok := object["entity_id"]; ok && !bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+			if value, err := releasedSyntoString(raw, 1024, true); err != nil || value == "" || !ValidSyntoEntityID(value) {
+				return errors.New("invalid Synto article entity_id")
+			}
+		}
+		if err := releasedSyntoNullableString(object["summary"], 1<<20); err != nil {
+			return err
+		}
+		for _, key := range []string{"tags", "aliases"} {
+			if _, err := releasedSyntoStringArray(object[key], 4096); err != nil {
+				return fmt.Errorf("invalid Synto article %q: %w", key, err)
+			}
+		}
+		if err := validateReleasedSyntoConfidence(object["confidence"]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateReleasedSyntoObjectArray(data []byte, name string) error {
+	items, err := releasedSyntoArray(data, name)
+	if err != nil {
+		return err
+	}
+	for _, item := range items {
+		if _, err := decodeStrictObject(item, nil); err != nil {
+			return fmt.Errorf("invalid Synto %s entry: %w", name, err)
+		}
+	}
+	return nil
+}
+
+func validateReleasedSyntoSources(data []byte) error {
+	items, err := releasedSyntoArray(data, "sources")
+	if err != nil {
+		return err
+	}
+	for _, item := range items {
+		object, err := decodeStrictObject(item, map[string]bool{"id": true, "title": true, "source_type": true})
+		if err != nil {
+			return fmt.Errorf("invalid Synto source entry: %w", err)
+		}
+		for _, key := range []string{"id", "title", "source_type"} {
+			if _, ok := object[key]; !ok {
+				return fmt.Errorf("missing Synto source field %q", key)
+			}
+		}
+		id, err := releasedSyntoString(object["id"], 1024, false)
+		if err != nil || !safeReleasedSyntoSourceID(id) {
+			return errors.New("invalid Synto source entry id")
+		}
+		if err := releasedSyntoNullableString(object["title"], 4096); err != nil {
+			return err
+		}
+		if sourceType, err := releasedSyntoString(object["source_type"], 256, true); err != nil || sourceType == "" {
+			return errors.New("invalid Synto source entry type")
+		}
+	}
+	return nil
+}
+
+func safeReleasedSyntoSourceID(value string) bool {
+	if strings.IndexFunc(value, func(r rune) bool { return r < 0x20 || r == 0x7f }) >= 0 {
+		return false
+	}
+	if len(value) >= 2 && value[1] == ':' {
+		first := value[0]
+		if ('A' <= first && first <= 'Z') || ('a' <= first && first <= 'z') {
+			return false
+		}
+	}
+	return value != "." && safeSyntoSourcePath(value)
+}
+
+func validateReleasedSyntoSourceConcepts(data []byte) error {
+	groups, err := releasedSyntoArray(data, "source_concepts")
+	if err != nil {
+		return err
+	}
+	seenGroups := make(map[string]struct{}, len(groups))
+	for _, groupData := range groups {
+		group, err := decodeStrictObject(groupData, map[string]bool{"source_path": true, "content_hash": true, "concepts": true})
+		if err != nil {
+			return fmt.Errorf("invalid Synto source_concepts group: %w", err)
+		}
+		for _, key := range []string{"source_path", "content_hash", "concepts"} {
+			if _, ok := group[key]; !ok {
+				return fmt.Errorf("missing Synto source_concepts field %q", key)
+			}
+		}
+		sourcePath, err := releasedSyntoString(group["source_path"], generation.MaxPathBytes, true)
+		if err != nil || !safeSyntoSourcePath(sourcePath) {
+			return errors.New("invalid Synto source concept source_path")
+		}
+		if _, exists := seenGroups[sourcePath]; exists {
+			return fmt.Errorf("duplicate Synto source_concepts group %q", sourcePath)
+		}
+		seenGroups[sourcePath] = struct{}{}
+		hash, err := releasedSyntoString(group["content_hash"], 256, true)
+		if err != nil || !validSyntoHash(hash) {
+			return errors.New("invalid Synto source concept content_hash")
+		}
+		items, err := releasedSyntoArray(group["concepts"], "source concepts")
+		if err != nil {
+			return err
+		}
+		seenItems := make(map[string]struct{}, len(items))
+		for _, itemData := range items {
+			item, err := decodeStrictObject(itemData, map[string]bool{"name": true, "entity_id": true})
+			if err != nil {
+				return fmt.Errorf("invalid Synto source concept: %w", err)
+			}
+			name, err := releasedSyntoString(item["name"], 4096, true)
+			entityID, entityErr := releasedSyntoString(item["entity_id"], 1024, true)
+			if err != nil || entityErr != nil || name == "" || !ValidSyntoEntityID(entityID) {
+				return errors.New("invalid Synto source concept identity")
+			}
+			semantic := name + "\x00" + entityID
+			if _, exists := seenItems[semantic]; exists {
+				return fmt.Errorf("duplicate Synto source concept %q", name)
+			}
+			seenItems[semantic] = struct{}{}
+		}
+	}
+	return nil
+}
+
+func validateReleasedSyntoSynthesis(data []byte) error {
+	items, err := releasedSyntoArray(data, "synthesis")
+	if err != nil {
+		return err
+	}
+	for _, item := range items {
+		object, err := decodeStrictObject(item, map[string]bool{"path": true, "title": true})
+		if err != nil {
+			return fmt.Errorf("invalid Synto synthesis entry: %w", err)
+		}
+		pathValue, pathErr := releasedSyntoString(object["path"], generation.MaxPathBytes, true)
+		title, titleErr := releasedSyntoString(object["title"], 4096, true)
+		if pathErr != nil || titleErr != nil || !safeSyntoSourcePath(pathValue) || title == "" {
+			return errors.New("invalid Synto synthesis entry")
+		}
+	}
+	return nil
+}
+
+func releasedSyntoArray(data []byte, name string) ([]json.RawMessage, error) {
+	if !jsonContainer(data, '[') {
+		return nil, fmt.Errorf("Synto INDEX field %q must be an array", name)
+	}
+	var items []json.RawMessage
+	if err := json.Unmarshal(data, &items); err != nil || len(items) > generation.MaxFiles {
+		return nil, fmt.Errorf("Synto INDEX field %q must be a bounded array", name)
+	}
+	return items, nil
+}
+
+func releasedSyntoString(data []byte, max int, trim bool) (string, error) {
+	var value string
+	if err := json.Unmarshal(data, &value); err != nil || len(value) > max {
+		return "", errors.New("expected bounded string")
+	}
+	if trim {
+		value = strings.TrimSpace(value)
+	}
+	return value, nil
+}
+
+func releasedSyntoStringArray(data []byte, maxString int) ([]string, error) {
+	items, err := releasedSyntoArray(data, "string array")
+	if err != nil {
+		return nil, err
+	}
+	values := make([]string, 0, len(items))
+	for _, item := range items {
+		value, err := releasedSyntoString(item, maxString, false)
+		if err != nil {
+			return nil, err
+		}
+		values = append(values, value)
+	}
+	return values, nil
+}
+
+func releasedSyntoNullableString(data []byte, max int) error {
+	if bytes.Equal(bytes.TrimSpace(data), []byte("null")) {
+		return nil
+	}
+	_, err := releasedSyntoString(data, max, false)
+	return err
+}
+
+func validateReleasedSyntoConfidence(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var value interface{}
+	if err := json.Unmarshal(trimmed, &value); err != nil {
+		return err
+	}
+	switch value.(type) {
+	case string, float64:
+		return nil
+	default:
+		return errors.New("invalid article confidence")
+	}
 }
 
 type syntoIdentityArticle struct {
@@ -261,7 +606,7 @@ func decodeStrictObject(data []byte, allowed map[string]bool) (map[string]json.R
 			return nil, err
 		}
 		name, ok := key.(string)
-		if !ok || seen[name] || !allowed[name] {
+		if !ok || seen[name] || (allowed != nil && !allowed[name]) {
 			return nil, fmt.Errorf("invalid or duplicate JSON object field %q", name)
 		}
 		seen[name] = true

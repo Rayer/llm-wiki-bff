@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 
 	"cloud.google.com/go/storage"
@@ -15,6 +16,7 @@ import (
 	"github.com/rayer/llm-wiki-bff/internal/annotation"
 	conceptcache "github.com/rayer/llm-wiki-bff/internal/cache"
 	"github.com/rayer/llm-wiki-bff/internal/generation"
+	"gopkg.in/yaml.v3"
 )
 
 const (
@@ -332,8 +334,13 @@ func RewriteSyntoConceptPage(data []byte, entityID string) ([]byte, error) {
 	if !ValidSyntoEntityID(entityID) {
 		return nil, fmt.Errorf("invalid Synto entity ID %q", entityID)
 	}
+	lineEnding := []byte("\n")
+	if bytes.Contains(data, []byte("\r\n")) {
+		lineEnding = []byte("\r\n")
+	}
 	if !bytes.HasPrefix(data, []byte("---")) {
-		return append([]byte("---\nid: "+entityID+"\n---\n"), data...), nil
+		prefix := []byte("---" + string(lineEnding) + "id: " + entityID + string(lineEnding) + "---" + string(lineEnding))
+		return append(prefix, data...), nil
 	}
 	lines := bytes.SplitAfter(data, []byte("\n"))
 	if len(lines) == 0 || strings.TrimSpace(string(lines[0])) != "---" {
@@ -349,36 +356,47 @@ func RewriteSyntoConceptPage(data []byte, entityID string) ([]byte, error) {
 	if end < 0 {
 		return nil, errors.New("concept frontmatter is unterminated")
 	}
-	var matter map[string]interface{}
-	if _, err := fm.MustParse(strings.NewReader(string(data)), &matter); err != nil {
+	for i := end + 1; i < len(lines); i++ {
+		line := strings.TrimSpace(strings.TrimSuffix(strings.TrimSuffix(string(lines[i]), "\n"), "\r"))
+		if line == "" {
+			continue
+		}
+		if line == "---" {
+			return nil, errors.New("concept frontmatter contains multiple YAML documents")
+		}
+	}
+	frontmatterBytes := bytes.Join(lines[1:end], nil)
+	root, err := validateSyntoFrontmatterYAML(frontmatterBytes)
+	if err != nil {
 		return nil, fmt.Errorf("unsafe concept frontmatter: %w", err)
 	}
+	var idNode *yaml.Node
+	for i := 0; i+1 < len(root.Content); i += 2 {
+		if root.Content[i].Value == "id" {
+			idNode = root.Content[i+1]
+			break
+		}
+	}
+	if idNode != nil && (idNode.Kind != yaml.ScalarNode || idNode.Tag != "!!str") {
+		return nil, errors.New("concept frontmatter id must be a string")
+	}
+	if idNode != nil && (!ValidLegacyConceptID(strings.TrimSpace(idNode.Value)) && !ValidSyntoEntityID(strings.TrimSpace(idNode.Value))) {
+		return nil, fmt.Errorf("invalid concept frontmatter id %q", strings.TrimSpace(idNode.Value))
+	}
 	found := 0
-	pageID := ""
 	for i := 1; i < end; i++ {
 		line := strings.TrimSuffix(strings.TrimSuffix(string(lines[i]), "\n"), "\r")
 		if strings.HasPrefix(line, " ") || strings.HasPrefix(line, "\t") {
 			continue
 		}
-		key, value, ok := strings.Cut(line, ":")
+		key, _, ok := strings.Cut(line, ":")
 		key = strings.Trim(strings.TrimSpace(key), "\"'")
 		if !ok || key != "id" {
 			continue
 		}
 		found++
-		pageID = strings.TrimSpace(strings.TrimSpace(value))
 		if found > 1 {
 			return nil, errors.New("duplicate concept frontmatter id")
-		}
-		if parsed, exists := matter["id"]; exists {
-			parsedID, ok := parsed.(string)
-			if !ok {
-				return nil, errors.New("concept frontmatter id must be a string")
-			}
-			pageID = strings.TrimSpace(parsedID)
-		}
-		if pageID != "" && !ValidLegacyConceptID(pageID) && !ValidSyntoEntityID(pageID) {
-			return nil, fmt.Errorf("invalid concept frontmatter id %q", pageID)
 		}
 		lineEnding := "\n"
 		if bytes.HasSuffix(lines[i], []byte("\r\n")) {
@@ -388,11 +406,69 @@ func RewriteSyntoConceptPage(data []byte, entityID string) ([]byte, error) {
 		lines[i] = []byte(prefix + " " + entityID + lineEnding)
 	}
 	if found == 0 {
+		closingLine := lines[end]
 		lines = append(lines, nil)
-		copy(lines[end+2:], lines[end+1:])
-		lines[end+1] = []byte("id: " + entityID + "\n")
+		copy(lines[end+1:], lines[end:])
+		ending := "\n"
+		if bytes.HasSuffix(closingLine, []byte("\r\n")) {
+			ending = "\r\n"
+		}
+		lines[end] = []byte("id: " + entityID + ending)
 	}
 	return bytes.Join(lines, nil), nil
+}
+
+func validateSyntoFrontmatterYAML(data []byte) (*yaml.Node, error) {
+	decoder := yaml.NewDecoder(bytes.NewReader(data))
+	var document yaml.Node
+	if err := decoder.Decode(&document); err != nil {
+		return nil, err
+	}
+	if document.Kind != yaml.DocumentNode || len(document.Content) != 1 || document.Content[0].Kind != yaml.MappingNode {
+		return nil, errors.New("frontmatter must be a YAML mapping")
+	}
+	var extra yaml.Node
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return nil, errors.New("frontmatter contains multiple YAML documents")
+		}
+		return nil, err
+	}
+	if err := validateSyntoYAMLNode(document.Content[0]); err != nil {
+		return nil, err
+	}
+	return document.Content[0], nil
+}
+
+func validateSyntoYAMLNode(node *yaml.Node) error {
+	switch node.Kind {
+	case yaml.MappingNode:
+		seen := make(map[string]struct{}, len(node.Content)/2)
+		for i := 0; i+1 < len(node.Content); i += 2 {
+			key := node.Content[i]
+			if key.Kind != yaml.ScalarNode || key.Tag != "!!str" {
+				return errors.New("frontmatter mapping keys must be strings")
+			}
+			if _, exists := seen[key.Value]; exists {
+				return fmt.Errorf("duplicate frontmatter key %q", key.Value)
+			}
+			seen[key.Value] = struct{}{}
+			if err := validateSyntoYAMLNode(node.Content[i+1]); err != nil {
+				return err
+			}
+		}
+	case yaml.SequenceNode:
+		for _, child := range node.Content {
+			if err := validateSyntoYAMLNode(child); err != nil {
+				return err
+			}
+		}
+	case yaml.AliasNode:
+		if node.Alias == nil {
+			return errors.New("frontmatter alias is invalid")
+		}
+	}
+	return nil
 }
 
 func planSyntoIDRedirects(next *IDMap, old IDMap) (int, error) {

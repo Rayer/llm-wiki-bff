@@ -140,8 +140,8 @@ func TestAdminRebuildIndexInvalidatesCaches(t *testing.T) {
 		index:         search.NewIndex(),
 		idRoutingMaps: make(map[string]dualIDMap),
 		listCache:     make(map[string]cachedLists),
-		projectExists: func(context.Context, string) error {
-			return nil
+		adminProjectRecordLoader: func(context.Context, string) (adminProjectRecord, error) {
+			return adminProjectRecord{id: docID, userID: uid, projectID: pid}, nil
 		},
 		rebuildIndex: func(context.Context, string, string) (idMap, error) {
 			return idMap{
