@@ -108,7 +108,8 @@ jobs:
         id: nonce
         run: |
           set -euo pipefail
-          BUILD_NONCE=$(openssl rand -hex 16)
+          BUILD_TIMESTAMP_NS=$(date -u +%s%N)
+          printf -v BUILD_NONCE '%032d' "$BUILD_TIMESTAMP_NS"
           if [[ ! "$BUILD_NONCE" =~ ^[0-9a-f]{32}$ ]]; then
             echo "generated worker build nonce is invalid"
             exit 1

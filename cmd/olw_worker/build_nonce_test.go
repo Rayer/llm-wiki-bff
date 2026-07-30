@@ -60,11 +60,12 @@ func TestWorkerDockerfileBuildNonceContract(t *testing.T) {
 
 func TestDeployWorkerWorkflowBuildNonceContract(t *testing.T) {
 	workflow := readRepoFile(t, ".github/workflows/deploy-worker.yml")
-	if strings.Count(workflow, "openssl rand -hex 16") != 1 {
-		t.Fatal("workflow must generate exactly one nonce with openssl rand -hex 16")
+	if strings.Count(workflow, "date -u +%s%N") != 1 {
+		t.Fatal("workflow must generate exactly one UTC nanosecond timestamp")
 	}
 	for _, want := range []string{
-		"BUILD_NONCE=$(openssl rand -hex 16)",
+		"BUILD_TIMESTAMP_NS=$(date -u +%s%N)",
+		"printf -v BUILD_NONCE '%032d' \"$BUILD_TIMESTAMP_NS\"",
 		"[[ ! \"$BUILD_NONCE\" =~ ^[0-9a-f]{32}$ ]]",
 		"echo \"build_nonce=$BUILD_NONCE\" >> \"$GITHUB_OUTPUT\"",
 		"BUILD_NONCE: ${{ steps.nonce.outputs.build_nonce }}",
@@ -74,13 +75,13 @@ func TestDeployWorkerWorkflowBuildNonceContract(t *testing.T) {
 			t.Fatalf("workflow missing nonce contract %q", want)
 		}
 	}
-	nonceAt := strings.Index(workflow, "openssl rand -hex 16")
+	nonceAt := strings.Index(workflow, "BUILD_TIMESTAMP_NS=$(date -u +%s%N)")
 	buildAt := strings.Index(workflow, "docker build")
 	if nonceAt < 0 || buildAt < 0 || nonceAt > buildAt {
 		t.Fatal("workflow must generate the nonce before docker build")
 	}
-	if strings.Contains(workflow, "BUILD_NONCE=${GITHUB_RUN_ID}") || strings.Contains(workflow, "BUILD_NONCE=$GITHUB_RUN_ID") || strings.Contains(workflow, "BUILD_NONCE=$(date") {
-		t.Fatal("workflow must not derive the nonce from a timestamp or run ID")
+	if strings.Contains(workflow, "openssl rand") || strings.Contains(workflow, "BUILD_NONCE=${GITHUB_RUN_ID}") || strings.Contains(workflow, "BUILD_NONCE=$GITHUB_RUN_ID") {
+		t.Fatal("workflow must derive the build value from the UTC timestamp, not randomness or a run ID")
 	}
 }
 
