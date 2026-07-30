@@ -134,7 +134,7 @@ func validateReleasedSyntoIndex(data []byte) error {
 		return err
 	}
 	for _, key := range []string{"terms", "papers"} {
-		if err := validateReleasedSyntoObjectArray(document[key], key); err != nil {
+		if _, err := releasedSyntoArray(document[key], key); err != nil {
 			return err
 		}
 	}
@@ -253,19 +253,6 @@ func validateReleasedSyntoArticles(data []byte) error {
 		}
 		if err := validateReleasedSyntoConfidence(object["confidence"]); err != nil {
 			return err
-		}
-	}
-	return nil
-}
-
-func validateReleasedSyntoObjectArray(data []byte, name string) error {
-	items, err := releasedSyntoArray(data, name)
-	if err != nil {
-		return err
-	}
-	for _, item := range items {
-		if _, err := decodeStrictObject(item, nil); err != nil {
-			return fmt.Errorf("invalid Synto %s entry: %w", name, err)
 		}
 	}
 	return nil
@@ -393,7 +380,78 @@ func releasedSyntoArray(data []byte, name string) ([]json.RawMessage, error) {
 	if err := json.Unmarshal(data, &items); err != nil || len(items) > generation.MaxFiles {
 		return nil, fmt.Errorf("Synto INDEX field %q must be a bounded array", name)
 	}
+	for _, item := range items {
+		if err := validateReleasedSyntoJSONValue(item); err != nil {
+			return nil, fmt.Errorf("invalid Synto INDEX field %q: %w", name, err)
+		}
+	}
 	return items, nil
+}
+
+const maxReleasedSyntoJSONDepth = 64
+
+func validateReleasedSyntoJSONValue(data []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	if err := decodeReleasedSyntoJSONValue(decoder, 0); err != nil {
+		return err
+	}
+	return generation.EnsureJSONEOF(decoder)
+}
+
+func decodeReleasedSyntoJSONValue(decoder *json.Decoder, depth int) error {
+	if depth > maxReleasedSyntoJSONDepth {
+		return errors.New("JSON nesting depth exceeds limit")
+	}
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	delimiter, ok := token.(json.Delim)
+	if !ok {
+		return nil
+	}
+	switch delimiter {
+	case '{':
+		seen := make(map[string]struct{})
+		for decoder.More() {
+			if len(seen) >= generation.MaxFiles {
+				return generation.ErrLogicalEntryLimit
+			}
+			keyToken, err := decoder.Token()
+			if err != nil {
+				return err
+			}
+			key, ok := keyToken.(string)
+			if !ok {
+				return errors.New("expected JSON object key")
+			}
+			if _, exists := seen[key]; exists {
+				return fmt.Errorf("duplicate JSON object key %q", key)
+			}
+			seen[key] = struct{}{}
+			if err := decodeReleasedSyntoJSONValue(decoder, depth+1); err != nil {
+				return err
+			}
+		}
+		_, err = decoder.Token()
+		return err
+	case '[':
+		count := 0
+		for decoder.More() {
+			if count >= generation.MaxFiles {
+				return generation.ErrLogicalEntryLimit
+			}
+			if err := decodeReleasedSyntoJSONValue(decoder, depth+1); err != nil {
+				return err
+			}
+			count++
+		}
+		_, err = decoder.Token()
+		return err
+	default:
+		return errors.New("invalid JSON delimiter")
+	}
 }
 
 func releasedSyntoString(data []byte, max int, trim bool) (string, error) {

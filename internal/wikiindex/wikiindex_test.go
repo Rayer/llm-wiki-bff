@@ -49,6 +49,20 @@ func TestDecodeSyntoIdentityPlanValidatesReleasedContainerContracts(t *testing.T
 	}
 }
 
+func TestDecodeSyntoIdentityPlanMatchesWorkerGenericArrayContract(t *testing.T) {
+	base := string(syntoIdentityReleasedFixture("null"))
+	valid := strings.Replace(base, `"terms":[]`, `"terms":[null,true,7,"term",[1,2],{"nested":{"value":1}}]`, 1)
+	valid = strings.Replace(valid, `"papers":[]`, `"papers":["paper",{"authors":["a","b"]}]`, 1)
+	if _, err := DecodeSyntoIdentityPlan([]byte(valid)); err != nil {
+		t.Fatalf("worker-compatible generic terms/papers rejected: %v", err)
+	}
+
+	duplicateNestedKey := strings.Replace(base, `"terms":[]`, `"terms":[{"nested":{"duplicate":1,"duplicate":2}}]`, 1)
+	if _, err := DecodeSyntoIdentityPlan([]byte(duplicateNestedKey)); err == nil {
+		t.Fatal("nested duplicate JSON key unexpectedly accepted")
+	}
+}
+
 func TestRebuildWithSyntoIdentityRewritesCanonicalPageAndFailsBeforeWrites(t *testing.T) {
 	store := &fakeStore{
 		files: map[string][]MarkdownFile{
