@@ -293,11 +293,15 @@ func (c *Client) ReadFileLimited(ctx context.Context, relPath string, limit int6
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	path, err := c.fullPath(relPath)
+	root, err := c.projectRoot()
 	if err != nil {
 		return nil, err
 	}
-	file, err := os.Open(path)
+	cleanRel, err := cleanRelativePath(relPath)
+	if err != nil {
+		return nil, err
+	}
+	file, err := openScopedRegularFile(root, cleanRel)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, storage.ErrObjectNotExist
@@ -320,16 +324,31 @@ func (c *Client) StatFile(ctx context.Context, relPath string) (int64, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
-	path, err := c.fullPath(relPath)
+	root, err := c.projectRoot()
 	if err != nil {
 		return 0, err
 	}
-	info, err := os.Stat(path)
+	cleanRel, err := cleanRelativePath(relPath)
+	if err != nil {
+		return 0, err
+	}
+	file, err := openScopedRegularFile(root, cleanRel)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return 0, storage.ErrObjectNotExist
 		}
+		if errors.Is(err, errSecureNotRegular) {
+			return 0, fmt.Errorf("stat %s: not a regular file", relPath)
+		}
 		return 0, fmt.Errorf("stat %s: %w", relPath, err)
+	}
+	info, statErr := file.Stat()
+	closeErr := file.Close()
+	if statErr != nil {
+		return 0, statErr
+	}
+	if closeErr != nil {
+		return 0, closeErr
 	}
 	if !info.Mode().IsRegular() {
 		return 0, fmt.Errorf("stat %s: not a regular file", relPath)
@@ -728,15 +747,23 @@ func (c *Client) fullPath(relPath string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	cleanRel := filepath.Clean(filepath.FromSlash(relPath))
-	if cleanRel == "." || filepath.IsAbs(cleanRel) || strings.HasPrefix(cleanRel, ".."+string(filepath.Separator)) || cleanRel == ".." {
-		return "", fmt.Errorf("unsafe relative path: %s", relPath)
+	cleanRel, err := cleanRelativePath(relPath)
+	if err != nil {
+		return "", err
 	}
 	target := filepath.Join(root, cleanRel)
 	if err := ensureWithinExistingParent(root, target); err != nil {
 		return "", err
 	}
 	return target, nil
+}
+
+func cleanRelativePath(relPath string) (string, error) {
+	cleanRel := filepath.Clean(filepath.FromSlash(relPath))
+	if cleanRel == "." || filepath.IsAbs(cleanRel) || strings.HasPrefix(cleanRel, ".."+string(filepath.Separator)) || cleanRel == ".." {
+		return "", fmt.Errorf("unsafe relative path: %s", relPath)
+	}
+	return cleanRel, nil
 }
 
 func (c *Client) projectRoot() (string, error) {

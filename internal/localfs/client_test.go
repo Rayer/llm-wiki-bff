@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"cloud.google.com/go/storage"
@@ -211,6 +212,98 @@ func TestReadFileLimitedBoundsFailureDiagnosticRead(t *testing.T) {
 	}
 	if len(data) != 4097 {
 		t.Fatalf("ReadFileLimited() bytes=%d, want exactly 4097", len(data))
+	}
+}
+
+func TestAuditReadFileLimitedAndStatFileConcurrentSwapCannotEscape(t *testing.T) {
+	root := t.TempDir()
+	outside := filepath.Join(t.TempDir(), "outside.log")
+	if err := os.WriteFile(outside, []byte("outside-secret-sentinel"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	project := filepath.Join(root, "users", "u", "projects", "p")
+	if err := os.MkdirAll(filepath.Join(project, "cache"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(project, "cache", "pipeline-swap.log")
+	regularSource := target + ".regular-source"
+	symlinkSource := target + ".symlink-source"
+	inside := []byte("inside")
+	if err := os.WriteFile(target, inside, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	client := New(root).WithScope("u", "p")
+	stop := make(chan struct{})
+	swapErrs := make(chan error, 1)
+	swapDone := make(chan struct{})
+	go func() {
+		defer close(swapDone)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if err := os.Symlink(outside, symlinkSource); err != nil {
+				swapErrs <- err
+				return
+			}
+			if err := os.Rename(symlinkSource, target); err != nil {
+				swapErrs <- err
+				return
+			}
+			if err := os.WriteFile(regularSource, inside, 0o600); err != nil {
+				swapErrs <- err
+				return
+			}
+			if err := os.Rename(regularSource, target); err != nil {
+				swapErrs <- err
+				return
+			}
+		}
+	}()
+
+	const readers = 8
+	const iterations = 5000
+	outsideFound := make(chan string, 1)
+	var wg sync.WaitGroup
+	wg.Add(readers)
+	for i := 0; i < readers; i++ {
+		go func() {
+			defer wg.Done()
+			for j := 0; j < iterations; j++ {
+				data, err := client.ReadFileLimited(context.Background(), "cache/pipeline-swap.log", 1024)
+				if err == nil && string(data) == "outside-secret-sentinel" {
+					select {
+					case outsideFound <- "ReadFileLimited returned outside sentinel content":
+					default:
+					}
+					return
+				}
+				size, err := client.StatFile(context.Background(), "cache/pipeline-swap.log")
+				if err == nil && size == int64(len("outside-secret-sentinel")) {
+					select {
+					case outsideFound <- "StatFile returned outside sentinel size":
+					default:
+					}
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(stop)
+	<-swapDone
+	select {
+	case err := <-swapErrs:
+		t.Fatal(err)
+	default:
+	}
+	select {
+	case finding := <-outsideFound:
+		t.Fatal(finding)
+	default:
 	}
 }
 
