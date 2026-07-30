@@ -2522,6 +2522,39 @@ func (s *pipelineLogMetadataSpyStore) ReadFileLimited(context.Context, string, i
 	return nil, errors.New("body read must not occur during status")
 }
 
+type pipelineStatusMetadataRoot struct {
+	store.RootStore
+	diagnostic      []byte
+	statSize        int64
+	rawReads        int
+	diagnosticReads int
+}
+
+func (r *pipelineStatusMetadataRoot) Scope(userID, projectID string) store.Store {
+	return &pipelineStatusMetadataStore{Store: r.RootStore.Scope(userID, projectID), root: r}
+}
+
+type pipelineStatusMetadataStore struct {
+	store.Store
+	root *pipelineStatusMetadataRoot
+}
+
+func (s *pipelineStatusMetadataStore) StatFile(context.Context, string) (int64, error) {
+	return s.root.statSize, nil
+}
+
+func (s *pipelineStatusMetadataStore) ReadFileLimited(_ context.Context, path string, _ int64) ([]byte, error) {
+	if strings.HasSuffix(path, ".log") {
+		s.root.rawReads++
+		return nil, errors.New("raw log body read must not occur during status")
+	}
+	if strings.HasSuffix(path, ".failure.json") {
+		s.root.diagnosticReads++
+		return append([]byte(nil), s.root.diagnostic...), nil
+	}
+	return nil, errors.New("unexpected bounded status read")
+}
+
 type pipelineFailureDiagnosticSpyRoot struct {
 	store.RootStore
 	data         []byte
@@ -2801,14 +2834,9 @@ func TestStatusIncludesLatestPipelineExecutionWhenAvailable(t *testing.T) {
 		case "/token":
 			return testHTTPResponse(http.StatusOK, `{"access_token":"test-token"}`), nil
 		case "/v2/projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline/executions":
-			return testHTTPResponse(http.StatusOK, `{
-				"executions": [{
-					"name": "projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline/executions/exec-1",
-					"startTime": "2026-06-29T01:02:03Z",
-					"completionTime": "2026-06-29T01:02:13Z",
-					"completionStatus": "EXECUTION_SUCCEEDED"
-				}]
-			}`), nil
+			return testHTTPResponse(http.StatusOK, `{"executions":[`+pipelineOwnershipExecution(
+				"projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline/executions/exec-1",
+				"request-user", "demo-project", "pipeline")+"]}"), nil
 		default:
 			return testHTTPResponse(http.StatusNotFound, `not found`), nil
 		}
@@ -2844,6 +2872,246 @@ func TestStatusIncludesLatestPipelineExecutionWhenAvailable(t *testing.T) {
 	if body.LastExecution.Status != "SUCCEEDED" || body.LastExecution.LogURL != "/api/v1/pipeline/log?execution_id=exec-1" {
 		t.Fatalf("last_execution = %#v", body.LastExecution)
 	}
+}
+
+func TestStatusRequiresAuthenticatedOwnerContext(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		userID    string
+		projectID string
+		wantCode  int
+		wantBody  string
+	}{
+		{name: "missing user", projectID: "demo-project", wantCode: http.StatusUnauthorized, wantBody: `{"error":"user not authenticated"}`},
+		{name: "missing project", userID: "request-user", wantCode: http.StatusBadRequest, wantBody: `{"error":"project is required"}`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			h := New(localfs.New(t.TempDir()), nil, search.NewIndex(), conceptcache.New(), nil, nil)
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodGet, "/api/v1/status", nil)
+			if tt.userID != "" {
+				c.Set("userID", tt.userID)
+			}
+			if tt.projectID != "" {
+				c.Set("projectID", tt.projectID)
+			}
+
+			h.Status(c)
+
+			if recorder.Code != tt.wantCode || recorder.Body.String() != tt.wantBody {
+				t.Fatalf("status=%d body=%s, want status=%d body=%s", recorder.Code, recorder.Body.String(), tt.wantCode, tt.wantBody)
+			}
+		})
+	}
+}
+
+func TestStatusProjectsOnlyOwnedExecutionAndMetadata(t *testing.T) {
+	root := t.TempDir()
+	unrelated := pipelineOwnershipExecution(
+		"projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline/executions/unrelated",
+		"other-user", "other-project", "pipeline")
+	owned := pipelineOwnershipExecution(
+		"projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline/executions/owned",
+		"request-user", "demo-project", "pipeline")
+	h := newStatusHandlerForTest(localfs.New(root), `{"executions":[`+unrelated+`,`+owned+`]}`)
+
+	recorder := invokeStatusForTest(t, h, "request-user", "demo-project")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var body struct {
+		LastExecution *struct {
+			Name           string `json:"name"`
+			LogURL         string `json:"log_url"`
+			LogState       string `json:"log_state"`
+			LogStateReason string `json:"log_state_reason"`
+		} `json:"last_execution"`
+		SuggestedQueries []string `json:"suggested_queries"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if body.LastExecution == nil {
+		t.Fatal("last_execution = nil, want owned execution")
+	}
+	if body.LastExecution.Name != "projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline/executions/owned" {
+		t.Fatalf("last_execution.name = %q, want owned execution", body.LastExecution.Name)
+	}
+	if body.LastExecution.LogURL != "/api/v1/pipeline/log?execution_id=owned" {
+		t.Fatalf("last_execution.log_url = %q, want authenticated owned execution URL", body.LastExecution.LogURL)
+	}
+	if body.LastExecution.LogState != pipelineLogStateUnavailable || body.LastExecution.LogStateReason != "log_unavailable" {
+		t.Fatalf("last_execution log metadata = %#v, want unavailable/log_unavailable", body.LastExecution)
+	}
+	if body.SuggestedQueries == nil {
+		t.Fatal("suggested_queries = nil, want explicit empty list")
+	}
+}
+
+func TestStatusProjectsTerminalMissingLogWithoutReadingBody(t *testing.T) {
+	root := &pipelineLogMetadataSpyRoot{
+		RootStore: localfs.New(t.TempDir()),
+		statErr:   store.ErrObjectNotExist,
+	}
+	owned := pipelineOwnershipExecution(
+		"projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline/executions/missing-log",
+		"request-user", "demo-project", "pipeline")
+	h := newStatusHandlerForTest(root, `{"executions":[`+owned+`]}`)
+
+	recorder := invokeStatusForTest(t, h, "request-user", "demo-project")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var body struct {
+		LastExecution *struct {
+			LogURL         string `json:"log_url"`
+			LogState       string `json:"log_state"`
+			LogStateReason string `json:"log_state_reason"`
+		} `json:"last_execution"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if body.LastExecution == nil || body.LastExecution.LogState != pipelineLogStateUnavailable || body.LastExecution.LogStateReason != "log_unavailable" {
+		t.Fatalf("last_execution = %#v, want unavailable/log_unavailable", body.LastExecution)
+	}
+	if body.LastExecution.LogURL != "/api/v1/pipeline/log?execution_id=missing-log" {
+		t.Fatalf("last_execution.log_url = %q, want owned execution URL", body.LastExecution.LogURL)
+	}
+	if root.statCalls != 1 || root.readCalls != 0 {
+		t.Fatalf("stat calls=%d, body reads=%d, want one stat and no raw body read", root.statCalls, root.readCalls)
+	}
+}
+
+func TestStatusProjectsAvailableLogMetadataWithoutReadingBody(t *testing.T) {
+	root := &pipelineLogMetadataSpyRoot{RootStore: localfs.New(t.TempDir()), statSize: 3}
+	owned := pipelineOwnershipExecution(
+		"projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline/executions/available-log",
+		"request-user", "demo-project", "pipeline")
+	h := newStatusHandlerForTest(root, `{"executions":[`+owned+`]}`)
+
+	recorder := invokeStatusForTest(t, h, "request-user", "demo-project")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var body struct {
+		LastExecution *struct {
+			LogState       string `json:"log_state"`
+			LogStateReason string `json:"log_state_reason"`
+		} `json:"last_execution"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if body.LastExecution == nil || body.LastExecution.LogState != pipelineLogStateAvailable || body.LastExecution.LogStateReason != "" {
+		t.Fatalf("last_execution = %#v, want available metadata", body.LastExecution)
+	}
+	if root.statCalls != 1 || root.readCalls != 0 {
+		t.Fatalf("stat calls=%d, body reads=%d, want one stat and no raw body read", root.statCalls, root.readCalls)
+	}
+}
+
+func TestStatusProjectsOwnedFailureDiagnostic(t *testing.T) {
+	exitCode := 42
+	root := &pipelineStatusMetadataRoot{
+		RootStore:  localfs.New(t.TempDir()),
+		statSize:   3,
+		diagnostic: []byte(`{"version":1,"status":"failed","stage":"concept_reconciliation","error_class":"child_exit","detail_code":"entity_mapping_article_source_missing","child_command":"run","exit_code":42}`),
+	}
+	failed := strings.Replace(pipelineOwnershipExecution(
+		"projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline/executions/failed-diagnostic",
+		"request-user", "demo-project", "pipeline"), "EXECUTION_SUCCEEDED", "EXECUTION_FAILED", 1)
+	h := newStatusHandlerForTest(root, `{"executions":[`+failed+`]}`)
+
+	recorder := invokeStatusForTest(t, h, "request-user", "demo-project")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var body struct {
+		LastExecution *struct {
+			LogState   string                             `json:"log_state"`
+			Diagnostic *handler.PipelineFailureDiagnostic `json:"diagnostic"`
+		} `json:"last_execution"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if body.LastExecution == nil || body.LastExecution.LogState != pipelineLogStateAvailable || body.LastExecution.Diagnostic == nil {
+		t.Fatalf("last_execution = %#v, want available diagnostic", body.LastExecution)
+	}
+	diagnostic := body.LastExecution.Diagnostic
+	if diagnostic.Version != 1 || diagnostic.Status != "failed" || diagnostic.Stage != "concept_reconciliation" || diagnostic.ErrorClass != "child_exit" || diagnostic.DetailCode != "entity_mapping_article_source_missing" || diagnostic.Child != "run" || diagnostic.ExitCode == nil || *diagnostic.ExitCode != exitCode {
+		t.Fatalf("diagnostic = %#v, want all typed fields projected", diagnostic)
+	}
+	if root.rawReads != 0 || root.diagnosticReads != 1 {
+		t.Fatalf("raw log reads=%d diagnostic reads=%d, want 0/1", root.rawReads, root.diagnosticReads)
+	}
+}
+
+func TestStatusRetainsFiniteMetadataForRunningAndUnsupportedStates(t *testing.T) {
+	unsupported := strings.Replace(pipelineOwnershipExecution(
+		"projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline/executions/unsupported",
+		"request-user", "demo-project", "pipeline"), "EXECUTION_SUCCEEDED", "EXECUTION_MYSTERY", 1)
+	for _, tt := range []struct {
+		name       string
+		execution  string
+		wantState  string
+		wantReason string
+	}{
+		{name: "running", execution: pipelineRunningOwnershipExecution("projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline/executions/running", "request-user", "demo-project"), wantState: pipelineLogStatePending},
+		{name: "unsupported", execution: unsupported, wantState: pipelineLogStateUnavailable, wantReason: "unsupported_execution_status"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newStatusHandlerForTest(localfs.New(t.TempDir()), `{"executions":[`+tt.execution+`]}`)
+			recorder := invokeStatusForTest(t, h, "request-user", "demo-project")
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusOK, recorder.Body.String())
+			}
+			var body struct {
+				SourcesCount     int      `json:"sources_count"`
+				ConceptsCount    int      `json:"concepts_count"`
+				SuggestedQueries []string `json:"suggested_queries"`
+				LastExecution    *struct {
+					LogState       string `json:"log_state"`
+					LogStateReason string `json:"log_state_reason"`
+				} `json:"last_execution"`
+			}
+			if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+				t.Fatalf("decode response: %v", err)
+			}
+			if body.LastExecution == nil || body.LastExecution.LogState != tt.wantState || body.LastExecution.LogStateReason != tt.wantReason {
+				t.Fatalf("last_execution = %#v, want state=%q reason=%q", body.LastExecution, tt.wantState, tt.wantReason)
+			}
+			if body.SourcesCount != 0 || body.ConceptsCount != 0 || body.SuggestedQueries == nil {
+				t.Fatalf("aggregate status fields regressed: sources=%d concepts=%d suggestions=%#v", body.SourcesCount, body.ConceptsCount, body.SuggestedQueries)
+			}
+		})
+	}
+}
+
+func newStatusHandlerForTest(root store.RootStore, executions string) *Handler {
+	h := New(root, nil, search.NewIndex(), conceptcache.New(), nil, nil)
+	h.httpClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == "/token" {
+			return testHTTPResponse(http.StatusOK, `{"access_token":"test-token"}`), nil
+		}
+		return testHTTPResponse(http.StatusOK, executions), nil
+	})}
+	h.metadataTokenURL = "http://metadata.test/token"
+	h.cloudRunJobURL = "https://run.googleapis.com/v2/projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline:run"
+	return h
+}
+
+func invokeStatusForTest(t *testing.T, h *Handler, userID, projectID string) *httptest.ResponseRecorder {
+	t.Helper()
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/api/v1/status", nil)
+	c.Set("userID", userID)
+	c.Set("projectID", projectID)
+	h.Status(c)
+	return recorder
 }
 
 func TestStatusIncludesEmptySuggestedQueriesWhenMissingArtifact(t *testing.T) {

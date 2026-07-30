@@ -1707,6 +1707,17 @@ func executionDuration(startTime, endTime string) string {
 //	@Security		ProjectHeader
 //	@Router			/api/v1/status [get]
 func (h *Handler) Status(c *gin.Context) {
+	userID := strings.TrimSpace(c.GetString("userID"))
+	if userID == "" {
+		c.JSON(http.StatusUnauthorized, handler.ErrorResponse{Error: "user not authenticated"})
+		return
+	}
+	projectID := strings.TrimSpace(c.GetString("projectID"))
+	if projectID == "" {
+		c.JSON(http.StatusBadRequest, handler.ErrorResponse{Error: "project is required"})
+		return
+	}
+
 	gcsClient, err := h.GetGCSClient(c)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "generated data unavailable"})
@@ -1733,7 +1744,7 @@ func (h *Handler) Status(c *gin.Context) {
 	}
 	resp.SuggestedQueries = suggestedQueries
 
-	if lastExecution, err := h.pipelineExecutionStatus(ctx, ""); err == nil {
+	if lastExecution, err := h.pipelineExecutionStatusForOwner(ctx, "", userID, projectID); err == nil {
 		resp.LastExecution = lastExecution
 	}
 
