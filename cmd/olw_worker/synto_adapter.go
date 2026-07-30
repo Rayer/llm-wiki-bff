@@ -1229,8 +1229,8 @@ func mapSyntoEntityIDsFromIndexTruth(index syntoIndexTruth, concepts map[string]
 	byID := make(map[string]string, len(index.Articles))
 	bySlug := make(map[string]string, len(index.Articles))
 	byEntity := make(map[string]string, len(index.Articles))
-	entitylessIDs := make(map[string]bool, len(index.Articles))
-	entitylessSlugs := make(map[string]bool, len(index.Articles))
+	entitylessIDs := make(map[string]string, len(index.Articles))
+	entitylessSlugs := make(map[string]string, len(index.Articles))
 	seenArticleIDs := make(map[string]string, len(index.Articles))
 	seenArticleSlugs := make(map[string]string, len(index.Articles))
 	if len(prior) > 1 {
@@ -1287,8 +1287,8 @@ func mapSyntoEntityIDsFromIndexTruth(index syntoIndexTruth, concepts map[string]
 		}
 		entityID := article.EntityID
 		if entityID == "" {
-			entitylessIDs[article.ID] = true
-			entitylessSlugs[articleSlug] = true
+			entitylessIDs[article.ID] = slug
+			entitylessSlugs[articleSlug] = article.ID
 			continue
 		}
 		if article.ID != "" {
@@ -1321,11 +1321,25 @@ func mapSyntoEntityIDsFromIndexTruth(index syntoIndexTruth, concepts map[string]
 	sort.Strings(currentConcepts)
 	for _, currentID := range currentConcepts {
 		slug := concepts[currentID]
-		if entitylessIDs[currentID] || entitylessSlugs[strings.ToLower(slug)] {
-			continue
-		}
 		idEntity, byIDPresent := byID[currentID]
 		pathSlug, byPathPresent := bySlug[strings.ToLower(slug)]
+		entitylessSlug, idIsEntityless := entitylessIDs[currentID]
+		entitylessID, slugIsEntityless := entitylessSlugs[strings.ToLower(slug)]
+		if idIsEntityless || slugIsEntityless {
+			if idIsEntityless {
+				if slugIsEntityless && entitylessID == currentID && strings.EqualFold(entitylessSlug, slug) {
+					continue
+				}
+				return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingConceptIDPathDisagreement, cause: fmt.Errorf("Synto INDEX.json ID/path disagreement for concept %q", currentID)}
+			}
+			if _, knownArticleID := seenArticleIDs[currentID]; knownArticleID {
+				return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingConceptIDPathDisagreement, cause: fmt.Errorf("Synto INDEX.json ID/path disagreement for concept %q", currentID)}
+			}
+			// A generated transient ID may not be present in INDEX.json for an
+			// entity-less article. Exclusion remains allowed when the slug identifies
+			// that ordinary article and the ID identifies no different INDEX article.
+			continue
+		}
 		pathEntity := ""
 		if byPathPresent && pathSlug == slug {
 			pathEntity = byEntityForSlug(byEntity, pathSlug)

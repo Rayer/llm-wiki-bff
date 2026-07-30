@@ -2007,6 +2007,40 @@ func syntoIndexTruthForEntityMapping(articles []syntoIndexEntry, sourceConcepts 
 	}
 }
 
+func TestSyntoEntityMappingRejectsEntitylessIDPathDisagreement(t *testing.T) {
+	const entityID = "01JAZ5N7Y3K8M2Q4R6T9VWXABC"
+	index, err := decodeSyntoIndex([]byte(syntoCrossArtifactEntitylessIDPathFixture(entityID)))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := mapSyntoEntityIDsFromIndexTruth(index, map[string]string{"article-a": "alpha"})
+	if err == nil {
+		t.Fatalf("malformed entityless ID/bound-path fixture was accepted with map=%#v", got)
+	}
+	testEntityMappingErrorDetail(t, err, conceptDetailEntityMappingConceptIDPathDisagreement)
+
+	got, err = mapSyntoEntityIDsFromIndexTruth(index, map[string]string{"article-a": "unknown"})
+	if err == nil {
+		t.Fatalf("known entityless ID with unknown path was accepted with map=%#v", got)
+	}
+	testEntityMappingErrorDetail(t, err, conceptDetailEntityMappingConceptIDPathDisagreement)
+
+	reservedAndOrdinary := syntoIndexTruthForEntityMapping(
+		[]syntoIndexEntry{
+			{ID: "root-index", Name: "Index", Path: "wiki/index.md"},
+			{ID: "ordinary-id", Name: "Ordinary", Path: "wiki/ordinary.md"},
+		},
+		nil,
+		nil,
+	)
+	got, err = mapSyntoEntityIDsFromIndexTruth(reservedAndOrdinary, map[string]string{"root-index": "ordinary"})
+	if err == nil {
+		t.Fatalf("reserved article ID was treated as an unknown transient ID: map=%#v", got)
+	}
+	testEntityMappingErrorDetail(t, err, conceptDetailEntityMappingConceptIDPathDisagreement)
+}
+
 func TestSyntoEntityMappingSkipsReservedRootPagesBeforeMandatoryMapping(t *testing.T) {
 	index := syntoIndexTruthForEntityMapping(
 		[]syntoIndexEntry{
@@ -2082,11 +2116,11 @@ func TestSyntoEntityMappingReservedRootPathMatrixFailsClosed(t *testing.T) {
 		want conceptReconcileDetailCode
 	}{
 		{name: "uppercase index", path: "wiki/Index.md"},
-		{name: "uppercase log", path: "wiki/Log.md"},
+		{name: "uppercase log", path: "wiki/Log.md", want: conceptDetailEntityMappingConceptIDPathDisagreement},
 		{name: "nested index", path: "wiki/nested/index.md", want: conceptDetailEntityMappingArticlePath},
 		{name: "nested log", path: "wiki/nested/log.md", want: conceptDetailEntityMappingArticlePath},
-		{name: "index lookalike", path: "wiki/index2.md"},
-		{name: "log lookalike", path: "wiki/logbook.md"},
+		{name: "index lookalike", path: "wiki/index2.md", want: conceptDetailEntityMappingConceptIDPathDisagreement},
+		{name: "log lookalike", path: "wiki/logbook.md", want: conceptDetailEntityMappingConceptIDPathDisagreement},
 		{name: "articles index", path: "articles/index.md"},
 	}
 	for _, tt := range tests {
@@ -3403,4 +3437,8 @@ func syntoIndexFixture(articleID, entityID, slug string, withSource bool) string
 		edges = `[{"source_path":"raw/source.md","content_hash":"` + strings.Repeat("0", 64) + `","concepts":[{"name":"` + slug + `","entity_id":"` + entityID + `"}]}]`
 	}
 	return `{"schema_version":1,"pack":{"id":"fixture","name":"fixture","version":"0","language":["en"],"capabilities":["articles","concepts"]},"articles":[{"id":"` + articleID + `","entity_id":"` + entityID + `","name":"` + slug + `","path":"wiki/` + slug + `.md","summary":null,"tags":[],"aliases":[],"confidence":"high"}],"terms":[],"papers":[],"sources":[],"source_concepts":` + edges + `,"synthesis":[],"stats":{"article_count":1,"draft_count":0,"concept_count":1,"alias_count":0,"knowledge_item_count":0,"source_count":1,"source_segment_count":0,"failed_note_count":0,"failed_concept_count":0}}`
+}
+
+func syntoCrossArtifactEntitylessIDPathFixture(entityID string) string {
+	return `{"schema_version":1,"pack":{"id":"fixture","name":"fixture","version":"0","language":["en"],"capabilities":["articles","concepts"]},"articles":[{"id":"article-a","entity_id":null,"name":"Ordinary","path":"wiki/ordinary.md","summary":null,"tags":[],"aliases":[],"confidence":"high"},{"id":"article-b","entity_id":"` + entityID + `","name":"Alpha","path":"wiki/alpha.md","summary":null,"tags":[],"aliases":[],"confidence":"high"}],"terms":[],"papers":[],"sources":[],"source_concepts":[{"source_path":"raw/alpha.md","content_hash":"` + strings.Repeat("0", 64) + `","concepts":[{"name":"Alpha","entity_id":"` + entityID + `"}]}],"synthesis":[],"stats":{"article_count":2,"draft_count":0,"concept_count":2,"alias_count":0,"knowledge_item_count":0,"source_count":1,"source_segment_count":0,"failed_note_count":0,"failed_concept_count":0}}`
 }

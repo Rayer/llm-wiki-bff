@@ -528,6 +528,25 @@ func TestReconcileWorkspaceConceptsExcludesEntitylessArticleFromConceptArtifacts
 	}
 }
 
+func TestReconcileWorkspaceConceptsRejectsEntitylessIDPathDisagreementWithoutWrites(t *testing.T) {
+	const entityID = "01JAZ5N7Y3K8M2Q4R6T9VWXABC"
+	workspace := t.TempDir()
+	page := []byte("---\nid: article-a\ntitle: Alpha\n---\nalpha bytes\n")
+	cache := []byte(`{"slug":"alpha","frontmatter":{"id":"article-a"}}` + "\n")
+	mustWriteFile(t, filepath.Join(workspace, ".synto", "INDEX.json"), []byte(syntoCrossArtifactEntitylessIDPathFixture(entityID)))
+	mustWriteFile(t, filepath.Join(workspace, "cache", "id_map.json"), []byte(`{"concept":{"article-a":"alpha"},"source":{},"redirects":{}}`))
+	mustWriteFile(t, filepath.Join(workspace, "cache", "concepts.jsonl"), cache)
+	mustWriteFile(t, filepath.Join(workspace, "wiki", "alpha.md"), page)
+
+	before := snapshotRelevantVaultBytes(t, workspace, "cache/id_map.json", "cache/concepts.jsonl", "wiki/alpha.md")
+	err := reconcileWorkspaceConcepts(workspace, nil)
+	if err == nil {
+		t.Fatal("malformed entityless ID/path fixture was accepted")
+	}
+	testEntityMappingErrorDetail(t, err, conceptDetailEntityMappingConceptIDPathDisagreement)
+	assertVaultBytesUnchanged(t, workspace, before)
+}
+
 func TestReconcileWorkspaceConceptsDirectPathDropsEntitylessConceptCacheRows(t *testing.T) {
 	const boundID = "01JAZ5N7Y3K8M2Q4R6T9VWXAC8"
 	const ordinaryID = "01JAZ5N7Y3K8M2Q4R6T9VWXAC9"
