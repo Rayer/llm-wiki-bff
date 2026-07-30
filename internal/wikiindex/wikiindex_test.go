@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -126,12 +127,90 @@ func TestDecodeSyntoIdentityPlanReleasedEntityShapes(t *testing.T) {
 	}
 }
 
+func TestDecodeSyntoIdentityPlanEntitylessRowsParticipateInValidation(t *testing.T) {
+	entityBound := `{"id":"bound","entity_id":"entity-bound","name":"Bound","path":"wiki/bound.md","summary":null,"tags":[],"aliases":[],"confidence":"high"}`
+	testCases := []struct {
+		name   string
+		rows   []string
+		needle string
+	}{
+		{
+			name: "duplicate ID with null and omitted entity",
+			rows: []string{
+				`{"id":"dup","entity_id":null,"name":"Duplicate","path":"wiki/first.md","summary":null,"tags":[],"aliases":[],"confidence":"high"}`,
+				`{"id":"dup","name":"Duplicate","path":"wiki/second.md","summary":null,"tags":[],"aliases":[],"confidence":"high"}`,
+			},
+			needle: "duplicate Synto article ID",
+		},
+		{
+			name: "duplicate slug with null and entityless rows",
+			rows: []string{
+				`{"id":"slug-a","entity_id":null,"name":"Alpha","path":"wiki/A.md","summary":null,"tags":[],"aliases":[],"confidence":"high"}`,
+				`{"id":"slug-b","name":"Alpha","path":"wiki/a.md","summary":null,"tags":[],"aliases":[],"confidence":"high"}`,
+				entityBound,
+			},
+			needle: "duplicate Synto article slug",
+		},
+		{
+			name: "unsafe entityless path fails",
+			rows: []string{
+				`{"id":"safe","entity_id":"entity-safe","name":"Safe","path":"wiki/safe.md","summary":null,"tags":[],"aliases":[],"confidence":"high"}`,
+				`{"id":"bad","name":"Bad","path":"wiki/../bad.md","summary":null,"tags":[],"aliases":[],"confidence":"high"}`,
+			},
+			needle: "unsafe Synto article path",
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := DecodeSyntoIdentityPlan(syntoIdentityFixtureFromArticles(append(tc.rows, entityBound))); err == nil || !strings.Contains(err.Error(), tc.needle) {
+				t.Fatalf("error=%v, want %q", err, tc.needle)
+			}
+		})
+	}
+
+	plan, err := DecodeSyntoIdentityPlan(syntoIdentityFixtureFromArticles([]string{
+		entityBound,
+		`{"id":"entityless","entity_id":null,"name":"Entityless","path":"wiki/entityless.md","summary":null,"tags":[],"aliases":[],"confidence":"high"}`,
+		`{"id":"omitted","name":"Omitted","path":"wiki/omitted.md","summary":null,"tags":[],"aliases":[],"confidence":"high"}`,
+	}))
+	if err != nil {
+		t.Fatalf("DecodeSyntoIdentityPlan() error = %v", err)
+	}
+	if len(plan.ByPath) != 1 || plan.ByPath["wiki/bound.md"] != "entity-bound" {
+		t.Fatalf("ByPath = %#v", plan.ByPath)
+	}
+	if _, ok := plan.ByPath["wiki/entityless.md"]; ok {
+		t.Fatalf("entityless row incorrectly persisted: %#v", plan.ByPath)
+	}
+}
+
+func TestDecodeSyntoIdentityPlanExcludedReservedRoots(t *testing.T) {
+	plan, err := DecodeSyntoIdentityPlan(syntoIdentityFixtureFromArticles([]string{
+		`{"id":"index","entity_id":null,"name":"Index","path":"wiki/index.md","summary":null,"tags":[],"aliases":[],"confidence":"high"}`,
+		`{"id":"alpha","entity_id":"entity-alpha","name":"Alpha","path":"wiki/alpha.md","summary":null,"tags":[],"aliases":[],"confidence":"high"}`,
+	}))
+	if err != nil {
+		t.Fatalf("DecodeSyntoIdentityPlan() error = %v", err)
+	}
+	if _, ok := plan.ByPath["wiki/index.md"]; ok {
+		t.Fatalf("reserved root article unexpectedly present: %#v", plan.ByPath)
+	}
+}
+
 func syntoIdentityReleasedFixture(entityJSON string) []byte {
 	entity := ""
 	if entityJSON != "" {
 		entity = `,"entity_id":` + entityJSON
 	}
 	return []byte(`{"schema_version":1,"pack":{"id":"fixture","name":"fixture","version":"0","language":["en"],"capabilities":["articles","concepts"]},"articles":[{"id":"article-1"` + entity + `,"name":"Ordinary","path":"wiki/ordinary.md","summary":null,"tags":[],"aliases":[],"confidence":"high"}],"terms":[],"papers":[],"sources":[],"source_concepts":[],"synthesis":[],"stats":{"article_count":1,"draft_count":0,"concept_count":0,"alias_count":0,"knowledge_item_count":0,"source_count":0,"source_segment_count":0,"failed_note_count":0,"failed_concept_count":0}}`)
+}
+
+func syntoIdentityFixtureFromArticles(articles []string) []byte {
+	return []byte(`{"schema_version":1,"pack":{"id":"fixture","name":"fixture","version":"0","language":["en"],"capabilities":["articles","concepts"]},"articles":[` + strings.Join(articles, ",") + `],"terms":[],"papers":[],"sources":[],"source_concepts":[],"synthesis":[],"stats":{"article_count":` + intToString(len(articles)) + `,"draft_count":0,"concept_count":` + intToString(len(articles)) + `,"alias_count":0,"knowledge_item_count":0,"source_count":0,"source_segment_count":0,"failed_note_count":0,"failed_concept_count":0}}`)
+}
+
+func intToString(value int) string {
+	return fmt.Sprintf("%d", value)
 }
 
 func TestRebuildWithSyntoIdentityFailsClosedOnMissingActiveEntityArticle(t *testing.T) {

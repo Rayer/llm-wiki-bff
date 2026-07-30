@@ -1404,6 +1404,83 @@ func TestReconcileConceptIDMapRejectsRedirectTranslationCollisions(t *testing.T)
 	}
 }
 
+func TestReconcileConceptIDMapPreservesIDRedirectsInEntityMode(t *testing.T) {
+	prior := []conceptSnapshot{{ConceptID: "stable-alpha", Slug: "alpha", EntityID: "entity-alpha"}, {ConceptID: "stable-beta", Slug: "beta", EntityID: "entity-beta"}}
+	out, _, err := reconcileConceptIDMapWithEntities([]byte(`{
+  "concept": {"transient-alpha":"alpha","transient-beta":"beta"},
+  "concept_entity_id": {"transient-alpha":"entity-alpha","transient-beta":"entity-beta"},
+  "source": {},
+  "source_meta": {},
+  "id_redirects": {"legacy-alpha":"transient-alpha","legacy-beta":"transient-beta"}
+}`), prior, true)
+	if err != nil {
+		t.Fatalf("unexpected IDRedirects rejection: %v", err)
+	}
+	var ids wikiindex.IDMap
+	if err := json.Unmarshal(out, &ids); err != nil {
+		t.Fatal(err)
+	}
+	if ids.Concept["stable-alpha"] != "alpha" || ids.Concept["stable-beta"] != "beta" {
+		t.Fatalf("concept map after redirect translation=%#v", ids.Concept)
+	}
+	if got := ids.IDRedirects["legacy-alpha"]; got != "stable-alpha" {
+		t.Fatalf("legacy redirect not preserved: want stable-alpha got %q", got)
+	}
+	if got := ids.IDRedirects["legacy-beta"]; got != "stable-beta" {
+		t.Fatalf("legacy redirect not preserved: want stable-beta got %q", got)
+	}
+
+	repeatOut, _, err := reconcileConceptIDMapWithEntities(out, prior, true)
+	if err != nil {
+		t.Fatalf("idempotent second run failed: %v", err)
+	}
+	var repeated wikiindex.IDMap
+	if err := json.Unmarshal(repeatOut, &repeated); err != nil {
+		t.Fatal(err)
+	}
+	for source, target := range ids.IDRedirects {
+		if repeated.IDRedirects[source] != target {
+			t.Fatalf("IDRedirects changed after second run: %s -> %q, want %q", source, repeated.IDRedirects[source], target)
+		}
+	}
+}
+
+func TestReconcileConceptIDMapRejectsInvalidIDRedirects(t *testing.T) {
+	testCases := []struct {
+		name   string
+		data   string
+		needle string
+	}{
+		{
+			name:   "missing target",
+			data:   `{"concept":{"entity-a":"alpha","entity-b":"beta"},"concept_entity_id":{"entity-a":"entity-a","entity-b":"entity-b"},"source":{},"source_meta":{},"id_redirects":{"legacy-a":"missing"}}`,
+			needle: "not found",
+		},
+		{
+			name:   "source reused as active concept",
+			data:   `{"concept":{"entity-a":"alpha","entity-b":"beta"},"concept_entity_id":{"entity-a":"entity-a","entity-b":"entity-b"},"source":{},"source_meta":{},"id_redirects":{"entity-a":"entity-a"}}`,
+			needle: "active concept",
+		},
+		{
+			name:   "redirect chain",
+			data:   `{"concept":{"entity-a":"alpha","entity-b":"beta"},"concept_entity_id":{"entity-a":"entity-a","entity-b":"entity-b"},"source":{},"source_meta":{},"id_redirects":{"legacy-a":"legacy-b","legacy-b":"legacy-a"}}`,
+			needle: "chain detected",
+		},
+		{
+			name:   "redirect target collision",
+			data:   `{"concept":{"entity-a":"alpha","entity-b":"beta"},"concept_entity_id":{"entity-a":"entity-a","entity-b":"entity-b"},"source":{},"source_meta":{},"id_redirects":{"legacy-a":"entity-a","legacy-b":"entity-a"}}`,
+			needle: "target collision",
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, _, err := reconcileConceptIDMapWithEntities([]byte(tc.data), nil, true); err == nil || !strings.Contains(err.Error(), tc.needle) {
+				t.Fatalf("error=%v, want %s", err, tc.needle)
+			}
+		})
+	}
+}
+
 func TestRunWorkerBatchWorkspacePublishesStableConceptIDFromSourceProvenance(t *testing.T) {
 	old := execOLW
 	defer func() { execOLW = old }()

@@ -295,6 +295,9 @@ func reconcileConceptIDMapWithEntities(data []byte, prior []conceptSnapshot, req
 	if ids.ConceptEntityID == nil {
 		ids.ConceptEntityID = map[string]string{}
 	}
+	if ids.IDRedirects == nil {
+		ids.IDRedirects = map[string]string{}
+	}
 
 	currentIDs := make([]string, 0, len(ids.Concept))
 	for currentID := range ids.Concept {
@@ -375,6 +378,54 @@ func reconcileConceptIDMapWithEntities(data []byte, prior []conceptSnapshot, req
 	}
 	ids.Concept = nextConcept
 	ids.ConceptEntityID = nextEntity
+
+	normalizedIDRedirects := make(map[string]string, len(ids.IDRedirects))
+	idRedirectTargetOwner := make(map[string]string, len(ids.IDRedirects))
+	redirectSources := make([]string, 0, len(ids.IDRedirects))
+	for from := range ids.IDRedirects {
+		redirectSources = append(redirectSources, from)
+	}
+	sort.Strings(redirectSources)
+	for _, from := range redirectSources {
+		if !annotation.ValidSourceID(from) {
+			return nil, nil, fmt.Errorf("unsafe ID redirect source %q", from)
+		}
+		target := strings.TrimSpace(ids.IDRedirects[from])
+		if target == "" || !annotation.ValidSourceID(target) {
+			return nil, nil, fmt.Errorf("unsafe ID redirect target %q for %q", target, from)
+		}
+		newFrom := normalizeTranslatedID(from, translated)
+		if !annotation.ValidSourceID(newFrom) {
+			return nil, nil, fmt.Errorf("unsafe ID redirect source %q", from)
+		}
+		newTarget := normalizeTranslatedID(target, translated)
+		if !annotation.ValidSourceID(newTarget) {
+			return nil, nil, fmt.Errorf("unsafe ID redirect target %q for %q", target, from)
+		}
+		if existing, ok := normalizedIDRedirects[newFrom]; ok && existing != newTarget {
+			return nil, nil, fmt.Errorf("ID redirect collision %q", newFrom)
+		}
+		if priorSource, ok := idRedirectTargetOwner[newTarget]; ok && priorSource != newFrom {
+			return nil, nil, fmt.Errorf("ID redirect target collision %q", newTarget)
+		}
+		normalizedIDRedirects[newFrom] = newTarget
+		idRedirectTargetOwner[newTarget] = newFrom
+	}
+	for source, target := range normalizedIDRedirects {
+		if _, exists := ids.Concept[source]; exists {
+			return nil, nil, fmt.Errorf("ID redirect source %q is an active concept", source)
+		}
+		if _, exists := normalizedIDRedirects[target]; exists {
+			return nil, nil, fmt.Errorf("ID redirect chain detected for %q", source)
+		}
+		if _, exists := ids.Concept[target]; !exists {
+			return nil, nil, fmt.Errorf("ID redirect target %q not found", target)
+		}
+		if requireEntity && ids.ConceptEntityID[target] == "" {
+			return nil, nil, fmt.Errorf("ID redirect target %q is not entity-bound", target)
+		}
+	}
+	ids.IDRedirects = normalizedIDRedirects
 
 	normalizedRedirects := make(map[string][]string, len(ids.Redirects))
 	redirectKeys := make([]string, 0, len(ids.Redirects))

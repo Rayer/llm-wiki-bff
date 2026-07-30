@@ -139,11 +139,17 @@ func decodeSyntoIdentityArticles(data []byte) ([]syntoIdentityArticle, error) {
 			}
 		}
 		if entity, ok := object["entity_id"]; ok {
-			if bytes.Equal(bytes.TrimSpace(entity), []byte("null")) {
-				continue
-			}
-			if !jsonContainer(entity, '"') || json.Unmarshal(entity, &article.EntityID) != nil || article.EntityID == "" {
+			var entityID *string
+			if err := json.Unmarshal(entity, &entityID); err != nil {
 				return nil, errors.New("invalid Synto article entity_id")
+			}
+			if entityID == nil {
+				article.EntityID = ""
+			} else {
+				article.EntityID = strings.TrimSpace(*entityID)
+				if article.EntityID == "" || !annotation.ValidSourceID(article.EntityID) {
+					return nil, errors.New("invalid Synto article entity_id")
+				}
 			}
 		}
 		out = append(out, article)

@@ -2892,7 +2892,7 @@ func TestSyntoWorkerDirectEntityPathExcludesEntitylessPageWithoutChangingBytes(t
 		mustWriteFile(t, filepath.Join(work, "cache", "concepts.jsonl"), []byte(""))
 		mustWriteFile(t, filepath.Join(work, "cache", "raw_status.json"), []byte("{}"))
 		mustWriteFile(t, filepath.Join(work, "cache", "suggested_queries.json"), []byte("{}"))
-		mustWriteFile(t, filepath.Join(work, ".synto", "INDEX.json"), []byte(syntoIndexFixtureWithEntities([]string{"article:entity-alpha:alpha", "ordinary::ordinary"}, nil)))
+		mustWriteFile(t, filepath.Join(work, ".synto", "INDEX.json"), []byte(`{"schema_version":1,"pack":{"id":"fixture","name":"fixture","version":"0","language":["en"],"capabilities":["articles","concepts"]},"articles":[{"id":"article","entity_id":"entity-alpha","name":"alpha","path":"wiki/alpha.md","summary":null,"tags":[],"aliases":[],"confidence":"high"},{"id":"ordinary","entity_id":null,"name":"ordinary","path":"wiki/ordinary.md","summary":null,"tags":[],"aliases":[],"confidence":"high"}],"terms":[],"papers":[],"sources":[],"source_concepts":[],"synthesis":[],"stats":{"article_count":2,"draft_count":0,"concept_count":2,"alias_count":0,"knowledge_item_count":0,"source_count":0,"source_segment_count":0,"failed_note_count":0,"failed_concept_count":0}}`))
 		writeValidSQLiteState(t, filepath.Join(work, ".synto", "state.db"))
 		return nil
 	}

@@ -1663,12 +1663,13 @@ func decodeSyntoArticles(dec *json.Decoder) ([]syntoIndexEntry, error) {
 		}
 		var article syntoIndexEntry
 		allowed := map[string]bool{"id": true, "entity_id": true, "name": true, "path": true, "summary": true, "tags": true, "aliases": true, "confidence": true}
+		var entityID *string
 		seen, err := decodeSyntoObject(dec, allowed, func(key string, dec *json.Decoder) error {
 			switch key {
 			case "id":
 				return decodeStringInto(dec, &article.ID, 1024)
 			case "entity_id":
-				return decodeStringInto(dec, &article.EntityID, 1024)
+				return decodeNullableStringInto(dec, &entityID, 1024)
 			case "name":
 				return decodeStringInto(dec, &article.Name, 4096)
 			case "path":
@@ -1685,6 +1686,12 @@ func decodeSyntoArticles(dec *json.Decoder) ([]syntoIndexEntry, error) {
 		})
 		if err != nil {
 			return nil, err
+		}
+		if entityID != nil {
+			if strings.TrimSpace(*entityID) == "" || !annotation.ValidSourceID(*entityID) {
+				return nil, &syntoIndexDecodeError{reason: syntoIndexDecodeReasonArticleIdentity, cause: errors.New("invalid Synto article identity")}
+			}
+			article.EntityID = *entityID
 		}
 		for _, key := range []string{"id", "name", "path", "summary", "tags", "aliases", "confidence"} {
 			if !seen[key] {
