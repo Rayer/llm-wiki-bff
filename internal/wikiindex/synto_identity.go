@@ -82,25 +82,27 @@ func DecodeSyntoIdentityPlan(data []byte) (SyntoIdentityPlan, error) {
 		}
 		seenSlugs[key] = article.Path
 		canonicalPath := "wiki/" + slug + ".md"
+		if article.EntityID != "" {
+			if !ValidSyntoEntityID(article.EntityID) {
+				return SyntoIdentityPlan{}, fmt.Errorf("unsafe Synto article entity_id %q", article.EntityID)
+			}
+			if previous, ok := seenEntities[article.EntityID]; ok {
+				return SyntoIdentityPlan{}, fmt.Errorf("Synto entity_id %q maps to multiple articles %q and %q", article.EntityID, previous, article.Path)
+			}
+			seenEntities[article.EntityID] = canonicalPath
+		}
 		if IsSyntoRootPage(canonicalPath) {
 			continue
 		}
 		if article.EntityID == "" {
 			continue
 		}
-		if !ValidSyntoEntityID(article.EntityID) {
-			return SyntoIdentityPlan{}, fmt.Errorf("unsafe Synto article entity_id %q", article.EntityID)
-		}
 		if owners := names[article.Name]; len(owners) > 0 {
 			if len(owners) != 1 || !owners[article.EntityID] {
 				return SyntoIdentityPlan{}, fmt.Errorf("Synto article/source entity disagreement for %q", slug)
 			}
 		}
-		if previous, ok := seenEntities[article.EntityID]; ok {
-			return SyntoIdentityPlan{}, fmt.Errorf("Synto entity_id %q maps to multiple articles %q and %q", article.EntityID, previous, article.Path)
-		}
 		path := canonicalPath
-		seenEntities[article.EntityID] = path
 		plan.ByPath[path] = article.EntityID
 	}
 	return plan, nil

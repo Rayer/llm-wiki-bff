@@ -150,6 +150,59 @@ func TestGenerationRebuildRejectsPostPreflightMutationBeforeCAS(t *testing.T) {
 	}
 }
 
+func TestGenerationRebuildRejectsLstatOpenSwapBeforeCAS(t *testing.T) {
+	client, backend := newMemoryClient()
+	files := generationRebuildTestFiles()
+	seedManifest(t, backend, "old-generation", files)
+	oldCurrent, err := backend.Read(context.Background(), projectObject(generation.ManifestPath), 0, generation.MaxManifestBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	previousPreflightHook := generationRebuildAfterPreflight
+	previousLstatHook := generationRebuildAfterFileLstat
+	defer func() {
+		generationRebuildAfterPreflight = previousPreflightHook
+		generationRebuildAfterFileLstat = previousLstatHook
+	}()
+	armed := false
+	generationRebuildAfterPreflight = func(string) { armed = true }
+	generationRebuildAfterFileLstat = func(filePath string) {
+		if !armed || !strings.HasSuffix(filepath.ToSlash(filePath), "cache/id_map.json") {
+			return
+		}
+		armed = false
+		outside := filepath.Join(t.TempDir(), "replacement.json")
+		original, readErr := os.ReadFile(filePath)
+		if readErr != nil {
+			t.Fatalf("read staged file: %v", readErr)
+		}
+		if writeErr := os.WriteFile(outside, original, 0o600); writeErr != nil {
+			t.Fatalf("write replacement: %v", writeErr)
+		}
+		if removeErr := os.Remove(filePath); removeErr != nil {
+			t.Fatalf("remove staged file: %v", removeErr)
+		}
+		if linkErr := os.Symlink(outside, filePath); linkErr != nil {
+			t.Fatalf("swap staged file: %v", linkErr)
+		}
+	}
+
+	_, err = client.RebuildIndexGeneration(context.Background(), func(_ context.Context, _ string) (store.GenerationRebuildPlan, error) {
+		return store.GenerationRebuildPlan{}, nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "manifest_stage") {
+		t.Fatalf("Lstat/Open swap error = %v, want manifest_stage", err)
+	}
+	current, err := backend.Read(context.Background(), projectObject(generation.ManifestPath), 0, generation.MaxManifestBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(current.Data) != string(oldCurrent.Data) {
+		t.Fatal("Lstat/Open swap advanced or changed current manifest")
+	}
+}
+
 func TestGenerationWorkspacePathRejectsAmbiguousPaths(t *testing.T) {
 	root := t.TempDir()
 	for _, rel := range []string{".", "..", "../outside", "/absolute", "wiki/../outside.md", `wiki\\escape.md`} {

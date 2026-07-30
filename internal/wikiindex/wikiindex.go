@@ -553,7 +553,7 @@ func validateSyntoIdentityPlan(files []MarkdownFile, plan SyntoIdentityPlan) err
 		if !validSyntoArticlePath(path) || !ValidSyntoEntityID(entityID) || entityID != strings.TrimSpace(entityID) {
 			return fmt.Errorf("unsafe Synto identity mapping %q -> %q", path, entityID)
 		}
-		if _, exists := fileByPath[path]; !exists && plan.ActiveEntities[entityID] {
+		if _, exists := fileByPath[path]; !exists {
 			return fmt.Errorf("Synto identity path %q is absent from wiki", path)
 		}
 		if previous, exists := entityPaths[entityID]; exists {

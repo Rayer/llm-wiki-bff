@@ -665,7 +665,7 @@ func TestCloudSyntoLifecycleOutputIsPublishedForEveryFailurePhase(t *testing.T) 
 		{name: "run", fail: "run", wantOutput: []string{"MIGRATION_STDOUT", "MIGRATION_STDERR", "RUN_STDOUT", "RUN_STDERR"}},
 		{name: "pack export", fail: "pack", wantOutput: []string{"MIGRATION_STDOUT", "MIGRATION_STDERR", "RUN_STDOUT", "RUN_STDERR", "PACK_EXPORT_STDOUT", "PACK_EXPORT_STDERR"}},
 		{name: "postprocess", fail: "postprocess", wantOutput: []string{"MIGRATION_STDOUT", "MIGRATION_STDERR", "RUN_STDOUT", "RUN_STDERR", "PACK_EXPORT_STDOUT", "PACK_EXPORT_STDERR"}},
-		{name: "ambiguous manifest", ambiguous: true, wantOutput: []string{"MIGRATION_STDOUT", "MIGRATION_STDERR", "RUN_STDOUT", "RUN_STDERR", "PACK_EXPORT_STDOUT", "PACK_EXPORT_STDERR"}, wantErr: errCloudPipelinePublish},
+		{name: "ambiguous manifest", ambiguous: true, wantOutput: []string{"MIGRATION_STDOUT", "MIGRATION_STDERR", "RUN_STDOUT", "RUN_STDERR", "PACK_EXPORT_STDOUT", "PACK_EXPORT_STDERR"}, wantErr: errManifestCommitOutcomeUnknown},
 	}
 
 	for _, tc := range tests {
@@ -718,6 +718,7 @@ func TestCloudSyntoLifecycleOutputIsPublishedForEveryFailurePhase(t *testing.T) 
 					if tc.fail == "pack" {
 						return errors.New("pack export failed")
 					}
+					mustWriteFile(t, filepath.Join(vault, "wiki", "alpha.md"), []byte("---\nid: a3f7b2c01d9d\n---\nAlpha\n"))
 					mustWriteFile(t, filepath.Join(command[5], "index", "INDEX.json"), []byte(syntoIndexFixtureWithEntities([]string{"article:01JAZ5N7Y3K8M2Q4R6T9VWXAC8:alpha"}, nil)))
 					mustWriteFile(t, filepath.Join(command[5], "agent", "concepts.json"), []byte(`{"schema_version":1,"concepts":[]}`))
 					return nil

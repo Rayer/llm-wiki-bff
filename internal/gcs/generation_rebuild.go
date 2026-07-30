@@ -128,6 +128,7 @@ type adminGenerationFile struct {
 }
 
 var generationRebuildAfterPreflight = func(string) {}
+var generationRebuildAfterFileLstat = func(string) {}
 
 func generationFilesFromWorkspace(root string) ([]adminGenerationFile, error) {
 	var files []adminGenerationFile
@@ -239,11 +240,16 @@ func readGenerationWorkspaceFile(filePath string, expectedSize int64) ([]byte, s
 	if err != nil || !info.Mode().IsRegular() || info.Size() != expectedSize {
 		return nil, "", errors.New("generation output changed")
 	}
+	generationRebuildAfterFileLstat(filePath)
 	f, err := os.Open(filePath)
 	if err != nil {
 		return nil, "", err
 	}
 	defer f.Close()
+	openedInfo, err := f.Stat()
+	if err != nil || !openedInfo.Mode().IsRegular() || openedInfo.Size() != expectedSize || !os.SameFile(info, openedInfo) {
+		return nil, "", errors.New("generation output changed")
+	}
 	data, err := io.ReadAll(io.LimitReader(f, generation.MaxFileBytes+1))
 	if err != nil || int64(len(data)) != expectedSize || int64(len(data)) > generation.MaxFileBytes {
 		return nil, "", errors.New("generation output changed")

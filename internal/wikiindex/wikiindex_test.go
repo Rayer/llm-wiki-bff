@@ -358,6 +358,30 @@ func TestDecodeSyntoIdentityPlanExcludedReservedRoots(t *testing.T) {
 	}
 }
 
+func TestDecodeSyntoIdentityPlanReservedRootsParticipateInEntityUniqueness(t *testing.T) {
+	_, err := DecodeSyntoIdentityPlan(syntoIdentityFixtureFromArticles([]string{
+		`{"id":"index","entity_id":"` + testEntityULID + `","name":"Index","path":"wiki/index.md","summary":null,"tags":[],"aliases":[],"confidence":"high"}`,
+		`{"id":"alpha","entity_id":"` + testEntityULID + `","name":"Alpha","path":"wiki/alpha.md","summary":null,"tags":[],"aliases":[],"confidence":"high"}`,
+	}))
+	if err == nil {
+		t.Fatal("reserved root duplicate entity_id unexpectedly accepted")
+	}
+}
+
+func TestRebuildWithSyntoIdentityRejectsMissingEntityBoundPageBeforeWrites(t *testing.T) {
+	store := &fakeStore{
+		files: map[string][]MarkdownFile{"wiki/": {}, "wiki/sources/": {}},
+		reads: map[string][]byte{},
+	}
+	_, err := RebuildWithSyntoIdentity(context.Background(), store, SyntoIdentityPlan{
+		ByPath:         map[string]string{"wiki/missing.md": testEntityULID},
+		ActiveEntities: map[string]bool{},
+	})
+	if err == nil || len(store.writes) != 0 {
+		t.Fatalf("missing entity-bound page result err=%v writes=%#v, want error and zero writes", err, store.writes)
+	}
+}
+
 func syntoIdentityReleasedFixture(entityJSON string) []byte {
 	entity := ""
 	if entityJSON != "" {
