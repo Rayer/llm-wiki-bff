@@ -10,6 +10,8 @@ import (
 func buildSystemPrompt(mode string) string {
 	base := "CRITICAL: If the user asks about a specific location (city, district, area), ONLY include results relevant to that location. Ignore results from other locations even if they match on topic keywords." +
 		"\n\nCITATION FORMAT RULES (mandatory):" +
+		"\n- Each wiki block includes a bounded internal reference such as [CITATION_REF_0]. Use that exact reference in brackets when citing the block; the server will replace it with the canonical title." +
+		"\n- Never invent, alter, or reuse a citation reference for a different wiki block" +
 		"\n- EVERY factual claim from wiki content MUST have a bracketed citation: [Exact Source Name]" +
 		"\n- Use the EXACT full title from the wiki content inside brackets" +
 		"\n- Never use **bold** instead of brackets" +
@@ -24,6 +26,8 @@ func buildSystemPrompt(mode string) string {
 			"\n- NEVER say 'I cannot find this in the wiki' or apologize for missing information. Just answer the question." +
 			"\n- When mixing wiki and general knowledge, make it seamless — don't call out which is which in the text." +
 			"\n\nCITATION FORMAT RULES (mandatory):" +
+			"\n- Each wiki block includes a bounded internal reference such as [CITATION_REF_0]. Use that exact reference in brackets when citing the block; the server will replace it with the canonical title." +
+			"\n- Never invent, alter, or reuse a citation reference for a different wiki block" +
 			"\n- EVERY factual claim from wiki content MUST have a bracketed citation: [Exact Source Name]" +
 			"\n- Use the EXACT full title from the wiki content inside brackets" +
 			"\n- Never use **bold** instead of brackets" +

@@ -389,8 +389,8 @@ func (h *Handler) Query(c *gin.Context) {
 			userPrompt := buildUserPrompt(query, contexts)
 			if answer, err := h.llm.Chat(c.Request.Context(), systemPrompt, userPrompt); err == nil {
 				answer = ensureBrackets(answer, results)
+				answer, citations, filtered := search.ResolveCitations(answer, results)
 				resp.AISynth = answer
-				citations, filtered := search.ParseCitations(answer, results)
 				resp.Citations = citations
 				resp.Results = filtered
 			} else {
@@ -404,7 +404,7 @@ func (h *Handler) Query(c *gin.Context) {
 
 func cachedContexts(ctx context.Context, conceptCache *conceptcache.Cache, reader conceptcache.Reader, results []search.Result) []string {
 	contexts := make([]string, 0, len(results))
-	for _, result := range results {
+	for rank, result := range results {
 		entry, ok := conceptCache.Entry(reader, result.Slug)
 		if !ok {
 			if _, err := conceptCache.Build(ctx, reader); err == nil {
@@ -419,8 +419,9 @@ func cachedContexts(ctx context.Context, conceptCache *conceptcache.Cache, reade
 			sourceContext = "Sources: [" + strings.Join(entry.Sources, ", ") + "]"
 		}
 		contexts = append(contexts, fmt.Sprintf(
-			"[%s] %s\n%s\n\n%s",
+			"[%s] %s %s\n%s\n\n%s",
 			entry.Title,
+			search.CitationReference(rank),
 			entry.Slug,
 			sourceContext,
 			entry.Body,

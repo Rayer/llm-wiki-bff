@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 
 	store "github.com/rayer/llm-wiki-bff/internal/storage"
@@ -419,58 +420,100 @@ func entryTitle(slug string, entry indexedPage) string {
 	return slug
 }
 
-// ParseCitations extracts [Name] citations from ai_synth and matches them to results.
-func ParseCitations(aiSynth string, results []Result) ([]Citation, []Result) {
+// CitationReference returns the deterministic reference used in model context.
+func CitationReference(rank int) string {
+	return "[CITATION_REF_" + strconv.Itoa(rank) + "]"
+}
+
+// ResolveCitations validates citations against the bounded ranked result set,
+// normalizes valid references to canonical titles, and preserves ranked results
+// when no citation validates.
+func ResolveCitations(aiSynth string, results []Result) (string, []Citation, []Result) {
 	if aiSynth == "" {
-		return nil, results
+		return aiSynth, nil, results
 	}
 
-	// Build lookup by title
-	byTitle := make(map[string]Result)
+	// Exact display titles remain compatible, but duplicate titles are ambiguous
+	// and therefore cannot identify a result.
+	byTitle := make(map[string][]Result)
 	for _, r := range results {
-		byTitle[strings.ToLower(r.Title)] = r
+		key := strings.ToLower(r.Title)
+		byTitle[key] = append(byTitle[key], r)
 	}
 
 	var citations []Citation
 	cited := make(map[string]bool)
+	var normalized strings.Builder
 	remaining := aiSynth
 
 	for {
 		start := strings.Index(remaining, "[")
 		if start < 0 {
+			normalized.WriteString(remaining)
 			break
 		}
 		end := strings.Index(remaining[start:], "]")
 		if end < 0 {
+			normalized.WriteString(remaining)
 			break
 		}
+		normalized.WriteString(remaining[:start])
 		text := remaining[start+1 : start+end]
 		remaining = remaining[start+end+1:]
 
 		// Skip URLs and other bracket content
 		if strings.Contains(text, "http") || strings.Contains(text, "wiki") || strings.Contains(text, "general") {
+			normalized.WriteString("[")
+			normalized.WriteString(text)
+			normalized.WriteString("]")
 			continue
 		}
 
-		if r, ok := byTitle[strings.ToLower(text)]; ok {
+		var matched *Result
+		if strings.HasPrefix(text, "CITATION_REF_") {
+			if rank, err := strconv.Atoi(strings.TrimPrefix(text, "CITATION_REF_")); err == nil && rank >= 0 && rank < len(results) {
+				matched = &results[rank]
+			}
+		} else if matches := byTitle[strings.ToLower(text)]; len(matches) == 1 {
+			matched = &matches[0]
+		}
+
+		if matched != nil {
+			r := *matched
 			collection := "concepts"
 			if r.Type == "source" {
 				collection = "sources"
 			}
 			path := "/" + collection + "/" + url.PathEscape(r.Slug)
-			citations = append(citations, Citation{Text: text, Slug: r.Slug, Type: r.Type, Path: path})
-			cited[r.Slug] = true
+			citations = append(citations, Citation{Text: r.Title, Slug: r.Slug, Type: r.Type, Path: path})
+			normalized.WriteString("[")
+			normalized.WriteString(r.Title)
+			normalized.WriteString("]")
+			cited[r.Type+"\x00"+r.Slug] = true
+		} else {
+			normalized.WriteString("[")
+			normalized.WriteString(text)
+			normalized.WriteString("]")
 		}
 	}
 
-	// Filter results to only cited
+	if len(citations) == 0 {
+		return normalized.String(), nil, results
+	}
+
 	var filtered []Result
 	for _, r := range results {
-		if cited[r.Slug] {
+		if cited[r.Type+"\x00"+r.Slug] {
 			filtered = append(filtered, r)
 		}
 	}
 
+	return normalized.String(), citations, filtered
+}
+
+// ParseCitations extracts [Name] citations from ai_synth and matches them to results.
+func ParseCitations(aiSynth string, results []Result) ([]Citation, []Result) {
+	_, citations, filtered := ResolveCitations(aiSynth, results)
 	return citations, filtered
 }
 
