@@ -13,13 +13,14 @@ import (
 
 const secureOpenFlags = unix.O_RDONLY | unix.O_CLOEXEC | unix.O_NOFOLLOW
 
-func openScopedRegularFile(root, relPath string) (*os.File, error) {
+func openScopedRegularFile(root, userID, projectID, relPath string) (*os.File, error) {
 	rootFD, err := unix.Open(root, secureOpenFlags|unix.O_DIRECTORY, 0)
 	if err != nil {
 		return nil, &os.PathError{Op: "open", Path: root, Err: err}
 	}
 	currentFD := rootFD
-	components := strings.Split(filepath.ToSlash(relPath), "/")
+	components := []string{"users", userID, "projects", projectID}
+	components = append(components, strings.Split(filepath.ToSlash(relPath), "/")...)
 	for i, component := range components {
 		flags := secureOpenFlags
 		if i < len(components)-1 {

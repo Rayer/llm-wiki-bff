@@ -293,15 +293,14 @@ func (c *Client) ReadFileLimited(ctx context.Context, relPath string, limit int6
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	root, err := c.projectRoot()
-	if err != nil {
-		return nil, err
+	if !safeSegment(c.userID) || !safeSegment(c.projectID) {
+		return nil, fmt.Errorf("localfs scope is incomplete")
 	}
 	cleanRel, err := cleanRelativePath(relPath)
 	if err != nil {
 		return nil, err
 	}
-	file, err := openScopedRegularFile(root, cleanRel)
+	file, err := openScopedRegularFile(c.root, c.userID, c.projectID, cleanRel)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, storage.ErrObjectNotExist
@@ -324,15 +323,14 @@ func (c *Client) StatFile(ctx context.Context, relPath string) (int64, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
-	root, err := c.projectRoot()
-	if err != nil {
-		return 0, err
+	if !safeSegment(c.userID) || !safeSegment(c.projectID) {
+		return 0, fmt.Errorf("localfs scope is incomplete")
 	}
 	cleanRel, err := cleanRelativePath(relPath)
 	if err != nil {
 		return 0, err
 	}
-	file, err := openScopedRegularFile(root, cleanRel)
+	file, err := openScopedRegularFile(c.root, c.userID, c.projectID, cleanRel)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return 0, storage.ErrObjectNotExist
