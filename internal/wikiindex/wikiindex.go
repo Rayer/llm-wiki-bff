@@ -356,15 +356,6 @@ func RewriteSyntoConceptPage(data []byte, entityID string) ([]byte, error) {
 	if end < 0 {
 		return nil, errors.New("concept frontmatter is unterminated")
 	}
-	for i := end + 1; i < len(lines); i++ {
-		line := strings.TrimSpace(strings.TrimSuffix(strings.TrimSuffix(string(lines[i]), "\n"), "\r"))
-		if line == "" {
-			continue
-		}
-		if line == "---" {
-			return nil, errors.New("concept frontmatter contains multiple YAML documents")
-		}
-	}
 	frontmatterBytes := bytes.Join(lines[1:end], nil)
 	root, err := validateSyntoFrontmatterYAML(frontmatterBytes)
 	if err != nil {

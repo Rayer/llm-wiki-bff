@@ -124,7 +124,7 @@ func TestRewriteSyntoConceptPageValidatesCompleteYAMLBeforeMutation(t *testing.T
 		{name: "duplicate id", data: []byte("---\nid: a3f7b2c01d9d\nid: b7e2c9a4d113\n---\nBody")},
 		{name: "complex key", data: []byte("---\n? [title, name]\n: Alpha\n---\nBody")},
 		{name: "non-string id", data: []byte("---\nid: 7\n---\nBody")},
-		{name: "multi-document", data: []byte("---\ntitle: Alpha\n---\ntitle: Beta\n---\nBody")},
+		{name: "multi-document", data: []byte("---\ntitle: Alpha\n--- # second document\ntitle: Beta\n---\nBody")},
 		{name: "unterminated", data: []byte("---\ntitle: Alpha\nBody")},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -139,6 +139,15 @@ func TestRewriteSyntoConceptPageValidatesCompleteYAMLBeforeMutation(t *testing.T
 	}
 	if _, err := RewriteSyntoConceptPage(valid, testEntityULID); err != nil {
 		t.Fatalf("valid YAML rejected: %v", err)
+	}
+	bodyWithRule := []byte("---\ntitle: Alpha\n---\nParagraph\n\n---\n\nNext section\n")
+	rewritten, err := RewriteSyntoConceptPage(bodyWithRule, testEntityULID)
+	if err != nil {
+		t.Fatalf("Markdown body horizontal rule rejected: %v", err)
+	}
+	wantBody := []byte("---\ntitle: Alpha\nid: " + testEntityULID + "\n---\nParagraph\n\n---\n\nNext section\n")
+	if !bytes.Equal(rewritten, wantBody) {
+		t.Fatalf("Markdown body changed: got %q want %q", rewritten, wantBody)
 	}
 }
 
