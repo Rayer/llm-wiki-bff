@@ -510,7 +510,7 @@ func TestRunWorkerBatchLegacyFullTransactionPreservesIdentityAndSourceLifecycle(
 	mustWriteFile(t, filepath.Join(vault, "cache", "concepts.jsonl"), []byte(`{"slug":"alpha","frontmatter":{"id":"a3f7b2c01d9d","sources":["stable-source"]}}`+"\n"))
 	rawBefore := []byte(rawBody)
 
-	postRunIndex := `{"schema_version":1,"pack":{"id":"fixture","name":"fixture","version":"0","language":["en"],"capabilities":["articles","concepts"]},"articles":[{"id":"generated-alpha","name":"Drifted Alpha","path":"articles/alpha.md","summary":null,"tags":[],"aliases":[],"confidence":"high"}],"terms":[],"papers":[],"sources":[],"source_concepts":[{"source_path":"raw/source.md","content_hash":"` + contentHash + `","concepts":[{"name":"Unrelated source label","entity_id":"01JAZ5N7Y3K8M2Q4R6T9VWXABC"}]}],"synthesis":[],"stats":{"article_count":1,"draft_count":0,"concept_count":1,"alias_count":0,"knowledge_item_count":0,"source_count":1,"source_segment_count":0,"failed_note_count":0,"failed_concept_count":0}}`
+	postRunIndex := `{"schema_version":1,"pack":{"id":"fixture","name":"fixture","version":"0","language":["en"],"capabilities":["articles","concepts"]},"articles":[{"id":"generated-alpha","entity_id":"01JAZ5N7Y3K8M2Q4R6T9VWXABC","name":"Drifted Alpha","path":"articles/alpha.md","summary":null,"tags":[],"aliases":[],"confidence":"high"}],"terms":[],"papers":[],"sources":[],"source_concepts":[{"source_path":"raw/source.md","content_hash":"` + contentHash + `","concepts":[{"name":"Unrelated source label","entity_id":"01JAZ5N7Y3K8M2Q4R6T9VWXABC"}]}],"synthesis":[],"stats":{"article_count":1,"draft_count":0,"concept_count":1,"alias_count":0,"knowledge_item_count":0,"source_count":1,"source_segment_count":0,"failed_note_count":0,"failed_concept_count":0}}`
 	conceptsExport := `{"schema_version":1,"concepts":[{"name":"Drifted Alpha","entity_id":"01JAZ5N7Y3K8M2Q4R6T9VWXABC","aliases":[],"canonical_article_id":"generated-alpha","article_path":"articles/alpha.md","related_names":[]}]}`
 	var commands []string
 	execOLW = func(_ context.Context, work string, command []string, _ []string, _, _ io.Writer) error {
@@ -1142,8 +1142,104 @@ func TestSyntoOfflineExportJoinsAgentConceptIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(truth.Articles) != 1 || truth.Articles[0].EntityID != "01JAZ5N7Y3K8M2Q4R6T9VWXABC" {
-		t.Fatalf("joined INDEX articles = %#v, want authoritative entity", truth.Articles)
+	if len(truth.Articles) != 1 || truth.Articles[0].EntityID != "" {
+		t.Fatalf("joined INDEX articles = %#v, want omitted entity to remain ordinary", truth.Articles)
+	}
+}
+
+func exportSyntoIndexFixture(t *testing.T, index, concepts string) []byte {
+	t.Helper()
+	old := execOLW
+	t.Cleanup(func() { execOLW = old })
+	vault := t.TempDir()
+	execOLW = func(_ context.Context, _ string, command []string, _ []string, _, _ io.Writer) error {
+		if len(command) != 6 || command[0] != "pack" || command[1] != "export" || command[2] != "--target" || command[3] != "agents" || command[4] != "--out" {
+			return fmt.Errorf("unexpected command %v", command)
+		}
+		mustWriteFile(t, filepath.Join(command[5], "index", "INDEX.json"), []byte(index))
+		mustWriteFile(t, filepath.Join(command[5], "agent", "concepts.json"), []byte(concepts))
+		return nil
+	}
+	joined, err := exportSyntoIndex(context.Background(), vault, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return joined
+}
+
+func TestSyntoOfflineExportPreservesNullArticleEntity(t *testing.T) {
+	const entity = "01JAZ5N7Y3K8M2Q4R6T9VWXABC"
+	index := strings.Replace(syntoIndexFixture("article", entity, "alpha", false), `"entity_id":"`+entity+`",`, `"entity_id":null,`, 1)
+	concepts := `{"schema_version":1,"concepts":[{"name":"Alpha","entity_id":"` + entity + `","aliases":[],"canonical_article_id":"article","article_path":"articles/alpha.md","related_names":[]}]}`
+	joined := exportSyntoIndexFixture(t, index, concepts)
+	truth, err := decodeSyntoIndex(joined)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if truth.Articles[0].EntityID != "" {
+		t.Fatalf("null article entity was populated: %#v", truth.Articles[0])
+	}
+	plan, err := syntoIdentityPlanFromIndex(truth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.ByPath) != 0 {
+		t.Fatalf("null article entered worker Concept plan: %#v", plan.ByPath)
+	}
+}
+
+func TestSyntoOfflineExportPreservesOmittedArticleEntity(t *testing.T) {
+	const entity = "01JAZ5N7Y3K8M2Q4R6T9VWXABC"
+	index := strings.Replace(syntoIndexFixture("article", entity, "alpha", false), `"entity_id":"`+entity+`",`, "", 1)
+	concepts := `{"schema_version":1,"concepts":[{"name":"Alpha","entity_id":"` + entity + `","aliases":[],"canonical_article_id":"article","article_path":"articles/alpha.md","related_names":[]}]}`
+	joined := exportSyntoIndexFixture(t, index, concepts)
+	truth, err := decodeSyntoIndex(joined)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if truth.Articles[0].EntityID != "" {
+		t.Fatalf("omitted article entity was populated: %#v", truth.Articles[0])
+	}
+	plan, err := syntoIdentityPlanFromIndex(truth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.ByPath) != 0 {
+		t.Fatalf("omitted article entered worker Concept plan: %#v", plan.ByPath)
+	}
+}
+
+func TestSyntoIdentityPlanValidatesDuplicateMetadataForEntitylessArticles(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		articles []syntoIndexEntry
+	}{
+		{name: "duplicate article ID", articles: []syntoIndexEntry{{ID: "same", Path: "wiki/alpha.md"}, {ID: "same", Path: "wiki/beta.md"}}},
+		{name: "duplicate article slug", articles: []syntoIndexEntry{{ID: "alpha-a", Path: "wiki/alpha.md"}, {ID: "alpha-b", Path: "wiki/ALPHA.md"}}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := syntoIdentityPlanFromIndex(syntoIndexTruthForEntityMapping(test.articles, nil, nil)); err == nil {
+				t.Fatal("entityless duplicate article metadata was accepted")
+			}
+		})
+	}
+}
+
+func TestSyntoAgentConceptDoesNotVetoExplicitArticleEntity(t *testing.T) {
+	const articleEntity = "01JAZ5N7Y3K8M2Q4R6T9VWXABC"
+	const agentEntity = "01JAZ5N7Y3K8M2Q4R6T9VWXABD"
+	index := syntoIndexFixture("article", articleEntity, "alpha", false)
+	concepts := `{"schema_version":1,"concepts":[{"name":"Alpha","entity_id":"` + agentEntity + `","aliases":[],"canonical_article_id":"article","article_path":"articles/alpha.md","related_names":[]}]}`
+	joined, err := enrichSyntoIndexWithAgentConcepts([]byte(index), []byte(concepts))
+	if err != nil {
+		t.Fatalf("agent disagreement vetoed explicit article entity: %v", err)
+	}
+	truth, err := decodeSyntoIndex(joined)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if truth.Articles[0].EntityID != articleEntity {
+		t.Fatalf("explicit article entity changed to %q", truth.Articles[0].EntityID)
 	}
 }
 
@@ -1183,8 +1279,9 @@ func TestSyntoAgentConceptJoinFailsClosed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := mapSyntoEntityIDsFromIndexTruth(truth, map[string]string{"article-a": "alpha"}); err == nil || !strings.Contains(err.Error(), "no source_concepts entity_id") {
-		t.Fatalf("ordinary article without proof error=%v, want fail-closed missing-source proof", err)
+	got, err := mapSyntoEntityIDsFromIndexTruth(truth, map[string]string{"article-a": "alpha"})
+	if err != nil || len(got) != 0 {
+		t.Fatalf("ordinary article identity result=%#v error=%v, want no Concept mapping", got, err)
 	}
 }
 
@@ -1202,9 +1299,9 @@ func TestSyntoOmittedArticleDoesNotUseExactSourceNameAsIdentity(t *testing.T) {
 	if truth.Articles[0].EntityID != "" {
 		t.Fatalf("enrichment assigned omitted article entity=%q", truth.Articles[0].EntityID)
 	}
-	var reconciliationErr *conceptReconciliationFailure
-	if got, err := mapSyntoEntityIDsFromIndexTruth(truth, map[string]string{"article-a": "alpha"}); err == nil || got != nil || !errors.As(err, &reconciliationErr) || reconciliationErr.detail != conceptDetailEntityMappingArticleSourceMissing {
-		t.Fatalf("exact source-name identity result=%#v error=%v, want typed article-source missing failure", got, err)
+	got, err := mapSyntoEntityIDsFromIndexTruth(truth, map[string]string{"article-a": "alpha"})
+	if err != nil || len(got) != 0 {
+		t.Fatalf("exact source-name identity result=%#v error=%v, want no Concept mapping", got, err)
 	}
 }
 
@@ -1223,11 +1320,8 @@ func TestSyntoDirectAgentProofAcceptsTitleDriftWithConsistentSourceEdge(t *testi
 		t.Fatal(err)
 	}
 	got, err := mapSyntoEntityIDsFromIndexTruth(truth, map[string]string{"article-a": "alpha"})
-	if err != nil {
-		t.Fatalf("direct agent proof with title drift was rejected: %v", err)
-	}
-	if got["article-a"] != "01JAZ5N7Y3K8M2Q4R6T9VWXAC0" {
-		t.Fatalf("entity mapping=%#v, want article-a -> 01JAZ5N7Y3K8M2Q4R6T9VWXAC0", got)
+	if err != nil || len(got) != 0 {
+		t.Fatalf("agent proof populated ordinary article identity: map=%#v error=%v", got, err)
 	}
 }
 
@@ -1432,15 +1526,8 @@ func TestSyntoPackExportOmittedArticleEntityUsesPriorStablePathIdentity(t *testi
 	mustWriteFile(t, filepath.Join(workspace, ".synto", "INDEX.json"), []byte(index))
 	mustWriteFile(t, filepath.Join(workspace, "cache", "id_map.json"), []byte(`{"concept":{"generated-alpha":"alpha"},"source":{"stable-source":"source"},"source_meta":{"stable-source":{"slug":"source","source_file":"raw/source.md"}},"redirects":{}}`))
 
-	if err := reconcileWorkspaceConcepts(workspace, prior, []sourceSnapshot{{SourceID: "stable-source", RawPath: "raw/source.md", RawBytes: raw, SyntoContentHash: contentHash}}); err != nil {
-		t.Fatalf("production-shaped pack export was not reconciled from prior stable identity: %v", err)
-	}
-	ids := mustSnapshotIDMap(t, workspace)
-	if ids.Concept["stable-alpha"] != "alpha" || ids.ConceptEntityID["stable-alpha"] != "01JAZ5N7Y3K8M2Q4R6T9VWXABC" {
-		t.Fatalf("reconciled identity map = %#v, want stable-alpha -> alpha/01JAZ5N7Y3K8M2Q4R6T9VWXABC", ids)
-	}
-	if _, exists := ids.Concept["generated-alpha"]; exists {
-		t.Fatalf("transient generated identity remained: %#v", ids.Concept)
+	if err := reconcileWorkspaceConcepts(workspace, prior, []sourceSnapshot{{SourceID: "stable-source", RawPath: "raw/source.md", RawBytes: raw, SyntoContentHash: contentHash}}); err == nil {
+		t.Fatal("omitted article was accepted from prior/source evidence")
 	}
 }
 
@@ -1453,11 +1540,8 @@ func TestSyntoPackExportOmittedArticleEntityUsesPriorStableIdentityAcrossMultipl
 	}
 
 	got, err := mapSyntoEntityIDsFromIndexTruth(index, map[string]string{"generated-alpha": "alpha"}, prior)
-	if err != nil {
-		t.Fatalf("multiple prior-owned source groups were rejected: %v", err)
-	}
-	if got["generated-alpha"] != "01JAZ5N7Y3K8M2Q4R6T9VWXABE" {
-		t.Fatalf("target entity=%q, want 01JAZ5N7Y3K8M2Q4R6T9VWXABE", got["generated-alpha"])
+	if err != nil || len(got) != 0 {
+		t.Fatalf("prior/source evidence populated omitted article: map=%#v error=%v", got, err)
 	}
 }
 
@@ -1480,11 +1564,13 @@ func TestSyntoPackExportOmittedArticleDoesNotReusePriorPathAcrossNestedSource(t 
 	// 01JAZ5N7Y3K8M2Q4R6T9VWXABE. Reusing alpha's prior path would transfer identity silently.
 	mustWriteFile(t, filepath.Join(workspace, ".synto", "INDEX.json"), []byte(index))
 	mustWriteFile(t, filepath.Join(workspace, "cache", "id_map.json"), []byte(`{"concept":{"generated-new":"alpha","generated-other":"other"},"concept_entity_id":{"generated-other":"01JAZ5N7Y3K8M2Q4R6T9VWXABF"},"source":{},"redirects":{}}`))
-	before := snapshotRelevantVaultBytes(t, workspace, "cache/id_map.json", "cache/concepts.jsonl", "wiki/alpha.md", "wiki/other.md", ".synto/INDEX.json")
-	if err := reconcileWorkspaceConcepts(workspace, prior, []sourceSnapshot{{RawPath: "raw/current.md", RawBytes: []byte("current source\n"), SyntoContentHash: contentHash}}); err == nil {
-		t.Fatal("omitted article reused prior path identity across an unrelated nested source")
+	if err := reconcileWorkspaceConcepts(workspace, prior, []sourceSnapshot{{RawPath: "raw/current.md", RawBytes: []byte("current source\n"), SyntoContentHash: contentHash}}); err != nil {
+		t.Fatalf("ordinary article reconciliation failed: %v", err)
 	}
-	assertVaultBytesUnchanged(t, workspace, before)
+	ids := mustSnapshotIDMap(t, workspace)
+	if _, exists := ids.Concept["stable-alpha"]; exists {
+		t.Fatalf("ordinary article reused prior identity: %#v", ids.Concept)
+	}
 }
 
 func TestSyntoPackExportSourcesIDAcceptsRawRelativePath(t *testing.T) {
@@ -1942,11 +2028,8 @@ func TestSyntoEntityMappingSkipsReservedRootPagesBeforeMandatoryMapping(t *testi
 		EntityID:    "01JAZ5N7Y3K8M2Q4R6T9VWXABC",
 		SourcePaths: []string{"raw/source.md"},
 	}})
-	if err != nil {
-		t.Fatalf("reserved roots blocked normal omitted-entity mapping: %v", err)
-	}
-	if got["generated-alpha"] != "01JAZ5N7Y3K8M2Q4R6T9VWXABC" {
-		t.Fatalf("normal article entity=%q, want 01JAZ5N7Y3K8M2Q4R6T9VWXABC", got["generated-alpha"])
+	if err == nil || len(got) != 0 {
+		t.Fatalf("normal entityless article was mapped: map=%#v error=%v", got, err)
 	}
 }
 
@@ -1967,11 +2050,8 @@ func TestSyntoEntityMappingReservedRootsPreservesAgentIdentityJoin(t *testing.T)
 		EntityID:    "01JAZ5N7Y3K8M2Q4R6T9VWXABC",
 		SourcePaths: []string{"raw/source.md"},
 	}})
-	if err != nil {
-		t.Fatalf("reserved roots blocked agent-joined normal article: %v", err)
-	}
-	if got["generated-alpha"] != "01JAZ5N7Y3K8M2Q4R6T9VWXABC" {
-		t.Fatalf("agent-joined normal article entity=%q, want 01JAZ5N7Y3K8M2Q4R6T9VWXABC", got["generated-alpha"])
+	if err != nil || len(got) != 0 {
+		t.Fatalf("agent-joined normal article was mapped: map=%#v error=%v", got, err)
 	}
 }
 
@@ -2001,13 +2081,13 @@ func TestSyntoEntityMappingReservedRootPathMatrixFailsClosed(t *testing.T) {
 		path string
 		want conceptReconcileDetailCode
 	}{
-		{name: "uppercase index", path: "wiki/Index.md", want: conceptDetailEntityMappingArticleSourceMissing},
-		{name: "uppercase log", path: "wiki/Log.md", want: conceptDetailEntityMappingArticleSourceMissing},
+		{name: "uppercase index", path: "wiki/Index.md"},
+		{name: "uppercase log", path: "wiki/Log.md"},
 		{name: "nested index", path: "wiki/nested/index.md", want: conceptDetailEntityMappingArticlePath},
 		{name: "nested log", path: "wiki/nested/log.md", want: conceptDetailEntityMappingArticlePath},
-		{name: "index lookalike", path: "wiki/index2.md", want: conceptDetailEntityMappingArticleSourceMissing},
-		{name: "log lookalike", path: "wiki/logbook.md", want: conceptDetailEntityMappingArticleSourceMissing},
-		{name: "articles index", path: "articles/index.md", want: conceptDetailEntityMappingArticleSourceMissing},
+		{name: "index lookalike", path: "wiki/index2.md"},
+		{name: "log lookalike", path: "wiki/logbook.md"},
+		{name: "articles index", path: "articles/index.md"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -2017,8 +2097,14 @@ func TestSyntoEntityMappingReservedRootPathMatrixFailsClosed(t *testing.T) {
 				nil,
 			)
 			_, err := mapSyntoEntityIDsFromIndexTruth(index, map[string]string{"not-a-root": "index"})
+			if tt.want == "" {
+				if err != nil {
+					t.Fatalf("ordinary path %q failed: %v", tt.path, err)
+				}
+				return
+			}
 			if err == nil {
-				t.Fatalf("path %q was skipped instead of failing closed", tt.path)
+				t.Fatalf("unsafe path %q was accepted", tt.path)
 			}
 			testEntityMappingErrorDetail(t, err, tt.want)
 		})
@@ -2094,13 +2180,13 @@ func TestReadSyntoEntityIDsReturnsReasonedDetailCodes(t *testing.T) {
 					{Name: "Alpha", EntityID: "01JAZ5N7Y3K8M2Q4R6T9VWXAC1"},
 				}, nil),
 			concepts: map[string]string{"article-a": "alpha"},
-			want:     conceptDetailEntityMappingArticleSourceAmbiguity,
+			want:     conceptDetailEntityMappingActiveEntityUnknown,
 		},
 		{
 			name:     "source concept missing",
 			index:    syntoIndexTruthForEntityMapping([]syntoIndexEntry{{ID: "article-a", Name: "Alpha", Path: "wiki/alpha.md"}}, []syntoSourceConcept{{Name: "Beta", EntityID: "01JAZ5N7Y3K8M2Q4R6T9VWXAC1"}}, nil),
 			concepts: map[string]string{"article-a": "alpha"},
-			want:     conceptDetailEntityMappingArticleSourceMissing,
+			want:     conceptDetailEntityMappingActiveEntityUnknown,
 		},
 		{
 			name:     "article path",
@@ -2251,22 +2337,16 @@ func TestSyntoOmittedArticleAmbiguityRequiresPriorOwnedSourceEvidence(t *testing
 
 	t.Run("one prior-owned match selects prior entity", func(t *testing.T) {
 		got, err := mapSyntoEntityIDsFromIndexTruth(newIndex(baseEdges), map[string]string{"generated-new": "alpha", "generated-other": "other"}, prior)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if got["generated-new"] != "01JAZ5N7Y3K8M2Q4R6T9VWXABE" {
-			t.Fatalf("target entity=%q, want 01JAZ5N7Y3K8M2Q4R6T9VWXABE", got["generated-new"])
+		if err == nil || got["generated-new"] != "" {
+			t.Fatalf("omitted article identity was inferred: map=%#v error=%v", got, err)
 		}
 	})
 
 	t.Run("duplicate prior-owned support selects prior entity", func(t *testing.T) {
 		edges := append(append([]syntoSourceConcept(nil), baseEdges...), syntoSourceConcept{Name: "Shared Name", EntityID: "01JAZ5N7Y3K8M2Q4R6T9VWXABE", SourcePath: "raw/alpha.md"})
 		got, err := mapSyntoEntityIDsFromIndexTruth(newIndex(edges), map[string]string{"generated-new": "alpha", "generated-other": "other"}, prior)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if got["generated-new"] != "01JAZ5N7Y3K8M2Q4R6T9VWXABE" {
-			t.Fatalf("target entity=%q, want 01JAZ5N7Y3K8M2Q4R6T9VWXABE", got["generated-new"])
+		if err == nil || got["generated-new"] != "" {
+			t.Fatalf("omitted article identity was inferred: map=%#v error=%v", got, err)
 		}
 	})
 
@@ -2284,7 +2364,7 @@ func TestSyntoOmittedArticleAmbiguityRequiresPriorOwnedSourceEvidence(t *testing
 			if _, err := mapSyntoEntityIDsFromIndexTruth(newIndex(tc.edges), map[string]string{"generated-new": "alpha", "generated-other": "other"}, prior); err == nil {
 				t.Fatal("omitted article was accepted without prior-owned source evidence")
 			} else {
-				testEntityMappingErrorDetail(t, err, conceptDetailEntityMappingArticleSourceAmbiguity)
+				testEntityMappingErrorDetail(t, err, conceptDetailEntityMappingActiveEntityUnknown)
 			}
 		})
 	}
@@ -2306,11 +2386,8 @@ func TestSyntoOmittedArticlePriorRecoveryIgnoresCurrentArticleTitle(t *testing.T
 	)
 
 	got, err := mapSyntoEntityIDsFromIndexTruth(index, map[string]string{"generated-alpha": "alpha", "generated-other": "other", "generated-third": "third"}, prior)
-	if err != nil {
-		t.Fatalf("prior-owned source edge should recover omitted entity despite changed title: %v", err)
-	}
-	if got["generated-alpha"] != "01JAZ5N7Y3K8M2Q4R6T9VWXABE" {
-		t.Fatalf("target entity=%q, want 01JAZ5N7Y3K8M2Q4R6T9VWXABE", got["generated-alpha"])
+	if err == nil || got["generated-alpha"] != "" {
+		t.Fatalf("prior/source evidence populated omitted article: map=%#v error=%v", got, err)
 	}
 }
 
@@ -2349,14 +2426,13 @@ func TestSyntoArticleEntityMustMatchCurrentTitleCandidates(t *testing.T) {
 		baseEdges, nil,
 	)
 	prior := []conceptSnapshot{{ConceptID: "stable-alpha", Slug: "alpha", EntityID: "01JAZ5N7Y3K8M2Q4R6T9VWXABE", SourcePaths: []string{"raw/alpha.md"}}}
-	if _, err := mapSyntoEntityIDsFromIndexTruth(omitted, map[string]string{
+	got, err = mapSyntoEntityIDsFromIndexTruth(omitted, map[string]string{
 		"generated-alpha": "alpha",
 		"generated-old":   "old",
 		"generated-other": "other",
-	}, prior); err == nil {
-		t.Fatal("omitted prior mapping was accepted without prior source/entity proof")
-	} else {
-		testEntityMappingErrorDetail(t, err, conceptDetailEntityMappingArticleSourceAmbiguity)
+	}, prior)
+	if err != nil || got["generated-alpha"] != "" {
+		t.Fatalf("omitted prior mapping populated identity: map=%#v error=%v", got, err)
 	}
 }
 
@@ -2372,21 +2448,21 @@ func TestSyntoOmittedArticleIdentityRejectsUnprovenSourceOwnership(t *testing.T)
 			index: syntoIndexTruthForEntityMapping(
 				[]syntoIndexEntry{{ID: "generated-alpha", Name: "Alpha", Path: "articles/alpha.md"}},
 				[]syntoSourceConcept{{Name: "Alpha", EntityID: "01JAZ5N7Y3K8M2Q4R6T9VWXABE", SourcePath: "raw/current.md"}}, nil),
-			want: conceptDetailEntityMappingConceptIDPathDisagreement,
+			want: conceptDetailEntityMappingActiveEntityUnknown,
 		},
 		{
 			name: "same path wrong entity",
 			index: syntoIndexTruthForEntityMapping(
 				[]syntoIndexEntry{{ID: "generated-alpha", Name: "Alpha", Path: "articles/alpha.md"}},
 				[]syntoSourceConcept{{Name: "Alpha", EntityID: "01JAZ5N7Y3K8M2Q4R6T9VWXABF", SourcePath: "raw/alpha.md"}}, nil),
-			want: conceptDetailEntityMappingConceptIDPathDisagreement,
+			want: conceptDetailEntityMappingActiveEntityUnknown,
 		},
 		{
 			name: "ordinary unknown article",
 			index: syntoIndexTruthForEntityMapping(
 				[]syntoIndexEntry{{ID: "generated-beta", Name: "Beta", Path: "articles/beta.md"}},
 				[]syntoSourceConcept{{Name: "Other", EntityID: "01JAZ5N7Y3K8M2Q4R6T9VWXABF", SourcePath: "raw/other.md"}}, nil),
-			want: conceptDetailEntityMappingArticleSourceMissing,
+			want: conceptDetailEntityMappingActiveEntityUnknown,
 		},
 		{
 			name: "direct entity disagreement",

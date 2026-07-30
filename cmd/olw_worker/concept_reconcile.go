@@ -811,13 +811,25 @@ func reconcileWorkspaceConcepts(workspace string, prior []conceptSnapshot, curre
 		if err != nil {
 			return wrapConceptReconciliationError(conceptDetailEntityMapping, err)
 		}
-		if err := validateSyntoDerivedArtifacts(workspace, generated, plan); err != nil {
+		expected, err := expectedSyntoConceptMap(workspace, plan)
+		if err != nil {
 			return wrapConceptReconciliationError(conceptDetailEntityMerge, err)
 		}
+		generated.Concept = expected
+		generated.ConceptEntityID = nil
 		if err := planSyntoDirectEntityIDRedirects(&generated, prior); err != nil {
 			return wrapConceptReconciliationError(conceptDetailIdentityReconciliation, err)
 		}
-		if err := validateSyntoDerivedArtifacts(workspace, generated, plan); err != nil {
+		directConcepts := make([]reconciledConcept, 0, len(generated.Concept))
+		for entityID, slug := range generated.Concept {
+			directConcepts = append(directConcepts, reconciledConcept{CurrentID: entityID, StableID: entityID, Slug: slug})
+		}
+		sort.Slice(directConcepts, func(i, j int) bool { return directConcepts[i].Slug < directConcepts[j].Slug })
+		cacheData, cachePresent, err := planConceptCacheIDs(workspace, directConcepts, nil, true)
+		if err != nil {
+			return wrapConceptReconciliationError(conceptDetailCacheRewrite, err)
+		}
+		if err := validateSyntoDerivedArtifacts(workspace, generated, plan, true); err != nil {
 			return wrapConceptReconciliationError(conceptDetailEntityMerge, err)
 		}
 		pageWrites, err := planSyntoEntityPageRewrites(workspace, plan)
@@ -836,19 +848,43 @@ func reconcileWorkspaceConcepts(workspace string, prior []conceptSnapshot, curre
 				return wrapConceptReconciliationError(conceptDetailArtifactWrite, err)
 			}
 		}
+		if cachePresent {
+			if err := writeFileAtomicWithin(workspace, "cache/concepts.jsonl", cacheData); err != nil {
+				return wrapConceptReconciliationError(conceptDetailArtifactWrite, err)
+			}
+		}
 		return nil
 	}
 	generated, omittedSlugs, err := filterUnmappedLegacyConcepts(workspace, generated, indexTruth, prior)
 	if err != nil {
 		return wrapConceptReconciliationError(conceptDetailEntityMapping, err)
 	}
-	generatedData, err := json.MarshalIndent(generated, "", "  ")
-	if err != nil {
-		return wrapConceptReconciliationError(conceptDetailEntityMerge, err)
-	}
 	entityIDs, err := readSyntoEntityIDs(workspace, generated.Concept, prior)
 	if err != nil {
 		return wrapConceptReconciliationError(conceptDetailEntityMapping, err)
+	}
+	if entityIDs != nil {
+		// INDEX article.entity_id is the only Concept identity authority. A
+		// generated article row without that field remains an ordinary page and
+		// must not enter the Concept map or subsequent cache plan.
+		filteredConcepts := make(map[string]string, len(entityIDs))
+		for conceptID, slug := range generated.Concept {
+			if _, bound := entityIDs[conceptID]; bound {
+				filteredConcepts[conceptID] = slug
+			}
+		}
+		generated.Concept = filteredConcepts
+		filteredEntities := make(map[string]string, len(entityIDs))
+		for conceptID, entityID := range generated.ConceptEntityID {
+			if _, bound := filteredConcepts[conceptID]; bound {
+				filteredEntities[conceptID] = entityID
+			}
+		}
+		generated.ConceptEntityID = filteredEntities
+	}
+	generatedData, err := json.MarshalIndent(generated, "", "  ")
+	if err != nil {
+		return wrapConceptReconciliationError(conceptDetailEntityMerge, err)
 	}
 	data = generatedData
 	data, err = mergeSyntoEntityIDs(data, entityIDs)
@@ -931,7 +967,7 @@ func reconcileWorkspaceConcepts(workspace string, prior []conceptSnapshot, curre
 	}
 	writes = append(writes, otherWrites...)
 
-	cacheData, cachePresent, err := planConceptCacheIDs(workspace, concepts, translations, omittedSlugs)
+	cacheData, cachePresent, err := planConceptCacheIDs(workspace, concepts, translations, entityIDs != nil, omittedSlugs)
 	if err != nil {
 		return wrapConceptReconciliationError(conceptDetailCacheRewrite, err)
 	}
@@ -1055,6 +1091,11 @@ func planSyntoDirectEntityIDRedirects(generated *wikiindex.IDMap, prior []concep
 		if !exists || old.ConceptID == target {
 			continue
 		}
+		if wikiindex.ValidSyntoEntityID(old.ConceptID) {
+			// A prior different released ULID is not migration evidence. The
+			// current explicit article.entity_id remains authoritative.
+			continue
+		}
 		if !wikiindex.ValidLegacyConceptID(old.ConceptID) {
 			return fmt.Errorf("non-legacy prior concept ID %q cannot be migrated", old.ConceptID)
 		}
@@ -1076,22 +1117,10 @@ func planSyntoDirectEntityIDRedirects(generated *wikiindex.IDMap, prior []concep
 	return nil
 }
 
-func validateSyntoDerivedArtifacts(workspace string, generated wikiindex.IDMap, plan wikiindex.SyntoIdentityPlan) error {
-	expected := make(map[string]string, len(plan.ByPath))
-	files, err := fsstore.New(workspace).ListMarkdownFiles(context.Background(), "wiki/")
+func validateSyntoDerivedArtifacts(workspace string, generated wikiindex.IDMap, plan wikiindex.SyntoIdentityPlan, allowUnmappedCache ...bool) error {
+	expected, err := expectedSyntoConceptMap(workspace, plan)
 	if err != nil {
-		return fmt.Errorf("list Synto pages: %w", err)
-	}
-	available := make(map[string]bool, len(files))
-	for _, file := range files {
-		available[file.Path] = true
-	}
-	for path, entityID := range plan.ByPath {
-		if !available[path] {
-			continue
-		}
-		slug := strings.TrimSuffix(strings.TrimPrefix(path, "wiki/"), ".md")
-		expected[entityID] = slug
+		return err
 	}
 	if !equalStringMap(generated.Concept, expected) || len(generated.DormantConcept) != 0 || len(generated.ConceptEntityID) != 0 {
 		return errors.New("Synto direct entity map disagrees with INDEX.json")
@@ -1116,6 +1145,9 @@ func validateSyntoDerivedArtifacts(workspace string, generated wikiindex.IDMap, 
 		}
 		entityID, ok := expectedEntityForSlug(expected, slug)
 		if !ok {
+			if len(allowUnmappedCache) > 0 && allowUnmappedCache[0] {
+				continue
+			}
 			return fmt.Errorf("entity-less or unknown page %q entered Synto concept cache", slug)
 		}
 		if seen[slug] {
@@ -1131,6 +1163,26 @@ func validateSyntoDerivedArtifacts(workspace string, generated wikiindex.IDMap, 
 		return errors.New("Synto concept cache is missing an entity-bound article")
 	}
 	return nil
+}
+
+func expectedSyntoConceptMap(workspace string, plan wikiindex.SyntoIdentityPlan) (map[string]string, error) {
+	expected := make(map[string]string, len(plan.ByPath))
+	files, err := fsstore.New(workspace).ListMarkdownFiles(context.Background(), "wiki/")
+	if err != nil {
+		return nil, fmt.Errorf("list Synto pages: %w", err)
+	}
+	available := make(map[string]bool, len(files))
+	for _, file := range files {
+		available[file.Path] = true
+	}
+	for path, entityID := range plan.ByPath {
+		if !available[path] {
+			continue
+		}
+		slug := strings.TrimSuffix(strings.TrimPrefix(path, "wiki/"), ".md")
+		expected[entityID] = slug
+	}
+	return expected, nil
 }
 
 func equalStringMap(left, right map[string]string) bool {
@@ -1567,7 +1619,7 @@ func indexWikilinkClose(data []byte, from int) int {
 }
 
 func rewriteConceptCacheIDs(workspace string, concepts []reconciledConcept, translations map[string]string) error {
-	data, present, err := planConceptCacheIDs(workspace, concepts, translations)
+	data, present, err := planConceptCacheIDs(workspace, concepts, translations, false)
 	if err != nil {
 		return err
 	}
@@ -1577,7 +1629,7 @@ func rewriteConceptCacheIDs(workspace string, concepts []reconciledConcept, tran
 	return writeFileAtomicWithin(workspace, "cache/concepts.jsonl", data)
 }
 
-func planConceptCacheIDs(workspace string, concepts []reconciledConcept, translations map[string]string, ignoredSlugs ...map[string]reconciledConcept) ([]byte, bool, error) {
+func planConceptCacheIDs(workspace string, concepts []reconciledConcept, translations map[string]string, dropUnmapped bool, ignoredSlugs ...map[string]reconciledConcept) ([]byte, bool, error) {
 	const rel = "cache/concepts.jsonl"
 	info, err := lstatRegularWithin(workspace, rel)
 	if errors.Is(err, os.ErrNotExist) {
@@ -1639,11 +1691,14 @@ func planConceptCacheIDs(workspace string, concepts []reconciledConcept, transla
 				continue
 			}
 		}
-		activeRows++
 		concept, ok := bySlug[slug]
 		if !ok {
+			if dropUnmapped {
+				continue
+			}
 			return nil, false, fmt.Errorf("concepts cache slug %q is not declared in id map", slug)
 		}
+		activeRows++
 		if frontmatter, ok := entry["frontmatter"].(map[string]any); ok {
 			if id, ok := frontmatter["id"].(string); ok {
 				if id != concept.CurrentID && id != concept.StableID {

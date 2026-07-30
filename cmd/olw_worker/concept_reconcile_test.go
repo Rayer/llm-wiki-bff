@@ -444,6 +444,130 @@ func TestDefaultInPlacePathReconcilesConceptIDs(t *testing.T) {
 	}
 }
 
+func TestReconcileWorkspaceConceptsUsesCurrentExplicitULIDAtSameSlug(t *testing.T) {
+	const priorEntity = "01JAZ5N7Y3K8M2Q4R6T9VWXABD"
+	const currentEntity = "01JAZ5N7Y3K8M2Q4R6T9VWXABE"
+	workspace := t.TempDir()
+	page := []byte("---\nid: " + priorEntity + "\ntitle: Alpha\n---\nidentical bytes\n")
+	mustWriteFile(t, filepath.Join(workspace, "cache", "id_map.json"), []byte(`{"concept":{"`+priorEntity+`":"alpha"},"source":{},"redirects":{}}`))
+	mustWriteFile(t, filepath.Join(workspace, "cache", "concepts.jsonl"), []byte(`{"slug":"alpha","frontmatter":{"id":"`+priorEntity+`"}}`+"\n"))
+	mustWriteFile(t, filepath.Join(workspace, "wiki", "alpha.md"), page)
+	prior, err := snapshotConcepts(workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The generated page bytes and slug are unchanged; only released INDEX.json
+	// supplies the current explicit Concept identity.
+	mustWriteFile(t, filepath.Join(workspace, "cache", "id_map.json"), []byte(`{"concept":{"`+currentEntity+`":"alpha"},"source":{},"redirects":{}}`))
+	mustWriteFile(t, filepath.Join(workspace, "cache", "concepts.jsonl"), []byte(`{"slug":"alpha","frontmatter":{"id":"`+currentEntity+`"}}`+"\n"))
+	mustWriteFile(t, filepath.Join(workspace, ".synto", "INDEX.json"), []byte(syntoIndexFixture(currentEntity, currentEntity, "alpha", false)))
+
+	if err := reconcileWorkspaceConcepts(workspace, prior); err != nil {
+		t.Fatalf("same-slug current explicit ULID was rejected: %v", err)
+	}
+	ids := mustSnapshotIDMap(t, workspace)
+	if len(ids.Concept) != 1 || ids.Concept[currentEntity] != "alpha" {
+		t.Fatalf("concept map=%#v, want only current entity", ids.Concept)
+	}
+	if _, exists := ids.Concept[priorEntity]; exists {
+		t.Fatalf("prior released entity remained authoritative: %#v", ids.Concept)
+	}
+	if _, exists := ids.IDRedirects[priorEntity]; exists {
+		t.Fatalf("prior released entity became a redirect: %#v", ids.IDRedirects)
+	}
+	updated, err := os.ReadFile(filepath.Join(workspace, "wiki", "alpha.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(updated, []byte("id: "+currentEntity+"\n")) || bytes.Contains(updated, []byte("id: "+priorEntity+"\n")) {
+		t.Fatalf("current page identity=%q", updated)
+	}
+}
+
+func TestReconcileWorkspaceConceptsExcludesEntitylessArticleFromConceptArtifacts(t *testing.T) {
+	const articleID = "01JAZ5N7Y3K8M2Q4R6T9VWXAC8"
+	for _, test := range []struct {
+		name  string
+		field string
+	}{
+		{name: "null", field: `"entity_id":null,`},
+		{name: "omitted", field: ""},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			workspace := t.TempDir()
+			index := strings.Replace(syntoIndexFixture("article", articleID, "ordinary", false), `"entity_id":"`+articleID+`",`, test.field, 1)
+			page := []byte("---\nid: " + articleID + "\ntitle: Ordinary\n---\nordinary bytes\n")
+			mustWriteFile(t, filepath.Join(workspace, ".synto", "INDEX.json"), []byte(index))
+			mustWriteFile(t, filepath.Join(workspace, "cache", "id_map.json"), []byte(`{"concept":{"`+articleID+`":"ordinary"},"source":{},"redirects":{}}`))
+			mustWriteFile(t, filepath.Join(workspace, "cache", "concepts.jsonl"), []byte(`{"slug":"ordinary","frontmatter":{"id":"`+articleID+`"}}`+"\n"))
+			mustWriteFile(t, filepath.Join(workspace, "wiki", "ordinary.md"), page)
+
+			if err := reconcileWorkspaceConcepts(workspace, nil); err != nil {
+				t.Fatalf("entityless article reconciliation failed: %v", err)
+			}
+			ids := mustSnapshotIDMap(t, workspace)
+			if len(ids.Concept) != 0 || len(ids.ConceptEntityID) != 0 {
+				t.Fatalf("entityless article entered Concept artifacts: %#v", ids)
+			}
+			cache, err := os.ReadFile(filepath.Join(workspace, "cache", "concepts.jsonl"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.TrimSpace(string(cache)) != "" {
+				t.Fatalf("entityless article entered Concept cache: %q", cache)
+			}
+			updated, err := os.ReadFile(filepath.Join(workspace, "wiki", "ordinary.md"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(updated, page) {
+				t.Fatalf("ordinary page bytes changed: %q", updated)
+			}
+		})
+	}
+}
+
+func TestReconcileWorkspaceConceptsDirectPathDropsEntitylessConceptCacheRows(t *testing.T) {
+	const boundID = "01JAZ5N7Y3K8M2Q4R6T9VWXAC8"
+	const ordinaryID = "01JAZ5N7Y3K8M2Q4R6T9VWXAC9"
+	workspace := t.TempDir()
+	index := syntoIndexFixtureWithEntitiesHash(
+		[]string{"bound:" + boundID + ":bound", "ordinary:" + ordinaryID + ":ordinary"},
+		nil,
+		strings.Repeat("0", 64),
+	)
+	index = strings.Replace(index, `"entity_id":"`+ordinaryID+`","name":"ordinary"`, `"entity_id":null,"name":"ordinary"`, 1)
+	mustWriteFile(t, filepath.Join(workspace, ".synto", "INDEX.json"), []byte(index))
+	mustWriteFile(t, filepath.Join(workspace, "cache", "id_map.json"), []byte(`{"concept":{"`+boundID+`":"bound","`+ordinaryID+`":"ordinary"},"source":{},"redirects":{}}`))
+	mustWriteFile(t, filepath.Join(workspace, "cache", "concepts.jsonl"), []byte(`{"slug":"bound","frontmatter":{"id":"`+boundID+`"}}`+"\n"+`{"slug":"ordinary","frontmatter":{"id":"`+ordinaryID+`"}}`+"\n"))
+	mustWriteFile(t, filepath.Join(workspace, "wiki", "bound.md"), []byte("---\nid: "+boundID+"\n---\nbound\n"))
+	ordinary := []byte("---\nid: " + ordinaryID + "\n---\nordinary\n")
+	mustWriteFile(t, filepath.Join(workspace, "wiki", "ordinary.md"), ordinary)
+
+	if err := reconcileWorkspaceConcepts(workspace, nil); err != nil {
+		t.Fatalf("mixed direct reconciliation failed: %v", err)
+	}
+	ids := mustSnapshotIDMap(t, workspace)
+	if len(ids.Concept) != 1 || ids.Concept[boundID] != "bound" {
+		t.Fatalf("mixed direct Concept map=%#v, want only bound article", ids.Concept)
+	}
+	cache, err := os.ReadFile(filepath.Join(workspace, "cache", "concepts.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(cache), "ordinary") {
+		t.Fatalf("entityless direct article entered cache: %q", cache)
+	}
+	gotOrdinary, err := os.ReadFile(filepath.Join(workspace, "wiki", "ordinary.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(gotOrdinary, ordinary) {
+		t.Fatalf("ordinary direct page changed: %q", gotOrdinary)
+	}
+}
+
 func TestRewriteOtherConceptPageWikilinksIncludesSources(t *testing.T) {
 	// Issue 2: Source pages with canonical concept wikilinks must be rewritten.
 	workspace := t.TempDir()
