@@ -1894,6 +1894,110 @@ func syntoIndexTruthForEntityMapping(articles []syntoIndexEntry, sourceConcepts 
 	}
 }
 
+func TestSyntoEntityMappingSkipsReservedRootPagesBeforeMandatoryMapping(t *testing.T) {
+	index := syntoIndexTruthForEntityMapping(
+		[]syntoIndexEntry{
+			{ID: "root-index", Name: "Index", Path: "wiki/index.md"},
+			{ID: "root-log", Name: "Log", Path: "wiki/log.md"},
+			// Omitted entity_id matches the released agents pack export. The
+			// source edge is the current title-drift-compatible identity proof.
+			{ID: "generated-alpha", Name: "Current Alpha", Path: "articles/alpha.md"},
+		},
+		[]syntoSourceConcept{{Name: "Current Alpha", EntityID: "entity-alpha", SourcePath: "raw/source.md"}},
+		nil,
+	)
+
+	got, err := mapSyntoEntityIDsFromIndexTruth(index, map[string]string{
+		"generated-alpha": "alpha",
+	}, []conceptSnapshot{{
+		ConceptID:   "stable-alpha",
+		Slug:        "alpha",
+		EntityID:    "entity-alpha",
+		SourcePaths: []string{"raw/source.md"},
+	}})
+	if err != nil {
+		t.Fatalf("reserved roots blocked normal omitted-entity mapping: %v", err)
+	}
+	if got["generated-alpha"] != "entity-alpha" {
+		t.Fatalf("normal article entity=%q, want entity-alpha", got["generated-alpha"])
+	}
+}
+
+func TestSyntoEntityMappingReservedRootsPreservesAgentIdentityJoin(t *testing.T) {
+	indexData := `{"schema_version":1,"pack":{"id":"fixture","name":"fixture","version":"0","language":["en"],"capabilities":["articles","concepts"]},"articles":[{"id":"root-index","name":"Index","path":"wiki/index.md","summary":null,"tags":[],"aliases":[],"confidence":"high"},{"id":"root-log","name":"Log","path":"wiki/log.md","summary":null,"tags":[],"aliases":[],"confidence":"high"},{"id":"generated-alpha","name":"Current Alpha","path":"articles/alpha.md","summary":null,"tags":[],"aliases":[],"confidence":"high"}],"terms":[],"papers":[],"sources":[],"source_concepts":[{"source_path":"raw/source.md","content_hash":"` + strings.Repeat("0", 64) + `","concepts":[{"name":"Current Alpha","entity_id":"entity-alpha"}]}],"synthesis":[],"stats":{"article_count":3,"draft_count":0,"concept_count":1,"alias_count":0,"knowledge_item_count":0,"source_count":1,"source_segment_count":0,"failed_note_count":0,"failed_concept_count":0}}`
+	conceptsData := agentConceptsFixture(`"canonical_article_id":"generated-alpha","article_path":"articles/alpha.md"`, `"entity_id":"entity-alpha"`)
+	joined, err := enrichSyntoIndexWithAgentConcepts([]byte(indexData), []byte(conceptsData))
+	if err != nil {
+		t.Fatalf("agent identity join failed: %v", err)
+	}
+	index, err := decodeSyntoIndex(joined)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := mapSyntoEntityIDsFromIndexTruth(index, map[string]string{"generated-alpha": "alpha"}, []conceptSnapshot{{
+		ConceptID:   "stable-alpha",
+		Slug:        "alpha",
+		EntityID:    "entity-alpha",
+		SourcePaths: []string{"raw/source.md"},
+	}})
+	if err != nil {
+		t.Fatalf("reserved roots blocked agent-joined normal article: %v", err)
+	}
+	if got["generated-alpha"] != "entity-alpha" {
+		t.Fatalf("agent-joined normal article entity=%q, want entity-alpha", got["generated-alpha"])
+	}
+}
+
+func TestSyntoEntityMappingReservedRootsStillValidateIdentity(t *testing.T) {
+	tests := []struct {
+		name    string
+		article syntoIndexEntry
+	}{
+		{name: "unsafe article ID", article: syntoIndexEntry{ID: "../root", Name: "Index", Path: "wiki/index.md"}},
+		{name: "unsafe entity ID", article: syntoIndexEntry{ID: "root-log", EntityID: "../entity", Name: "Log", Path: "wiki/log.md"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			index := syntoIndexTruthForEntityMapping([]syntoIndexEntry{tt.article}, nil, nil)
+			_, err := mapSyntoEntityIDsFromIndexTruth(index, map[string]string{})
+			if err == nil {
+				t.Fatal("unsafe reserved-root identity was skipped")
+			}
+			testEntityMappingErrorDetail(t, err, conceptDetailEntityMappingArticleIdentity)
+		})
+	}
+}
+
+func TestSyntoEntityMappingReservedRootPathMatrixFailsClosed(t *testing.T) {
+	tests := []struct {
+		name string
+		path string
+		want conceptReconcileDetailCode
+	}{
+		{name: "uppercase index", path: "wiki/Index.md", want: conceptDetailEntityMappingArticleSourceMissing},
+		{name: "uppercase log", path: "wiki/Log.md", want: conceptDetailEntityMappingArticleSourceMissing},
+		{name: "nested index", path: "wiki/nested/index.md", want: conceptDetailEntityMappingArticlePath},
+		{name: "nested log", path: "wiki/nested/log.md", want: conceptDetailEntityMappingArticlePath},
+		{name: "index lookalike", path: "wiki/index2.md", want: conceptDetailEntityMappingArticleSourceMissing},
+		{name: "log lookalike", path: "wiki/logbook.md", want: conceptDetailEntityMappingArticleSourceMissing},
+		{name: "articles index", path: "articles/index.md", want: conceptDetailEntityMappingArticleSourceMissing},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			index := syntoIndexTruthForEntityMapping(
+				[]syntoIndexEntry{{ID: "not-a-root", Name: "Reserved Lookalike", Path: tt.path}},
+				nil,
+				nil,
+			)
+			_, err := mapSyntoEntityIDsFromIndexTruth(index, map[string]string{"not-a-root": "index"})
+			if err == nil {
+				t.Fatalf("path %q was skipped instead of failing closed", tt.path)
+			}
+			testEntityMappingErrorDetail(t, err, tt.want)
+		})
+	}
+}
+
 func TestReadSyntoEntityIDsReturnsReasonedDetailCodes(t *testing.T) {
 	workspace := t.TempDir()
 	mustWriteFile(t, filepath.Join(workspace, ".synto", "INDEX.json"), []byte(`{"schema_version":1}`))
