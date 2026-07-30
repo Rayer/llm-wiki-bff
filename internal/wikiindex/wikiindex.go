@@ -239,7 +239,7 @@ func BuildIDMap(ctx context.Context, store Store) (IDMap, error) {
 // RebuildWithSyntoIdentity builds the derived artifacts for a Synto
 // generation. It is deliberately separate from Rebuild: legacy projects keep
 // frontmatter/content-derived ID behavior, while Synto uses entity_id as the
-// Concept ID authority without changing article bytes.
+// Concept ID authority and canonicalizes entity-bound page frontmatter.
 func RebuildWithSyntoIdentity(ctx context.Context, store Store, plan SyntoIdentityPlan) (IDMap, error) {
 	files, err := store.ListMarkdownFiles(ctx, "wiki/")
 	if err != nil {
@@ -249,19 +249,18 @@ func RebuildWithSyntoIdentity(ctx context.Context, store Store, plan SyntoIdenti
 		return IDMap{}, err
 	}
 	plan = syntoPlanForAvailableFiles(files, plan)
+	filesByPath := make(map[string]MarkdownFile, len(files))
+	for _, file := range files {
+		filesByPath[file.Path] = file
+	}
 	rewrittenPages := make(map[string][]byte, len(plan.ByPath))
 	for path, entityID := range plan.ByPath {
-		for _, file := range files {
-			if file.Path != path {
-				continue
-			}
-			page, err := RewriteSyntoConceptPage(file.Data, entityID)
-			if err != nil {
-				return IDMap{}, fmt.Errorf("rewrite %s: %w", path, err)
-			}
-			rewrittenPages[path] = page
-			break
+		file := filesByPath[path]
+		page, err := RewriteSyntoConceptPage(file.Data, entityID)
+		if err != nil {
+			return IDMap{}, fmt.Errorf("rewrite %s: %w", path, err)
 		}
+		rewrittenPages[path] = page
 	}
 
 	next := IDMap{
@@ -398,6 +397,13 @@ func RewriteSyntoConceptPage(data []byte, entityID string) ([]byte, error) {
 
 func planSyntoIDRedirects(next *IDMap, old IDMap) (int, error) {
 	redirects := make(map[string]string, len(old.IDRedirects)+len(old.Concept))
+	currentBySlug := make(map[string]string, len(next.Concept))
+	for entityID, slug := range next.Concept {
+		if previous, exists := currentBySlug[slug]; exists && previous != entityID {
+			return 0, fmt.Errorf("multiple current concepts use slug %q", slug)
+		}
+		currentBySlug[slug] = entityID
+	}
 	add := func(source, target string) error {
 		if !ValidLegacyConceptID(source) || source == target {
 			return fmt.Errorf("invalid ID redirect source %q", source)
@@ -424,13 +430,7 @@ func planSyntoIDRedirects(next *IDMap, old IDMap) (int, error) {
 	}
 	for _, concepts := range []map[string]string{old.Concept, old.DormantConcept} {
 		for oldID, slug := range concepts {
-			var target string
-			for entityID, currentSlug := range next.Concept {
-				if currentSlug == slug {
-					target = entityID
-					break
-				}
-			}
+			target := currentBySlug[slug]
 			if target == "" || oldID == target {
 				continue
 			}
