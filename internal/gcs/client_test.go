@@ -16,6 +16,25 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+func TestStatFileUsesScopedMetadataOnly(t *testing.T) {
+	client, backend := newMemoryClient()
+	backend.put("users/user/projects/project/cache/pipeline-execution.log", []byte("log"), 7, nil)
+
+	size, err := client.StatFile(context.Background(), "cache/pipeline-execution.log")
+	if err != nil || size != 3 {
+		t.Fatalf("StatFile() = %d, %v; want size 3", size, err)
+	}
+	requests, _ := backend.snapshots()
+	if len(requests) != 0 {
+		t.Fatalf("StatFile read body requests = %d, want 0", len(requests))
+	}
+
+	other := client.WithScope("user", "other")
+	if _, err := other.StatFile(context.Background(), "cache/pipeline-execution.log"); !errors.Is(err, store.ErrObjectNotExist) {
+		t.Fatalf("foreign StatFile error = %v, want object not exist", err)
+	}
+}
+
 func TestNewScopedClientUsesRequestedPrefixWithoutChangingDefault(t *testing.T) {
 	defaultClient := &Client{userID: "default-user", projectID: "default-project"}
 

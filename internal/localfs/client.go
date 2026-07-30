@@ -315,6 +315,28 @@ func (c *Client) ReadFileLimited(ctx context.Context, relPath string, limit int6
 	return data, nil
 }
 
+// StatFile returns file metadata without reading its contents.
+func (c *Client) StatFile(ctx context.Context, relPath string) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	path, err := c.fullPath(relPath)
+	if err != nil {
+		return 0, err
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return 0, storage.ErrObjectNotExist
+		}
+		return 0, fmt.Errorf("stat %s: %w", relPath, err)
+	}
+	if !info.Mode().IsRegular() {
+		return 0, fmt.Errorf("stat %s: not a regular file", relPath)
+	}
+	return info.Size(), nil
+}
+
 func (c *Client) WriteBytes(ctx context.Context, data []byte, relPath string) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err

@@ -417,6 +417,33 @@ func (c *Client) ReadFileLimited(ctx context.Context, relPath string, limit int6
 	return object.Data, nil
 }
 
+// StatFile returns object metadata without reading its contents.
+func (c *Client) StatFile(ctx context.Context, relPath string) (int64, error) {
+	view := generationView{}
+	var err error
+	if generation.GenerationOwned(relPath) {
+		view, err = c.operationView(ctx)
+		if err != nil {
+			return 0, err
+		}
+	}
+	path, expected, err := c.resolveReadPath(relPath, view)
+	if err != nil {
+		return 0, err
+	}
+	attrs, err := c.objectAttrs(ctx, path, expected)
+	if err != nil {
+		if objectNotFound(err) {
+			return 0, store.ErrObjectNotExist
+		}
+		return 0, fmt.Errorf("attrs %s: %w", path, err)
+	}
+	if attrs.Size < 0 {
+		return 0, errors.New("object has invalid size")
+	}
+	return attrs.Size, nil
+}
+
 func (c *Client) readFileWithView(ctx context.Context, relPath string, view generationView) ([]byte, error) {
 	path, expected, err := c.resolveReadPath(relPath, view)
 	if err != nil {

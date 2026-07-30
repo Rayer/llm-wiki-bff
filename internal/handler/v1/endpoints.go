@@ -1329,14 +1329,39 @@ func (h *Handler) attachPipelineDiagnostic(ctx context.Context, response *handle
 		return
 	}
 	project := projectStore.Scope(owner.userID, owner.projectID)
-	// Terminal status is the worker's log-state metadata. The raw body is
-	// fetched only by the explicit PipelineLog endpoint.
-	response.LogState = pipelineLogStateAvailable
+	stat, ok := project.(pipelineLogStatter)
+	if !ok {
+		response.LogState = pipelineLogStateUnavailable
+		response.LogStateReason = "storage_unavailable"
+	} else {
+		executionID := shortCloudRunExecutionName(response.Name, true)
+		size, err := stat.StatFile(ctx, "cache/pipeline-"+executionID+".log")
+		switch {
+		case errors.Is(err, store.ErrObjectNotExist), errors.Is(err, storage.ErrObjectNotExist):
+			response.LogState = pipelineLogStateUnavailable
+			response.LogStateReason = "log_unavailable"
+		case err != nil:
+			response.LogState = pipelineLogStateUnavailable
+			response.LogStateReason = "storage_unavailable"
+		case size < 0 || size > pipelinediagnostic.MaxPipelineLogBytes:
+			response.LogState = pipelineLogStateUnavailable
+			response.LogStateReason = "log_too_large"
+		default:
+			response.LogState = pipelineLogStateAvailable
+		}
+	}
 	if response.Status == "FAILED" {
 		if diagnostic, err := readPipelineFailureDiagnostic(ctx, project, response.Name); err == nil {
 			response.Diagnostic = diagnostic
 		}
 	}
+}
+
+// pipelineLogStatter is intentionally optional so the main storage contract
+// remains stable. Implementations must return metadata only; status polling
+// must never fetch the raw log body.
+type pipelineLogStatter interface {
+	StatFile(context.Context, string) (int64, error)
 }
 
 type limitedPipelineLogReader interface {

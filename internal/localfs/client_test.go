@@ -196,6 +196,24 @@ func TestReadFileLimitedRejectsFinalSymlinkOutsideProject(t *testing.T) {
 	}
 }
 
+func TestStatFileIsScopedAndMetadataOnly(t *testing.T) {
+	root := t.TempDir()
+	project := New(root).WithScope("u", "p")
+	path := filepath.Join(root, "users", "u", "projects", "p", "cache", "pipeline-run.log")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("log"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if size, err := project.StatFile(context.Background(), "cache/pipeline-run.log"); err != nil || size != 3 {
+		t.Fatalf("StatFile() = %d, %v; want size 3", size, err)
+	}
+	if _, err := New(root).WithScope("u", "other").StatFile(context.Background(), "cache/pipeline-run.log"); !errors.Is(err, storage.ErrObjectNotExist) {
+		t.Fatalf("foreign StatFile error = %v, want object not exist", err)
+	}
+}
+
 func TestConditionalAnnotationWrites(t *testing.T) {
 	client := New(t.TempDir()).WithScope("u", "p")
 	ctx := context.Background()

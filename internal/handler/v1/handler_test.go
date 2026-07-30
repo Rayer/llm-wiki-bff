@@ -2368,11 +2368,12 @@ func TestPipelineStatusDiagnosticStates(t *testing.T) {
 	}{
 		{name: "running pending", statusBody: pipelineRunningOwnershipExecution("projects/p/locations/l/jobs/j/executions/running", "u", "p"), wantState: "pending"},
 		{name: "success available", statusBody: pipelineOwnershipExecution("projects/p/locations/l/jobs/j/executions/success", "u", "p", "pipeline"), raw: "success output\n", wantState: "available"},
-		{name: "succeeded missing", statusBody: pipelineOwnershipExecution("projects/p/locations/l/jobs/j/executions/succeeded-missing", "u", "p", "pipeline"), wantState: "available"},
-		{name: "failed delayed", statusBody: strings.Replace(pipelineOwnershipExecution("projects/p/locations/l/jobs/j/executions/delayed", "u", "p", "pipeline"), "EXECUTION_SUCCEEDED", "EXECUTION_FAILED", 1), wantState: "available"},
-		{name: "cancelled missing", statusBody: strings.Replace(pipelineOwnershipExecution("projects/p/locations/l/jobs/j/executions/cancelled-missing", "u", "p", "pipeline"), "EXECUTION_SUCCEEDED", "EXECUTION_CANCELLED", 1), wantState: "available"},
+		{name: "succeeded missing", statusBody: pipelineOwnershipExecution("projects/p/locations/l/jobs/j/executions/succeeded-missing", "u", "p", "pipeline"), wantState: "unavailable", wantReason: "log_unavailable"},
+		{name: "failed delayed", statusBody: strings.Replace(pipelineOwnershipExecution("projects/p/locations/l/jobs/j/executions/delayed", "u", "p", "pipeline"), "EXECUTION_SUCCEEDED", "EXECUTION_FAILED", 1), wantState: "unavailable", wantReason: "log_unavailable"},
+		{name: "cancelled missing", statusBody: strings.Replace(pipelineOwnershipExecution("projects/p/locations/l/jobs/j/executions/cancelled-missing", "u", "p", "pipeline"), "EXECUTION_SUCCEEDED", "EXECUTION_CANCELLED", 1), wantState: "unavailable", wantReason: "log_unavailable"},
 		{name: "failed malformed", statusBody: strings.Replace(pipelineOwnershipExecution("projects/p/locations/l/jobs/j/executions/malformed", "u", "p", "pipeline"), "EXECUTION_SUCCEEDED", "EXECUTION_FAILED", 1), diagnostic: `{"version":1,"status":"failed","stage":"unknown","error_class":"unknown","unknown":"nope"}`, raw: "raw survives malformed diagnostic\n", wantState: "available"},
 		{name: "failed oversized", statusBody: strings.Replace(pipelineOwnershipExecution("projects/p/locations/l/jobs/j/executions/oversized", "u", "p", "pipeline"), "EXECUTION_SUCCEEDED", "EXECUTION_FAILED", 1), diagnostic: strings.Repeat("x", maxPipelineDiagnosticBytes+1), raw: "raw survives oversized diagnostic\n", wantState: "available"},
+		{name: "succeeded oversized log", statusBody: pipelineOwnershipExecution("projects/p/locations/l/jobs/j/executions/oversized-log", "u", "p", "pipeline"), raw: strings.Repeat("x", pipelinediagnostic.MaxPipelineLogBytes+1), wantState: "unavailable", wantReason: "log_too_large"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -2465,13 +2466,56 @@ func (s pipelineLogErrorStore) ReadFileLimited(context.Context, string, int64) (
 	return nil, s.err
 }
 
+type pipelineLogMetadataSpyRoot struct {
+	store.RootStore
+	statCalls int
+	readCalls int
+	statSize  int64
+	statErr   error
+}
+
+func (r *pipelineLogMetadataSpyRoot) Scope(userID, projectID string) store.Store {
+	return &pipelineLogMetadataSpyStore{Store: r.RootStore.Scope(userID, projectID), root: r}
+}
+
+type pipelineLogMetadataSpyStore struct {
+	store.Store
+	root *pipelineLogMetadataSpyRoot
+}
+
+func (s *pipelineLogMetadataSpyStore) StatFile(context.Context, string) (int64, error) {
+	s.root.statCalls++
+	return s.root.statSize, s.root.statErr
+}
+
+func (s *pipelineLogMetadataSpyStore) ReadFileLimited(context.Context, string, int64) ([]byte, error) {
+	s.root.readCalls++
+	return nil, errors.New("body read must not occur during status")
+}
+
+func TestAttachPipelineDiagnosticUsesMetadataWithoutReadingLog(t *testing.T) {
+	root := &pipelineLogMetadataSpyRoot{RootStore: localfs.New(t.TempDir()), statSize: 3}
+	h := New(root, nil, search.NewIndex(), conceptcache.New(), nil, nil)
+	response := &handler.PipelineExecutionResponse{
+		Name:   "projects/p/locations/l/jobs/j/executions/metadata-only",
+		Status: "SUCCEEDED",
+	}
+	h.attachPipelineDiagnostic(context.Background(), response, &pipelineExecutionOwner{userID: "u", projectID: "p"})
+	if response.LogState != pipelineLogStateAvailable || response.LogStateReason != "" {
+		t.Fatalf("response=%+v, want available", response)
+	}
+	if root.statCalls != 1 || root.readCalls != 0 {
+		t.Fatalf("stat calls=%d, body reads=%d, want one metadata probe and no body reads", root.statCalls, root.readCalls)
+	}
+}
+
 func TestAttachPipelineDiagnosticTerminalMalformedStoreIsFinite(t *testing.T) {
 	h := New(pipelineLogErrorRoot{RootStore: localfs.New(t.TempDir()), err: errors.New("malformed provider response")}, nil, search.NewIndex(), conceptcache.New(), nil, nil)
 	for _, status := range []string{"FAILED", "SUCCEEDED", "CANCELLED"} {
 		t.Run(status, func(t *testing.T) {
 			response := &handler.PipelineExecutionResponse{Status: status}
 			h.attachPipelineDiagnostic(context.Background(), response, &pipelineExecutionOwner{userID: "u", projectID: "p"})
-			if response.LogState != pipelineLogStateAvailable || response.LogStateReason != "" {
+			if response.LogState != pipelineLogStateUnavailable || response.LogStateReason != "storage_unavailable" {
 				t.Fatalf("response=%+v, want finite unavailable log state", response)
 			}
 		})
