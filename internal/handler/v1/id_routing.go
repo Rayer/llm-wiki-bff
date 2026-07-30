@@ -17,8 +17,8 @@ import (
 
 var (
 	errIDMapNotFound = errors.New("id map not found")
-	idSlugRE         = regexp.MustCompile(`^([a-f0-9]{12})-(.+)$`)
-	idOnlyRE         = regexp.MustCompile(`^[a-f0-9]{12}$`)
+	idSlugRE         = regexp.MustCompile(`^([a-f0-9]{12}|[0-9A-HJKMNP-TV-Z]{26})-(.+)$`)
+	idOnlyRE         = regexp.MustCompile(`^(?:[a-f0-9]{12}|[0-9A-HJKMNP-TV-Z]{26})$`)
 	wikilinkRE       = regexp.MustCompile(`\[\[([^\[\]\n]+)\]\]`)
 )
 
