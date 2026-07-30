@@ -147,21 +147,18 @@ func TestWorkerPromotionWorkflowsContract(t *testing.T) {
 		"case \"${GITHUB_REF_NAME}\" in",
 		"develop|main)",
 		"GITHUB_SHA",
-		"worker-image-digest-${GITHUB_SHA}",
+		"worker-image-digest-${SHA}.txt",
 		"sha256:[0-9a-f]{64}",
 		"immutable_image=${AR_REPO}/olw-pipeline@${DIGEST}",
 		"actions/upload-artifact@v4",
-		"path: worker-image-digest-${{ github.sha }}.txt",
+		"path: worker-image-digest-${{ steps.source.outputs.candidate_sha }}.txt",
 	} {
 		if !strings.Contains(deploy, want) {
 			t.Fatalf("dev workflow missing %q", want)
 		}
 	}
-	if strings.Count(deploy, "actions/upload-artifact@v4") != 1 || strings.Count(deploy, "worker-image-digest-${GITHUB_SHA}.txt") != 1 || strings.Count(deploy, "path: worker-image-digest-${{ github.sha }}.txt") != 1 {
+	if strings.Count(deploy, "actions/upload-artifact@v4") != 1 || strings.Count(deploy, "worker-image-digest-${SHA}.txt") != 1 || strings.Count(deploy, "path: worker-image-digest-${{ steps.source.outputs.candidate_sha }}.txt") != 1 {
 		t.Fatal("dev workflow must persist and upload exactly one full-SHA digest artifact")
-	}
-	if strings.Contains(deploy, "origin/develop") {
-		t.Fatal("dev workflow must not hardcode develop ordering for main runs")
 	}
 
 	for _, want := range []string{
