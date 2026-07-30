@@ -396,6 +396,9 @@ func RewriteSyntoConceptPage(data []byte, entityID string) ([]byte, error) {
 		prefix := line[:strings.Index(line, ":")+1]
 		lines[i] = []byte(prefix + " " + entityID + lineEnding)
 	}
+	if idNode != nil && found == 0 {
+		return nil, errors.New("concept frontmatter id cannot be rewritten safely")
+	}
 	if found == 0 {
 		closingLine := lines[end]
 		lines = append(lines, nil)
@@ -410,12 +413,15 @@ func RewriteSyntoConceptPage(data []byte, entityID string) ([]byte, error) {
 }
 
 func validateSyntoFrontmatterYAML(data []byte) (*yaml.Node, error) {
+	if len(bytes.TrimSpace(data)) == 0 {
+		return &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}, nil
+	}
 	decoder := yaml.NewDecoder(bytes.NewReader(data))
 	var document yaml.Node
 	if err := decoder.Decode(&document); err != nil {
 		return nil, err
 	}
-	if document.Kind != yaml.DocumentNode || len(document.Content) != 1 || document.Content[0].Kind != yaml.MappingNode {
+	if document.Kind != yaml.DocumentNode || len(document.Content) != 1 || document.Content[0].Kind != yaml.MappingNode || document.Content[0].Style&yaml.FlowStyle != 0 {
 		return nil, errors.New("frontmatter must be a YAML mapping")
 	}
 	var extra yaml.Node

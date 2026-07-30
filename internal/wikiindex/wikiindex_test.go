@@ -123,6 +123,8 @@ func TestRewriteSyntoConceptPageValidatesCompleteYAMLBeforeMutation(t *testing.T
 		{name: "duplicate title", data: []byte("---\ntitle: Alpha\ntitle: Beta\n---\nBody")},
 		{name: "duplicate id", data: []byte("---\nid: a3f7b2c01d9d\nid: b7e2c9a4d113\n---\nBody")},
 		{name: "complex key", data: []byte("---\n? [title, name]\n: Alpha\n---\nBody")},
+		{name: "flow mapping", data: []byte("---\n{id: a3f7b2c01d9d, title: Alpha}\n---\nBody")},
+		{name: "tagged id key", data: []byte("---\n!!str id: a3f7b2c01d9d\n---\nBody")},
 		{name: "non-string id", data: []byte("---\nid: 7\n---\nBody")},
 		{name: "multi-document", data: []byte("---\ntitle: Alpha\n--- # second document\ntitle: Beta\n---\nBody")},
 		{name: "unterminated", data: []byte("---\ntitle: Alpha\nBody")},
@@ -148,6 +150,14 @@ func TestRewriteSyntoConceptPageValidatesCompleteYAMLBeforeMutation(t *testing.T
 	wantBody := []byte("---\ntitle: Alpha\nid: " + testEntityULID + "\n---\nParagraph\n\n---\n\nNext section\n")
 	if !bytes.Equal(rewritten, wantBody) {
 		t.Fatalf("Markdown body changed: got %q want %q", rewritten, wantBody)
+	}
+	empty, err := RewriteSyntoConceptPage([]byte("---\n---\nBody\n"), testEntityULID)
+	if err != nil {
+		t.Fatalf("empty frontmatter rejected: %v", err)
+	}
+	wantEmpty := []byte("---\nid: " + testEntityULID + "\n---\nBody\n")
+	if !bytes.Equal(empty, wantEmpty) {
+		t.Fatalf("empty frontmatter rewrite = %q, want %q", empty, wantEmpty)
 	}
 }
 
