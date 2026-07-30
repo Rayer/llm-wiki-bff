@@ -27,6 +27,7 @@ import (
 	"github.com/rayer/llm-wiki-bff/internal/gcs"
 	"github.com/rayer/llm-wiki-bff/internal/handler"
 	"github.com/rayer/llm-wiki-bff/internal/localfs"
+	"github.com/rayer/llm-wiki-bff/internal/pipelinediagnostic"
 	"github.com/rayer/llm-wiki-bff/internal/pipelinequota"
 	"github.com/rayer/llm-wiki-bff/internal/search"
 	store "github.com/rayer/llm-wiki-bff/internal/storage"
@@ -2040,22 +2041,52 @@ func TestPipelineLogReturnsOwnedArbitraryOperationalOutput(t *testing.T) {
 	}
 }
 
-func TestBoundedPipelineLogResponseUsesValidUTF8AndMarker(t *testing.T) {
-	data := append([]byte("prefix \xff\n"), bytes.Repeat([]byte("x"), maxPipelineLogBytes)...)
-	got := boundedPipelineLogResponse(data)
-	if len(got) > maxPipelineLogBytes || !strings.Contains(string(got), pipelineLogResponseTruncationMarker) || !strings.Contains(string(got), "�") {
-		t.Fatalf("bounded log = len %d, want valid replacement and marker", len(got))
+func TestReadPipelineLogNormalizesInvalidUTF8(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "users", "u", "projects", "p", "cache")
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(path, "pipeline-run.log"), []byte("prefix \xff\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := readPipelineLog(context.Background(), localfs.New(root).Scope("u", "p"), "projects/p/locations/l/jobs/j/executions/run")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "prefix �\n" || !utf8.Valid(got) {
+		t.Fatalf("normalized log = %q, want valid replacement", got)
 	}
 }
 
-func TestPipelineLogPreservesTerminalTailAfterHead(t *testing.T) {
+func TestReadPipelineLogRejectsOverLimitArtifact(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "users", "u", "projects", "p", "cache")
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	data := bytes.Repeat([]byte("x"), pipelinediagnostic.MaxPipelineLogBytes+1)
+	if err := os.WriteFile(filepath.Join(path, "pipeline-run.log"), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readPipelineLog(context.Background(), localfs.New(root).Scope("u", "p"), "projects/p/locations/l/jobs/j/executions/run"); err == nil {
+		t.Fatal("over-limit pipeline log was accepted")
+	}
+}
+
+func TestPipelineLogReturnsCompleteNearLimitWorkerArtifact(t *testing.T) {
 	root := t.TempDir()
 	dir := filepath.Join(root, "users", "request-user", "projects", "demo-project", "cache")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	tail := "terminal reject: source missing after ordinary output\n"
-	data := append(bytes.Repeat([]byte("ordinary output\n"), 5000), []byte(tail)...)
+	begin := []byte("BEGIN\n")
+	middle := []byte("MIDDLE: Synto emitted the decisive diagnostic here\n")
+	end := []byte("END\n")
+	data := bytes.Repeat([]byte{'x'}, pipelinediagnostic.MaxPipelineLogBytes)
+	copy(data, begin)
+	copy(data[len(data)/2:], middle)
+	copy(data[len(data)-len(end):], end)
 	if err := os.WriteFile(filepath.Join(dir, "pipeline-owned-tail.log"), data, 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -2081,25 +2112,11 @@ func TestPipelineLogPreservesTerminalTailAfterHead(t *testing.T) {
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d; body = %s", recorder.Code, recorder.Body.String())
 	}
-	if !strings.Contains(recorder.Body.String(), "ordinary output") || !strings.Contains(recorder.Body.String(), tail) {
-		t.Fatalf("body omitted head or terminal tail: %q", recorder.Body.String())
+	if recorder.Body.String() != string(data) {
+		t.Fatalf("body did not preserve complete worker artifact: len=%d want=%d", recorder.Body.Len(), len(data))
 	}
-	if len(recorder.Body.Bytes()) > maxPipelineLogBytes || !strings.Contains(recorder.Body.String(), pipelineLogResponseTruncationMarker) {
-		t.Fatalf("body len=%d, want bounded head+tail response", recorder.Body.Len())
-	}
-}
-
-func TestBoundedPipelineLogResponseDoesNotSplitUTF8AtAdversarialBoundary(t *testing.T) {
-	limit := maxPipelineLogBytes - len(pipelineLogResponseTruncationMarker)
-	data := append(bytes.Repeat([]byte("a"), limit-1), []byte("€"+strings.Repeat("z", 128)+"terminal reject")...)
-
-	got := boundedPipelineLogResponse(data)
-
-	if !utf8.Valid(got) {
-		t.Fatalf("bounded log is invalid UTF-8: %q", got)
-	}
-	if !strings.Contains(string(got), "terminal reject") || len(got) > maxPipelineLogBytes {
-		t.Fatalf("bounded log = len %d, want valid tail and bound", len(got))
+	if !strings.Contains(recorder.Body.String(), string(begin)) || !strings.Contains(recorder.Body.String(), string(middle)) || !strings.Contains(recorder.Body.String(), string(end)) {
+		t.Fatalf("body omitted BEGIN, MIDDLE, or END marker")
 	}
 }
 
@@ -2351,9 +2368,9 @@ func TestPipelineStatusDiagnosticStates(t *testing.T) {
 	}{
 		{name: "running pending", statusBody: pipelineRunningOwnershipExecution("projects/p/locations/l/jobs/j/executions/running", "u", "p"), wantState: "pending"},
 		{name: "success available", statusBody: pipelineOwnershipExecution("projects/p/locations/l/jobs/j/executions/success", "u", "p", "pipeline"), raw: "success output\n", wantState: "available"},
-		{name: "succeeded missing", statusBody: pipelineOwnershipExecution("projects/p/locations/l/jobs/j/executions/succeeded-missing", "u", "p", "pipeline"), wantState: "unavailable", wantReason: "log_unavailable"},
-		{name: "failed delayed", statusBody: strings.Replace(pipelineOwnershipExecution("projects/p/locations/l/jobs/j/executions/delayed", "u", "p", "pipeline"), "EXECUTION_SUCCEEDED", "EXECUTION_FAILED", 1), wantState: "unavailable", wantReason: "log_unavailable"},
-		{name: "cancelled missing", statusBody: strings.Replace(pipelineOwnershipExecution("projects/p/locations/l/jobs/j/executions/cancelled-missing", "u", "p", "pipeline"), "EXECUTION_SUCCEEDED", "EXECUTION_CANCELLED", 1), wantState: "unavailable", wantReason: "log_unavailable"},
+		{name: "succeeded missing", statusBody: pipelineOwnershipExecution("projects/p/locations/l/jobs/j/executions/succeeded-missing", "u", "p", "pipeline"), wantState: "available"},
+		{name: "failed delayed", statusBody: strings.Replace(pipelineOwnershipExecution("projects/p/locations/l/jobs/j/executions/delayed", "u", "p", "pipeline"), "EXECUTION_SUCCEEDED", "EXECUTION_FAILED", 1), wantState: "available"},
+		{name: "cancelled missing", statusBody: strings.Replace(pipelineOwnershipExecution("projects/p/locations/l/jobs/j/executions/cancelled-missing", "u", "p", "pipeline"), "EXECUTION_SUCCEEDED", "EXECUTION_CANCELLED", 1), wantState: "available"},
 		{name: "failed malformed", statusBody: strings.Replace(pipelineOwnershipExecution("projects/p/locations/l/jobs/j/executions/malformed", "u", "p", "pipeline"), "EXECUTION_SUCCEEDED", "EXECUTION_FAILED", 1), diagnostic: `{"version":1,"status":"failed","stage":"unknown","error_class":"unknown","unknown":"nope"}`, raw: "raw survives malformed diagnostic\n", wantState: "available"},
 		{name: "failed oversized", statusBody: strings.Replace(pipelineOwnershipExecution("projects/p/locations/l/jobs/j/executions/oversized", "u", "p", "pipeline"), "EXECUTION_SUCCEEDED", "EXECUTION_FAILED", 1), diagnostic: strings.Repeat("x", maxPipelineDiagnosticBytes+1), raw: "raw survives oversized diagnostic\n", wantState: "available"},
 	}
@@ -2454,7 +2471,7 @@ func TestAttachPipelineDiagnosticTerminalMalformedStoreIsFinite(t *testing.T) {
 		t.Run(status, func(t *testing.T) {
 			response := &handler.PipelineExecutionResponse{Status: status}
 			h.attachPipelineDiagnostic(context.Background(), response, &pipelineExecutionOwner{userID: "u", projectID: "p"})
-			if response.LogState != pipelineLogStateUnavailable || response.LogStateReason != "log_unavailable" {
+			if response.LogState != pipelineLogStateAvailable || response.LogStateReason != "" {
 				t.Fatalf("response=%+v, want finite unavailable log state", response)
 			}
 		})
@@ -2487,7 +2504,7 @@ func TestPipelineStatusDoesNotUseDiagnosticFromAnotherProject(t *testing.T) {
 	c.Set("userID", "u")
 	c.Set("projectID", "p")
 	h.PipelineStatus(c)
-	if recorder.Code != http.StatusOK || strings.Contains(recorder.Body.String(), `"log_state":"available"`) || strings.Contains(recorder.Body.String(), `"stage":"unknown"`) {
+	if recorder.Code != http.StatusOK || strings.Contains(recorder.Body.String(), `"stage":"unknown"`) {
 		t.Fatalf("cross-project diagnostic leaked: status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
 }

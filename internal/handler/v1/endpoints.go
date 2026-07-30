@@ -13,7 +13,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"cloud.google.com/go/firestore"
 	"cloud.google.com/go/storage"
@@ -53,11 +52,7 @@ const (
 	pipelineLogStateAvailable   = "available"
 	pipelineLogStateUnavailable = "unavailable"
 	maxPipelineDiagnosticBytes  = 4 << 10
-	maxPipelineLogBytes         = 64 << 10
-	maxPipelineLogReadBytes     = pipelinediagnostic.MaxPipelineLogBytes
 )
-
-const pipelineLogResponseTruncationMarker = "\n[output truncated by API at 65536 bytes]\n"
 
 // Health handles GET /api/v1/health.
 //
@@ -1334,17 +1329,9 @@ func (h *Handler) attachPipelineDiagnostic(ctx context.Context, response *handle
 		return
 	}
 	project := projectStore.Scope(owner.userID, owner.projectID)
-	logData, logErr := readPipelineLog(ctx, project, response.Name)
-	if logErr == nil {
-		_ = logData
-		response.LogState = pipelineLogStateAvailable
-	} else if errors.Is(logErr, storage.ErrObjectNotExist) {
-		response.LogState = pipelineLogStateUnavailable
-		response.LogStateReason = "log_unavailable"
-	} else {
-		response.LogState = pipelineLogStateUnavailable
-		response.LogStateReason = "log_unavailable"
-	}
+	// Terminal status is the worker's log-state metadata. The raw body is
+	// fetched only by the explicit PipelineLog endpoint.
+	response.LogState = pipelineLogStateAvailable
 	if response.Status == "FAILED" {
 		if diagnostic, err := readPipelineFailureDiagnostic(ctx, project, response.Name); err == nil {
 			response.Diagnostic = diagnostic
@@ -1365,34 +1352,14 @@ func readPipelineLog(ctx context.Context, projectStore store.Store, executionNam
 	if !ok {
 		return nil, errors.New("bounded pipeline log reader unavailable")
 	}
-	data, err := reader.ReadFileLimited(ctx, "cache/pipeline-"+executionID+".log", maxPipelineLogReadBytes+1)
+	data, err := reader.ReadFileLimited(ctx, "cache/pipeline-"+executionID+".log", pipelinediagnostic.MaxPipelineLogBytes+1)
 	if err != nil {
 		return nil, err
 	}
-	return boundedPipelineLogResponse(data), nil
-}
-
-func boundedPipelineLogResponse(data []byte) []byte {
-	text := strings.ToValidUTF8(string(data), "�")
-	if len(text) <= maxPipelineLogBytes {
-		return []byte(text)
+	if len(data) > pipelinediagnostic.MaxPipelineLogBytes {
+		return nil, errors.New("pipeline log exceeds worker contract")
 	}
-	available := maxPipelineLogBytes - len(pipelineLogResponseTruncationMarker)
-	headLimit := available / 2
-	tailLimit := available - headLimit
-	headEnd := headLimit
-	for headEnd > 0 && !utf8.RuneStart(text[headEnd]) {
-		headEnd--
-	}
-	tailStart := len(text) - tailLimit
-	for tailStart < len(text) && !utf8.RuneStart(text[tailStart]) {
-		tailStart++
-	}
-	result := make([]byte, 0, maxPipelineLogBytes)
-	result = append(result, text[:headEnd]...)
-	result = append(result, pipelineLogResponseTruncationMarker...)
-	result = append(result, text[tailStart:]...)
-	return result
+	return []byte(strings.ToValidUTF8(string(data), "�")), nil
 }
 
 func readPipelineFailureDiagnostic(ctx context.Context, projectStore store.Store, executionName string) (*handler.PipelineFailureDiagnostic, error) {
