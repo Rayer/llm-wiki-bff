@@ -568,6 +568,25 @@ func TestAdminRebuildIndexUsesGenerationRebuilderAfterAuthorization(t *testing.T
 	}
 }
 
+func TestPublicRebuildNeverInvokesGenerationRebuilder(t *testing.T) {
+	project := &adminGenerationRebuilderStore{
+		adminStatsProjectStore: &adminStatsProjectStore{prefix: "users/user/project", hasManifest: true},
+	}
+	root := &adminGenerationRootStore{adminGenerationRebuilderStore: project}
+	h := &Handler{store: root}
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/api/v1/pipeline/rebuild-index", nil)
+	c.Request.Header.Set("X-User-ID", "spoofed-user")
+	c.Request.Header.Set("X-Project-ID", "spoofed-project")
+	h.RebuildIndex(c)
+
+	if recorder.Code != http.StatusConflict || project.called {
+		t.Fatalf("public rebuild status=%d called=%v body=%s, want managed 409 and zero writer calls", recorder.Code, project.called, recorder.Body.String())
+	}
+}
+
 func TestRebuildIndexAuthenticatesBeforeGenerationProbeAndSanitizesProbeErrors(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	project := &adminStatsProjectStore{manifestErr: errors.New("sentinel-provider-path/users/tenant")}

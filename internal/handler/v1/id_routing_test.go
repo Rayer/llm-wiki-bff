@@ -119,6 +119,8 @@ func TestIDFromPathValueRejectsInvalidULIDGrammar(t *testing.T) {
 		"01JAZ5N7Y3K8M2Q4R6T9VWXABC/alpha",   // slash
 		"01JAZ5N7Y3K8M2Q4R6T9VWXABC%2Falpha", // percent ambiguity
 		"entity-alpha",                       // arbitrary ID
+		"8JAZ5N7Y3K8M2Q4R6T9VWXABC",          // ULID overflow
+		"Z1JAZ5N7Y3K8M2Q4R6T9VWXABC",         // ULID overflow
 	}
 	for _, value := range invalid {
 		if _, _, ok := idFromPathValue(value); ok {

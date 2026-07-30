@@ -40,7 +40,7 @@ type reconciledConcept struct {
 func validateConceptEntityMap(ids wikiindex.IDMap) error {
 	seen := make(map[string]string, len(ids.ConceptEntityID))
 	for conceptID, entityID := range ids.ConceptEntityID {
-		if !annotation.ValidSourceID(conceptID) || !annotation.ValidSourceID(entityID) {
+		if !annotation.ValidSourceID(conceptID) || !wikiindex.ValidSyntoEntityID(entityID) {
 			return fmt.Errorf("unsafe concept entity mapping %q -> %q", conceptID, entityID)
 		}
 		if _, active := ids.Concept[conceptID]; !active {
@@ -124,7 +124,13 @@ func snapshotConcepts(vault string, priorSources ...[]sourceSnapshot) ([]concept
 		if len(priorSources) > 0 {
 			sourcePaths = exactConceptSourcePaths(page, priorSources[0])
 		}
-		out = append(out, conceptSnapshot{ConceptID: conceptID, Slug: slug, EntityID: ids.ConceptEntityID[conceptID], Dormant: dormant, Page: page, CacheRow: row, SourcePaths: sourcePaths, IDRedirects: priorIDRedirects})
+		// Keep the immutable redirect table once per snapshot set, not once per
+		// concept. The direct-entity planner consumes it from the first row.
+		redirects := map[string]string(nil)
+		if len(out) == 0 {
+			redirects = priorIDRedirects
+		}
+		out = append(out, conceptSnapshot{ConceptID: conceptID, Slug: slug, EntityID: ids.ConceptEntityID[conceptID], Dormant: dormant, Page: page, CacheRow: row, SourcePaths: sourcePaths, IDRedirects: redirects})
 	}
 	return out, nil
 }
@@ -265,7 +271,7 @@ func reconcileConceptIDMapWithEntities(data []byte, prior []conceptSnapshot, req
 		oldBySlug[concept.Slug] = concept.ConceptID
 		reservedByID[concept.ConceptID] = concept.Slug
 		if concept.EntityID != "" {
-			if !annotation.ValidSourceID(concept.EntityID) {
+			if !wikiindex.ValidSyntoEntityID(concept.EntityID) {
 				return nil, nil, errors.New("unsafe prior concept entity mapping")
 			}
 			if old, exists := oldByEntity[concept.EntityID]; exists && old != concept.ConceptID {
@@ -328,7 +334,7 @@ func reconcileConceptIDMapWithEntities(data []byte, prior []conceptSnapshot, req
 		if requireEntity && entityID == "" {
 			return nil, nil, fmt.Errorf("missing Synto entity_id for concept %q", slug)
 		}
-		if entityID != "" && !annotation.ValidSourceID(entityID) {
+		if entityID != "" && !wikiindex.ValidSyntoEntityID(entityID) {
 			return nil, nil, fmt.Errorf("unsafe Synto entity_id %q", entityID)
 		}
 		stableID := currentID
@@ -372,7 +378,7 @@ func reconcileConceptIDMapWithEntities(data []byte, prior []conceptSnapshot, req
 			entityID = priorEntityBySlug[concept.Slug]
 		}
 		if entityID != "" {
-			if !annotation.ValidSourceID(entityID) {
+			if !wikiindex.ValidSyntoEntityID(entityID) {
 				return nil, nil, fmt.Errorf("unsafe Synto entity_id %q", entityID)
 			}
 			if priorID, exists := nextEntity[concept.StableID]; exists && priorID != entityID {
@@ -819,12 +825,21 @@ func reconcileWorkspaceConcepts(workspace string, prior []conceptSnapshot, curre
 		if err := validateSyntoDerivedArtifacts(workspace, generated, plan); err != nil {
 			return wrapConceptReconciliationError(conceptDetailEntityMerge, err)
 		}
+		pageWrites, err := planSyntoEntityPageRewrites(workspace, plan)
+		if err != nil {
+			return wrapConceptReconciliationError(conceptDetailConceptPageRewrite, err)
+		}
 		generatedData, err := wikiindex.EncodeIDMap(generated)
 		if err != nil {
 			return wrapConceptReconciliationError(conceptDetailEntityMerge, err)
 		}
 		if err := writeFileAtomicWithin(workspace, "cache/id_map.json", generatedData); err != nil {
 			return wrapConceptReconciliationError(conceptDetailArtifactWrite, err)
+		}
+		for _, write := range pageWrites {
+			if err := writeFileAtomicWithin(workspace, write.rel, write.data); err != nil {
+				return wrapConceptReconciliationError(conceptDetailArtifactWrite, err)
+			}
 		}
 		return nil
 	}
@@ -953,6 +968,29 @@ func reconcileWorkspaceConcepts(workspace string, prior []conceptSnapshot, curre
 	return nil
 }
 
+func planSyntoEntityPageRewrites(workspace string, plan wikiindex.SyntoIdentityPlan) ([]plannedWrite, error) {
+	paths := make([]string, 0, len(plan.ByPath))
+	for path := range plan.ByPath {
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+	writes := make([]plannedWrite, 0, len(paths))
+	for _, path := range paths {
+		data, err := readBoundedRegularFileWithin(workspace, path)
+		if err != nil {
+			return nil, fmt.Errorf("read %s: %w", path, err)
+		}
+		updated, err := wikiindex.RewriteSyntoConceptPage(data, plan.ByPath[path])
+		if err != nil {
+			return nil, fmt.Errorf("rewrite %s: %w", path, err)
+		}
+		if !bytes.Equal(data, updated) {
+			writes = append(writes, plannedWrite{rel: path, data: updated})
+		}
+	}
+	return writes, nil
+}
+
 func isSyntoDirectEntityCandidate(generated wikiindex.IDMap, index syntoIndexTruth) bool {
 	if len(generated.Concept) == 0 {
 		return true
@@ -973,7 +1011,7 @@ func isSyntoDirectEntityCandidate(generated wikiindex.IDMap, index syntoIndexTru
 func planSyntoDirectEntityIDRedirects(generated *wikiindex.IDMap, prior []conceptSnapshot) error {
 	currentBySlug := make(map[string]string, len(generated.Concept))
 	for entityID, slug := range generated.Concept {
-		if !annotation.ValidSourceID(entityID) || !safeConceptSlug(slug) {
+		if !wikiindex.ValidSyntoEntityID(entityID) || !safeConceptSlug(slug) {
 			return fmt.Errorf("unsafe Synto direct concept mapping %q -> %q", entityID, slug)
 		}
 		normalizedSlug := strings.ToLower(strings.TrimSpace(slug))
@@ -984,26 +1022,21 @@ func planSyntoDirectEntityIDRedirects(generated *wikiindex.IDMap, prior []concep
 	}
 
 	redirects := make(map[string]string, len(generated.IDRedirects)+len(prior))
-	targetOwners := make(map[string]string, len(generated.IDRedirects)+len(prior))
 	addRedirect := func(source, target string) error {
-		if !annotation.ValidSourceID(source) {
+		if _, current := generated.Concept[source]; current {
+			return fmt.Errorf("ID redirect source %q is an active concept", source)
+		}
+		if !wikiindex.ValidLegacyConceptID(source) {
 			return fmt.Errorf("unsafe ID redirect source %q", source)
 		}
 		target = strings.TrimSpace(target)
-		if !annotation.ValidSourceID(target) {
+		if !wikiindex.ValidSyntoEntityID(target) {
 			return fmt.Errorf("unsafe ID redirect target %q for %q", target, source)
-		}
-		if _, current := generated.Concept[source]; current {
-			return fmt.Errorf("ID redirect source %q is an active concept", source)
 		}
 		if previous, exists := redirects[source]; exists && previous != target {
 			return fmt.Errorf("ID redirect conflict for %q", source)
 		}
-		if previous, exists := targetOwners[target]; exists && previous != source {
-			return fmt.Errorf("ID redirect target collision %q", target)
-		}
 		redirects[source] = target
-		targetOwners[target] = source
 		return nil
 	}
 	for source, target := range generated.IDRedirects {
@@ -1026,6 +1059,9 @@ func planSyntoDirectEntityIDRedirects(generated *wikiindex.IDMap, prior []concep
 		target, exists := currentBySlug[strings.ToLower(strings.TrimSpace(old.Slug))]
 		if !exists || old.ConceptID == target {
 			continue
+		}
+		if !wikiindex.ValidLegacyConceptID(old.ConceptID) {
+			return fmt.Errorf("non-legacy prior concept ID %q cannot be migrated", old.ConceptID)
 		}
 		if err := addRedirect(old.ConceptID, target); err != nil {
 			return err

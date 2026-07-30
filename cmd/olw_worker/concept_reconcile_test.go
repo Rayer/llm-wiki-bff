@@ -402,13 +402,13 @@ func TestDefaultInPlacePathReconcilesConceptIDs(t *testing.T) {
 
 	vault := t.TempDir()
 	mustWriteFile(t, filepath.Join(vault, "raw", "source.md"), []byte("x"))
-	mustWriteFile(t, filepath.Join(vault, "cache", "id_map.json"), []byte(`{"concept":{"stable-a":"alpha"},"source":{"stable-source":"source"},"source_meta":{"stable-source":{"source_file":"raw/source.md"}},"redirects":{}}`))
-	mustWriteFile(t, filepath.Join(vault, "wiki", "alpha.md"), []byte("---\nid: stable-a\ntitle: Alpha\n---\nprior body\n"))
+	mustWriteFile(t, filepath.Join(vault, "cache", "id_map.json"), []byte(`{"concept":{"a3f7b2c01d9d":"alpha"},"source":{"stable-source":"source"},"source_meta":{"stable-source":{"source_file":"raw/source.md"}},"redirects":{}}`))
+	mustWriteFile(t, filepath.Join(vault, "wiki", "alpha.md"), []byte("---\nid: a3f7b2c01d9d\ntitle: Alpha\n---\nprior body\n"))
 
 	execOLW = func(_ context.Context, work string, command []string, _ []string, _, _ io.Writer) error {
 		// OLW regenerates the same slug under a transient concept ID.
-		mustWriteFile(t, filepath.Join(work, "wiki", "alpha.md"), []byte("---\nid: transient-a\ntitle: Alpha Regenerated\n---\nregenerated [[concepts/transient-a-alpha|Alpha]]\n"))
-		mustWriteFile(t, filepath.Join(work, ".synto", "INDEX.json"), []byte(syntoIndexFixtureWithEntitiesHash([]string{"article:entity:alpha"}, []string{"entity"}, sha256Text("x"))))
+		mustWriteFile(t, filepath.Join(work, "wiki", "alpha.md"), []byte("---\nid: a3f7b2c01d9d\ntitle: Alpha Regenerated\n---\nregenerated [[concepts/transient-a-alpha|Alpha]]\n"))
+		mustWriteFile(t, filepath.Join(work, ".synto", "INDEX.json"), []byte(syntoIndexFixtureWithEntitiesHash([]string{"article:01JAZ5N7Y3K8M2Q4R6T9VWXAC8:alpha"}, []string{"01JAZ5N7Y3K8M2Q4R6T9VWXAC8"}, sha256Text("x"))))
 		writeValidSQLiteState(t, filepath.Join(work, ".synto", "state.db"))
 		if strings.Join(command, " ") == "pack export --target agents --out" {
 			return nil
@@ -429,7 +429,7 @@ func TestDefaultInPlacePathReconcilesConceptIDs(t *testing.T) {
 	if err := json.Unmarshal(mapData, &ids); err != nil {
 		t.Fatal(err)
 	}
-	if ids.Concept["entity"] != "alpha" || len(ids.Concept) != 1 {
+	if ids.Concept["01JAZ5N7Y3K8M2Q4R6T9VWXAC8"] != "alpha" || len(ids.Concept) != 1 {
 		t.Fatalf("entity concept missing from id_map: %#v (%s)", ids.Concept, mapData)
 	}
 	if _, exists := ids.Concept["transient-a"]; exists {
@@ -439,7 +439,7 @@ func TestDefaultInPlacePathReconcilesConceptIDs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(page), "id: transient-a\n") || strings.Contains(string(page), "id: stable-a") {
+	if !strings.Contains(string(page), "id: 01JAZ5N7Y3K8M2Q4R6T9VWXAC8\n") || strings.Contains(string(page), "id: stable-a") {
 		t.Fatalf("article bytes changed on direct entity path: %s", page)
 	}
 }
@@ -927,28 +927,28 @@ func TestExactSlugStabilityThroughWorkspaceAndCloudCompose(t *testing.T) {
 	vault := t.TempDir()
 	mustWriteFile(t, filepath.Join(vault, "raw", "source.md"), []byte("raw body"))
 	mustWriteFile(t, filepath.Join(vault, "cache", "id_map.json"), []byte(`{
-  "concept": {"c-stable": "alpha"},
+	  "concept": {"a3f7b2c01d9d": "alpha"},
   "source": {"s-stable": "source"},
   "source_meta": {"s-stable": {"slug": "source", "source_file": "raw/source.md"}},
   "redirects": {}
 }`))
-	mustWriteFile(t, filepath.Join(vault, "wiki", "alpha.md"), []byte("---\nid: c-stable\nsources:\n  - s-stable\n---\nprior [[concepts/c-stable-alpha|Alpha]]\n"))
+	mustWriteFile(t, filepath.Join(vault, "wiki", "alpha.md"), []byte("---\nid: a3f7b2c01d9d\nsources:\n  - s-stable\n---\nprior [[concepts/c-stable-alpha|Alpha]]\n"))
 	mustWriteFile(t, filepath.Join(vault, "wiki", "sources", "source.md"), []byte("---\nid: s-stable\nsource_file: raw/source.md\n---\nsource [[concepts/c-stable-alpha|Alpha]]\n"))
-	mustWriteFile(t, filepath.Join(vault, "cache", "concepts.jsonl"), []byte(`{"slug":"alpha","frontmatter":{"id":"c-stable","sources":["s-stable"]},"sources":["s-stable"]}`+"\n"))
+	mustWriteFile(t, filepath.Join(vault, "cache", "concepts.jsonl"), []byte(`{"slug":"alpha","frontmatter":{"id":"a3f7b2c01d9d","sources":["s-stable"]},"sources":["s-stable"]}`+"\n"))
 	mustWriteFile(t, filepath.Join(vault, "wiki.toml"), []byte("name = \"t\"\n"))
 	mustWriteFile(t, filepath.Join(vault, "synto.toml"), []byte("[pipeline]\nauto_commit = false\nauto_maintain = false\nrelation_extraction = false\n"))
-	mustWriteFile(t, filepath.Join(vault, ".synto", "INDEX.json"), []byte(syntoIndexFixtureWithEntitiesHash([]string{"c-stable:entity-c:alpha"}, []string{"entity-c"}, sha256Text("raw body"))))
+	mustWriteFile(t, filepath.Join(vault, ".synto", "INDEX.json"), []byte(syntoIndexFixtureWithEntitiesHash([]string{"c-stable:01JAZ5N7Y3K8M2Q4R6T9VWXAC2:alpha"}, []string{"01JAZ5N7Y3K8M2Q4R6T9VWXAC2"}, sha256Text("raw body"))))
 	writeValidSQLiteState(t, filepath.Join(vault, ".synto", "state.db"))
 	writeValidSQLiteState(t, filepath.Join(vault, ".olw", "state.db"))
 
 	var gen int
 	execOLW = func(_ context.Context, work string, _ []string, _ []string, _, _ io.Writer) error {
 		gen++
-		transientC := fmt.Sprintf("c-transient-%d", gen)
+		transientC := fmt.Sprintf("c%011x", gen)
 		transientS := fmt.Sprintf("s-transient-%d", gen)
 		mustWriteFile(t, filepath.Join(work, "wiki", "alpha.md"), []byte("---\nid: "+transientC+"\nsources:\n  - "+transientS+"\n---\nbody [[concepts/"+transientC+"-alpha|Alpha]]\n"))
 		mustWriteFile(t, filepath.Join(work, "wiki", "sources", "source.md"), []byte("---\nid: "+transientS+"\nsource_file: raw/source.md\n---\nsource [[concepts/"+transientC+"-alpha|Alpha]]\n"))
-		mustWriteFile(t, filepath.Join(work, ".synto", "INDEX.json"), []byte(syntoIndexFixtureWithEntitiesHash([]string{transientC + ":entity-c:alpha"}, []string{"entity-c"}, sha256Text("raw body"))))
+		mustWriteFile(t, filepath.Join(work, ".synto", "INDEX.json"), []byte(syntoIndexFixtureWithEntitiesHash([]string{transientC + ":01JAZ5N7Y3K8M2Q4R6T9VWXAC2:alpha"}, []string{"01JAZ5N7Y3K8M2Q4R6T9VWXAC2"}, sha256Text("raw body"))))
 		// Postprocess rebuilds id_map/concepts from these pages.
 		return nil
 	}
@@ -965,22 +965,22 @@ func TestExactSlugStabilityThroughWorkspaceAndCloudCompose(t *testing.T) {
 		if err := json.Unmarshal(mapData, &ids); err != nil {
 			t.Fatal(err)
 		}
-		if ids.Concept["entity-c"] != "alpha" || ids.Source["s-stable"] != "source" {
+		if ids.Concept["01JAZ5N7Y3K8M2Q4R6T9VWXAC2"] != "alpha" || ids.Source["s-stable"] != "source" {
 			t.Fatalf("workspace gen %d lost exact-slug stability: %s", i+1, mapData)
 		}
 		if strings.Contains(string(mapData), "transient") {
 			t.Fatalf("workspace gen %d retained transient IDs: %s", i+1, mapData)
 		}
 		page, _ := os.ReadFile(filepath.Join(vault, "wiki", "alpha.md"))
-		if !strings.Contains(string(page), "id: c-transient-") || strings.Contains(string(page), "id: c-stable\n") {
+		if !strings.Contains(string(page), "id: 01JAZ5N7Y3K8M2Q4R6T9VWXAC2\n") || strings.Contains(string(page), "id: c-stable\n") {
 			t.Fatalf("workspace gen %d page=%s", i+1, page)
 		}
 		src, _ := os.ReadFile(filepath.Join(vault, "wiki", "sources", "source.md"))
-		if !strings.Contains(string(src), "id: s-stable\n") || !strings.Contains(string(src), "[[concepts/c-transient-") {
+		if !strings.Contains(string(src), "id: s-stable\n") || !strings.Contains(string(src), "[[concepts/c") {
 			t.Fatalf("workspace gen %d source=%s", i+1, src)
 		}
 		cache, _ := os.ReadFile(filepath.Join(vault, "cache", "concepts.jsonl"))
-		if !strings.Contains(string(cache), `"entity-c"`) || !strings.Contains(string(cache), `"s-stable"`) {
+		if !strings.Contains(string(cache), `"01JAZ5N7Y3K8M2Q4R6T9VWXAC2"`) || !strings.Contains(string(cache), `"s-stable"`) {
 			t.Fatalf("workspace gen %d cache=%s", i+1, cache)
 		}
 	}
@@ -990,10 +990,10 @@ func TestExactSlugStabilityThroughWorkspaceAndCloudCompose(t *testing.T) {
 	prefix := "users/user-secret/projects/project-secret/"
 	seedCloudSource(t, m, prefix, "raw body", "", priorCloudReceipt())
 	// Prior committed generation with stable concept+source IDs.
-	priorConceptPage := []byte("---\nid: c-stable\nsources:\n  - s1\n---\nprior [[concepts/c-stable-alpha|Alpha]]\n")
+	priorConceptPage := []byte("---\nid: a3f7b2c01d9d\nsources:\n  - s1\n---\nprior [[concepts/c-stable-alpha|Alpha]]\n")
 	priorSourcePage := []byte("---\nid: s1\nsource_file: raw/source.md\n---\nsource [[concepts/c-stable-alpha|Alpha]]\n")
-	priorMap := []byte(`{"concept":{"c-stable":"alpha"},"source":{"s1":"source"},"source_meta":{"s1":{"slug":"source","source_file":"raw/source.md"}},"redirects":{}}`)
-	priorConcepts := []byte(`{"slug":"alpha","frontmatter":{"id":"c-stable","sources":["s1"]},"sources":["s1"]}` + "\n")
+	priorMap := []byte(`{"concept":{"a3f7b2c01d9d":"alpha"},"source":{"s1":"source"},"source_meta":{"s1":{"slug":"source","source_file":"raw/source.md"}},"redirects":{}}`)
+	priorConcepts := []byte(`{"slug":"alpha","frontmatter":{"id":"a3f7b2c01d9d","sources":["s1"]},"sources":["s1"]}` + "\n")
 	seedCloudManifestWithFiles(t, m, prefix, map[string][]byte{
 		"wiki/alpha.md":          priorConceptPage,
 		"wiki/sources/source.md": priorSourcePage,
@@ -1003,7 +1003,7 @@ func TestExactSlugStabilityThroughWorkspaceAndCloudCompose(t *testing.T) {
 	gen = 0
 	execOLW = func(_ context.Context, work string, _ []string, _ []string, _, _ io.Writer) error {
 		gen++
-		transientC := fmt.Sprintf("c-cloud-%d", gen)
+		transientC := fmt.Sprintf("d%011x", gen)
 		transientS := fmt.Sprintf("s-cloud-%d", gen)
 		if err := os.RemoveAll(filepath.Join(work, "wiki", "sources")); err != nil {
 			return err
@@ -1016,7 +1016,7 @@ func TestExactSlugStabilityThroughWorkspaceAndCloudCompose(t *testing.T) {
 		writeCloudRequiredOutputs(t, work)
 		mustWriteFile(t, filepath.Join(work, "cache", "id_map.json"), []byte(`{"concept":{"`+transientC+`":"alpha"},"source":{"`+transientS+`":"source"},"source_meta":{"`+transientS+`":{"slug":"source","source_file":"raw/source.md"}},"redirects":{}}`))
 		mustWriteFile(t, filepath.Join(work, "cache", "concepts.jsonl"), []byte(`{"slug":"alpha","frontmatter":{"id":"`+transientC+`","sources":["`+transientS+`"]},"sources":["`+transientS+`"],"body":"[[concepts/`+transientC+`-alpha|Alpha]]"}`+"\n"))
-		mustWriteFile(t, filepath.Join(work, ".synto", "INDEX.json"), []byte(syntoIndexFixtureWithEntitiesHash([]string{transientC + ":entity-c:alpha"}, []string{"entity-c"}, sha256Text("raw body"))))
+		mustWriteFile(t, filepath.Join(work, ".synto", "INDEX.json"), []byte(syntoIndexFixtureWithEntitiesHash([]string{transientC + ":01JAZ5N7Y3K8M2Q4R6T9VWXAC2:alpha"}, []string{"01JAZ5N7Y3K8M2Q4R6T9VWXAC2"}, sha256Text("raw body"))))
 		return nil
 	}
 	for i := 0; i < 2; i++ {
@@ -1035,7 +1035,7 @@ func TestExactSlugStabilityThroughWorkspaceAndCloudCompose(t *testing.T) {
 		currentPage := mustCloudGenerationFile(t, m, prefix, manifest, "wiki/alpha.md")
 		currentSrc := mustCloudGenerationFile(t, m, prefix, manifest, "wiki/sources/source.md")
 		currentCache := mustCloudGenerationFile(t, m, prefix, manifest, "cache/concepts.jsonl")
-		if !strings.Contains(string(currentMap), `"entity-c": "alpha"`) && !strings.Contains(string(currentMap), `"entity-c":"alpha"`) {
+		if !strings.Contains(string(currentMap), `"01JAZ5N7Y3K8M2Q4R6T9VWXAC2": "alpha"`) && !strings.Contains(string(currentMap), `"01JAZ5N7Y3K8M2Q4R6T9VWXAC2":"alpha"`) {
 			t.Fatalf("cloud gen %d concept map lost direct entity id: %s", i+1, currentMap)
 		}
 		if strings.Contains(string(currentMap), "c-cloud-") || strings.Contains(string(currentMap), "s-cloud-") {
@@ -1044,13 +1044,13 @@ func TestExactSlugStabilityThroughWorkspaceAndCloudCompose(t *testing.T) {
 		if !strings.Contains(string(currentMap), `"s1"`) {
 			t.Fatalf("cloud gen %d lost stable source id s1: %s", i+1, currentMap)
 		}
-		if !strings.Contains(string(currentPage), "id: c-cloud-") || !strings.Contains(string(currentPage), "[[concepts/c-cloud-") {
+		if !strings.Contains(string(currentPage), "id: 01JAZ5N7Y3K8M2Q4R6T9VWXAC2\n") || !strings.Contains(string(currentPage), "[[concepts/d") {
 			t.Fatalf("cloud gen %d page=%s", i+1, currentPage)
 		}
-		if !strings.Contains(string(currentSrc), "id: s1\n") || !strings.Contains(string(currentSrc), "[[concepts/c-cloud-") {
+		if !strings.Contains(string(currentSrc), "id: s1\n") || !strings.Contains(string(currentSrc), "[[concepts/d") {
 			t.Fatalf("cloud gen %d source=%s", i+1, currentSrc)
 		}
-		if !strings.Contains(string(currentCache), "entity-c") || !strings.Contains(string(currentCache), `"s1"`) {
+		if !strings.Contains(string(currentCache), "01JAZ5N7Y3K8M2Q4R6T9VWXAC2") || !strings.Contains(string(currentCache), `"s1"`) {
 			t.Fatalf("cloud gen %d cache=%s", i+1, currentCache)
 		}
 	}
@@ -1197,18 +1197,18 @@ func TestSyntoMigrationConceptSlugChangeUsesExactSourceProvenance(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	mustWriteFile(t, filepath.Join(workspace, "cache", "id_map.json"), []byte(`{"concept":{"stable-old":"old","current-article":"new"},"source":{"stable-source":"source"},"source_meta":{"stable-source":{"slug":"source","source_file":"raw/source.md"}},"redirects":{}}`))
+	mustWriteFile(t, filepath.Join(workspace, "cache", "id_map.json"), []byte(`{"concept":{"stable-old":"old","b7e2c9a4d113":"new"},"source":{"stable-source":"source"},"source_meta":{"stable-source":{"slug":"source","source_file":"raw/source.md"}},"redirects":{}}`))
 	mustWriteFile(t, filepath.Join(workspace, "cache", "concepts.jsonl"), []byte(
-		`{"slug":"old","frontmatter":{"id":"stable-old","sources":["stable-source"]}}`+"\n"+`{"slug":"new","frontmatter":{"id":"current-article","sources":["stable-source"]}}`+"\n",
+		`{"slug":"old","frontmatter":{"id":"stable-old","sources":["stable-source"]}}`+"\n"+`{"slug":"new","frontmatter":{"id":"b7e2c9a4d113","sources":["stable-source"]}}`+"\n",
 	))
-	mustWriteFile(t, filepath.Join(workspace, "wiki", "new.md"), []byte("---\nid: current-article\nsources:\n  - stable-source\n---\nprovider article\n"))
-	mustWriteFile(t, filepath.Join(workspace, ".synto", "INDEX.json"), []byte(syntoIndexFixture("current-article", "entity-current", "new", true)))
+	mustWriteFile(t, filepath.Join(workspace, "wiki", "new.md"), []byte("---\nid: b7e2c9a4d113\nsources:\n  - stable-source\n---\nprovider article\n"))
+	mustWriteFile(t, filepath.Join(workspace, ".synto", "INDEX.json"), []byte(syntoIndexFixture("current-article", "01JAZ5N7Y3K8M2Q4R6T9VWXAC2", "new", true)))
 	err = reconcileWorkspaceConcepts(workspace, prior, []sourceSnapshot{{RawPath: "raw/source.md", SyntoContentHash: strings.Repeat("0", 64)}})
 	if err != nil {
 		t.Fatalf("slug-change reconciliation: %v", err)
 	}
 	ids := mustSnapshotIDMap(t, workspace)
-	if len(ids.Concept) != 1 || ids.Concept["stable-old"] != "new" || ids.ConceptEntityID["stable-old"] != "entity-current" {
+	if len(ids.Concept) != 1 || ids.Concept["stable-old"] != "new" || ids.ConceptEntityID["stable-old"] != "01JAZ5N7Y3K8M2Q4R6T9VWXAC2" {
 		t.Fatalf("reconciled map=%#v", ids)
 	}
 	if _, ok := ids.Concept["current-article"]; ok {
@@ -1262,7 +1262,7 @@ func TestSyntoMigrationMissingCandidatesRemainFailClosed(t *testing.T) {
 			mustWriteFile(t, filepath.Join(workspace, "wiki", "new.md"), []byte("---\nid: current-article\n---\nprovider\n"))
 			mustWriteFile(t, filepath.Join(workspace, "cache", "id_map.json"), []byte(`{"concept":{"`+tc.generated+`":"old","current-article":"new"},"source":{},"redirects":{}}`))
 			mustWriteFile(t, filepath.Join(workspace, "cache", "concepts.jsonl"), []byte(`{"slug":"old","frontmatter":{"id":"`+tc.generated+`"}}`+"\n"+`{"slug":"new","frontmatter":{"id":"current-article"}}`+"\n"))
-			mustWriteFile(t, filepath.Join(workspace, ".synto", "INDEX.json"), []byte(syntoIndexFixture("current-article", "entity-current", "new", true)))
+			mustWriteFile(t, filepath.Join(workspace, ".synto", "INDEX.json"), []byte(syntoIndexFixture("current-article", "01JAZ5N7Y3K8M2Q4R6T9VWXAC2", "new", true)))
 			before := snapshotRelevantVaultBytes(t, workspace, "cache/id_map.json", "cache/concepts.jsonl", "wiki/old.md", "wiki/new.md", ".synto/INDEX.json")
 			err = reconcileWorkspaceConcepts(workspace, prior, []sourceSnapshot{{RawPath: "raw/source.md", SyntoContentHash: strings.Repeat("0", 64)}})
 			if err == nil {
@@ -1276,8 +1276,8 @@ func TestSyntoMigrationMissingCandidatesRemainFailClosed(t *testing.T) {
 
 func TestSyntoMigrationSourceSetAmbiguityDoesNotTransferIdentity(t *testing.T) {
 	index := syntoIndexTruthForEntityMapping(
-		[]syntoIndexEntry{{ID: "article-a", EntityID: "entity-a", Name: "A", Path: "wiki/a.md"}, {ID: "article-b", EntityID: "entity-b", Name: "B", Path: "wiki/b.md"}},
-		[]syntoSourceConcept{{Name: "A", EntityID: "entity-a", SourcePath: "raw/source.md"}, {Name: "B", EntityID: "entity-b", SourcePath: "raw/source.md"}},
+		[]syntoIndexEntry{{ID: "article-a", EntityID: "01JAZ5N7Y3K8M2Q4R6T9VWXAC0", Name: "A", Path: "wiki/a.md"}, {ID: "article-b", EntityID: "01JAZ5N7Y3K8M2Q4R6T9VWXAC1", Name: "B", Path: "wiki/b.md"}},
+		[]syntoSourceConcept{{Name: "A", EntityID: "01JAZ5N7Y3K8M2Q4R6T9VWXAC0", SourcePath: "raw/source.md"}, {Name: "B", EntityID: "01JAZ5N7Y3K8M2Q4R6T9VWXAC1", SourcePath: "raw/source.md"}},
 		nil,
 	)
 	for _, tc := range []struct {
@@ -1290,30 +1290,30 @@ func TestSyntoMigrationSourceSetAmbiguityDoesNotTransferIdentity(t *testing.T) {
 		{
 			name:   "multiple prior concepts",
 			prior:  []conceptSnapshot{{ConceptID: "stable-a", Slug: "old-a", SourcePaths: []string{"raw/source.md"}}, {ConceptID: "stable-b", Slug: "old-b", SourcePaths: []string{"raw/source.md"}}},
-			ids:    map[string]string{"article-a": "entity-a"},
+			ids:    map[string]string{"article-a": "01JAZ5N7Y3K8M2Q4R6T9VWXAC0"},
 			proofs: nil,
 			wantID: "",
 		},
 		{
 			name:   "multiple current entities",
 			prior:  []conceptSnapshot{{ConceptID: "stable-a", Slug: "old-a", SourcePaths: []string{"raw/source.md"}}},
-			ids:    map[string]string{"article-a": "entity-a", "article-b": "entity-b"},
+			ids:    map[string]string{"article-a": "01JAZ5N7Y3K8M2Q4R6T9VWXAC0", "article-b": "01JAZ5N7Y3K8M2Q4R6T9VWXAC1"},
 			proofs: nil,
 			wantID: "",
 		},
 		{
 			name:   "non-omitted prior concept does not transfer",
 			prior:  []conceptSnapshot{{ConceptID: "stable-a", Slug: "old-a", SourcePaths: []string{"raw/source.md"}}},
-			ids:    map[string]string{"article-a": "entity-a"},
+			ids:    map[string]string{"article-a": "01JAZ5N7Y3K8M2Q4R6T9VWXAC0"},
 			proofs: nil,
 			wantID: "",
 		},
 		{
 			name:   "proven prior transfers",
 			prior:  []conceptSnapshot{{ConceptID: "stable-a", Slug: "old-a", SourcePaths: []string{"raw/source.md"}}},
-			ids:    map[string]string{"article-a": "entity-a"},
+			ids:    map[string]string{"article-a": "01JAZ5N7Y3K8M2Q4R6T9VWXAC0"},
 			proofs: []reconciledConcept{{StableID: "stable-a", CurrentID: "stable-a", Slug: "old-a"}},
-			wantID: "entity-a",
+			wantID: "01JAZ5N7Y3K8M2Q4R6T9VWXAC0",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1330,7 +1330,7 @@ func TestSyntoMigrationSourceSetAmbiguityDoesNotTransferIdentity(t *testing.T) {
 
 func TestFilterUnmappedLegacyConceptsRejectsDuplicateGeneratedSlugs(t *testing.T) {
 	workspace := t.TempDir()
-	mustWriteFile(t, filepath.Join(workspace, ".synto", "INDEX.json"), []byte(syntoIndexFixture("article-a", "entity-a", "alpha", true)))
+	mustWriteFile(t, filepath.Join(workspace, ".synto", "INDEX.json"), []byte(syntoIndexFixture("article-a", "01JAZ5N7Y3K8M2Q4R6T9VWXAC0", "alpha", true)))
 	indexTruth, err := readSyntoIndexTruth(workspace)
 	if err != nil {
 		t.Fatal(err)
@@ -1355,7 +1355,7 @@ func TestSyntoMigrationCaseFoldIndexPathMatchRetainsCandidateAndFailsClosed(t *t
 	if err != nil {
 		t.Fatal(err)
 	}
-	mustWriteFile(t, filepath.Join(workspace, ".synto", "INDEX.json"), []byte(syntoIndexFixture("current-article", "entity-a", "alpha", true)))
+	mustWriteFile(t, filepath.Join(workspace, ".synto", "INDEX.json"), []byte(syntoIndexFixture("current-article", "01JAZ5N7Y3K8M2Q4R6T9VWXAC0", "alpha", true)))
 	before := snapshotRelevantVaultBytes(t, workspace, "cache/id_map.json", "cache/concepts.jsonl", "wiki/ALPHA.md", ".synto/INDEX.json")
 	err = reconcileWorkspaceConcepts(workspace, prior, []sourceSnapshot{{RawPath: "raw/source.md", SyntoContentHash: strings.Repeat("0", 64)}})
 	if err == nil {
@@ -1366,10 +1366,10 @@ func TestSyntoMigrationCaseFoldIndexPathMatchRetainsCandidateAndFailsClosed(t *t
 }
 
 func TestReconcileConceptIDMapRejectsRedirectTranslationCollisions(t *testing.T) {
-	prior := []conceptSnapshot{{ConceptID: "stable-old", Slug: "old", EntityID: "entity-old"}}
+	prior := []conceptSnapshot{{ConceptID: "stable-old", Slug: "old", EntityID: "01JAZ5N7Y3K8M2Q4R6T9VWXABE"}}
 	success := []byte(`{
   "concept": {"current-article":"new"},
-  "concept_entity_id": {"current-article": "entity-old"},
+  "concept_entity_id": {"current-article": "01JAZ5N7Y3K8M2Q4R6T9VWXABE"},
   "source": {},
   "source_meta": {},
   "redirects": {"current-article":["legacy"],"stable-old":["legacy"]}
@@ -1394,7 +1394,7 @@ func TestReconcileConceptIDMapRejectsRedirectTranslationCollisions(t *testing.T)
 
 	collision := []byte(`{
   "concept": {"current-article":"new"},
-  "concept_entity_id": {"current-article":"entity-old"},
+  "concept_entity_id": {"current-article":"01JAZ5N7Y3K8M2Q4R6T9VWXABE"},
   "source": {},
   "source_meta": {},
   "redirects": {"current-article":["legacy"],"stable-old":["different"]}
@@ -1405,10 +1405,10 @@ func TestReconcileConceptIDMapRejectsRedirectTranslationCollisions(t *testing.T)
 }
 
 func TestReconcileConceptIDMapPreservesIDRedirectsInEntityMode(t *testing.T) {
-	prior := []conceptSnapshot{{ConceptID: "stable-alpha", Slug: "alpha", EntityID: "entity-alpha"}, {ConceptID: "stable-beta", Slug: "beta", EntityID: "entity-beta"}}
+	prior := []conceptSnapshot{{ConceptID: "stable-alpha", Slug: "alpha", EntityID: "01JAZ5N7Y3K8M2Q4R6T9VWXABC"}, {ConceptID: "stable-beta", Slug: "beta", EntityID: "01JAZ5N7Y3K8M2Q4R6T9VWXABD"}}
 	out, _, err := reconcileConceptIDMapWithEntities([]byte(`{
   "concept": {"transient-alpha":"alpha","transient-beta":"beta"},
-  "concept_entity_id": {"transient-alpha":"entity-alpha","transient-beta":"entity-beta"},
+  "concept_entity_id": {"transient-alpha":"01JAZ5N7Y3K8M2Q4R6T9VWXABC","transient-beta":"01JAZ5N7Y3K8M2Q4R6T9VWXABD"},
   "source": {},
   "source_meta": {},
   "id_redirects": {"legacy-alpha":"transient-alpha","legacy-beta":"transient-beta"}
@@ -1453,22 +1453,22 @@ func TestReconcileConceptIDMapRejectsInvalidIDRedirects(t *testing.T) {
 	}{
 		{
 			name:   "missing target",
-			data:   `{"concept":{"entity-a":"alpha","entity-b":"beta"},"concept_entity_id":{"entity-a":"entity-a","entity-b":"entity-b"},"source":{},"source_meta":{},"id_redirects":{"legacy-a":"missing"}}`,
+			data:   `{"concept":{"01JAZ5N7Y3K8M2Q4R6T9VWXAC0":"alpha","01JAZ5N7Y3K8M2Q4R6T9VWXAC1":"beta"},"concept_entity_id":{"01JAZ5N7Y3K8M2Q4R6T9VWXAC0":"01JAZ5N7Y3K8M2Q4R6T9VWXAC0","01JAZ5N7Y3K8M2Q4R6T9VWXAC1":"01JAZ5N7Y3K8M2Q4R6T9VWXAC1"},"source":{},"source_meta":{},"id_redirects":{"legacy-a":"missing"}}`,
 			needle: "not found",
 		},
 		{
 			name:   "source reused as active concept",
-			data:   `{"concept":{"entity-a":"alpha","entity-b":"beta"},"concept_entity_id":{"entity-a":"entity-a","entity-b":"entity-b"},"source":{},"source_meta":{},"id_redirects":{"entity-a":"entity-a"}}`,
+			data:   `{"concept":{"01JAZ5N7Y3K8M2Q4R6T9VWXAC0":"alpha","01JAZ5N7Y3K8M2Q4R6T9VWXAC1":"beta"},"concept_entity_id":{"01JAZ5N7Y3K8M2Q4R6T9VWXAC0":"01JAZ5N7Y3K8M2Q4R6T9VWXAC0","01JAZ5N7Y3K8M2Q4R6T9VWXAC1":"01JAZ5N7Y3K8M2Q4R6T9VWXAC1"},"source":{},"source_meta":{},"id_redirects":{"01JAZ5N7Y3K8M2Q4R6T9VWXAC0":"01JAZ5N7Y3K8M2Q4R6T9VWXAC0"}}`,
 			needle: "active concept",
 		},
 		{
 			name:   "redirect chain",
-			data:   `{"concept":{"entity-a":"alpha","entity-b":"beta"},"concept_entity_id":{"entity-a":"entity-a","entity-b":"entity-b"},"source":{},"source_meta":{},"id_redirects":{"legacy-a":"legacy-b","legacy-b":"legacy-a"}}`,
+			data:   `{"concept":{"01JAZ5N7Y3K8M2Q4R6T9VWXAC0":"alpha","01JAZ5N7Y3K8M2Q4R6T9VWXAC1":"beta"},"concept_entity_id":{"01JAZ5N7Y3K8M2Q4R6T9VWXAC0":"01JAZ5N7Y3K8M2Q4R6T9VWXAC0","01JAZ5N7Y3K8M2Q4R6T9VWXAC1":"01JAZ5N7Y3K8M2Q4R6T9VWXAC1"},"source":{},"source_meta":{},"id_redirects":{"legacy-a":"legacy-b","legacy-b":"legacy-a"}}`,
 			needle: "chain detected",
 		},
 		{
 			name:   "redirect target collision",
-			data:   `{"concept":{"entity-a":"alpha","entity-b":"beta"},"concept_entity_id":{"entity-a":"entity-a","entity-b":"entity-b"},"source":{},"source_meta":{},"id_redirects":{"legacy-a":"entity-a","legacy-b":"entity-a"}}`,
+			data:   `{"concept":{"01JAZ5N7Y3K8M2Q4R6T9VWXAC0":"alpha","01JAZ5N7Y3K8M2Q4R6T9VWXAC1":"beta"},"concept_entity_id":{"01JAZ5N7Y3K8M2Q4R6T9VWXAC0":"01JAZ5N7Y3K8M2Q4R6T9VWXAC0","01JAZ5N7Y3K8M2Q4R6T9VWXAC1":"01JAZ5N7Y3K8M2Q4R6T9VWXAC1"},"source":{},"source_meta":{},"id_redirects":{"legacy-a":"01JAZ5N7Y3K8M2Q4R6T9VWXAC0","legacy-b":"01JAZ5N7Y3K8M2Q4R6T9VWXAC0"}}`,
 			needle: "target collision",
 		},
 	}
@@ -1497,7 +1497,7 @@ func TestRunWorkerBatchWorkspacePublishesStableConceptIDFromSourceProvenance(t *
 	mustWriteFile(t, filepath.Join(vault, "synto.toml"), []byte("[pipeline]\nauto_commit = false\nauto_maintain = false\nrelation_extraction = false\n"))
 	writeValidSQLiteState(t, filepath.Join(vault, ".synto", "state.db"))
 	writeValidSQLiteState(t, filepath.Join(vault, ".olw", "state.db"))
-	mustWriteFile(t, filepath.Join(vault, ".synto", "INDEX.json"), []byte(syntoIndexFixture("old", "entity-old", "old", true)))
+	mustWriteFile(t, filepath.Join(vault, ".synto", "INDEX.json"), []byte(syntoIndexFixture("old", "01JAZ5N7Y3K8M2Q4R6T9VWXABE", "old", true)))
 	beforeRaw, err := os.ReadFile(filepath.Join(vault, "raw", "source.md"))
 	if err != nil {
 		t.Fatal(err)
@@ -1512,11 +1512,11 @@ func TestRunWorkerBatchWorkspacePublishesStableConceptIDFromSourceProvenance(t *
 	}
 	execOLW = func(_ context.Context, work string, _ []string, _ []string, _, _ io.Writer) error {
 		mustWriteFile(t, filepath.Join(work, "wiki", "old.md"), priorPage)
-		mustWriteFile(t, filepath.Join(work, "wiki", "new.md"), []byte("---\nid: transient-new\nsources:\n  - transient-source\n---\nprovider article\n"))
+		mustWriteFile(t, filepath.Join(work, "wiki", "new.md"), []byte("---\nid: c5d9e3f1a028\nsources:\n  - transient-source\n---\nprovider article\n"))
 		mustWriteFile(t, filepath.Join(work, "wiki", "sources", "source.md"), []byte("---\nid: transient-source\nsource_file: raw/source.md\n---\nsource for new\n"))
-		mustWriteFile(t, filepath.Join(work, "cache", "id_map.json"), []byte(`{"concept":{"stable-old":"old","current-article":"new"},"source":{"transient-source":"source"},"source_meta":{"transient-source":{"slug":"source","source_file":"raw/source.md"}},"redirects":{}}`))
-		mustWriteFile(t, filepath.Join(work, "cache", "concepts.jsonl"), []byte(`{"slug":"old","frontmatter":{"id":"stable-old","sources":["transient-source"]}}`+"\n"+`{"slug":"new","frontmatter":{"id":"current-article","sources":["transient-source"]}}`+"\n"))
-		mustWriteFile(t, filepath.Join(work, ".synto", "INDEX.json"), []byte(syntoIndexFixtureWithEntitiesHash([]string{"current-article:entity-stable:new"}, []string{"entity-stable"}, sha256Text(rawBody))))
+		mustWriteFile(t, filepath.Join(work, "cache", "id_map.json"), []byte(`{"concept":{"stable-old":"old","c5d9e3f1a028":"new"},"source":{"transient-source":"source"},"source_meta":{"transient-source":{"slug":"source","source_file":"raw/source.md"}},"redirects":{}}`))
+		mustWriteFile(t, filepath.Join(work, "cache", "concepts.jsonl"), []byte(`{"slug":"old","frontmatter":{"id":"stable-old","sources":["transient-source"]}}`+"\n"+`{"slug":"new","frontmatter":{"id":"c5d9e3f1a028","sources":["transient-source"]}}`+"\n"))
+		mustWriteFile(t, filepath.Join(work, ".synto", "INDEX.json"), []byte(syntoIndexFixtureWithEntitiesHash([]string{"c5d9e3f1a028:01JAZ5N7Y3K8M2Q4R6T9VWXAC6:new"}, []string{"01JAZ5N7Y3K8M2Q4R6T9VWXAC6"}, sha256Text(rawBody))))
 		return nil
 	}
 	cfg := workerConfig{VaultPath: vault, APIKey: "secret", Workspace: true, WorkspaceDir: t.TempDir(), Postprocess: true, StopOnError: true}
@@ -1525,7 +1525,7 @@ func TestRunWorkerBatchWorkspacePublishesStableConceptIDFromSourceProvenance(t *
 	}
 
 	ids := mustSnapshotIDMap(t, vault)
-	if len(ids.Concept) != 1 || ids.Concept["entity-stable"] != "new" {
+	if len(ids.Concept) != 1 || ids.Concept["01JAZ5N7Y3K8M2Q4R6T9VWXAC6"] != "new" {
 		t.Fatalf("unexpected concept map: %#v", ids.Concept)
 	}
 	if len(ids.ConceptEntityID) != 0 {
@@ -1541,7 +1541,7 @@ func TestRunWorkerBatchWorkspacePublishesStableConceptIDFromSourceProvenance(t *
 		t.Fatalf("entity-less legacy page was deleted: %v", err)
 	}
 	page, err := os.ReadFile(filepath.Join(vault, "wiki", "new.md"))
-	if err != nil || !bytes.Contains(page, []byte("id: transient-new\n")) {
+	if err != nil || !bytes.Contains(page, []byte("id: 01JAZ5N7Y3K8M2Q4R6T9VWXAC6\n")) {
 		t.Fatalf("new page identity=%q err=%v", page, err)
 	}
 	rawAfter, err := os.ReadFile(filepath.Join(vault, "raw", "source.md"))

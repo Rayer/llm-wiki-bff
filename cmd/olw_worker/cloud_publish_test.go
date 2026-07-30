@@ -665,7 +665,7 @@ func TestCloudSyntoLifecycleOutputIsPublishedForEveryFailurePhase(t *testing.T) 
 		{name: "run", fail: "run", wantOutput: []string{"MIGRATION_STDOUT", "MIGRATION_STDERR", "RUN_STDOUT", "RUN_STDERR"}},
 		{name: "pack export", fail: "pack", wantOutput: []string{"MIGRATION_STDOUT", "MIGRATION_STDERR", "RUN_STDOUT", "RUN_STDERR", "PACK_EXPORT_STDOUT", "PACK_EXPORT_STDERR"}},
 		{name: "postprocess", fail: "postprocess", wantOutput: []string{"MIGRATION_STDOUT", "MIGRATION_STDERR", "RUN_STDOUT", "RUN_STDERR", "PACK_EXPORT_STDOUT", "PACK_EXPORT_STDERR"}},
-		{name: "ambiguous manifest", ambiguous: true, wantOutput: []string{"MIGRATION_STDOUT", "MIGRATION_STDERR", "RUN_STDOUT", "RUN_STDERR", "PACK_EXPORT_STDOUT", "PACK_EXPORT_STDERR"}, wantErr: errManifestCommitOutcomeUnknown},
+		{name: "ambiguous manifest", ambiguous: true, wantOutput: []string{"MIGRATION_STDOUT", "MIGRATION_STDERR", "RUN_STDOUT", "RUN_STDERR", "PACK_EXPORT_STDOUT", "PACK_EXPORT_STDERR"}, wantErr: errCloudPipelinePublish},
 	}
 
 	for _, tc := range tests {
@@ -718,7 +718,7 @@ func TestCloudSyntoLifecycleOutputIsPublishedForEveryFailurePhase(t *testing.T) 
 					if tc.fail == "pack" {
 						return errors.New("pack export failed")
 					}
-					mustWriteFile(t, filepath.Join(command[5], "index", "INDEX.json"), []byte(syntoIndexFixtureWithEntities([]string{"article:entity:alpha"}, nil)))
+					mustWriteFile(t, filepath.Join(command[5], "index", "INDEX.json"), []byte(syntoIndexFixtureWithEntities([]string{"article:01JAZ5N7Y3K8M2Q4R6T9VWXAC8:alpha"}, nil)))
 					mustWriteFile(t, filepath.Join(command[5], "agent", "concepts.json"), []byte(`{"schema_version":1,"concepts":[]}`))
 					return nil
 				default:
@@ -1098,9 +1098,9 @@ func TestCloudPersistsNestedEntityMappingDetailAndReplaysIdempotently(t *testing
 	cloudReconcileConcepts = func(workspace string, prior []conceptSnapshot, current ...[]sourceSnapshot) error {
 		mustWriteFile(t, filepath.Join(workspace, "cache", "id_map.json"), []byte(`{"concept":{"article-a":"alpha","article-b":"alpha"},"source":{},"redirects":{}}`))
 		mustWriteFile(t, filepath.Join(workspace, ".synto", "INDEX.json"), []byte(syntoIndexFixtureWithEntitiesHash([]string{
-			"article-a:entity-a:alpha",
-			"article-b:entity-b:alpha",
-		}, []string{"entity-a", "entity-b"}, strings.Repeat("0", 64))))
+			"article-a:01JAZ5N7Y3K8M2Q4R6T9VWXAC0:alpha",
+			"article-b:01JAZ5N7Y3K8M2Q4R6T9VWXAC1:alpha",
+		}, []string{"01JAZ5N7Y3K8M2Q4R6T9VWXAC0", "01JAZ5N7Y3K8M2Q4R6T9VWXAC1"}, strings.Repeat("0", 64))))
 		return reconcileWorkspaceConcepts(workspace, prior, current...)
 	}
 	cfg := cloudCfgFor("user", "project", "execution-secret")
@@ -1660,9 +1660,9 @@ func TestCloudSuggestedQueriesGenerateInsidePrivateWorkspaceBeforeManifestPublis
 	prefix := "users/user/projects/project/"
 	seedCloudSource(t, m, prefix, "raw-start", "", priorCloudReceipt())
 	provider := &testSuggestedQueryProvider{raw: `{"candidates":[
-{"question":"哪些概念值得一起比較？","intent/use_case":"comparison","corpus_anchor_concept_ids":["entity-old"]},
-{"question":"如何探索這個主題的不同面向？","intent/use_case":"exploration","corpus_anchor_concept_ids":["entity-old"]},
-{"question":"哪些選擇適合進一步查找？","intent/use_case":"retrieval","corpus_anchor_concept_ids":["entity-old"]}
+{"question":"哪些概念值得一起比較？","intent/use_case":"comparison","corpus_anchor_concept_ids":["01JAZ5N7Y3K8M2Q4R6T9VWXABE"]},
+{"question":"如何探索這個主題的不同面向？","intent/use_case":"exploration","corpus_anchor_concept_ids":["01JAZ5N7Y3K8M2Q4R6T9VWXABE"]},
+{"question":"哪些選擇適合進一步查找？","intent/use_case":"retrieval","corpus_anchor_concept_ids":["01JAZ5N7Y3K8M2Q4R6T9VWXABE"]}
 ]}`}
 	cfg := cloudCfgFor("user", "project", "execution")
 	cfg.SuggestedQueries = true
@@ -3058,8 +3058,8 @@ func cloudCfgFor(user, project, execution string) workerConfig {
 }
 func writeCloudRequiredOutputs(t *testing.T, root string) {
 	t.Helper()
-	mustWriteFile(t, filepath.Join(root, "wiki", "old.md"), []byte("---\nid: legacy-old\n---\nOld\n"))
-	mustWriteFile(t, filepath.Join(root, "wiki", "new.md"), []byte("---\nid: legacy-new\n---\nNew\n"))
+	mustWriteFile(t, filepath.Join(root, "wiki", "old.md"), []byte("---\nid: a3f7b2c01d9d\n---\nOld\n"))
+	mustWriteFile(t, filepath.Join(root, "wiki", "new.md"), []byte("---\nid: b7e2c9a4d113\n---\nNew\n"))
 	for path, data := range map[string]string{
 		"wiki.toml":                    "name = \"test\"\n",
 		"synto.toml":                   "[pipeline]\nauto_commit = false\nauto_maintain = false\nrelation_extraction = false\n",
@@ -3068,7 +3068,7 @@ func writeCloudRequiredOutputs(t *testing.T, root string) {
 		"cache/dormant_concepts.jsonl": "",
 		"cache/raw_status.json":        "{}",
 		"cache/suggested_queries.json": "{}",
-		".synto/INDEX.json":            syntoIndexFixtureWithEntities([]string{"149603e6c035:entity-old:old", "22af645d1859:entity:new"}, nil),
+		".synto/INDEX.json":            syntoIndexFixtureWithEntities([]string{"149603e6c035:01JAZ5N7Y3K8M2Q4R6T9VWXABE:old", "22af645d1859:01JAZ5N7Y3K8M2Q4R6T9VWXAC8:new"}, nil),
 	} {
 		mustWriteFile(t, filepath.Join(root, filepath.FromSlash(path)), []byte(data))
 	}
@@ -3089,7 +3089,7 @@ func writeCloudRequiredOutputs(t *testing.T, root string) {
 
 func writeFreshSyntoRequiredOutputs(t *testing.T, root string) {
 	t.Helper()
-	mustWriteFile(t, filepath.Join(root, "wiki", "alpha.md"), []byte("---\nid: legacy-alpha\n---\nAlpha\n"))
+	mustWriteFile(t, filepath.Join(root, "wiki", "alpha.md"), []byte("---\nid: c5d9e3f1a028\n---\nAlpha\n"))
 	for path, data := range map[string]string{
 		"synto.toml":                   "[pipeline]\nauto_commit = false\nauto_maintain = false\nrelation_extraction = false\n",
 		"cache/id_map.json":            `{"concept":{},"source":{},"redirects":{}}`,
@@ -3097,7 +3097,7 @@ func writeFreshSyntoRequiredOutputs(t *testing.T, root string) {
 		"cache/dormant_concepts.jsonl": "",
 		"cache/raw_status.json":        "{}",
 		"cache/suggested_queries.json": "{}",
-		".synto/INDEX.json":            syntoIndexFixture("article", "entity", "alpha", false),
+		".synto/INDEX.json":            syntoIndexFixture("article", "01JAZ5N7Y3K8M2Q4R6T9VWXAC8", "alpha", false),
 	} {
 		mustWriteFile(t, filepath.Join(root, filepath.FromSlash(path)), []byte(data))
 	}

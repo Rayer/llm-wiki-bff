@@ -863,7 +863,7 @@ func syntoIdentityPlanFromIndex(index syntoIndexTruth) (wikiindex.SyntoIdentityP
 		ActiveEntities: make(map[string]bool, len(index.ActiveEntities)),
 	}
 	for entityID := range index.ActiveEntities {
-		if !annotation.ValidSourceID(entityID) {
+		if !wikiindex.ValidSyntoEntityID(entityID) {
 			return wikiindex.SyntoIdentityPlan{}, fmt.Errorf("unsafe active Synto entity_id %q", entityID)
 		}
 		plan.ActiveEntities[entityID] = true
@@ -874,7 +874,7 @@ func syntoIdentityPlanFromIndex(index syntoIndexTruth) (wikiindex.SyntoIdentityP
 	seenEntities := make(map[string]string, len(index.Articles))
 	byName := make(map[string]map[string]bool)
 	for _, edge := range index.SourceConcepts {
-		if edge.Name == "" || !annotation.ValidSourceID(edge.EntityID) {
+		if edge.Name == "" || !wikiindex.ValidSyntoEntityID(edge.EntityID) {
 			return wikiindex.SyntoIdentityPlan{}, errors.New("invalid Synto source concept identity")
 		}
 		if byName[edge.Name] == nil {
@@ -905,7 +905,7 @@ func syntoIdentityPlanFromIndex(index syntoIndexTruth) (wikiindex.SyntoIdentityP
 		if article.EntityID == "" {
 			continue
 		}
-		if !annotation.ValidSourceID(article.EntityID) {
+		if !wikiindex.ValidSyntoEntityID(article.EntityID) {
 			return wikiindex.SyntoIdentityPlan{}, fmt.Errorf("unsafe Synto article entity_id %q", article.EntityID)
 		}
 		if entities := byName[article.Name]; len(entities) > 0 && (len(entities) != 1 || !entities[article.EntityID]) {
@@ -1051,7 +1051,7 @@ func enrichSyntoIndexWithAgentConcepts(indexData, conceptsData []byte) ([]byte, 
 		if idIndex != pathIndex {
 			return nil, fmt.Errorf("agent concept canonical article ID/path disagreement: %q/%q", *concept.CanonicalArticleID, *concept.ArticlePath)
 		}
-		if concept.EntityID == "" || !annotation.ValidSourceID(concept.EntityID) {
+		if concept.EntityID == "" || !wikiindex.ValidSyntoEntityID(concept.EntityID) {
 			return nil, errors.New("agent concept has invalid entity_id")
 		}
 		key := syntoArticleProofKey{ID: *concept.CanonicalArticleID, Path: path}
@@ -1207,7 +1207,7 @@ func decodeSyntoAgentConceptList(dec *json.Decoder) ([]syntoAgentConcept, error)
 		if name == "" {
 			return nil, errors.New("agent concept name is empty")
 		}
-		if concept.EntityID != "" && !annotation.ValidSourceID(concept.EntityID) {
+		if concept.EntityID != "" && !wikiindex.ValidSyntoEntityID(concept.EntityID) {
 			return nil, errors.New("agent concept entity_id is unsafe")
 		}
 		if canonicalArticleID != nil && !annotation.ValidSourceID(*canonicalArticleID) {
@@ -1286,7 +1286,7 @@ func mapSyntoEntityIDsFromIndexTruth(index syntoIndexTruth, concepts map[string]
 	}
 	if len(prior) == 1 {
 		for _, concept := range prior[0] {
-			if !annotation.ValidSourceID(concept.ConceptID) || !safeConceptSlug(concept.Slug) || (concept.EntityID != "" && !annotation.ValidSourceID(concept.EntityID)) {
+			if !annotation.ValidSourceID(concept.ConceptID) || !safeConceptSlug(concept.Slug) || (concept.EntityID != "" && !wikiindex.ValidSyntoEntityID(concept.EntityID)) {
 				return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingConceptMissingMapping, cause: fmt.Errorf("invalid prior concept identity for %q", concept.ConceptID)}
 			}
 			if _, exists := priorByID[concept.ConceptID]; exists {
@@ -1308,7 +1308,7 @@ func mapSyntoEntityIDsFromIndexTruth(index syntoIndexTruth, concepts map[string]
 		}
 	}
 	for _, edge := range index.SourceConcepts {
-		if edge.Name == "" || !annotation.ValidSourceID(edge.EntityID) {
+		if edge.Name == "" || !wikiindex.ValidSyntoEntityID(edge.EntityID) {
 			return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingSourceConceptIdentity, cause: errors.New("invalid Synto INDEX.json source concept identity")}
 		}
 		if byNameEntities[edge.Name] == nil {
@@ -1325,7 +1325,7 @@ func mapSyntoEntityIDsFromIndexTruth(index syntoIndexTruth, concepts map[string]
 		}
 	}
 	for _, article := range index.Articles {
-		if (article.ID != "" && !annotation.ValidSourceID(article.ID)) || (article.EntityID != "" && !annotation.ValidSourceID(article.EntityID)) {
+		if (article.ID != "" && !annotation.ValidSourceID(article.ID)) || (article.EntityID != "" && !wikiindex.ValidSyntoEntityID(article.EntityID)) {
 			return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingArticleIdentity, cause: errors.New("invalid Synto INDEX.json article identity")}
 		}
 		slug, err := normalizeSyntoArticlePath(article.Path)
@@ -1688,7 +1688,7 @@ func decodeSyntoArticles(dec *json.Decoder) ([]syntoIndexEntry, error) {
 			return nil, err
 		}
 		if entityID != nil {
-			if strings.TrimSpace(*entityID) == "" || !annotation.ValidSourceID(*entityID) {
+			if strings.TrimSpace(*entityID) == "" || !wikiindex.ValidSyntoEntityID(*entityID) {
 				return nil, &syntoIndexDecodeError{reason: syntoIndexDecodeReasonArticleIdentity, cause: errors.New("invalid Synto article identity")}
 			}
 			article.EntityID = *entityID
@@ -1699,7 +1699,7 @@ func decodeSyntoArticles(dec *json.Decoder) ([]syntoIndexEntry, error) {
 			}
 		}
 		if (article.ID != "" && !annotation.ValidSourceID(article.ID)) ||
-			(article.EntityID != "" && !annotation.ValidSourceID(article.EntityID)) || article.Name == "" {
+			(article.EntityID != "" && !wikiindex.ValidSyntoEntityID(article.EntityID)) || article.Name == "" {
 			return nil, &syntoIndexDecodeError{reason: syntoIndexDecodeReasonArticleIdentity, cause: errors.New("invalid Synto article identity")}
 		}
 		if _, err := normalizeSyntoArticlePath(article.Path); err != nil {
@@ -1821,7 +1821,7 @@ func decodeSyntoSourceConceptItems(dec *json.Decoder) ([]syntoSourceConcept, err
 			if _, err := dec.Token(); err != nil {
 				return nil, err
 			}
-			if !seen["name"] || !seen["entity_id"] || name == "" || !annotation.ValidSourceID(entity) {
+			if !seen["name"] || !seen["entity_id"] || name == "" || !wikiindex.ValidSyntoEntityID(entity) {
 				return nil, &syntoIndexDecodeError{reason: syntoIndexDecodeReasonSourceConceptIdentity, cause: errors.New("invalid source concept identity")}
 			}
 			out = append(out, syntoSourceConcept{Name: name, EntityID: entity})

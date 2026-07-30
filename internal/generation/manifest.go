@@ -2,6 +2,7 @@
 package generation
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -48,14 +49,138 @@ func Decode(data []byte) (Manifest, error) {
 	if len(data) > MaxManifestBytes {
 		return Manifest{}, errors.New("generation manifest exceeds limit")
 	}
-	var m Manifest
-	if err := json.Unmarshal(data, &m); err != nil {
+	m, err := decodeManifestStrict(data)
+	if err != nil {
 		return Manifest{}, errors.New("invalid generation manifest")
 	}
 	if err := m.Validate(); err != nil {
 		return Manifest{}, err
 	}
 	return m, nil
+}
+
+func decodeManifestStrict(data []byte) (Manifest, error) {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	var manifest Manifest
+	token, err := dec.Token()
+	if err != nil || token != json.Delim('{') {
+		return Manifest{}, errors.New("expected manifest object")
+	}
+	seen := make(map[string]struct{}, 6)
+	for dec.More() {
+		key, err := dec.Token()
+		if err != nil {
+			return Manifest{}, err
+		}
+		name, ok := key.(string)
+		if !ok {
+			return Manifest{}, errors.New("expected manifest field name")
+		}
+		if _, exists := seen[name]; exists {
+			return Manifest{}, errors.New("duplicate manifest field")
+		}
+		seen[name] = struct{}{}
+		switch name {
+		case "version":
+			err = dec.Decode(&manifest.Version)
+		case "generation_id":
+			err = dec.Decode(&manifest.GenerationID)
+		case "previous_generation_id":
+			err = dec.Decode(&manifest.PreviousGenerationID)
+		case "created_at":
+			err = dec.Decode(&manifest.CreatedAt)
+		case "input_fingerprint":
+			err = dec.Decode(&manifest.InputFingerprint)
+		case "files":
+			err = decodeManifestFiles(dec, &manifest.Files)
+		default:
+			return Manifest{}, fmt.Errorf("unknown manifest field %q", name)
+		}
+		if err != nil {
+			return Manifest{}, err
+		}
+	}
+	if _, err := dec.Token(); err != nil {
+		return Manifest{}, err
+	}
+	for _, required := range []string{"version", "generation_id", "created_at", "input_fingerprint", "files"} {
+		if _, ok := seen[required]; !ok {
+			return Manifest{}, fmt.Errorf("missing manifest field %q", required)
+		}
+	}
+	if err := EnsureJSONEOF(dec); err != nil {
+		return Manifest{}, err
+	}
+	return manifest, nil
+}
+
+func decodeManifestFiles(dec *json.Decoder, files *[]File) error {
+	token, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	if token != json.Delim('[') {
+		return errors.New("manifest files must be an array")
+	}
+	for dec.More() {
+		if len(*files) >= MaxFiles {
+			return errors.New("manifest file limit exceeded")
+		}
+		file, err := decodeManifestFile(dec)
+		if err != nil {
+			return err
+		}
+		*files = append(*files, file)
+	}
+	_, err = dec.Token()
+	return err
+}
+
+func decodeManifestFile(dec *json.Decoder) (File, error) {
+	var file File
+	token, err := dec.Token()
+	if err != nil || token != json.Delim('{') {
+		return File{}, errors.New("manifest file must be an object")
+	}
+	seen := make(map[string]struct{}, 4)
+	for dec.More() {
+		key, err := dec.Token()
+		if err != nil {
+			return File{}, err
+		}
+		name, ok := key.(string)
+		if !ok {
+			return File{}, errors.New("expected manifest file field name")
+		}
+		if _, exists := seen[name]; exists {
+			return File{}, errors.New("duplicate manifest file field")
+		}
+		seen[name] = struct{}{}
+		switch name {
+		case "path":
+			err = dec.Decode(&file.Path)
+		case "size":
+			err = dec.Decode(&file.Size)
+		case "sha256":
+			err = dec.Decode(&file.SHA256)
+		case "generation":
+			err = dec.Decode(&file.Generation)
+		default:
+			return File{}, fmt.Errorf("unknown manifest file field %q", name)
+		}
+		if err != nil {
+			return File{}, err
+		}
+	}
+	if _, err := dec.Token(); err != nil {
+		return File{}, err
+	}
+	for _, required := range []string{"path", "size", "sha256", "generation"} {
+		if _, ok := seen[required]; !ok {
+			return File{}, fmt.Errorf("missing manifest file field %q", required)
+		}
+	}
+	return file, nil
 }
 
 func (m Manifest) Validate() error {

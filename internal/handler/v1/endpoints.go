@@ -1054,10 +1054,6 @@ func (h *Handler) RebuildIndex(c *gin.Context) {
 				return
 			}
 			if exists {
-				if rebuilder, ok := projectStore.(store.GenerationRebuilder); ok {
-					h.handleGenerationRebuild(c, userID, projectID, rebuilder)
-					return
-				}
 				c.JSON(http.StatusConflict, handler.ErrorResponse{Error: "generated output is managed by the pipeline; run the pipeline"})
 				return
 			}

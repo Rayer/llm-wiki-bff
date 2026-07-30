@@ -39,38 +39,11 @@ func planSyntoGeneration(ctx context.Context, workspace string) (store.Generatio
 	}
 	migrated := 0
 	for oldID, slug := range prior.Concept {
-		if oldID == "" || slug == "" {
-			continue
-		}
-		if _, stillCurrent := next.Concept[oldID]; stillCurrent {
-			continue
-		}
-		entityID := ""
-		for candidate, candidateSlug := range next.Concept {
-			if candidateSlug != slug {
-				continue
+		if target, ok := next.IDRedirects[oldID]; ok && target != oldID && slug == next.Concept[target] && wikiindex.ValidLegacyConceptID(oldID) {
+			if prior.IDRedirects[oldID] != target {
+				migrated++
 			}
-			if entityID != "" {
-				entityID = ""
-				break
-			}
-			entityID = candidate
 		}
-		if entityID == "" || entityID == oldID {
-			continue
-		}
-		if next.IDRedirects == nil {
-			next.IDRedirects = make(map[string]string)
-		}
-		next.IDRedirects[oldID] = entityID
-		migrated++
-	}
-	encoded, err := wikiindex.EncodeIDMap(next)
-	if err != nil {
-		return store.GenerationRebuildPlan{}, errors.New("id_map_encode")
-	}
-	if _, err := indexStore.WriteBytesAtomic(ctx, encoded, wikiindex.IDMapTempPath, wikiindex.IDMapPath); err != nil {
-		return store.GenerationRebuildPlan{}, errors.New("id_map_write")
 	}
 	redirects := len(next.IDRedirects)
 	for _, values := range next.Redirects {

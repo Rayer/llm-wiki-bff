@@ -249,6 +249,20 @@ func RebuildWithSyntoIdentity(ctx context.Context, store Store, plan SyntoIdenti
 		return IDMap{}, err
 	}
 	plan = syntoPlanForAvailableFiles(files, plan)
+	rewrittenPages := make(map[string][]byte, len(plan.ByPath))
+	for path, entityID := range plan.ByPath {
+		for _, file := range files {
+			if file.Path != path {
+				continue
+			}
+			page, err := RewriteSyntoConceptPage(file.Data, entityID)
+			if err != nil {
+				return IDMap{}, fmt.Errorf("rewrite %s: %w", path, err)
+			}
+			rewrittenPages[path] = page
+			break
+		}
+	}
 
 	next := IDMap{
 		Concept:         map[string]string{},
@@ -279,23 +293,165 @@ func RebuildWithSyntoIdentity(ctx context.Context, store Store, plan SyntoIdenti
 		}
 	}
 	next.IDRedirects = cloneStringMap(old.IDRedirects)
+	if _, err := planSyntoIDRedirects(&next, old); err != nil {
+		return next, err
+	}
 	appendChangedRedirects(next.Redirects, old.Source, next.Source)
 
 	idMapData, err := encodeIDMap(next)
 	if err != nil {
 		return next, err
 	}
-	conceptsData, err := buildSyntoConceptsJSONL(files, plan)
+	cacheFiles := make([]MarkdownFile, len(files))
+	copy(cacheFiles, files)
+	for i := range cacheFiles {
+		if page, ok := rewrittenPages[cacheFiles[i].Path]; ok {
+			cacheFiles[i].Data = page
+		}
+	}
+	conceptsData, err := buildSyntoConceptsJSONL(cacheFiles, plan)
 	if err != nil {
 		return next, err
 	}
 	if err := writeIDMap(ctx, store, idMapData); err != nil {
 		return next, err
 	}
+	for path, page := range rewrittenPages {
+		if _, err := store.WriteBytesAtomic(ctx, page, path+".tmp", path); err != nil {
+			return next, fmt.Errorf("write %s: %w", path, err)
+		}
+	}
 	if err := writeConceptsJSONL(ctx, store, conceptsData); err != nil {
 		return next, err
 	}
 	return next, nil
+}
+
+// RewriteSyntoConceptPage makes an entity-bound page's top-level frontmatter
+// identity canonical while preserving its body and unrelated frontmatter.
+func RewriteSyntoConceptPage(data []byte, entityID string) ([]byte, error) {
+	if !ValidSyntoEntityID(entityID) {
+		return nil, fmt.Errorf("invalid Synto entity ID %q", entityID)
+	}
+	if !bytes.HasPrefix(data, []byte("---")) {
+		return append([]byte("---\nid: "+entityID+"\n---\n"), data...), nil
+	}
+	lines := bytes.SplitAfter(data, []byte("\n"))
+	if len(lines) == 0 || strings.TrimSpace(string(lines[0])) != "---" {
+		return nil, errors.New("concept frontmatter is malformed")
+	}
+	end := -1
+	for i := 1; i < len(lines); i++ {
+		if strings.TrimSpace(string(lines[i])) == "---" {
+			end = i
+			break
+		}
+	}
+	if end < 0 {
+		return nil, errors.New("concept frontmatter is unterminated")
+	}
+	var matter map[string]interface{}
+	if _, err := fm.MustParse(strings.NewReader(string(data)), &matter); err != nil {
+		return nil, fmt.Errorf("unsafe concept frontmatter: %w", err)
+	}
+	found := 0
+	pageID := ""
+	for i := 1; i < end; i++ {
+		line := strings.TrimSuffix(strings.TrimSuffix(string(lines[i]), "\n"), "\r")
+		if strings.HasPrefix(line, " ") || strings.HasPrefix(line, "\t") {
+			continue
+		}
+		key, value, ok := strings.Cut(line, ":")
+		key = strings.Trim(strings.TrimSpace(key), "\"'")
+		if !ok || key != "id" {
+			continue
+		}
+		found++
+		pageID = strings.TrimSpace(strings.TrimSpace(value))
+		if found > 1 {
+			return nil, errors.New("duplicate concept frontmatter id")
+		}
+		if parsed, exists := matter["id"]; exists {
+			parsedID, ok := parsed.(string)
+			if !ok {
+				return nil, errors.New("concept frontmatter id must be a string")
+			}
+			pageID = strings.TrimSpace(parsedID)
+		}
+		if pageID != "" && !ValidLegacyConceptID(pageID) && !ValidSyntoEntityID(pageID) {
+			return nil, fmt.Errorf("invalid concept frontmatter id %q", pageID)
+		}
+		lineEnding := "\n"
+		if bytes.HasSuffix(lines[i], []byte("\r\n")) {
+			lineEnding = "\r\n"
+		}
+		prefix := line[:strings.Index(line, ":")+1]
+		lines[i] = []byte(prefix + " " + entityID + lineEnding)
+	}
+	if found == 0 {
+		lines = append(lines, nil)
+		copy(lines[end+2:], lines[end+1:])
+		lines[end+1] = []byte("id: " + entityID + "\n")
+	}
+	return bytes.Join(lines, nil), nil
+}
+
+func planSyntoIDRedirects(next *IDMap, old IDMap) (int, error) {
+	redirects := make(map[string]string, len(old.IDRedirects)+len(old.Concept))
+	add := func(source, target string) error {
+		if !ValidLegacyConceptID(source) || source == target {
+			return fmt.Errorf("invalid ID redirect source %q", source)
+		}
+		if _, current := next.Concept[source]; current {
+			return fmt.Errorf("ID redirect source %q is an active concept", source)
+		}
+		if !ValidSyntoEntityID(target) {
+			return fmt.Errorf("invalid ID redirect target %q", target)
+		}
+		if _, current := next.Concept[target]; !current {
+			return fmt.Errorf("ID redirect target %q not found", target)
+		}
+		if previous, exists := redirects[source]; exists && previous != target {
+			return fmt.Errorf("ID redirect conflict for %q", source)
+		}
+		redirects[source] = target
+		return nil
+	}
+	for source, target := range old.IDRedirects {
+		if err := add(source, strings.TrimSpace(target)); err != nil {
+			return 0, err
+		}
+	}
+	for _, concepts := range []map[string]string{old.Concept, old.DormantConcept} {
+		for oldID, slug := range concepts {
+			var target string
+			for entityID, currentSlug := range next.Concept {
+				if currentSlug == slug {
+					target = entityID
+					break
+				}
+			}
+			if target == "" || oldID == target {
+				continue
+			}
+			if !ValidLegacyConceptID(oldID) {
+				return 0, fmt.Errorf("non-legacy prior concept ID %q cannot be migrated", oldID)
+			}
+			if err := add(oldID, target); err != nil {
+				return 0, err
+			}
+		}
+	}
+	for source, target := range redirects {
+		if _, chained := redirects[target]; chained {
+			return 0, fmt.Errorf("ID redirect chain detected for %q", source)
+		}
+		if source == target {
+			return 0, fmt.Errorf("ID redirect cycle detected for %q", source)
+		}
+	}
+	next.IDRedirects = redirects
+	return len(redirects) - len(old.IDRedirects), nil
 }
 
 func validateSyntoIdentityPlan(files []MarkdownFile, plan SyntoIdentityPlan) error {
@@ -314,7 +470,7 @@ func validateSyntoIdentityPlan(files []MarkdownFile, plan SyntoIdentityPlan) err
 	}
 	entityPaths := make(map[string]string, len(plan.ByPath))
 	for path, entityID := range plan.ByPath {
-		if !validSyntoArticlePath(path) || !annotation.ValidSourceID(entityID) || entityID != strings.TrimSpace(entityID) {
+		if !validSyntoArticlePath(path) || !ValidSyntoEntityID(entityID) || entityID != strings.TrimSpace(entityID) {
 			return fmt.Errorf("unsafe Synto identity mapping %q -> %q", path, entityID)
 		}
 		if _, exists := fileByPath[path]; !exists && plan.ActiveEntities[entityID] {
@@ -326,7 +482,7 @@ func validateSyntoIdentityPlan(files []MarkdownFile, plan SyntoIdentityPlan) err
 		entityPaths[entityID] = path
 	}
 	for entityID := range plan.ActiveEntities {
-		if !annotation.ValidSourceID(entityID) || entityID != strings.TrimSpace(entityID) {
+		if !ValidSyntoEntityID(entityID) || entityID != strings.TrimSpace(entityID) {
 			return fmt.Errorf("unsafe active Synto entity_id %q", entityID)
 		}
 		if _, exists := entityPaths[entityID]; !exists {

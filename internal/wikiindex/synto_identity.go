@@ -85,7 +85,7 @@ func DecodeSyntoIdentityPlan(data []byte) (SyntoIdentityPlan, error) {
 		if article.EntityID == "" {
 			continue
 		}
-		if !annotation.ValidSourceID(article.EntityID) {
+		if !ValidSyntoEntityID(article.EntityID) {
 			return SyntoIdentityPlan{}, fmt.Errorf("unsafe Synto article entity_id %q", article.EntityID)
 		}
 		if owners := names[article.Name]; len(owners) > 0 {
@@ -147,7 +147,7 @@ func decodeSyntoIdentityArticles(data []byte) ([]syntoIdentityArticle, error) {
 				article.EntityID = ""
 			} else {
 				article.EntityID = strings.TrimSpace(*entityID)
-				if article.EntityID == "" || !annotation.ValidSourceID(article.EntityID) {
+				if article.EntityID == "" || !ValidSyntoEntityID(article.EntityID) {
 					return nil, errors.New("invalid Synto article entity_id")
 				}
 			}
@@ -194,7 +194,7 @@ func decodeSyntoIdentitySourceConcepts(data []byte) (map[string]bool, map[string
 				return nil, nil, fmt.Errorf("decode Synto source concept: %w", err)
 			}
 			var name, entityID string
-			if err := json.Unmarshal(item["name"], &name); err != nil || name == "" || json.Unmarshal(item["entity_id"], &entityID) != nil || !annotation.ValidSourceID(entityID) {
+			if err := json.Unmarshal(item["name"], &name); err != nil || name == "" || json.Unmarshal(item["entity_id"], &entityID) != nil || !ValidSyntoEntityID(entityID) {
 				return nil, nil, errors.New("invalid Synto source concept identity")
 			}
 			active[entityID] = true

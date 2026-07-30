@@ -9,8 +9,53 @@ import (
 	"testing"
 )
 
+const testEntityULID = "01JAZ5N7Y3K8M2Q4R6T9VWXABC"
+const testArticleULID = "01JAZ5N7Y3K8M2Q4R6T9VWXABD"
+
+func TestDecodeSyntoIdentityPlanEnforcesReleasedEntityULID(t *testing.T) {
+	for _, entityID := range []string{"entity-alpha", "01jaz5n7y3k8m2q4r6t9vw xabc", "01JAZ5N7Y3K8M2Q4R6T9VWXABCI", "8JAZ5N7Y3K8M2Q4R6T9VWXABC", "Z1JAZ5N7Y3K8M2Q4R6T9VWXABC"} {
+		if _, err := DecodeSyntoIdentityPlan(syntoIdentityReleasedFixture(fmt.Sprintf(`%q`, entityID))); err == nil {
+			t.Errorf("DecodeSyntoIdentityPlan accepted invalid entity ID %q", entityID)
+		}
+	}
+	if plan, err := DecodeSyntoIdentityPlan(syntoIdentityReleasedFixture(fmt.Sprintf(`%q`, testEntityULID))); err != nil || plan.ByPath["wiki/ordinary.md"] != testEntityULID {
+		t.Fatalf("valid released entity ID rejected: plan=%#v err=%v", plan, err)
+	}
+}
+
+func TestRebuildWithSyntoIdentityRewritesCanonicalPageAndFailsBeforeWrites(t *testing.T) {
+	store := &fakeStore{
+		files: map[string][]MarkdownFile{
+			"wiki/": {
+				{Slug: "alpha", Path: "wiki/alpha.md", Data: []byte("---\nid: a3f7b2c01d9d\ntitle: Alpha\n---\nAlpha body")},
+			},
+			"wiki/sources/": {},
+		},
+		reads: map[string][]byte{},
+	}
+	if _, err := RebuildWithSyntoIdentity(context.Background(), store, SyntoIdentityPlan{
+		ByPath: map[string]string{"wiki/alpha.md": testEntityULID}, ActiveEntities: map[string]bool{testEntityULID: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	page := store.writes["wiki/alpha.md"]
+	if !bytes.Contains(page, []byte("id: "+testEntityULID)) || bytes.Contains(page, []byte("a3f7b2c01d9d")) {
+		t.Fatalf("canonical page=%q", page)
+	}
+
+	bad := &fakeStore{
+		files: map[string][]MarkdownFile{"wiki/": {{Slug: "alpha", Path: "wiki/alpha.md", Data: []byte("---\nid: a3f7b2c01d9d\nid: " + testEntityULID + "\n---\nbody")}}, "wiki/sources/": {}},
+		reads: map[string][]byte{},
+	}
+	if _, err := RebuildWithSyntoIdentity(context.Background(), bad, SyntoIdentityPlan{
+		ByPath: map[string]string{"wiki/alpha.md": testEntityULID}, ActiveEntities: map[string]bool{testEntityULID: true},
+	}); err == nil || len(bad.writes) != 0 {
+		t.Fatalf("duplicate page ID result err=%v writes=%#v, want error and zero writes", err, bad.writes)
+	}
+}
+
 func TestRebuildWithSyntoIdentityUsesEntityIDsAndExcludesEntitylessPages(t *testing.T) {
-	page := []byte("---\nid: old-content-id\ntitle: Alpha\n---\nAlpha body")
+	page := []byte("---\nid: a3f7b2c01d9d\ntitle: Alpha\n---\nAlpha body")
 	store := &fakeStore{
 		files: map[string][]MarkdownFile{
 			"wiki/": {
@@ -23,16 +68,16 @@ func TestRebuildWithSyntoIdentityUsesEntityIDsAndExcludesEntitylessPages(t *test
 	}
 
 	next, err := RebuildWithSyntoIdentity(context.Background(), store, SyntoIdentityPlan{
-		ByPath:         map[string]string{"wiki/alpha.md": "entity-alpha"},
-		ActiveEntities: map[string]bool{"entity-alpha": true},
+		ByPath:         map[string]string{"wiki/alpha.md": "01JAZ5N7Y3K8M2Q4R6T9VWXABC"},
+		ActiveEntities: map[string]bool{"01JAZ5N7Y3K8M2Q4R6T9VWXABC": true},
 	})
 	if err != nil {
 		t.Fatalf("RebuildWithSyntoIdentity() error = %v", err)
 	}
-	if got := next.Concept["entity-alpha"]; got != "alpha" {
-		t.Fatalf("concept entity map = %#v, want entity-alpha -> alpha", next.Concept)
+	if got := next.Concept["01JAZ5N7Y3K8M2Q4R6T9VWXABC"]; got != "alpha" {
+		t.Fatalf("concept entity map = %#v, want 01JAZ5N7Y3K8M2Q4R6T9VWXABC -> alpha", next.Concept)
 	}
-	if _, ok := next.Concept["old-content-id"]; ok {
+	if _, ok := next.Concept["a3f7b2c01d9d"]; ok {
 		t.Fatalf("content-derived/frontmatter ID remained authoritative: %#v", next.Concept)
 	}
 	if len(next.ConceptEntityID) != 0 {
@@ -49,22 +94,22 @@ func TestRebuildWithSyntoIdentityUsesEntityIDsAndExcludesEntitylessPages(t *test
 	if err := json.Unmarshal(bytes.TrimSpace(store.writes[ConceptsJSONLPath]), &entry); err != nil {
 		t.Fatalf("concept cache row is not valid JSON: %v", err)
 	}
-	if entry.Slug != "alpha" || entry.Frontmatter["id"] != "entity-alpha" {
-		t.Fatalf("Synto concept cache row = %+v, want entity-bound id", entry)
+	if entry.Slug != "alpha" || entry.Frontmatter["id"] != "01JAZ5N7Y3K8M2Q4R6T9VWXABC" {
+		t.Fatalf("Synto concept cache row = %+v, want 01JAZ5N7Y3K8M2Q4R6T9VWXABE id", entry)
 	}
 	if strings.Contains(string(store.writes[ConceptsJSONLPath]), "draft") {
 		t.Fatalf("entity-less page entered Synto concept cache: %s", store.writes[ConceptsJSONLPath])
 	}
 
-	store.files["wiki/"][0].Data = []byte("---\nid: a-different-old-id\ntitle: Alpha\n---\nEdited body")
+	store.files["wiki/"][0].Data = []byte("---\nid: b7e2c9a4d113\ntitle: Alpha\n---\nEdited body")
 	second, err := RebuildWithSyntoIdentity(context.Background(), store, SyntoIdentityPlan{
-		ByPath:         map[string]string{"wiki/alpha.md": "entity-alpha"},
-		ActiveEntities: map[string]bool{"entity-alpha": true},
+		ByPath:         map[string]string{"wiki/alpha.md": "01JAZ5N7Y3K8M2Q4R6T9VWXABC"},
+		ActiveEntities: map[string]bool{"01JAZ5N7Y3K8M2Q4R6T9VWXABC": true},
 	})
 	if err != nil {
 		t.Fatalf("body-edit rebuild error = %v", err)
 	}
-	if got := second.Concept["entity-alpha"]; got != "alpha" || len(second.Concept) != 1 {
+	if got := second.Concept["01JAZ5N7Y3K8M2Q4R6T9VWXABC"]; got != "alpha" || len(second.Concept) != 1 {
 		t.Fatalf("body edit changed entity identity = %#v", second.Concept)
 	}
 }
@@ -78,7 +123,7 @@ func TestDecodeSyntoIdentityPlanReleasedEntityShapes(t *testing.T) {
 	}{
 		{name: "missing is entityless", wantEntity: ""},
 		{name: "null is entityless", entityJSON: "null", wantEntity: ""},
-		{name: "non-empty string", entityJSON: `"entity-alpha"`, wantEntity: "entity-alpha"},
+		{name: "non-empty string", entityJSON: `"01JAZ5N7Y3K8M2Q4R6T9VWXABC"`, wantEntity: "01JAZ5N7Y3K8M2Q4R6T9VWXABC"},
 		{name: "empty string", entityJSON: `""`, wantErr: true},
 		{name: "number", entityJSON: "7", wantErr: true},
 		{name: "object", entityJSON: `{}`, wantErr: true},
@@ -128,7 +173,7 @@ func TestDecodeSyntoIdentityPlanReleasedEntityShapes(t *testing.T) {
 }
 
 func TestDecodeSyntoIdentityPlanEntitylessRowsParticipateInValidation(t *testing.T) {
-	entityBound := `{"id":"bound","entity_id":"entity-bound","name":"Bound","path":"wiki/bound.md","summary":null,"tags":[],"aliases":[],"confidence":"high"}`
+	entityBound := `{"id":"bound","entity_id":"01JAZ5N7Y3K8M2Q4R6T9VWXABE","name":"Bound","path":"wiki/bound.md","summary":null,"tags":[],"aliases":[],"confidence":"high"}`
 	testCases := []struct {
 		name   string
 		rows   []string
@@ -154,7 +199,7 @@ func TestDecodeSyntoIdentityPlanEntitylessRowsParticipateInValidation(t *testing
 		{
 			name: "unsafe entityless path fails",
 			rows: []string{
-				`{"id":"safe","entity_id":"entity-safe","name":"Safe","path":"wiki/safe.md","summary":null,"tags":[],"aliases":[],"confidence":"high"}`,
+				`{"id":"safe","entity_id":"01JAZ5N7Y3K8M2Q4R6T9VWXABF","name":"Safe","path":"wiki/safe.md","summary":null,"tags":[],"aliases":[],"confidence":"high"}`,
 				`{"id":"bad","name":"Bad","path":"wiki/../bad.md","summary":null,"tags":[],"aliases":[],"confidence":"high"}`,
 			},
 			needle: "unsafe Synto article path",
@@ -176,7 +221,7 @@ func TestDecodeSyntoIdentityPlanEntitylessRowsParticipateInValidation(t *testing
 	if err != nil {
 		t.Fatalf("DecodeSyntoIdentityPlan() error = %v", err)
 	}
-	if len(plan.ByPath) != 1 || plan.ByPath["wiki/bound.md"] != "entity-bound" {
+	if len(plan.ByPath) != 1 || plan.ByPath["wiki/bound.md"] != "01JAZ5N7Y3K8M2Q4R6T9VWXABE" {
 		t.Fatalf("ByPath = %#v", plan.ByPath)
 	}
 	if _, ok := plan.ByPath["wiki/entityless.md"]; ok {
@@ -187,7 +232,7 @@ func TestDecodeSyntoIdentityPlanEntitylessRowsParticipateInValidation(t *testing
 func TestDecodeSyntoIdentityPlanExcludedReservedRoots(t *testing.T) {
 	plan, err := DecodeSyntoIdentityPlan(syntoIdentityFixtureFromArticles([]string{
 		`{"id":"index","entity_id":null,"name":"Index","path":"wiki/index.md","summary":null,"tags":[],"aliases":[],"confidence":"high"}`,
-		`{"id":"alpha","entity_id":"entity-alpha","name":"Alpha","path":"wiki/alpha.md","summary":null,"tags":[],"aliases":[],"confidence":"high"}`,
+		`{"id":"alpha","entity_id":"01JAZ5N7Y3K8M2Q4R6T9VWXABC","name":"Alpha","path":"wiki/alpha.md","summary":null,"tags":[],"aliases":[],"confidence":"high"}`,
 	}))
 	if err != nil {
 		t.Fatalf("DecodeSyntoIdentityPlan() error = %v", err)
@@ -202,7 +247,7 @@ func syntoIdentityReleasedFixture(entityJSON string) []byte {
 	if entityJSON != "" {
 		entity = `,"entity_id":` + entityJSON
 	}
-	return []byte(`{"schema_version":1,"pack":{"id":"fixture","name":"fixture","version":"0","language":["en"],"capabilities":["articles","concepts"]},"articles":[{"id":"article-1"` + entity + `,"name":"Ordinary","path":"wiki/ordinary.md","summary":null,"tags":[],"aliases":[],"confidence":"high"}],"terms":[],"papers":[],"sources":[],"source_concepts":[],"synthesis":[],"stats":{"article_count":1,"draft_count":0,"concept_count":0,"alias_count":0,"knowledge_item_count":0,"source_count":0,"source_segment_count":0,"failed_note_count":0,"failed_concept_count":0}}`)
+	return []byte(`{"schema_version":1,"pack":{"id":"fixture","name":"fixture","version":"0","language":["en"],"capabilities":["articles","concepts"]},"articles":[{"id":"` + testArticleULID + `"` + entity + `,"name":"Ordinary","path":"wiki/ordinary.md","summary":null,"tags":[],"aliases":[],"confidence":"high"}],"terms":[],"papers":[],"sources":[],"source_concepts":[],"synthesis":[],"stats":{"article_count":1,"draft_count":0,"concept_count":0,"alias_count":0,"knowledge_item_count":0,"source_count":0,"source_segment_count":0,"failed_note_count":0,"failed_concept_count":0}}`)
 }
 
 func syntoIdentityFixtureFromArticles(articles []string) []byte {
@@ -221,7 +266,7 @@ func TestRebuildWithSyntoIdentityFailsClosedOnMissingActiveEntityArticle(t *test
 
 	if _, err := RebuildWithSyntoIdentity(context.Background(), store, SyntoIdentityPlan{
 		ByPath:         map[string]string{},
-		ActiveEntities: map[string]bool{"entity-missing": true},
+		ActiveEntities: map[string]bool{"01JAZ5N7Y3K8M2Q4R6T9VWXABG": true},
 	}); err == nil || !strings.Contains(err.Error(), "no entity-bound article") {
 		t.Fatalf("missing active entity error = %v", err)
 	}
@@ -607,7 +652,7 @@ func TestRebuildPreservesDormantConceptsAndOwnedEntityMappings(t *testing.T) {
 	old := IDMap{
 		Concept:         map[string]string{"stable-alpha": "alpha"},
 		DormantConcept:  map[string]string{"stable-beta": "beta"},
-		ConceptEntityID: map[string]string{"stable-alpha": "entity-alpha", "stable-beta": "entity-beta", "orphan": "entity-orphan"},
+		ConceptEntityID: map[string]string{"stable-alpha": "01JAZ5N7Y3K8M2Q4R6T9VWXABC", "stable-beta": "01JAZ5N7Y3K8M2Q4R6T9VWXABD", "orphan": "entity-orphan"},
 		Source:          map[string]string{},
 		Redirects:       map[string][]string{},
 	}
@@ -630,7 +675,7 @@ func TestRebuildPreservesDormantConceptsAndOwnedEntityMappings(t *testing.T) {
 	if next.DormantConcept["stable-beta"] != "beta" {
 		t.Fatalf("dormant concept = %#v, want stable-beta -> beta", next.DormantConcept)
 	}
-	if next.ConceptEntityID["stable-alpha"] != "entity-alpha" || next.ConceptEntityID["stable-beta"] != "entity-beta" {
+	if next.ConceptEntityID["stable-alpha"] != "01JAZ5N7Y3K8M2Q4R6T9VWXABC" || next.ConceptEntityID["stable-beta"] != "01JAZ5N7Y3K8M2Q4R6T9VWXABD" {
 		t.Fatalf("owned entity mappings = %#v", next.ConceptEntityID)
 	}
 	if _, ok := next.ConceptEntityID["orphan"]; ok {
@@ -647,14 +692,14 @@ func TestRebuildFailsClosedOnLifecycleMappingCollisions(t *testing.T) {
 			name: "active dormant slug",
 			old: IDMap{
 				DormantConcept:  map[string]string{"stable-beta": "alpha"},
-				ConceptEntityID: map[string]string{"stable-beta": "entity-beta"},
+				ConceptEntityID: map[string]string{"stable-beta": "01JAZ5N7Y3K8M2Q4R6T9VWXABD"},
 			},
 		},
 		{
 			name: "active dormant id",
 			old: IDMap{
 				DormantConcept:  map[string]string{"stable-alpha": "beta"},
-				ConceptEntityID: map[string]string{"stable-alpha": "entity-alpha"},
+				ConceptEntityID: map[string]string{"stable-alpha": "01JAZ5N7Y3K8M2Q4R6T9VWXABC"},
 			},
 		},
 		{
@@ -698,7 +743,7 @@ func TestRebuildFailsClosedOnLifecycleMappingCollisions(t *testing.T) {
 func TestRebuildFailsClosedOnMalformedLifecycleMapping(t *testing.T) {
 	old := IDMap{
 		DormantConcept:  map[string]string{"../stable": "beta"},
-		ConceptEntityID: map[string]string{"../stable": "entity-beta"},
+		ConceptEntityID: map[string]string{"../stable": "01JAZ5N7Y3K8M2Q4R6T9VWXABD"},
 	}
 	oldJSON, err := json.Marshal(old)
 	if err != nil {

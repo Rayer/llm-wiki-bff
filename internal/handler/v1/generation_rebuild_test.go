@@ -17,10 +17,10 @@ func TestPlanSyntoGenerationIsIdempotentAndPlansOneTimeRedirect(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	writeGenerationRebuildTestFile(t, workspace, "wiki/alpha.md", []byte("---\nid: old-id\n---\nalpha\n"))
-	writeGenerationRebuildTestFile(t, workspace, "cache/id_map.json", []byte(`{"concept":{"old-id":"alpha"},"source":{},"redirects":{}}`))
-	writeGenerationRebuildTestFile(t, workspace, "cache/concepts.jsonl", []byte(`{"slug":"alpha","frontmatter":{"id":"old-id"}}`+"\n"))
-	writeGenerationRebuildTestFile(t, workspace, ".synto/INDEX.json", []byte(`{"schema_version":1,"pack":{},"articles":[{"id":"generated","entity_id":"entity-alpha","name":"alpha","path":"wiki/alpha.md","summary":null,"tags":[],"aliases":[],"confidence":"high"}],"terms":[],"papers":[],"sources":[],"source_concepts":[{"source_path":"raw/source.md","content_hash":"0000000000000000000000000000000000000000000000000000000000000000","concepts":[{"name":"alpha","entity_id":"entity-alpha"}]}],"synthesis":[],"stats":{}}`))
+	writeGenerationRebuildTestFile(t, workspace, "wiki/alpha.md", []byte("---\nid: a3f7b2c01d9d\n---\nalpha\n"))
+	writeGenerationRebuildTestFile(t, workspace, "cache/id_map.json", []byte(`{"concept":{"a3f7b2c01d9d":"alpha"},"source":{},"redirects":{}}`))
+	writeGenerationRebuildTestFile(t, workspace, "cache/concepts.jsonl", []byte(`{"slug":"alpha","frontmatter":{"id":"a3f7b2c01d9d"}}`+"\n"))
+	writeGenerationRebuildTestFile(t, workspace, ".synto/INDEX.json", []byte(`{"schema_version":1,"pack":{},"articles":[{"id":"generated","entity_id":"01JAZ5N7Y3K8M2Q4R6T9VWXABC","name":"alpha","path":"wiki/alpha.md","summary":null,"tags":[],"aliases":[],"confidence":"high"}],"terms":[],"papers":[],"sources":[],"source_concepts":[{"source_path":"raw/source.md","content_hash":"0000000000000000000000000000000000000000000000000000000000000000","concepts":[{"name":"alpha","entity_id":"01JAZ5N7Y3K8M2Q4R6T9VWXABC"}]}],"synthesis":[],"stats":{}}`))
 
 	first, err := planSyntoGeneration(context.Background(), workspace)
 	if err != nil {
@@ -30,7 +30,7 @@ func TestPlanSyntoGenerationIsIdempotentAndPlansOneTimeRedirect(t *testing.T) {
 		t.Fatalf("first plan=%+v, want one migration and redirect", first)
 	}
 	firstMap := readGenerationRebuildTestMap(t, workspace)
-	if firstMap.Concept["entity-alpha"] != "alpha" || firstMap.IDRedirects["old-id"] != "entity-alpha" {
+	if firstMap.Concept["01JAZ5N7Y3K8M2Q4R6T9VWXABC"] != "alpha" || firstMap.IDRedirects["a3f7b2c01d9d"] != "01JAZ5N7Y3K8M2Q4R6T9VWXABC" {
 		t.Fatalf("first map=%+v", firstMap)
 	}
 
