@@ -17,8 +17,7 @@ import (
 
 var (
 	errIDMapNotFound = errors.New("id map not found")
-	idSlugRE         = regexp.MustCompile(`^([a-f0-9]{12})-(.+)$`)
-	idOnlyRE         = regexp.MustCompile(`^[a-f0-9]{12}$`)
+	idSlugRE         = regexp.MustCompile(`^([a-f0-9]{12}|[0-7][0-9A-HJKMNP-TV-Z]{25})-(.+)$`)
 	wikilinkRE       = regexp.MustCompile(`\[\[([^\[\]\n]+)\]\]`)
 )
 
@@ -31,8 +30,9 @@ type idRouteEntry struct {
 }
 
 type dualIDMap struct {
-	byID   map[string]idRouteEntry
-	bySlug map[string][]idRouteEntry
+	byID       map[string]idRouteEntry
+	bySlug     map[string][]idRouteEntry
+	idRedirect map[string]string
 }
 
 func loadDualIDMap(ctx context.Context, store idMapStore) (dualIDMap, error) {
@@ -53,11 +53,17 @@ func loadDualIDMap(ctx context.Context, store idMapStore) (dualIDMap, error) {
 
 func buildDualIDMap(source idMap) dualIDMap {
 	dual := dualIDMap{
-		byID:   map[string]idRouteEntry{},
-		bySlug: map[string][]idRouteEntry{},
+		byID:       map[string]idRouteEntry{},
+		bySlug:     map[string][]idRouteEntry{},
+		idRedirect: map[string]string{},
 	}
 	addDualIDMapEntries(dual, source.Concept, "concept")
 	addDualIDMapEntries(dual, source.Source, "source")
+	for oldID, newID := range source.IDRedirects {
+		if strings.TrimSpace(oldID) != "" && strings.TrimSpace(newID) != "" {
+			dual.idRedirect[oldID] = newID
+		}
+	}
 	return dual
 }
 
@@ -114,7 +120,7 @@ func canonicalWikilinkTarget(entry idRouteEntry, anchor string, hasAnchor bool, 
 
 func parseIDSlug(value string) (string, string, bool) {
 	matches := idSlugRE.FindStringSubmatch(value)
-	if len(matches) != 3 {
+	if len(matches) != 3 || !validRouteID(matches[1]) {
 		return "", "", false
 	}
 	return matches[1], matches[2], true
@@ -124,10 +130,14 @@ func idFromPathValue(value string) (string, string, bool) {
 	if id, slug, ok := parseIDSlug(value); ok {
 		return id, slug, true
 	}
-	if idOnlyRE.MatchString(value) {
+	if validRouteID(value) {
 		return value, "", true
 	}
 	return "", "", false
+}
+
+func validRouteID(value string) bool {
+	return wikiindex.ValidLegacyConceptID(value) || wikiindex.ValidSyntoEntityID(value)
 }
 
 func canonicalIDRoute(currentType, idSlug string, dual dualIDMap) (string, bool) {
@@ -137,6 +147,11 @@ func canonicalIDRoute(currentType, idSlug string, dual dualIDMap) (string, bool)
 	}
 	entry, ok := dual.byID[id]
 	if !ok {
+		if targetID, redirected := dual.idRedirect[id]; redirected {
+			if target, targetExists := dual.byID[targetID]; targetExists {
+				return "/" + routePrefix(target.Type) + "/" + entryIDSlug(target), true
+			}
+		}
 		return "", false
 	}
 	if entry.Type == currentType && slug == entry.Slug {
@@ -211,6 +226,12 @@ func (h *Handler) handleIDRoutedPage(c *gin.Context, gcsClient store.Store, curr
 	id, _, _ := idFromPathValue(idSlug)
 	entry, ok := dual.byID[id]
 	if !ok {
+		if targetID, redirected := dual.idRedirect[id]; redirected {
+			if target, targetExists := dual.byID[targetID]; targetExists {
+				c.Redirect(idRouteRedirectStatus, requestRelativeIDRoute(c, "/"+routePrefix(target.Type)+"/"+entryIDSlug(target)))
+				return true
+			}
+		}
 		c.JSON(http.StatusNotFound, handler.ErrorResponse{Error: "id not found: " + id})
 		return true
 	}
@@ -240,6 +261,7 @@ func (h *Handler) handleIDRoutedPage(c *gin.Context, gcsClient store.Store, curr
 	}
 
 	c.JSON(http.StatusOK, handler.ConceptDetailResponse{
+		ID:          entry.ID,
 		Slug:        entry.Slug,
 		Title:       entry.Slug,
 		Type:        "concept",

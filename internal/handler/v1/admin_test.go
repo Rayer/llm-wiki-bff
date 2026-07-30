@@ -155,8 +155,8 @@ func TestAdminProjectCountsByUserUsesActualOwnership(t *testing.T) {
 	assert.Equal(t, 0, got["user-c"])
 }
 
-func TestAdminProjectRecordFromFirestoreDocUsesStoredProjectID(t *testing.T) {
-	project, ok := adminProjectRecordFromFirestoreDoc("user-a_doc-suffix", map[string]interface{}{
+func TestAdminProjectRecordFromFirestoreDocRequiresMatchingStoredProjectID(t *testing.T) {
+	project, ok := adminProjectRecordFromFirestoreDoc("user-a_authoritative-project", map[string]interface{}{
 		"project_id": "authoritative-project",
 		"name":       "Authoritative Project",
 	})
@@ -166,6 +166,15 @@ func TestAdminProjectRecordFromFirestoreDocUsesStoredProjectID(t *testing.T) {
 	assert.Equal(t, "user-a", project.userID)
 	assert.Equal(t, "authoritative-project", project.projectID)
 	assert.Equal(t, "Authoritative Project", project.name)
+}
+
+func TestAdminProjectRecordFromFirestoreDocRejectsMismatchedStoredProjectID(t *testing.T) {
+	if _, ok := adminProjectRecordFromFirestoreDoc("user-a_doc-suffix", map[string]interface{}{
+		"project_id": "authoritative-project",
+		"name":       "Mismatched Project",
+	}); ok {
+		t.Fatal("mismatched project document must not authorize rebuild")
+	}
 }
 
 func TestAdminProjectRecordFromFirestoreDocRejectsMalformedProject(t *testing.T) {
@@ -481,7 +490,9 @@ func TestGenerationProjectsRejectManualRebuildWithoutCallingWriter(t *testing.T)
 	project := &adminStatsProjectStore{hasManifest: true}
 	root := &adminStatsRootStore{adminStatsProjectStore: project, scoped: map[string]*adminStatsProjectStore{"request-user/demo": project}}
 	calls := 0
-	h := &Handler{store: root, rebuildIndex: func(context.Context, string, string) (idMap, error) {
+	h := &Handler{store: root, adminProjectRecordLoader: func(context.Context, string) (adminProjectRecord, error) {
+		return adminProjectRecord{id: "request-user_demo", userID: "request-user", projectID: "demo"}, nil
+	}, rebuildIndex: func(context.Context, string, string) (idMap, error) {
 		calls++
 		return idMap{}, nil
 	}}
@@ -520,6 +531,130 @@ func TestGenerationProjectsRejectManualRebuildWithoutCallingWriter(t *testing.T)
 	project.hasManifest = true
 	if recorder := request(false); recorder.Code != http.StatusConflict || calls != 1 {
 		t.Fatalf("malformed manifest rebuild = %d, calls = %d; want 409 and 1", recorder.Code, calls)
+	}
+}
+
+type adminGenerationRebuilderStore struct {
+	*adminStatsProjectStore
+	result store.GenerationRebuildResult
+	err    error
+	called bool
+}
+
+type adminGenerationRootStore struct{ *adminGenerationRebuilderStore }
+
+func (s *adminGenerationRootStore) Scope(string, string) store.Store {
+	return s.adminGenerationRebuilderStore
+}
+
+func (s *adminGenerationRebuilderStore) RebuildIndexGeneration(context.Context, store.GenerationRebuildPlanner) (store.GenerationRebuildResult, error) {
+	s.called = true
+	if s.err != nil {
+		return store.GenerationRebuildResult{}, s.err
+	}
+	return s.result, nil
+}
+
+func TestAdminRebuildIndexUsesGenerationRebuilderAfterAuthorization(t *testing.T) {
+	project := &adminGenerationRebuilderStore{
+		adminStatsProjectStore: &adminStatsProjectStore{prefix: "users/user/project", hasManifest: true},
+		result: store.GenerationRebuildResult{
+			Status: "ok", OldGeneration: "g_old", NewGeneration: "g_new", ConceptCount: 2, SourceCount: 1,
+		},
+	}
+	root := &adminGenerationRootStore{adminGenerationRebuilderStore: project}
+	h := &Handler{store: root, adminProjectRecordLoader: func(context.Context, string) (adminProjectRecord, error) {
+		return adminProjectRecord{id: "user-account_project-account", userID: "user-account", projectID: "project-account"}, nil
+	}}
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/admin/projects/user-account_project-account/rebuild-index", nil)
+	c.Params = gin.Params{{Key: "id", Value: "user-account_project-account"}}
+	h.AdminRebuildIndex(c)
+
+	if recorder.Code != http.StatusOK || !project.called {
+		t.Fatalf("generation rebuild status=%d called=%v body=%s", recorder.Code, project.called, recorder.Body.String())
+	}
+	var response store.GenerationRebuildResult
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.NewGeneration != "g_new" || response.ConceptCount != 2 {
+		t.Fatalf("response=%+v", response)
+	}
+}
+
+func TestAdminRebuildIndexClassifiesOnlyGenerationMismatchAsConflict(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		err        error
+		wantStatus int
+	}{
+		{name: "provider error containing cas label", err: errors.New("cas_conflict: permission denied"), wantStatus: http.StatusInternalServerError},
+		{name: "generation mismatch", err: store.ErrGenerationMismatch, wantStatus: http.StatusConflict},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			project := &adminGenerationRebuilderStore{
+				adminStatsProjectStore: &adminStatsProjectStore{prefix: "users/user/project", hasManifest: true},
+				err:                    tc.err,
+			}
+			root := &adminGenerationRootStore{adminGenerationRebuilderStore: project}
+			h := &Handler{store: root, adminProjectRecordLoader: func(context.Context, string) (adminProjectRecord, error) {
+				return adminProjectRecord{id: "user-account_project-account", userID: "user-account", projectID: "project-account"}, nil
+			}}
+			recorder := invokeHandlerWithParams(h.AdminRebuildIndex, http.MethodPost, "/admin/projects/user-account_project-account/rebuild-index", gin.Params{{Key: "id", Value: "user-account_project-account"}})
+			if recorder.Code != tc.wantStatus {
+				t.Fatalf("status=%d body=%s, want %d", recorder.Code, recorder.Body.String(), tc.wantStatus)
+			}
+		})
+	}
+}
+
+func TestAdminRebuildIndexUsesAuthoritativeRecordAndFailsClosedOnMismatch(t *testing.T) {
+	project := &adminGenerationRebuilderStore{
+		adminStatsProjectStore: &adminStatsProjectStore{prefix: "users/authoritative/project", hasManifest: true},
+	}
+	root := &adminGenerationRootStore{adminGenerationRebuilderStore: project}
+	loaderCalls := 0
+	h := &Handler{
+		store: root,
+		adminProjectRecordLoader: func(context.Context, string) (adminProjectRecord, error) {
+			loaderCalls++
+			return adminProjectRecord{id: "caller_user_caller_project", userID: "authoritative-user", projectID: "authoritative-project"}, nil
+		},
+	}
+	recorder := invokeHandlerWithParams(h.AdminRebuildIndex, http.MethodPost, "/admin/projects/caller_user_caller_project/rebuild-index", gin.Params{{Key: "id", Value: "caller_user_caller_project"}})
+	if recorder.Code != http.StatusInternalServerError || loaderCalls != 1 || project.called {
+		t.Fatalf("mismatched admin rebuild status=%d loaderCalls=%d writerCalled=%v body=%s", recorder.Code, loaderCalls, project.called, recorder.Body.String())
+	}
+
+	project.called = false
+	h.adminProjectRecordLoader = func(context.Context, string) (adminProjectRecord, error) {
+		return adminProjectRecord{id: "authoritative-user_authoritative-project", userID: "authoritative-user", projectID: "authoritative-project"}, nil
+	}
+	recorder = invokeHandlerWithParams(h.AdminRebuildIndex, http.MethodPost, "/admin/projects/authoritative-user_authoritative-project/rebuild-index", gin.Params{{Key: "id", Value: "authoritative-user_authoritative-project"}})
+	if recorder.Code != http.StatusOK || !project.called {
+		t.Fatalf("matching admin rebuild status=%d writerCalled=%v body=%s", recorder.Code, project.called, recorder.Body.String())
+	}
+}
+
+func TestPublicRebuildNeverInvokesGenerationRebuilder(t *testing.T) {
+	project := &adminGenerationRebuilderStore{
+		adminStatsProjectStore: &adminStatsProjectStore{prefix: "users/user/project", hasManifest: true},
+	}
+	root := &adminGenerationRootStore{adminGenerationRebuilderStore: project}
+	h := &Handler{store: root}
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/api/v1/pipeline/rebuild-index", nil)
+	c.Request.Header.Set("X-User-ID", "spoofed-user")
+	c.Request.Header.Set("X-Project-ID", "spoofed-project")
+	h.RebuildIndex(c)
+
+	if recorder.Code != http.StatusConflict || project.called {
+		t.Fatalf("public rebuild status=%d called=%v body=%s, want managed 409 and zero writer calls", recorder.Code, project.called, recorder.Body.String())
 	}
 }
 

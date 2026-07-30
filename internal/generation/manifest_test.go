@@ -48,3 +48,21 @@ func TestDecodeRejectsOversizedEncodingBeforeDecode(t *testing.T) {
 		t.Fatalf("Decode oversized manifest error = %v", err)
 	}
 }
+
+func TestDecodeRejectsDuplicateManifestFields(t *testing.T) {
+	valid := `{"version":1,"generation_id":"g_abc123","created_at":"2026-07-18T00:00:00Z","input_fingerprint":"x","files":[{"path":"wiki/a.md","size":1,"sha256":"` + strings.Repeat("a", 64) + `","generation":7}]}`
+	duplicateTopLevel := strings.Replace(valid, `"version":1,`, `"version":1,"version":1,`, 1)
+	duplicateFileField := strings.Replace(valid, `"path":"wiki/a.md","size":1`, `"path":"wiki/a.md","path":"wiki/a.md","size":1`, 1)
+	unknownTopLevel := strings.Replace(valid, `"version":1,`, `"unexpected":true,"version":1,`, 1)
+	for name, data := range map[string]string{
+		"duplicate top level":  duplicateTopLevel,
+		"duplicate file field": duplicateFileField,
+		"unknown top level":    unknownTopLevel,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := Decode([]byte(data)); err == nil {
+				t.Fatal("Decode accepted malformed manifest")
+			}
+		})
+	}
+}

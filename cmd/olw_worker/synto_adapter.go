@@ -785,7 +785,7 @@ func (e *syntoIndexDecodeError) SyntoIndexDecodeReason() syntoIndexDecodeReason 
 	return e.reason
 }
 
-const maxSyntoIndexBytes = 8 << 20
+const maxSyntoIndexBytes = generation.MaxFileBytes
 
 const sqliteHeader = "SQLite format 3\x00"
 
@@ -851,6 +851,67 @@ func readSyntoIndexTruth(workspace string) (syntoIndexTruth, error) {
 	}
 	index.Present = true
 	return index, nil
+}
+
+// syntoIdentityPlanFromIndex converts the already validated INDEX artifact
+// into the direct Concept identity authority. It never matches by title,
+// source name, path history or content; only an explicit article.entity_id is
+// eligible. Entity-less articles remain ordinary page bytes.
+func syntoIdentityPlanFromIndex(index syntoIndexTruth) (wikiindex.SyntoIdentityPlan, error) {
+	plan := wikiindex.SyntoIdentityPlan{
+		ByPath:         make(map[string]string),
+		ActiveEntities: make(map[string]bool, len(index.ActiveEntities)),
+	}
+	for entityID := range index.ActiveEntities {
+		if !wikiindex.ValidSyntoEntityID(entityID) {
+			return wikiindex.SyntoIdentityPlan{}, fmt.Errorf("unsafe active Synto entity_id %q", entityID)
+		}
+		plan.ActiveEntities[entityID] = true
+	}
+
+	seenIDs := make(map[string]string, len(index.Articles))
+	seenSlugs := make(map[string]string, len(index.Articles))
+	seenEntities := make(map[string]string, len(index.Articles))
+	for _, edge := range index.SourceConcepts {
+		if edge.Name == "" || !wikiindex.ValidSyntoEntityID(edge.EntityID) {
+			return wikiindex.SyntoIdentityPlan{}, errors.New("invalid Synto source concept identity")
+		}
+		plan.ActiveEntities[edge.EntityID] = true
+	}
+	for _, article := range index.Articles {
+		slug, err := normalizeSyntoArticlePath(article.Path)
+		if err != nil {
+			return wikiindex.SyntoIdentityPlan{}, err
+		}
+		canonicalPath := filepath.ToSlash(filepath.Join("wiki", slug+".md"))
+		if article.ID == "" || !annotation.ValidSourceID(article.ID) {
+			return wikiindex.SyntoIdentityPlan{}, fmt.Errorf("invalid Synto article ID for %q", slug)
+		}
+		if previous, exists := seenIDs[article.ID]; exists {
+			return wikiindex.SyntoIdentityPlan{}, fmt.Errorf("duplicate Synto article ID %q for %q and %q", article.ID, previous, slug)
+		}
+		seenIDs[article.ID] = slug
+		if previous, exists := seenSlugs[strings.ToLower(slug)]; exists {
+			return wikiindex.SyntoIdentityPlan{}, fmt.Errorf("duplicate Synto article slug %q for %q and %q", slug, previous, slug)
+		}
+		seenSlugs[strings.ToLower(slug)] = slug
+		if article.EntityID == "" {
+			continue
+		}
+		if !wikiindex.ValidSyntoEntityID(article.EntityID) {
+			return wikiindex.SyntoIdentityPlan{}, fmt.Errorf("unsafe Synto article entity_id %q", article.EntityID)
+		}
+		if previous, exists := seenEntities[article.EntityID]; exists {
+			return wikiindex.SyntoIdentityPlan{}, fmt.Errorf("Synto entity_id %q maps to multiple articles %q and %q", article.EntityID, previous, slug)
+		}
+		seenEntities[article.EntityID] = canonicalPath
+		if wikiindex.IsSyntoRootPage(canonicalPath) {
+			continue
+		}
+		path := canonicalPath
+		plan.ByPath[path] = article.EntityID
+	}
+	return plan, nil
 }
 
 // ensureSyntoIndex uses the exact 0.7.0 documented offline pack-export
@@ -983,7 +1044,7 @@ func enrichSyntoIndexWithAgentConcepts(indexData, conceptsData []byte) ([]byte, 
 		if idIndex != pathIndex {
 			return nil, fmt.Errorf("agent concept canonical article ID/path disagreement: %q/%q", *concept.CanonicalArticleID, *concept.ArticlePath)
 		}
-		if concept.EntityID == "" || !annotation.ValidSourceID(concept.EntityID) {
+		if concept.EntityID == "" || !wikiindex.ValidSyntoEntityID(concept.EntityID) {
 			return nil, errors.New("agent concept has invalid entity_id")
 		}
 		key := syntoArticleProofKey{ID: *concept.CanonicalArticleID, Path: path}
@@ -998,51 +1059,12 @@ func enrichSyntoIndexWithAgentConcepts(indexData, conceptsData []byte) ([]byte, 
 		}
 		proofs[key] = concept.EntityID
 		entityOwners[concept.EntityID] = key
-		article := index.Articles[idIndex]
-		if article.EntityID != "" && article.EntityID != concept.EntityID {
-			return nil, fmt.Errorf("agent concept entity_id disagrees with INDEX article %q", article.ID)
-		}
 	}
 
-	if len(proofs) == 0 {
-		return indexData, nil
-	}
-	var document map[string]json.RawMessage
-	if err := json.Unmarshal(indexData, &document); err != nil {
-		return nil, fmt.Errorf("decode INDEX document: %w", err)
-	}
-	var articles []map[string]json.RawMessage
-	if err := json.Unmarshal(document["articles"], &articles); err != nil {
-		return nil, fmt.Errorf("decode INDEX articles: %w", err)
-	}
-	for i := range articles {
-		article := index.Articles[i]
-		if article.EntityID != "" {
-			continue
-		}
-		path, err := normalizeSyntoArticlePath(article.Path)
-		if err != nil {
-			return nil, fmt.Errorf("article %q has unsafe path: %w", article.ID, err)
-		}
-		entityID, exists := proofs[syntoArticleProofKey{ID: article.ID, Path: path}]
-		if !exists {
-			continue
-		}
-		encoded, err := json.Marshal(entityID)
-		if err != nil {
-			return nil, err
-		}
-		articles[i]["entity_id"] = encoded
-	}
-	document["articles"], err = json.Marshal(articles)
-	if err != nil {
-		return nil, fmt.Errorf("encode INDEX articles: %w", err)
-	}
-	joined, err := json.Marshal(document)
-	if err != nil {
-		return nil, fmt.Errorf("encode INDEX document: %w", err)
-	}
-	return joined, nil
+	// Agent concepts are validated as a consistency/evidence artifact only.
+	// Released article.entity_id remains authoritative, including when it is
+	// null or omitted, so this join must never rewrite INDEX.json identity.
+	return indexData, nil
 }
 
 func decodeSyntoAgentConcepts(data []byte) ([]syntoAgentConcept, error) {
@@ -1139,7 +1161,7 @@ func decodeSyntoAgentConceptList(dec *json.Decoder) ([]syntoAgentConcept, error)
 		if name == "" {
 			return nil, errors.New("agent concept name is empty")
 		}
-		if concept.EntityID != "" && !annotation.ValidSourceID(concept.EntityID) {
+		if concept.EntityID != "" && !wikiindex.ValidSyntoEntityID(concept.EntityID) {
 			return nil, errors.New("agent concept entity_id is unsafe")
 		}
 		if canonicalArticleID != nil && !annotation.ValidSourceID(*canonicalArticleID) {
@@ -1207,125 +1229,67 @@ func mapSyntoEntityIDsFromIndexTruth(index syntoIndexTruth, concepts map[string]
 	byID := make(map[string]string, len(index.Articles))
 	bySlug := make(map[string]string, len(index.Articles))
 	byEntity := make(map[string]string, len(index.Articles))
-	byName := make(map[string]string, len(index.SourceConcepts))
-	byNameEntities := make(map[string]map[string]bool)
-	ambiguousNames := make(map[string]bool)
-	priorByID := make(map[string]conceptSnapshot)
-	priorBySlug := make(map[string]conceptSnapshot)
-	priorByEntity := make(map[string]conceptSnapshot)
+	entitylessIDs := make(map[string]string, len(index.Articles))
+	entitylessSlugs := make(map[string]string, len(index.Articles))
+	seenArticleIDs := make(map[string]string, len(index.Articles))
+	seenArticleSlugs := make(map[string]string, len(index.Articles))
 	if len(prior) > 1 {
 		return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingConceptMissingMapping, cause: errors.New("multiple prior concept identity sets supplied")}
 	}
 	if len(prior) == 1 {
+		seenPriorIDs := make(map[string]bool, len(prior[0]))
+		seenPriorSlugs := make(map[string]bool, len(prior[0]))
+		seenPriorEntities := make(map[string]bool, len(prior[0]))
 		for _, concept := range prior[0] {
-			if !annotation.ValidSourceID(concept.ConceptID) || !safeConceptSlug(concept.Slug) || (concept.EntityID != "" && !annotation.ValidSourceID(concept.EntityID)) {
+			if !annotation.ValidSourceID(concept.ConceptID) || !safeConceptSlug(concept.Slug) || (concept.EntityID != "" && !wikiindex.ValidSyntoEntityID(concept.EntityID)) {
 				return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingConceptMissingMapping, cause: fmt.Errorf("invalid prior concept identity for %q", concept.ConceptID)}
 			}
-			if _, exists := priorByID[concept.ConceptID]; exists {
+			if seenPriorIDs[concept.ConceptID] {
 				return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingDuplicateArticleID, cause: fmt.Errorf("duplicate prior article ID %q", concept.ConceptID)}
 			}
-			if _, exists := priorBySlug[concept.Slug]; exists {
+			if seenPriorSlugs[concept.Slug] {
 				return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingDuplicateArticlePath, cause: fmt.Errorf("duplicate prior article path %q", concept.Slug)}
 			}
-			if concept.EntityID != "" {
-				if _, exists := priorByEntity[concept.EntityID]; exists {
-					return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingConceptEntityCollision, cause: fmt.Errorf("prior entity_id %q maps to multiple LWC IDs", concept.EntityID)}
-				}
+			if concept.EntityID != "" && seenPriorEntities[concept.EntityID] {
+				return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingConceptEntityCollision, cause: fmt.Errorf("prior entity_id %q maps to multiple LWC IDs", concept.EntityID)}
 			}
-			priorByID[concept.ConceptID] = concept
-			priorBySlug[concept.Slug] = concept
+			seenPriorIDs[concept.ConceptID] = true
+			seenPriorSlugs[concept.Slug] = true
 			if concept.EntityID != "" {
-				priorByEntity[concept.EntityID] = concept
+				seenPriorEntities[concept.EntityID] = true
 			}
 		}
 	}
 	for _, edge := range index.SourceConcepts {
-		if edge.Name == "" || !annotation.ValidSourceID(edge.EntityID) {
+		if edge.Name == "" || !wikiindex.ValidSyntoEntityID(edge.EntityID) {
 			return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingSourceConceptIdentity, cause: errors.New("invalid Synto INDEX.json source concept identity")}
-		}
-		if byNameEntities[edge.Name] == nil {
-			byNameEntities[edge.Name] = make(map[string]bool)
-		}
-		byNameEntities[edge.Name][edge.EntityID] = true
-		if old, exists := byName[edge.Name]; exists && old != edge.EntityID {
-			ambiguousNames[edge.Name] = true
-			delete(byName, edge.Name)
-			continue
-		}
-		if !ambiguousNames[edge.Name] {
-			byName[edge.Name] = edge.EntityID
 		}
 	}
 	for _, article := range index.Articles {
-		if (article.ID != "" && !annotation.ValidSourceID(article.ID)) || (article.EntityID != "" && !annotation.ValidSourceID(article.EntityID)) {
+		if (article.ID != "" && !annotation.ValidSourceID(article.ID)) || (article.EntityID != "" && !wikiindex.ValidSyntoEntityID(article.EntityID)) {
 			return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingArticleIdentity, cause: errors.New("invalid Synto INDEX.json article identity")}
 		}
 		slug, err := normalizeSyntoArticlePath(article.Path)
 		if err != nil {
 			return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingArticlePath, cause: err}
 		}
+		if previous, exists := seenArticleIDs[article.ID]; exists {
+			return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingDuplicateArticleID, cause: fmt.Errorf("Synto INDEX.json duplicate article ID %q for %q and %q", article.ID, previous, slug)}
+		}
+		seenArticleIDs[article.ID] = slug
+		articleSlug := strings.ToLower(slug)
+		if previous, exists := seenArticleSlugs[articleSlug]; exists {
+			return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingDuplicateArticlePath, cause: fmt.Errorf("Synto INDEX.json duplicate article path %q for %q and %q", slug, previous, article.Path)}
+		}
+		seenArticleSlugs[articleSlug] = article.Path
 		if wikiindex.IsSyntoRootPage(article.Path) {
 			continue
 		}
 		entityID := article.EntityID
-		sourceEntity := ""
-		if !ambiguousNames[article.Name] {
-			sourceEntity = byName[article.Name]
-		}
-		if article.EntityID != "" && len(byNameEntities[article.Name]) > 0 && !byNameEntities[article.Name][article.EntityID] {
-			return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingArticleSourceDisagreement, cause: fmt.Errorf("Synto INDEX.json article/source disagreement for %q", slug)}
-		}
-		articleEntityOmitted := article.EntityID == ""
-		priorByArticleID, priorIDPresent := priorByID[article.ID]
-		priorByArticlePath, priorPathPresent := priorBySlug[slug]
-		priorIdentity := conceptSnapshot{}
-		priorIdentityPresent := false
-		if priorIDPresent {
-			priorIdentity = priorByArticleID
-			priorIdentityPresent = true
-		}
-		if priorPathPresent {
-			if priorIdentityPresent && priorIdentity.ConceptID != priorByArticlePath.ConceptID {
-				return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingConceptIDPathDisagreement, cause: fmt.Errorf("prior article ID/path disagreement for %q", slug)}
-			}
-			priorIdentity = priorByArticlePath
-			priorIdentityPresent = true
-		}
-		if priorIDPresent && priorByArticleID.Slug != slug {
-			return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingConceptIDPathDisagreement, cause: fmt.Errorf("prior article ID/path disagreement for %q", slug)}
-		}
-		if priorIDPresent && priorByArticleID.EntityID != "" && entityID != "" && priorByArticleID.EntityID != entityID {
-			return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingConceptIDPathDisagreement, cause: fmt.Errorf("prior article ID/entity disagreement for %q", slug)}
-		}
-		if priorPathPresent && priorByArticlePath.EntityID != "" && entityID != "" && priorByArticlePath.EntityID != entityID {
-			return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingConceptIDPathDisagreement, cause: fmt.Errorf("prior article path/entity disagreement for %q", slug)}
-		}
-		priorEvidence := 0
-		if priorIdentityPresent && priorIdentity.EntityID != "" {
-			priorEvidence = countPriorOwnedSourceEdges(index.SourceConcepts, priorIdentity, "")
-		}
-		if articleEntityOmitted && priorIdentityPresent && priorIdentity.EntityID != "" && priorEvidence == 0 && sourceEntity != "" {
-			return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingConceptIDPathDisagreement, cause: fmt.Errorf("prior article identity lacks current source evidence for %q", slug)}
-		}
-		if articleEntityOmitted && entityID == "" && priorIdentityPresent {
-			// Pack export may omit article.entity_id. The prior LWC-owned
-			// article ID/path/entity tuple is usable only with at least one
-			// current, source-owned edge proving the same entity on a prior source path.
-			if priorEvidence > 0 {
-				entityID = priorIdentity.EntityID
-			}
-		}
-		if articleEntityOmitted && priorIdentityPresent && priorIdentity.EntityID != "" && entityID == priorIdentity.EntityID && priorEvidence == 0 {
-			return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingConceptIDPathDisagreement, cause: fmt.Errorf("prior article identity lacks current source evidence for %q", slug)}
-		}
-		if sourceEntity != "" && entityID != "" && sourceEntity != entityID {
-			return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingArticleSourceDisagreement, cause: fmt.Errorf("Synto INDEX.json article/source disagreement for %q", slug)}
-		}
 		if entityID == "" {
-			if ambiguousNames[article.Name] {
-				return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingArticleSourceAmbiguity, cause: fmt.Errorf("Synto INDEX.json article %q has ambiguous source_concepts entity_id", slug)}
-			}
-			return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingArticleSourceMissing, cause: fmt.Errorf("Synto INDEX.json article %q has no source_concepts entity_id or authoritative prior identity", slug)}
+			entitylessIDs[article.ID] = slug
+			entitylessSlugs[articleSlug] = article.ID
+			continue
 		}
 		if article.ID != "" {
 			if _, exists := byID[article.ID]; exists {
@@ -1359,6 +1323,23 @@ func mapSyntoEntityIDsFromIndexTruth(index syntoIndexTruth, concepts map[string]
 		slug := concepts[currentID]
 		idEntity, byIDPresent := byID[currentID]
 		pathSlug, byPathPresent := bySlug[strings.ToLower(slug)]
+		entitylessSlug, idIsEntityless := entitylessIDs[currentID]
+		entitylessID, slugIsEntityless := entitylessSlugs[strings.ToLower(slug)]
+		if idIsEntityless || slugIsEntityless {
+			if idIsEntityless {
+				if slugIsEntityless && entitylessID == currentID && strings.EqualFold(entitylessSlug, slug) {
+					continue
+				}
+				return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingConceptIDPathDisagreement, cause: fmt.Errorf("Synto INDEX.json ID/path disagreement for concept %q", currentID)}
+			}
+			if _, knownArticleID := seenArticleIDs[currentID]; knownArticleID {
+				return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingConceptIDPathDisagreement, cause: fmt.Errorf("Synto INDEX.json ID/path disagreement for concept %q", currentID)}
+			}
+			// A generated transient ID may not be present in INDEX.json for an
+			// entity-less article. Exclusion remains allowed when the slug identifies
+			// that ordinary article and the ID identifies no different INDEX article.
+			continue
+		}
 		pathEntity := ""
 		if byPathPresent && pathSlug == slug {
 			pathEntity = byEntityForSlug(byEntity, pathSlug)
@@ -1595,12 +1576,13 @@ func decodeSyntoArticles(dec *json.Decoder) ([]syntoIndexEntry, error) {
 		}
 		var article syntoIndexEntry
 		allowed := map[string]bool{"id": true, "entity_id": true, "name": true, "path": true, "summary": true, "tags": true, "aliases": true, "confidence": true}
+		var entityID *string
 		seen, err := decodeSyntoObject(dec, allowed, func(key string, dec *json.Decoder) error {
 			switch key {
 			case "id":
 				return decodeStringInto(dec, &article.ID, 1024)
 			case "entity_id":
-				return decodeStringInto(dec, &article.EntityID, 1024)
+				return decodeNullableStringInto(dec, &entityID, 1024)
 			case "name":
 				return decodeStringInto(dec, &article.Name, 4096)
 			case "path":
@@ -1618,13 +1600,19 @@ func decodeSyntoArticles(dec *json.Decoder) ([]syntoIndexEntry, error) {
 		if err != nil {
 			return nil, err
 		}
+		if entityID != nil {
+			if strings.TrimSpace(*entityID) == "" || !wikiindex.ValidSyntoEntityID(*entityID) {
+				return nil, &syntoIndexDecodeError{reason: syntoIndexDecodeReasonArticleIdentity, cause: errors.New("invalid Synto article identity")}
+			}
+			article.EntityID = *entityID
+		}
 		for _, key := range []string{"id", "name", "path", "summary", "tags", "aliases", "confidence"} {
 			if !seen[key] {
 				return nil, fmt.Errorf("missing article field %q", key)
 			}
 		}
 		if (article.ID != "" && !annotation.ValidSourceID(article.ID)) ||
-			(article.EntityID != "" && !annotation.ValidSourceID(article.EntityID)) || article.Name == "" {
+			(article.EntityID != "" && !wikiindex.ValidSyntoEntityID(article.EntityID)) || article.Name == "" {
 			return nil, &syntoIndexDecodeError{reason: syntoIndexDecodeReasonArticleIdentity, cause: errors.New("invalid Synto article identity")}
 		}
 		if _, err := normalizeSyntoArticlePath(article.Path); err != nil {
@@ -1643,6 +1631,7 @@ func decodeSyntoSourceConcepts(dec *json.Decoder) ([]syntoSourceConcept, error) 
 		return nil, errors.New("source_concepts must be an array")
 	}
 	out := make([]syntoSourceConcept, 0)
+	seenGroups := make(map[string]struct{})
 	for dec.More() {
 		if len(out) >= generation.MaxFiles {
 			return nil, generation.ErrLogicalEntryLimit
@@ -1681,7 +1670,17 @@ func decodeSyntoSourceConcepts(dec *json.Decoder) ([]syntoSourceConcept, error) 
 		if !validSyntoContentHash(contentHash) {
 			return nil, errors.New("source_concepts content_hash must be a lowercase SHA-256 digest")
 		}
+		if _, exists := seenGroups[sourcePath]; exists {
+			return nil, fmt.Errorf("duplicate Synto source_concepts group %q", sourcePath)
+		}
+		seenGroups[sourcePath] = struct{}{}
+		seenItems := make(map[string]struct{}, len(edgeItems))
 		for i := range edgeItems {
+			semantic := edgeItems[i].Name + "\x00" + edgeItems[i].EntityID
+			if _, exists := seenItems[semantic]; exists {
+				return nil, fmt.Errorf("duplicate Synto source concept %q", edgeItems[i].Name)
+			}
+			seenItems[semantic] = struct{}{}
 			edgeItems[i].SourcePath = sourcePath
 			edgeItems[i].ContentHash = contentHash
 		}
@@ -1746,7 +1745,7 @@ func decodeSyntoSourceConceptItems(dec *json.Decoder) ([]syntoSourceConcept, err
 			if _, err := dec.Token(); err != nil {
 				return nil, err
 			}
-			if !seen["name"] || !seen["entity_id"] || name == "" || !annotation.ValidSourceID(entity) {
+			if !seen["name"] || !seen["entity_id"] || name == "" || !wikiindex.ValidSyntoEntityID(entity) {
 				return nil, &syntoIndexDecodeError{reason: syntoIndexDecodeReasonSourceConceptIdentity, cause: errors.New("invalid source concept identity")}
 			}
 			out = append(out, syntoSourceConcept{Name: name, EntityID: entity})

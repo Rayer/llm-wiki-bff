@@ -486,21 +486,21 @@ func TestSuggestedQueryGenerationFailureWritesValidEmptyV2WhenAbsent(t *testing.
 
 func TestWorkerPostprocessDirectPreservesDormantConceptAndEntityMappings(t *testing.T) {
 	vault := t.TempDir()
-	mustWriteFile(t, filepath.Join(vault, "wiki", "alpha.md"), []byte("---\nid: stable-alpha\n---\nAlpha"))
-	mustWriteFile(t, filepath.Join(vault, "cache", "id_map.json"), []byte(`{"concept":{"stable-alpha":"alpha"},"dormant_concept":{"stable-beta":"beta"},"concept_entity_id":{"stable-alpha":"entity-alpha","stable-beta":"entity-beta","orphan":"entity-orphan"},"source":{},"redirects":{}}`))
+	mustWriteFile(t, filepath.Join(vault, "wiki", "alpha.md"), []byte("---\nid: a3f7b2c01d9d\n---\nAlpha"))
+	mustWriteFile(t, filepath.Join(vault, "cache", "id_map.json"), []byte(`{"concept":{"a3f7b2c01d9d":"alpha"},"dormant_concept":{"stable-beta":"beta"},"concept_entity_id":{"a3f7b2c01d9d":"01JAZ5N7Y3K8M2Q4R6T9VWXABC","stable-beta":"01JAZ5N7Y3K8M2Q4R6T9VWXABD","orphan":"01JAZ5N7Y3K8M2Q4R6T9VWXAC7"},"source":{},"redirects":{}}`))
 	mustWriteFile(t, filepath.Join(vault, "synto.toml"), []byte("[pipeline]\nauto_commit = false\nauto_maintain = false\nrelation_extraction = false\n"))
-	mustWriteFile(t, filepath.Join(vault, ".synto", "INDEX.json"), []byte(syntoIndexFixture("stable-alpha", "entity-alpha", "alpha", false)))
+	mustWriteFile(t, filepath.Join(vault, ".synto", "INDEX.json"), []byte(syntoIndexFixture("a3f7b2c01d9d", "01JAZ5N7Y3K8M2Q4R6T9VWXABC", "alpha", false)))
 	writeValidSQLiteState(t, filepath.Join(vault, ".synto", "state.db"))
 
 	if err := runPostprocessCommand(context.Background(), workerConfig{VaultPath: vault, ExecutionID: "direct-r1"}); err != nil {
 		t.Fatalf("runPostprocessCommand() error = %v", err)
 	}
 	ids := mustSnapshotIDMap(t, vault)
-	if ids.Concept["stable-alpha"] != "alpha" || ids.DormantConcept["stable-beta"] != "beta" {
-		t.Fatalf("postprocess lifecycle maps = %#v", ids)
+	if ids.Concept["01JAZ5N7Y3K8M2Q4R6T9VWXABC"] != "alpha" || len(ids.Concept) != 1 || len(ids.DormantConcept) != 0 {
+		t.Fatalf("postprocess direct entity maps = %#v", ids)
 	}
-	if ids.ConceptEntityID["stable-alpha"] != "entity-alpha" || ids.ConceptEntityID["stable-beta"] != "entity-beta" {
-		t.Fatalf("postprocess entity maps = %#v", ids.ConceptEntityID)
+	if len(ids.ConceptEntityID) != 0 {
+		t.Fatalf("postprocess retained legacy entity map = %#v", ids.ConceptEntityID)
 	}
 	if _, ok := ids.ConceptEntityID["orphan"]; ok {
 		t.Fatalf("postprocess retained orphan entity mapping: %#v", ids.ConceptEntityID)
@@ -509,22 +509,22 @@ func TestWorkerPostprocessDirectPreservesDormantConceptAndEntityMappings(t *test
 
 func TestWorkerPostprocessWorkspacePreservesDormantConceptAndEntityMappings(t *testing.T) {
 	vault := t.TempDir()
-	mustWriteFile(t, filepath.Join(vault, "wiki", "alpha.md"), []byte("---\nid: stable-alpha\n---\nAlpha"))
-	mustWriteFile(t, filepath.Join(vault, "cache", "id_map.json"), []byte(`{"concept":{"stable-alpha":"alpha"},"dormant_concept":{"stable-beta":"beta"},"concept_entity_id":{"stable-alpha":"entity-alpha","stable-beta":"entity-beta","orphan":"entity-orphan"},"source":{},"redirects":{}}`))
+	mustWriteFile(t, filepath.Join(vault, "wiki", "alpha.md"), []byte("---\nid: a3f7b2c01d9d\n---\nAlpha"))
+	mustWriteFile(t, filepath.Join(vault, "cache", "id_map.json"), []byte(`{"concept":{"a3f7b2c01d9d":"alpha"},"dormant_concept":{"stable-beta":"beta"},"concept_entity_id":{"a3f7b2c01d9d":"01JAZ5N7Y3K8M2Q4R6T9VWXABC","stable-beta":"01JAZ5N7Y3K8M2Q4R6T9VWXABD","orphan":"01JAZ5N7Y3K8M2Q4R6T9VWXAC7"},"source":{},"redirects":{}}`))
 	mustWriteFile(t, filepath.Join(vault, "cache", "dormant_concepts.jsonl"), nil)
 	mustWriteFile(t, filepath.Join(vault, "synto.toml"), []byte("[pipeline]\n"))
-	mustWriteFile(t, filepath.Join(vault, ".synto", "INDEX.json"), []byte(syntoIndexFixture("stable-alpha", "entity-alpha", "alpha", true)))
+	mustWriteFile(t, filepath.Join(vault, ".synto", "INDEX.json"), []byte(syntoIndexFixture("a3f7b2c01d9d", "01JAZ5N7Y3K8M2Q4R6T9VWXABC", "alpha", true)))
 	writeValidSQLiteState(t, filepath.Join(vault, ".synto", "state.db"))
 
 	if err := runPostprocessCommand(context.Background(), workerConfig{VaultPath: vault, Workspace: true, WorkspaceDir: t.TempDir(), ExecutionID: "workspace-r1"}); err != nil {
 		t.Fatalf("runPostprocessCommand(workspace) error = %v", err)
 	}
 	ids := mustSnapshotIDMap(t, vault)
-	if ids.Concept["stable-alpha"] != "alpha" || ids.DormantConcept["stable-beta"] != "beta" {
-		t.Fatalf("workspace postprocess lifecycle maps = %#v", ids)
+	if ids.Concept["01JAZ5N7Y3K8M2Q4R6T9VWXABC"] != "alpha" || len(ids.Concept) != 1 || len(ids.DormantConcept) != 0 {
+		t.Fatalf("workspace postprocess direct entity maps = %#v", ids)
 	}
-	if ids.ConceptEntityID["stable-alpha"] != "entity-alpha" || ids.ConceptEntityID["stable-beta"] != "entity-beta" {
-		t.Fatalf("workspace postprocess entity maps = %#v", ids.ConceptEntityID)
+	if len(ids.ConceptEntityID) != 0 {
+		t.Fatalf("workspace postprocess retained legacy entity map = %#v", ids.ConceptEntityID)
 	}
 	if _, ok := ids.ConceptEntityID["orphan"]; ok {
 		t.Fatalf("workspace postprocess retained orphan entity mapping: %#v", ids.ConceptEntityID)
@@ -1587,8 +1587,9 @@ func workspaceVault(t *testing.T, raw string) string {
 	vault := t.TempDir()
 	mustWriteFile(t, filepath.Join(vault, "raw", "source.md"), []byte(raw))
 	mustWriteFile(t, filepath.Join(vault, "cache", "id_map.json"), []byte(`{"source_meta":{"s1":{"source_file":"raw/source.md"}}}`))
+	mustWriteFile(t, filepath.Join(vault, "wiki", "new.md"), []byte("---\nid: 22af645d1859\n---\nnew article\n"))
 	mustWriteFile(t, filepath.Join(vault, "synto.toml"), []byte("[pipeline]\nauto_commit = false\nauto_maintain = false\nrelation_extraction = false\n"))
-	mustWriteFile(t, filepath.Join(vault, ".synto", "INDEX.json"), []byte(syntoIndexFixture("22af645d1859", "entity", "new", false)))
+	mustWriteFile(t, filepath.Join(vault, ".synto", "INDEX.json"), []byte(syntoIndexFixture("22af645d1859", "01JAZ5N7Y3K8M2Q4R6T9VWXAC8", "new", false)))
 	writeValidSQLiteState(t, filepath.Join(vault, ".synto", "state.db"))
 	return vault
 }
