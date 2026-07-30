@@ -144,6 +144,30 @@ func TestRebuildWithSyntoIdentityIgnoresPriorDifferentULIDAtSameSlug(t *testing.
 	})
 }
 
+func TestPlanSyntoIDRedirectsAllowsManyLegacySourcesToOneCurrentULID(t *testing.T) {
+	const current = "01JAZ5N7Y3K8M2Q4R6T9VWXABC"
+	next := IDMap{Concept: map[string]string{current: "alpha"}}
+	old := IDMap{
+		Concept: map[string]string{
+			"a3f7b2c01d9d": "alpha",
+			"b7e2c9a4d113": "alpha",
+		},
+	}
+
+	added, err := planSyntoIDRedirects(&next, old)
+	if err != nil {
+		t.Fatalf("many-to-one legacy migration rejected: %v", err)
+	}
+	if added != 2 || len(next.IDRedirects) != 2 {
+		t.Fatalf("redirect count added=%d redirects=%#v, want two", added, next.IDRedirects)
+	}
+	for _, legacy := range []string{"a3f7b2c01d9d", "b7e2c9a4d113"} {
+		if got := next.IDRedirects[legacy]; got != current {
+			t.Fatalf("redirect %q = %q, want %q", legacy, got, current)
+		}
+	}
+}
+
 func TestRewriteSyntoConceptPageInsertsIDBeforeClosingDelimiter(t *testing.T) {
 	got, err := RewriteSyntoConceptPage([]byte("---\ntitle: Alpha\n---\nBody"), testEntityULID)
 	if err != nil {
