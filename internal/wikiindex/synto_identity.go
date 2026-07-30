@@ -139,7 +139,10 @@ func decodeSyntoIdentityArticles(data []byte) ([]syntoIdentityArticle, error) {
 			}
 		}
 		if entity, ok := object["entity_id"]; ok {
-			if !jsonContainer(entity, '"') || json.Unmarshal(entity, &article.EntityID) != nil {
+			if bytes.Equal(bytes.TrimSpace(entity), []byte("null")) {
+				continue
+			}
+			if !jsonContainer(entity, '"') || json.Unmarshal(entity, &article.EntityID) != nil || article.EntityID == "" {
 				return nil, errors.New("invalid Synto article entity_id")
 			}
 		}

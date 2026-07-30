@@ -203,13 +203,17 @@ const generationManifestPath = ".lwc/publish/current.json"
 func projectObject(rel string) string { return "users/user/projects/project/" + rel }
 
 func manifestBytes(t *testing.T, generationID string, files map[string]backendObject) []byte {
+	return manifestBytesWithInputFingerprint(t, generationID, files, "test-input")
+}
+
+func manifestBytesWithInputFingerprint(t *testing.T, generationID string, files map[string]backendObject, inputFingerprint string) []byte {
 	t.Helper()
 	paths := make([]string, 0, len(files))
 	for rel := range files {
 		paths = append(paths, rel)
 	}
 	sort.Strings(paths)
-	manifest := generation.Manifest{Version: generation.Version, GenerationID: generationID, CreatedAt: time.Now().UTC().Format(time.RFC3339), InputFingerprint: "test-input", Files: make([]generation.File, 0, len(files))}
+	manifest := generation.Manifest{Version: generation.Version, GenerationID: generationID, CreatedAt: time.Now().UTC().Format(time.RFC3339), InputFingerprint: inputFingerprint, Files: make([]generation.File, 0, len(files))}
 	for _, rel := range paths {
 		object := files[rel]
 		manifest.Files = append(manifest.Files, generation.File{Path: rel, Size: int64(len(object.Data)), SHA256: digest(object.Data), Generation: object.Generation})
@@ -222,11 +226,15 @@ func manifestBytes(t *testing.T, generationID string, files map[string]backendOb
 }
 
 func seedManifest(t *testing.T, backend *memoryBackend, generationID string, files map[string]backendObject) {
+	seedManifestWithInputFingerprint(t, backend, generationID, files, "test-input")
+}
+
+func seedManifestWithInputFingerprint(t *testing.T, backend *memoryBackend, generationID string, files map[string]backendObject, inputFingerprint string) {
 	t.Helper()
 	for rel, object := range files {
 		backend.put(projectObject(path.Join(generation.Prefix, generationID, rel)), object.Data, object.Generation, map[string]string{"sha256": digest(object.Data)})
 	}
-	backend.put(projectObject(generation.ManifestPath), manifestBytes(t, generationID, files), 7, nil)
+	backend.put(projectObject(generation.ManifestPath), manifestBytesWithInputFingerprint(t, generationID, files, inputFingerprint), 7, nil)
 }
 
 func digest(data []byte) string {

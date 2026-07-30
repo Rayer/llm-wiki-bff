@@ -8,9 +8,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/rayer/llm-wiki-bff/internal/generation"
@@ -32,6 +35,9 @@ func (c *Client) RebuildIndexGeneration(ctx context.Context, planner store.Gener
 	if !exists {
 		return store.GenerationRebuildResult{}, errors.New("generation_missing")
 	}
+	if err := old.Validate(); err != nil {
+		return store.GenerationRebuildResult{}, errors.New("manifest_invalid")
+	}
 	workspace, err := os.MkdirTemp("", "lwc-admin-rebuild-")
 	if err != nil {
 		return store.GenerationRebuildResult{}, errors.New("stage_create")
@@ -43,7 +49,10 @@ func (c *Client) RebuildIndexGeneration(ctx context.Context, planner store.Gener
 		if err != nil || int64(len(object.Data)) != file.Size || digestBytes(object.Data) != file.SHA256 {
 			return store.GenerationRebuildResult{}, fmt.Errorf("manifest_input:%s", file.Path)
 		}
-		path := filepath.Join(workspace, filepath.FromSlash(file.Path))
+		path, err := generationWorkspacePath(workspace, file.Path)
+		if err != nil {
+			return store.GenerationRebuildResult{}, errors.New("manifest_input")
+		}
 		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 			return store.GenerationRebuildResult{}, errors.New("stage_create")
 		}
@@ -61,6 +70,7 @@ func (c *Client) RebuildIndexGeneration(ctx context.Context, planner store.Gener
 	if err != nil {
 		return store.GenerationRebuildResult{}, errors.New("manifest_stage")
 	}
+	generationRebuildAfterPreflight(workspace)
 	id, err := newAdminGenerationID()
 	if err != nil {
 		return store.GenerationRebuildResult{}, errors.New("generation_id")
@@ -70,11 +80,15 @@ func (c *Client) RebuildIndexGeneration(ctx context.Context, planner store.Gener
 		GenerationID:         id,
 		PreviousGenerationID: old.GenerationID,
 		CreatedAt:            time.Now().UTC().Format(time.RFC3339),
-		InputFingerprint:     adminInputFingerprint(old, files),
+		InputFingerprint:     old.InputFingerprint,
 	}
 	for _, file := range files {
-		data, err := os.ReadFile(filepath.Join(workspace, filepath.FromSlash(file.Path)))
+		path, err := generationWorkspacePath(workspace, file.Path)
 		if err != nil {
+			return store.GenerationRebuildResult{}, errors.New("manifest_stage")
+		}
+		data, digest, err := readGenerationWorkspaceFile(path, file.Size)
+		if err != nil || digest != file.SHA256 {
 			return store.GenerationRebuildResult{}, errors.New("manifest_stage")
 		}
 		a, err := c.writeObject(ctx, c.prefix()+"/"+generation.Prefix+id+"/"+file.Path, data, contentTypeForPath(file.Path), map[string]string{"sha256": file.SHA256}, writeCondition{DoesNotExist: true})
@@ -113,24 +127,50 @@ type adminGenerationFile struct {
 	SHA256 string
 }
 
+var generationRebuildAfterPreflight = func(string) {}
+
 func generationFilesFromWorkspace(root string) ([]adminGenerationFile, error) {
 	var files []adminGenerationFile
-	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+	var total int64
+	err := filepath.WalkDir(root, func(filePath string, entry os.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
-		if info.IsDir() {
+		if filePath == root {
 			return nil
 		}
-		rel, err := filepath.Rel(root, path)
-		if err != nil || !generation.GenerationOwned(filepath.ToSlash(rel)) {
-			return err
-		}
-		data, err := os.ReadFile(path)
+		rel, err := generationWorkspaceRelativePath(root, filePath)
 		if err != nil {
 			return err
 		}
-		files = append(files, adminGenerationFile{Path: filepath.ToSlash(rel), Size: int64(len(data)), SHA256: digestBytes(data)})
+		if entry.Type()&os.ModeSymlink != 0 {
+			return errors.New("generation contains symlink")
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if !info.Mode().IsRegular() {
+			return errors.New("generation contains special file")
+		}
+		if !generation.GenerationOwned(rel) {
+			return nil
+		}
+		if info.Size() < 0 || info.Size() > generation.MaxFileBytes || total > generation.MaxTotalSize-info.Size() {
+			return errors.New("generation output too large")
+		}
+		if len(files) >= generation.MaxFiles {
+			return errors.New("too many generation files")
+		}
+		data, digest, err := readGenerationWorkspaceFile(filePath, info.Size())
+		if err != nil {
+			return err
+		}
+		total += int64(len(data))
+		files = append(files, adminGenerationFile{Path: rel, Size: info.Size(), SHA256: digest})
 		return nil
 	})
 	if err != nil {
@@ -152,21 +192,71 @@ func generationFilesFromWorkspace(root string) ([]adminGenerationFile, error) {
 	return files, nil
 }
 
+func generationWorkspacePath(root, rel string) (string, error) {
+	canonical, err := validateGenerationWorkspaceRelative(root, rel)
+	if err != nil || canonical != rel {
+		return "", errors.New("invalid generation workspace path")
+	}
+	return filepath.Join(root, filepath.FromSlash(canonical)), nil
+}
+
+func generationWorkspaceRelativePath(root, filePath string) (string, error) {
+	rel, err := filepath.Rel(root, filePath)
+	if err != nil {
+		return "", errors.New("invalid generation workspace path")
+	}
+	return validateGenerationWorkspaceRelative(root, filepath.ToSlash(rel))
+}
+
+func validateGenerationWorkspaceRelative(root, rel string) (string, error) {
+	if rel == "." || filepath.IsAbs(rel) || filepath.VolumeName(rel) != "" || strings.Contains(rel, "\\") {
+		return "", errors.New("invalid generation workspace path")
+	}
+	canonical := filepath.ToSlash(rel)
+	if canonical == "" || canonical == "." || path.IsAbs(canonical) || path.Clean(canonical) != canonical || canonical == ".." || strings.HasPrefix(canonical, "../") || strings.Contains(canonical, "//") {
+		return "", errors.New("invalid generation workspace path")
+	}
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		return "", err
+	}
+	absolute, err := filepath.Abs(filepath.Join(root, filepath.FromSlash(canonical)))
+	if err != nil {
+		return "", err
+	}
+	confined, err := filepath.Rel(absRoot, absolute)
+	if err != nil || confined == "." || filepath.IsAbs(confined) || confined == ".." || strings.HasPrefix(confined, ".."+string(filepath.Separator)) || filepath.ToSlash(confined) != canonical {
+		return "", errors.New("invalid generation workspace path")
+	}
+	return canonical, nil
+}
+
+func readGenerationWorkspaceFile(filePath string, expectedSize int64) ([]byte, string, error) {
+	if expectedSize < 0 || expectedSize > generation.MaxFileBytes {
+		return nil, "", errors.New("generation output too large")
+	}
+	info, err := os.Lstat(filePath)
+	if err != nil || !info.Mode().IsRegular() || info.Size() != expectedSize {
+		return nil, "", errors.New("generation output changed")
+	}
+	f, err := os.Open(filePath)
+	if err != nil {
+		return nil, "", err
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, generation.MaxFileBytes+1))
+	if err != nil || int64(len(data)) != expectedSize || int64(len(data)) > generation.MaxFileBytes {
+		return nil, "", errors.New("generation output changed")
+	}
+	return data, digestBytes(data), nil
+}
+
 func newAdminGenerationID() (string, error) {
 	data := make([]byte, 16)
 	if _, err := rand.Read(data); err != nil {
 		return "", err
 	}
 	return "g_" + hex.EncodeToString(data), nil
-}
-
-func adminInputFingerprint(old generation.Manifest, files []adminGenerationFile) string {
-	h := sha256.New()
-	_, _ = h.Write([]byte(old.InputFingerprint))
-	for _, file := range files {
-		_, _ = h.Write([]byte(file.Path + "\x00" + file.SHA256 + "\n"))
-	}
-	return hex.EncodeToString(h.Sum(nil))
 }
 
 func digestBytes(data []byte) string {

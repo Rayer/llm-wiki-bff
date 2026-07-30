@@ -68,6 +68,72 @@ func TestRebuildWithSyntoIdentityUsesEntityIDsAndExcludesEntitylessPages(t *test
 	}
 }
 
+func TestDecodeSyntoIdentityPlanReleasedEntityShapes(t *testing.T) {
+	tests := []struct {
+		name       string
+		entityJSON string
+		wantEntity string
+		wantErr    bool
+	}{
+		{name: "missing is entityless", wantEntity: ""},
+		{name: "null is entityless", entityJSON: "null", wantEntity: ""},
+		{name: "non-empty string", entityJSON: `"entity-alpha"`, wantEntity: "entity-alpha"},
+		{name: "empty string", entityJSON: `""`, wantErr: true},
+		{name: "number", entityJSON: "7", wantErr: true},
+		{name: "object", entityJSON: `{}`, wantErr: true},
+		{name: "array", entityJSON: `[]`, wantErr: true},
+		{name: "boolean", entityJSON: "false", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			data := syntoIdentityReleasedFixture(tt.entityJSON)
+			plan, err := DecodeSyntoIdentityPlan(data)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("DecodeSyntoIdentityPlan() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if tt.wantErr {
+				return
+			}
+			if got := plan.ByPath["wiki/ordinary.md"]; got != tt.wantEntity {
+				t.Fatalf("ByPath[ordinary] = %q, want %q", got, tt.wantEntity)
+			}
+			if tt.name == "null is entityless" {
+				page := []byte("ordinary page bytes")
+				store := &fakeStore{files: map[string][]MarkdownFile{
+					"wiki/":         {{Slug: "ordinary", Path: "wiki/ordinary.md", Data: page}},
+					"wiki/sources/": {},
+				}, reads: map[string][]byte{}}
+				next, err := RebuildWithSyntoIdentity(context.Background(), store, plan)
+				if err != nil {
+					t.Fatalf("RebuildWithSyntoIdentity() error = %v", err)
+				}
+				if len(next.Concept) != 0 || !bytes.Equal(store.files["wiki/"][0].Data, page) || len(bytes.TrimSpace(store.writes[ConceptsJSONLPath])) != 0 {
+					t.Fatalf("entityless page rebuild = concepts=%#v page=%q cache=%q", next.Concept, store.files["wiki/"][0].Data, store.writes[ConceptsJSONLPath])
+				}
+			}
+		})
+	}
+
+	for name, data := range map[string][]byte{
+		"trailing data":       append(syntoIdentityReleasedFixture("null"), []byte(" trailing")...),
+		"duplicate entity_id": []byte(`{"schema_version":1,"pack":{},"articles":[{"id":"article-1","entity_id":null,"entity_id":null,"name":"Ordinary","path":"wiki/ordinary.md","summary":null,"tags":[],"aliases":[],"confidence":"high"}],"terms":[],"papers":[],"sources":[],"source_concepts":[],"synthesis":[],"stats":{}}`),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := DecodeSyntoIdentityPlan(data); err == nil {
+				t.Fatal("DecodeSyntoIdentityPlan() unexpectedly accepted malformed JSON")
+			}
+		})
+	}
+}
+
+func syntoIdentityReleasedFixture(entityJSON string) []byte {
+	entity := ""
+	if entityJSON != "" {
+		entity = `,"entity_id":` + entityJSON
+	}
+	return []byte(`{"schema_version":1,"pack":{"id":"fixture","name":"fixture","version":"0","language":["en"],"capabilities":["articles","concepts"]},"articles":[{"id":"article-1"` + entity + `,"name":"Ordinary","path":"wiki/ordinary.md","summary":null,"tags":[],"aliases":[],"confidence":"high"}],"terms":[],"papers":[],"sources":[],"source_concepts":[],"synthesis":[],"stats":{"article_count":1,"draft_count":0,"concept_count":0,"alias_count":0,"knowledge_item_count":0,"source_count":0,"source_segment_count":0,"failed_note_count":0,"failed_concept_count":0}}`)
+}
+
 func TestRebuildWithSyntoIdentityFailsClosedOnMissingActiveEntityArticle(t *testing.T) {
 	store := &fakeStore{files: map[string][]MarkdownFile{
 		"wiki/":         {{Slug: "alpha", Path: "wiki/alpha.md", Data: []byte("alpha")}},
