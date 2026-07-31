@@ -484,6 +484,148 @@ func TestSuggestedQueryGenerationFailureWritesValidEmptyV2WhenAbsent(t *testing.
 	}
 }
 
+func TestSuggestedQueriesStageOnlyRewritesQueryChips(t *testing.T) {
+	vault := t.TempDir()
+	idMap := []byte(`{"concept":{"alpha-id":"alpha"},"source":{},"redirects":{}}`)
+	concepts := []byte(`{"id":"alpha-id","slug":"alpha","title":"Alpha","body":"Alpha","frontmatter":{"id":"alpha-id","title":"Alpha"}}` + "\n")
+	priorQueries := []byte(`{"version":2,"queries":["舊的 query"],"candidates":[{"question":"舊的 query","intent/use_case":"exploration","corpus_anchor_concept_ids":["alpha-id"],"generation":{"model":"fixture","prompt_version":"v1"}}],"updated_at":"2026-07-01T00:00:00Z"}`)
+	mustWriteFile(t, filepath.Join(vault, "cache", "id_map.json"), idMap)
+	mustWriteFile(t, filepath.Join(vault, "cache", "concepts.jsonl"), concepts)
+	mustWriteFile(t, filepath.Join(vault, "cache", "suggested_queries.json"), priorQueries)
+	mustWriteFile(t, filepath.Join(vault, "wiki", "alpha.md"), []byte("---\nid: alpha-id\ntitle: Alpha\n---\nAlpha"))
+
+	provider := &testSuggestedQueryProvider{raw: `{"candidates":[
+{"question":"哪些概念值得一起比較？","intent/use_case":"comparison","corpus_anchor_concept_ids":["alpha-id"]},
+{"question":"如何探索這個主題的不同面向？","intent/use_case":"exploration","corpus_anchor_concept_ids":["alpha-id"]},
+{"question":"哪些選擇適合進一步查找？","intent/use_case":"retrieval","corpus_anchor_concept_ids":["alpha-id"]}
+]}`}
+	if err := runSuggestedQueriesStage(context.Background(), vault, provider); err != nil {
+		t.Fatalf("runSuggestedQueriesStage() error = %v", err)
+	}
+	if provider.calls != 1 {
+		t.Fatalf("provider calls = %d, want 1", provider.calls)
+	}
+
+	gotMap, err := os.ReadFile(filepath.Join(vault, "cache", "id_map.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(gotMap, idMap) {
+		t.Fatalf("id_map.json changed: got %s", gotMap)
+	}
+	gotConcepts, err := os.ReadFile(filepath.Join(vault, "cache", "concepts.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(gotConcepts, concepts) {
+		t.Fatalf("concepts.jsonl changed: got %s", gotConcepts)
+	}
+	gotQueries, err := os.ReadFile(filepath.Join(vault, "cache", "suggested_queries.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(gotQueries, priorQueries) {
+		t.Fatal("suggested_queries.json was not regenerated")
+	}
+	artifact, err := suggestedqueries.Decode(gotQueries)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(artifact.Queries) != 3 || artifact.Queries[0] != "哪些概念值得一起比較？" {
+		t.Fatalf("queries = %#v", artifact.Queries)
+	}
+}
+
+func TestCacheIndexStageDoesNotTouchSuggestedQueries(t *testing.T) {
+	vault := t.TempDir()
+	priorQueries := []byte(`{"version":2,"queries":["保留的 chip"],"candidates":[{"question":"保留的 chip","intent/use_case":"exploration","corpus_anchor_concept_ids":["alpha-id"],"generation":{"model":"fixture","prompt_version":"v1"}}],"updated_at":"2026-07-01T00:00:00Z"}`)
+	mustWriteFile(t, filepath.Join(vault, "cache", "suggested_queries.json"), priorQueries)
+	mustWriteFile(t, filepath.Join(vault, "wiki", "alpha.md"), []byte("---\nid: a3f7b2c01d9d\ntitle: Alpha\n---\nAlpha"))
+	mustWriteFile(t, filepath.Join(vault, "synto.toml"), []byte("[pipeline]\nauto_commit = false\n"))
+	mustWriteFile(t, filepath.Join(vault, ".synto", "INDEX.json"), []byte(syntoIndexFixture("a3f7b2c01d9d", "01JAZ5N7Y3K8M2Q4R6T9VWXABC", "alpha", false)))
+	writeValidSQLiteState(t, filepath.Join(vault, ".synto", "state.db"))
+
+	if err := runCacheIndexStage(context.Background(), vault, nil); err != nil {
+		t.Fatalf("runCacheIndexStage() error = %v", err)
+	}
+	gotQueries, err := os.ReadFile(filepath.Join(vault, "cache", "suggested_queries.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(gotQueries, priorQueries) {
+		t.Fatalf("suggested_queries.json changed during cache/index stage: %s", gotQueries)
+	}
+	if _, err := os.Stat(filepath.Join(vault, "cache", "id_map.json")); err != nil {
+		t.Fatalf("id_map.json missing after cache/index stage: %v", err)
+	}
+}
+
+func TestSuggestedQueriesCommandPublishesChipsWithoutIndexRebuild(t *testing.T) {
+	vault := t.TempDir()
+	// Use content-stable concept id so a full index rebuild would rewrite id_map;
+	// the suggested-queries command must leave the hand-authored map untouched.
+	idMap := []byte(`{"concept":{"a3f7b2c01d9d":"alpha"},"source":{},"redirects":{},"concept_entity_id":{"a3f7b2c01d9d":"01JAZ5N7Y3K8M2Q4R6T9VWXABC"}}`)
+	concepts := []byte(`{"id":"a3f7b2c01d9d","slug":"alpha","title":"Alpha","body":"Alpha","frontmatter":{"id":"a3f7b2c01d9d","title":"Alpha"}}` + "\n")
+	mustWriteFile(t, filepath.Join(vault, "cache", "id_map.json"), idMap)
+	mustWriteFile(t, filepath.Join(vault, "cache", "concepts.jsonl"), concepts)
+	mustWriteFile(t, filepath.Join(vault, "wiki", "alpha.md"), []byte("---\nid: a3f7b2c01d9d\ntitle: Alpha\n---\nAlpha"))
+	mustWriteFile(t, filepath.Join(vault, "cache", "dormant_concepts.jsonl"), nil)
+	mustWriteFile(t, filepath.Join(vault, "cache", "raw_status.json"), []byte(`{"version":1,"files":{},"file_count":0}`))
+	mustWriteFile(t, filepath.Join(vault, "cache", "suggested_queries.json"), []byte(`{"version":2,"queries":[],"candidates":[],"updated_at":"2026-07-01T00:00:00Z"}`))
+	mustWriteFile(t, filepath.Join(vault, "synto.toml"), []byte("[pipeline]\nauto_commit = false\nauto_maintain = false\nrelation_extraction = false\n"))
+	mustWriteFile(t, filepath.Join(vault, ".synto", "INDEX.json"), []byte(syntoIndexFixture("a3f7b2c01d9d", "01JAZ5N7Y3K8M2Q4R6T9VWXABC", "alpha", false)))
+	writeValidSQLiteState(t, filepath.Join(vault, ".synto", "state.db"))
+
+	provider := &testSuggestedQueryProvider{raw: `{"candidates":[
+{"question":"哪些概念值得一起比較？","intent/use_case":"comparison","corpus_anchor_concept_ids":["a3f7b2c01d9d"]},
+{"question":"如何探索這個主題的不同面向？","intent/use_case":"exploration","corpus_anchor_concept_ids":["a3f7b2c01d9d"]},
+{"question":"哪些選擇適合進一步查找？","intent/use_case":"retrieval","corpus_anchor_concept_ids":["a3f7b2c01d9d"]}
+]}`}
+	cfg := workerConfig{
+		VaultPath:                vault,
+		ExecutionID:              "suggest-only-1",
+		SuggestedQueries:         true,
+		suggestedQueriesProvider: provider,
+	}
+	if err := runSuggestedQueriesCommand(context.Background(), cfg); err != nil {
+		t.Fatalf("runSuggestedQueriesCommand() error = %v", err)
+	}
+	if provider.calls != 1 {
+		t.Fatalf("provider calls = %d, want 1", provider.calls)
+	}
+	gotMap, err := os.ReadFile(filepath.Join(vault, "cache", "id_map.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(gotMap, idMap) {
+		t.Fatalf("command rewrote id_map.json: %s", gotMap)
+	}
+	gotQueries, err := os.ReadFile(filepath.Join(vault, "cache", "suggested_queries.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifact, err := suggestedqueries.Decode(gotQueries)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(artifact.Queries) != 3 {
+		t.Fatalf("queries = %#v, want 3", artifact.Queries)
+	}
+}
+
+func TestSuggestedQueriesCommandRejectsCloudWithLocalRouting(t *testing.T) {
+	err := runSuggestedQueriesCommand(context.Background(), workerConfig{
+		Bucket:    "some-bucket",
+		UserID:    "u",
+		ProjectID: "p",
+		VaultPath: "/tmp/vault",
+		vaultSet:  true,
+	})
+	if err == nil || !errors.Is(err, errWorkerConfigInvalid) {
+		t.Fatalf("error = %v, want errWorkerConfigInvalid", err)
+	}
+}
+
 func TestWorkerPostprocessDirectPreservesDormantConceptAndEntityMappings(t *testing.T) {
 	vault := t.TempDir()
 	mustWriteFile(t, filepath.Join(vault, "wiki", "alpha.md"), []byte("---\nid: a3f7b2c01d9d\n---\nAlpha"))

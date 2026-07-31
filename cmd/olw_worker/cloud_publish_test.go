@@ -1738,6 +1738,92 @@ func TestCloudSuggestedQueriesGenerateInsidePrivateWorkspaceBeforeManifestPublis
 	}
 }
 
+func TestCloudSuggestedQueriesStageOnlyPublishesNewChips(t *testing.T) {
+	m := newMemoryObjects()
+	prefix := "users/user/projects/project/"
+	seedCloudSource(t, m, prefix, "raw-start", "", priorCloudReceipt())
+
+	// Hand-seed a complete committed generation (no full pipeline / no Synto).
+	workspace := t.TempDir()
+	writeCloudRequiredOutputs(t, workspace)
+	seedIDMap := []byte(`{"concept":{"149603e6c035":"old"},"source":{"s1":"source"},"source_meta":{"s1":{"slug":"source","source_file":"raw/source.md"}},"redirects":{}}`)
+	seedWiki := []byte("---\nid: 149603e6c035\ntitle: Old\n---\nOld\n")
+	seedConcepts := []byte(`{"id":"149603e6c035","slug":"old","title":"Old","body":"Old","frontmatter":{"id":"149603e6c035","title":"Old"}}` + "\n")
+	seedQueries := []byte(`{"version":2,"queries":["seed one?","seed two?","seed three?"],"candidates":[{"question":"seed one?","intent/use_case":"comparison","corpus_anchor_concept_ids":["149603e6c035"],"generation":{"model":"fixture","prompt_version":"v1"}},{"question":"seed two?","intent/use_case":"exploration","corpus_anchor_concept_ids":["149603e6c035"],"generation":{"model":"fixture","prompt_version":"v1"}},{"question":"seed three?","intent/use_case":"retrieval","corpus_anchor_concept_ids":["149603e6c035"],"generation":{"model":"fixture","prompt_version":"v1"}}],"updated_at":"2026-07-01T00:00:00Z"}`)
+	mustWriteFile(t, filepath.Join(workspace, "wiki", "old.md"), seedWiki)
+	mustWriteFile(t, filepath.Join(workspace, "cache", "id_map.json"), seedIDMap)
+	mustWriteFile(t, filepath.Join(workspace, "cache", "concepts.jsonl"), seedConcepts)
+	mustWriteFile(t, filepath.Join(workspace, "cache", "suggested_queries.json"), seedQueries)
+	seedManifest, _, err := publishCloudGeneration(context.Background(), m, prefix, workspace, nil)
+	if err != nil {
+		t.Fatalf("seed publishCloudGeneration() error = %v", err)
+	}
+
+	suggestProvider := &testSuggestedQueryProvider{raw: `{"candidates":[
+{"question":"哪些概念值得一起比較？","intent/use_case":"comparison","corpus_anchor_concept_ids":["149603e6c035"]},
+{"question":"如何探索這個主題的不同面向？","intent/use_case":"exploration","corpus_anchor_concept_ids":["149603e6c035"]},
+{"question":"哪些選擇適合進一步查找？","intent/use_case":"retrieval","corpus_anchor_concept_ids":["149603e6c035"]}
+]}`}
+	suggestCfg := cloudCfgFor("user", "project", "suggest-exec")
+	suggestCfg.SuggestedQueries = true
+	suggestCfg.suggestedQueriesProvider = suggestProvider
+	old := execOLW
+	t.Cleanup(func() { execOLW = old })
+	execOLW = func(context.Context, string, []string, []string, io.Writer, io.Writer) error {
+		t.Fatal("suggested-queries stage must not invoke Synto")
+		return nil
+	}
+	if err := runCloudSuggestedQueries(context.Background(), suggestCfg, m); err != nil {
+		t.Fatalf("runCloudSuggestedQueries() error = %v", err)
+	}
+	if suggestProvider.calls != 1 {
+		t.Fatalf("suggest provider calls = %d, want 1", suggestProvider.calls)
+	}
+	nextManifestData, _, err := m.Read(context.Background(), prefix+generation.ManifestPath, 0, generation.MaxManifestBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nextManifest, err := generation.Decode(nextManifestData)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nextManifest.GenerationID == seedManifest.GenerationID {
+		t.Fatal("suggest stage did not advance generation")
+	}
+	if nextManifest.PreviousGenerationID != seedManifest.GenerationID {
+		t.Fatalf("previous_generation_id = %q, want %q", nextManifest.PreviousGenerationID, seedManifest.GenerationID)
+	}
+	gotIDMap, _ := cloudGenerationFile(t, m, prefix, nextManifest, "cache/id_map.json")
+	if !bytes.Equal(gotIDMap, seedIDMap) {
+		t.Fatalf("id_map changed during suggest-only stage")
+	}
+	gotWiki, _ := cloudGenerationFile(t, m, prefix, nextManifest, "wiki/old.md")
+	if !bytes.Equal(gotWiki, seedWiki) {
+		t.Fatalf("wiki page changed during suggest-only stage")
+	}
+	published, _ := cloudGenerationFile(t, m, prefix, nextManifest, suggestedqueries.Path)
+	artifact, err := suggestedqueries.Decode(published)
+	if err != nil || len(artifact.Queries) != 3 || artifact.Queries[0] != "哪些概念值得一起比較？" {
+		t.Fatalf("published chips invalid: err=%v artifact=%#v", err, artifact)
+	}
+}
+
+func TestCloudSuggestedQueriesRequiresCommittedGeneration(t *testing.T) {
+	m := newMemoryObjects()
+	prefix := "users/user/projects/project/"
+	seedCloudSource(t, m, prefix, "raw-only", "", priorCloudReceipt())
+	cfg := cloudCfgFor("user", "project", "suggest-missing-gen")
+	cfg.SuggestedQueries = true
+	cfg.suggestedQueriesProvider = &testSuggestedQueryProvider{raw: `{"candidates":[]}`}
+	err := runCloudSuggestedQueries(context.Background(), cfg, m)
+	if err == nil {
+		t.Fatal("expected error when no committed generation")
+	}
+	if !errors.Is(err, errCloudMaterialization) {
+		t.Fatalf("error = %v, want errCloudMaterialization", err)
+	}
+}
+
 func TestCloudSuggestedQueryProviderFailurePreservesByteIdenticalLKG(t *testing.T) {
 	m := newMemoryObjects()
 	prefix := "users/user/projects/project/"

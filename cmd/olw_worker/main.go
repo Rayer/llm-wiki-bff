@@ -33,20 +33,20 @@ import (
 )
 
 type workerConfig struct {
-	VaultPath                string
-	Bucket                   string
-	DataDir                  string
-	UserID                   string
-	ProjectID                string
-	ExecutionID              string
-	APIKey                   string
-	InitVault                bool
-	Postprocess              bool
-	StopOnError              bool
-	Workspace                bool
-	WorkspaceDir             string
-	SuppressOutput           bool
-	SuggestedQueries         bool
+	VaultPath        string
+	Bucket           string
+	DataDir          string
+	UserID           string
+	ProjectID        string
+	ExecutionID      string
+	APIKey           string
+	InitVault        bool
+	Postprocess      bool
+	StopOnError      bool
+	Workspace        bool
+	WorkspaceDir     string
+	SuppressOutput   bool
+	SuggestedQueries bool
 	// CleanRebuild skips materializing prior generation outputs (wiki/.synto/
 	// cache artifacts) so Synto cold-starts from raw only. Default false.
 	CleanRebuild             bool
@@ -192,6 +192,7 @@ func formatWorkerExitMessage(err error) string {
 func newRootCommand() *cobra.Command {
 	cfg := workerConfig{Postprocess: true, StopOnError: true, SuggestedQueries: true}
 	var noPostprocess bool
+	var noSuggestedQueries bool
 
 	rootCmd := &cobra.Command{
 		Use:           "worker",
@@ -236,11 +237,27 @@ func newRootCommand() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			postprocessCfg := cfg
 			setWorkerFlagPresence(&postprocessCfg, cmd)
+			if noSuggestedQueries {
+				postprocessCfg.SuggestedQueries = false
+			}
 			return runPostprocessCommand(cmd.Context(), postprocessCfg)
 		},
 	}
+	postprocessCmd.Flags().BoolVar(&noSuggestedQueries, "no-suggested-queries", false, "skip query-chip regeneration during postprocess")
 
-	rootCmd.AddCommand(runCmd, postprocessCmd)
+	suggestedQueriesCmd := &cobra.Command{
+		Use:   "suggested-queries",
+		Short: "Regenerate cache/suggested_queries.json query chips only",
+		Args:  fixedArgs(0),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			suggestCfg := cfg
+			setWorkerFlagPresence(&suggestCfg, cmd)
+			suggestCfg.SuggestedQueries = true
+			return runSuggestedQueriesCommand(cmd.Context(), suggestCfg)
+		},
+	}
+
+	rootCmd.AddCommand(runCmd, postprocessCmd, suggestedQueriesCmd)
 	return rootCmd
 }
 
@@ -509,6 +526,53 @@ func runPostprocessCommand(ctx context.Context, cfg workerConfig) (runErr error)
 	}
 	defer os.RemoveAll(workspace)
 	if err := runPostprocessWithProvider(ctx, workspace, suggestedQueryProvider(cfg), nil); err != nil {
+		return err
+	}
+	return syncWorkspaceOutputs(workspace, vault, cfg.ExecutionID)
+}
+
+// runSuggestedQueriesCommand regenerates query chips only, then publishes.
+// Cloud mode materializes the current generation, rewrites suggested_queries,
+// and CAS-publishes a complete carry-forward generation. Local mode uses the
+// vault workspace path. It never runs Synto, index rebuild, or reconcile.
+func runSuggestedQueriesCommand(ctx context.Context, cfg workerConfig) (runErr error) {
+	cfg = configFromEnvironment(cfg)
+	if cfg.Bucket != "" {
+		cfg.cloudMode = true
+		if cfg.VaultPath != "" || cfg.DataDir != "" || cfg.Workspace {
+			return errWorkerConfigInvalid
+		}
+		if err := validateWorkerConfigBounds(cfg); err != nil {
+			return annotateError(errWorkerInputInvalid, err)
+		}
+		return runCloudSuggestedQueries(ctx, cfg, newCloudObjectStore(cfg.Bucket))
+	}
+	vault, err := resolveVaultPath(cfg)
+	if err != nil {
+		return err
+	}
+	vault, err = canonicalExistingDir(vault)
+	if err != nil {
+		return err
+	}
+	lease, err := acquireVaultLease(vault, cfg.ExecutionID)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := lease.Release(); err != nil && runErr == nil {
+			runErr = err
+		}
+	}()
+	if err := recoverInterruptedPublish(vault); err != nil {
+		return err
+	}
+	workspace, err := createWorkspace(cfg.WorkspaceDir, vault)
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(workspace)
+	if err := runSuggestedQueriesStage(ctx, workspace, suggestedQueryProvider(cfg)); err != nil {
 		return err
 	}
 	return syncWorkspaceOutputs(workspace, vault, cfg.ExecutionID)
@@ -1041,7 +1105,22 @@ func suggestedQueryProvider(cfg workerConfig) suggestedqueries.Provider {
 	return llm.NewClient(cfg.APIKey)
 }
 
+// runPostprocessWithProvider rebuilds cache/index artifacts, then regenerates
+// query chips when provider is non-nil (or ensures empty/last-known-good when nil).
+// Query-chip work is also available alone via runSuggestedQueriesStage / CLI.
 func runPostprocessWithProvider(ctx context.Context, vault string, provider suggestedqueries.Provider, warn io.Writer) error {
+	if err := runCacheIndexStage(ctx, vault, warn); err != nil {
+		return err
+	}
+	if err := runSuggestedQueriesStage(ctx, vault, provider); err != nil {
+		return err
+	}
+	return nil
+}
+
+// runCacheIndexStage rebuilds id_map/concepts, dormant cache, and raw_status.
+// It does not touch suggested_queries.json.
+func runCacheIndexStage(ctx context.Context, vault string, warn io.Writer) error {
 	store := fsstore.New(vault)
 	index, err := readSyntoIndexTruth(vault)
 	if err != nil {
@@ -1068,8 +1147,14 @@ func runPostprocessWithProvider(ctx context.Context, vault string, provider sugg
 	if err := writeRawStatus(ctx, vault); err != nil {
 		return fmt.Errorf("postprocess raw status: %w", err)
 	}
+	return nil
+}
+
+// runSuggestedQueriesStage regenerates cache/suggested_queries.json only.
+// Provider nil preserves last-known-good or writes a valid empty v2 artifact.
+func runSuggestedQueriesStage(ctx context.Context, vault string, provider suggestedqueries.Provider) error {
 	if err := writeSuggestedQueries(ctx, vault, provider); err != nil {
-		return fmt.Errorf("postprocess suggested queries: %w", err)
+		return fmt.Errorf("suggested queries: %w", err)
 	}
 	return nil
 }

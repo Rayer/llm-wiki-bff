@@ -55,6 +55,28 @@ Postprocess-only command:
 worker postprocess --vault /path/to/project
 ```
 
+Query-chip-only command (regenerates `cache/suggested_queries.json` without
+Synto, index rebuild, or reconcile):
+
+```bash
+worker suggested-queries --vault /path/to/project
+```
+
+`worker postprocess` still runs cache/index rebuild and then the suggested-queries
+stage. Pass `--no-suggested-queries` to rebuild index artifacts without calling
+the LLM chip generator.
+
+Cloud mode supports the standalone stage on the same Job image:
+
+```bash
+# Cloud Run containerOverrides.args
+["suggested-queries"]
+# with USER_ID, PROJECT_ID, BUCKET (job env), EXECUTION_ID from Cloud Run
+```
+
+Admin BFF: `POST /api/v1/admin/projects/{id}/pipeline` with
+`{"stage":"suggested-queries"}` (see LWC-232).
+
 The worker rejects every second command, `--force` in any position, and
 mutation-capable Synto commands such as compile, ingest, identity curation,
 undo, import/export, watch, query, or MCP. It creates a safe `synto.toml` only
