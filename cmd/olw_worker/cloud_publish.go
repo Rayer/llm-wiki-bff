@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -364,7 +365,10 @@ func runCloudWorkerBatch(ctx context.Context, cfg workerConfig, commands [][]str
 		return primary
 	}
 	defer os.RemoveAll(workspace)
-	snapshots, manifestData, manifestAttrs, err := materializeCloudWorkspace(ctx, objects, prefix, workspace)
+	if cfg.CleanRebuild {
+		log.Printf("worker: clean_rebuild=true; skipping prior generation materialization (raw/annotations retained)")
+	}
+	snapshots, manifestData, manifestAttrs, err := materializeCloudWorkspace(ctx, objects, prefix, workspace, cfg.CleanRebuild)
 	if err != nil {
 		failure := preserveWorkerFailure(err, failureStageInputMaterialization, failureClassUnknown)
 		primary := annotateError(errCloudMaterialization, failure)
@@ -454,7 +458,7 @@ func runCloudWorkerBatch(ctx context.Context, cfg workerConfig, commands [][]str
 	return nil
 }
 
-func materializeCloudWorkspace(ctx context.Context, objects objectStore, prefix, workspace string) ([]sourceSnapshot, []byte, objectAttrs, error) {
+func materializeCloudWorkspace(ctx context.Context, objects objectStore, prefix, workspace string, cleanRebuild bool) ([]sourceSnapshot, []byte, objectAttrs, error) {
 	budget := cloudMaterializationBudget{}
 	snapshots, err := materializeCanonicalCloudInputs(ctx, objects, prefix, workspace, &budget)
 	if err != nil {
@@ -466,7 +470,15 @@ func materializeCloudWorkspace(ctx context.Context, objects objectStore, prefix,
 	if err != nil && !isObjectNotFound(err) {
 		return snapshots, nil, objectAttrs{}, err
 	}
-	if manifestExists {
+	// Always retain current manifest bytes/attrs for CAS publish even when
+	// clean rebuild skips installing prior generation outputs into the workspace.
+	if cleanRebuild {
+		if manifestExists {
+			if _, err := generation.Decode(manifestData); err != nil {
+				return snapshots, nil, objectAttrs{}, err
+			}
+		}
+	} else if manifestExists {
 		m, err := generation.Decode(manifestData)
 		if err != nil {
 			return snapshots, nil, objectAttrs{}, err

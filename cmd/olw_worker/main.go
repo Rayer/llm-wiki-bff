@@ -47,6 +47,9 @@ type workerConfig struct {
 	WorkspaceDir             string
 	SuppressOutput           bool
 	SuggestedQueries         bool
+	// CleanRebuild skips materializing prior generation outputs (wiki/.synto/
+	// cache artifacts) so Synto cold-starts from raw only. Default false.
+	CleanRebuild             bool
 	cloudMode                bool
 	suggestedQueriesProvider suggestedqueries.Provider
 	// These record Cobra presence, rather than a truthy value, so an explicit
@@ -340,6 +343,11 @@ func configFromEnvironment(cfg workerConfig) workerConfig {
 	}
 	if !cfg.Workspace && !cfg.workspaceSet && !cloud {
 		cfg.Workspace = envBool("WORKSPACE")
+	}
+	// CLEAN_REBUILD is opt-in only (never implied by other flags). Explicit
+	// true on the config struct wins; otherwise env may enable it.
+	if !cfg.CleanRebuild {
+		cfg.CleanRebuild = envBool("CLEAN_REBUILD")
 	}
 	return cfg
 }
