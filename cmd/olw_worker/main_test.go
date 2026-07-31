@@ -403,7 +403,7 @@ func TestRunPostprocessWritesSuggestedQueriesFromConcepts(t *testing.T) {
 {"question":"如何探索這個主題的不同面向？","intent/use_case":"exploration","corpus_anchor_concept_ids":["alpha-id"]},
 {"question":"哪些選擇適合進一步查找？","intent/use_case":"retrieval","corpus_anchor_concept_ids":["beta-id"]}
 ]}`}
-	if err := runPostprocessWithProvider(context.Background(), vault, provider); err != nil {
+	if err := runPostprocessWithProvider(context.Background(), vault, provider, nil); err != nil {
 		t.Fatalf("runPostprocess() error = %v", err)
 	}
 
@@ -438,7 +438,7 @@ func TestSuggestedQueryGenerationDoesNotReadVaultRootIndexAsDescription(t *testi
 {"question":"如何探索這個主題的不同面向？","intent/use_case":"exploration","corpus_anchor_concept_ids":["alpha-id"]},
 {"question":"哪些選擇適合進一步查找？","intent/use_case":"retrieval","corpus_anchor_concept_ids":["alpha-id"]}
 ]}`}
-	if err := runPostprocessWithProvider(context.Background(), vault, provider); err != nil {
+	if err := runPostprocessWithProvider(context.Background(), vault, provider, nil); err != nil {
 		t.Fatalf("runPostprocessWithProvider() error = %v", err)
 	}
 	if strings.Contains(provider.user, "SYSTEM_INDEX_MUST_NOT_REACH_SUGGESTED_QUERY_PROVIDER") {
@@ -452,7 +452,7 @@ func TestSuggestedQueryGenerationFailurePreservesLastKnownGoodBytes(t *testing.T
 	prior := []byte(`{"version":2,"queries":["哪些概念值得一起比較？","如何探索這個主題的不同面向？","哪些選擇適合進一步查找？"],"candidates":[{"question":"哪些概念值得一起比較？","intent/use_case":"comparison","corpus_anchor_concept_ids":["alpha-id"],"generation":{"model":"fixture","prompt_version":"v1"}},{"question":"如何探索這個主題的不同面向？","intent/use_case":"exploration","corpus_anchor_concept_ids":["alpha-id"],"generation":{"model":"fixture","prompt_version":"v1"}},{"question":"哪些選擇適合進一步查找？","intent/use_case":"retrieval","corpus_anchor_concept_ids":["alpha-id"],"generation":{"model":"fixture","prompt_version":"v1"}}],"updated_at":"2026-07-28T00:00:00Z"}`)
 	mustWriteFile(t, filepath.Join(vault, "cache", "suggested_queries.json"), prior)
 	provider := &testSuggestedQueryProvider{err: errors.New("provider unavailable")}
-	if err := runPostprocessWithProvider(context.Background(), vault, provider); err != nil {
+	if err := runPostprocessWithProvider(context.Background(), vault, provider, nil); err != nil {
 		t.Fatalf("runPostprocessWithProvider() error = %v", err)
 	}
 	got, err := os.ReadFile(filepath.Join(vault, "cache", "suggested_queries.json"))
@@ -468,7 +468,7 @@ func TestSuggestedQueryGenerationFailureWritesValidEmptyV2WhenAbsent(t *testing.
 	vault := t.TempDir()
 	mustWriteFile(t, filepath.Join(vault, "wiki", "alpha.md"), []byte("---\nid: alpha-id\ntitle: Alpha\n---\nAlpha"))
 	provider := &testSuggestedQueryProvider{err: errors.New("provider unavailable")}
-	if err := runPostprocessWithProvider(context.Background(), vault, provider); err != nil {
+	if err := runPostprocessWithProvider(context.Background(), vault, provider, nil); err != nil {
 		t.Fatalf("runPostprocessWithProvider() error = %v", err)
 	}
 	data, err := os.ReadFile(filepath.Join(vault, suggestedqueries.Path))

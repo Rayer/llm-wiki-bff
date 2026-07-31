@@ -385,7 +385,7 @@ func runWorkerBatchAtVault(ctx context.Context, cfg workerConfig, commands [][]s
 		return preserveWorkerFailure(err, failureStageSyntoConfigValidation, failureClassValidation)
 	}
 	if cfg.Postprocess {
-		if err := runPostprocessWithProvider(ctx, vault, suggestedQueryProvider(cfg)); err != nil {
+		if err := runPostprocessWithProvider(ctx, vault, suggestedQueryProvider(cfg), stderr); err != nil {
 			return preserveWorkerFailure(err, failureStagePostprocess, failureClassIO)
 		}
 	}
@@ -500,7 +500,7 @@ func runPostprocessCommand(ctx context.Context, cfg workerConfig) (runErr error)
 		return err
 	}
 	defer os.RemoveAll(workspace)
-	if err := runPostprocessWithProvider(ctx, workspace, suggestedQueryProvider(cfg)); err != nil {
+	if err := runPostprocessWithProvider(ctx, workspace, suggestedQueryProvider(cfg), nil); err != nil {
 		return err
 	}
 	return syncWorkspaceOutputs(workspace, vault, cfg.ExecutionID)
@@ -1020,7 +1020,7 @@ func cleanStaleLock(vault string, maxAge time.Duration) error {
 }
 
 func runPostprocess(ctx context.Context, vault string) error {
-	return runPostprocessWithProvider(ctx, vault, nil)
+	return runPostprocessWithProvider(ctx, vault, nil, nil)
 }
 
 func suggestedQueryProvider(cfg workerConfig) suggestedqueries.Provider {
@@ -1033,7 +1033,7 @@ func suggestedQueryProvider(cfg workerConfig) suggestedqueries.Provider {
 	return llm.NewClient(cfg.APIKey)
 }
 
-func runPostprocessWithProvider(ctx context.Context, vault string, provider suggestedqueries.Provider) error {
+func runPostprocessWithProvider(ctx context.Context, vault string, provider suggestedqueries.Provider, warn io.Writer) error {
 	store := fsstore.New(vault)
 	index, err := readSyntoIndexTruth(vault)
 	if err != nil {
@@ -1044,6 +1044,7 @@ func runPostprocessWithProvider(ctx context.Context, vault string, provider sugg
 		if err != nil {
 			return fmt.Errorf("build Synto identity authority: %w", err)
 		}
+		reportUnboundActiveEntities(plan, index, warn)
 		if _, err := wikiindex.RebuildWithSyntoIdentity(ctx, store, plan); err != nil {
 			return fmt.Errorf("postprocess Synto index: %w", err)
 		}
