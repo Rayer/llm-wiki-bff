@@ -178,6 +178,9 @@ func parseProviderCandidates(raw string) ([]Candidate, error) {
 	if len(raw) > MaxProviderBytes {
 		return nil, errors.New("suggested-query provider output exceeds byte limit")
 	}
+	// DeepSeek (and other chat models) often wrap JSON in markdown fences despite
+	// "return only JSON" instructions. Strip the same way query expander does.
+	raw = stripMarkdownCodeFence(raw)
 	dec := json.NewDecoder(bytes.NewReader([]byte(raw)))
 	providerCandidates, err := decodeProviderEnvelope(dec)
 	if err != nil {
@@ -611,4 +614,22 @@ func normalize(value string) string {
 		}
 	}
 	return b.String()
+}
+
+// stripMarkdownCodeFence removes a single leading/trailing ``` fence wrapper
+// (optionally with a language tag such as ```json). Unfenced input is returned
+// trimmed. This matches internal/llm/query_expander behavior.
+func stripMarkdownCodeFence(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if !strings.HasPrefix(raw, "```") {
+		return raw
+	}
+	lines := strings.SplitN(raw, "\n", 3)
+	if len(lines) < 2 {
+		return raw
+	}
+	raw = strings.TrimPrefix(raw, lines[0]+"\n")
+	raw = strings.TrimSuffix(raw, "\n```")
+	raw = strings.TrimSuffix(raw, "```")
+	return strings.TrimSpace(raw)
 }
