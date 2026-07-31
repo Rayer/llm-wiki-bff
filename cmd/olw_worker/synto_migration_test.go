@@ -1209,6 +1209,41 @@ func TestSyntoOfflineExportPreservesOmittedArticleEntity(t *testing.T) {
 	}
 }
 
+func TestReportUnboundActiveEntitiesRecordsCoverageGap(t *testing.T) {
+	const entity = "01KYW6JAFPX69EDQZERN3X5R09"
+	plan := wikiindex.SyntoIdentityPlan{
+		ByPath:         map[string]string{},
+		ActiveEntities: map[string]bool{entity: true},
+	}
+	index := syntoIndexTruth{
+		Articles: []syntoIndexEntry{
+			{ID: "generated-orphan", Name: "Orphan Concept", Path: "articles/orphan-concept.md"},
+		},
+		SourceConcepts: []syntoSourceConcept{
+			{Name: "Orphan Concept", EntityID: entity, SourcePath: "raw/source.md"},
+			{Name: "Orphan Concept", EntityID: entity, SourcePath: "raw/other.md"},
+		},
+		ActiveEntities: map[string]bool{entity: true},
+		Present:        true,
+	}
+	var buf bytes.Buffer
+	reportUnboundActiveEntities(plan, index, &buf)
+	got := buf.String()
+	for _, want := range []string{
+		"WARNING postprocess identity_coverage_gap_summary count=1",
+		"WARNING postprocess identity_coverage_gap",
+		`entity_id="` + entity + `"`,
+		`concept_names="Orphan Concept"`,
+		`source_paths="raw/other.md,raw/source.md"`,
+		`candidate_article_paths="articles/orphan-concept.md"`,
+		"continuing without concept",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("warning log %q missing %q", got, want)
+		}
+	}
+}
+
 func TestSyntoIdentityPlanValidatesDuplicateMetadataForEntitylessArticles(t *testing.T) {
 	for _, test := range []struct {
 		name     string

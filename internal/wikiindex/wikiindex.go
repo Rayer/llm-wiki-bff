@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 
 	"cloud.google.com/go/storage"
@@ -53,10 +54,29 @@ type IDMap struct {
 // SyntoIdentityPlan is the validated identity authority for one Synto
 // INDEX.json. ByPath contains only explicit entity-bound article rows; pages
 // absent from the plan are intentionally not Concepts. ActiveEntities is the
-// source-concept coverage set and every member must have one bound article.
+// source-concept coverage set; members without a bound article are coverage
+// gaps that callers may warn on, and do not fail rebuild.
 type SyntoIdentityPlan struct {
 	ByPath         map[string]string
 	ActiveEntities map[string]bool
+}
+
+// UnboundActiveEntities returns sorted active entity IDs that have no entry in
+// ByPath (no explicit article.entity_id binding). These are source_concepts
+// coverage gaps, not identity authority for entity-less articles.
+func UnboundActiveEntities(plan SyntoIdentityPlan) []string {
+	bound := make(map[string]bool, len(plan.ByPath))
+	for _, entityID := range plan.ByPath {
+		bound[entityID] = true
+	}
+	var unbound []string
+	for entityID := range plan.ActiveEntities {
+		if !bound[entityID] {
+			unbound = append(unbound, entityID)
+		}
+	}
+	sort.Strings(unbound)
+	return unbound
 }
 
 type SourceMeta struct {
@@ -566,12 +586,11 @@ func validateSyntoIdentityPlan(files []MarkdownFile, plan SyntoIdentityPlan) err
 		}
 		entityPaths[entityID] = path
 	}
+	// Active entities without a ByPath binding are coverage gaps. Rebuild
+	// continues; callers use UnboundActiveEntities to record warnings.
 	for entityID := range plan.ActiveEntities {
 		if !ValidSyntoEntityID(entityID) || entityID != strings.TrimSpace(entityID) {
 			return fmt.Errorf("unsafe active Synto entity_id %q", entityID)
-		}
-		if _, exists := entityPaths[entityID]; !exists {
-			return fmt.Errorf("active Synto entity_id %q has no entity-bound article", entityID)
 		}
 	}
 	return nil

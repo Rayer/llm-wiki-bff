@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -851,6 +852,100 @@ func readSyntoIndexTruth(workspace string) (syntoIndexTruth, error) {
 	}
 	index.Present = true
 	return index, nil
+}
+
+// reportUnboundActiveEntities records source_concepts entities that have no
+// explicit article.entity_id binding. These coverage gaps no longer fail the
+// run; they are written to the durable pipeline log (when warn is set) and to
+// the worker process log under a stable greppable code.
+//
+// Each warning includes the Synto concept name(s) and raw source_path(s) from
+// INDEX source_concepts so operators can map entity_id -> concept without
+// opening state.db.
+func reportUnboundActiveEntities(plan wikiindex.SyntoIdentityPlan, index syntoIndexTruth, warn io.Writer) {
+	unbound := wikiindex.UnboundActiveEntities(plan)
+	if len(unbound) == 0 {
+		return
+	}
+	type entityCoverage struct {
+		names []string
+		paths []string
+	}
+	byEntity := make(map[string]*entityCoverage, len(unbound))
+	for _, entityID := range unbound {
+		byEntity[entityID] = &entityCoverage{}
+	}
+	for _, edge := range index.SourceConcepts {
+		detail, ok := byEntity[edge.EntityID]
+		if !ok {
+			continue
+		}
+		if edge.Name != "" {
+			detail.names = append(detail.names, edge.Name)
+		}
+		if edge.SourcePath != "" {
+			detail.paths = append(detail.paths, edge.SourcePath)
+		}
+	}
+	// Optional hint: entity-less INDEX articles whose title matches a missing
+	// concept name (common when pack export omits article.entity_id).
+	articlesByName := make(map[string][]string)
+	for _, article := range index.Articles {
+		if article.EntityID != "" || article.Name == "" {
+			continue
+		}
+		articlesByName[article.Name] = append(articlesByName[article.Name], article.Path)
+	}
+
+	msg := fmt.Sprintf(
+		`WARNING postprocess identity_coverage_gap_summary count=%d detail="active Synto entities missing entity-bound articles; continuing"`,
+		len(unbound),
+	)
+	log.Print(msg)
+	if warn != nil {
+		fmt.Fprintln(warn, msg)
+	}
+	for _, entityID := range unbound {
+		detail := byEntity[entityID]
+		names := uniqueSortedStrings(detail.names)
+		paths := uniqueSortedStrings(detail.paths)
+		var candidatePaths []string
+		for _, name := range names {
+			candidatePaths = append(candidatePaths, articlesByName[name]...)
+		}
+		candidatePaths = uniqueSortedStrings(candidatePaths)
+		conceptNames := strings.Join(names, ",")
+		if conceptNames == "" {
+			conceptNames = "<unknown>"
+		}
+		line := fmt.Sprintf(
+			`WARNING postprocess identity_coverage_gap entity_id=%q concept_names=%q source_paths=%q candidate_article_paths=%q detail="active Synto entity has no entity-bound article; continuing without concept"`,
+			entityID,
+			conceptNames,
+			strings.Join(paths, ","),
+			strings.Join(candidatePaths, ","),
+		)
+		log.Print(line)
+		if warn != nil {
+			fmt.Fprintln(warn, line)
+		}
+	}
+}
+
+func uniqueSortedStrings(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	sort.Strings(values)
+	out := values[:0]
+	var prev string
+	for i, value := range values {
+		if i == 0 || value != prev {
+			out = append(out, value)
+			prev = value
+		}
+	}
+	return out
 }
 
 // syntoIdentityPlanFromIndex converts the already validated INDEX artifact

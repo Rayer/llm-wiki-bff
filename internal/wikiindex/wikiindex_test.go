@@ -520,20 +520,29 @@ func intToString(value int) string {
 	return fmt.Sprintf("%d", value)
 }
 
-func TestRebuildWithSyntoIdentityFailsClosedOnMissingActiveEntityArticle(t *testing.T) {
+func TestRebuildWithSyntoIdentityContinuesOnMissingActiveEntityArticle(t *testing.T) {
+	const unboundEntity = "01JAZ5N7Y3K8M2Q4R6T9VWXABG"
 	store := &fakeStore{files: map[string][]MarkdownFile{
 		"wiki/":         {{Slug: "alpha", Path: "wiki/alpha.md", Data: []byte("alpha")}},
 		"wiki/sources/": {},
 	}, reads: map[string][]byte{}}
 
-	if _, err := RebuildWithSyntoIdentity(context.Background(), store, SyntoIdentityPlan{
+	plan := SyntoIdentityPlan{
 		ByPath:         map[string]string{},
-		ActiveEntities: map[string]bool{"01JAZ5N7Y3K8M2Q4R6T9VWXABG": true},
-	}); err == nil || !strings.Contains(err.Error(), "no entity-bound article") {
-		t.Fatalf("missing active entity error = %v", err)
+		ActiveEntities: map[string]bool{unboundEntity: true},
 	}
-	if len(store.writes) != 0 {
-		t.Fatalf("missing active entity caused writes: %#v", store.writes)
+	if got := UnboundActiveEntities(plan); len(got) != 1 || got[0] != unboundEntity {
+		t.Fatalf("UnboundActiveEntities() = %#v, want [%q]", got, unboundEntity)
+	}
+	next, err := RebuildWithSyntoIdentity(context.Background(), store, plan)
+	if err != nil {
+		t.Fatalf("RebuildWithSyntoIdentity() error = %v, want coverage gap to continue", err)
+	}
+	if len(next.Concept) != 0 {
+		t.Fatalf("Concept = %#v, want empty for unbound active entity", next.Concept)
+	}
+	if len(store.writes) == 0 {
+		t.Fatal("expected rebuild to write derived artifacts after soft coverage gap")
 	}
 }
 
