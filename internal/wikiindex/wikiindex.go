@@ -17,14 +17,14 @@ import (
 	"github.com/rayer/llm-wiki-bff/internal/annotation"
 	conceptcache "github.com/rayer/llm-wiki-bff/internal/cache"
 	"github.com/rayer/llm-wiki-bff/internal/generation"
+	"github.com/rayer/llm-wiki-bff/internal/jsonutil"
 	"gopkg.in/yaml.v3"
 )
 
 const (
-	IDMapPath                 = "cache/id_map.json"
-	IDMapTempPath             = "cache/id_map.json.tmp"
-	ConceptsJSONLPath         = "cache/concepts.jsonl"
-	maxJSONNormalizationDepth = 64
+	IDMapPath         = "cache/id_map.json"
+	IDMapTempPath     = "cache/id_map.json.tmp"
+	ConceptsJSONLPath = "cache/concepts.jsonl"
 )
 
 var ErrNotFound = errors.New("wikiindex: not found")
@@ -830,11 +830,11 @@ func buildConceptsJSONL(ctx context.Context, store Store) ([]byte, error) {
 			continue
 		}
 		entry := parseCacheEntry(file.Slug, string(file.Data))
-		normalizedFrontmatter, err := normalizeJSONValue(entry.Frontmatter, 0)
+		normalizedFrontmatter, err := jsonutil.NormalizeMap(entry.Frontmatter)
 		if err != nil {
 			return nil, fmt.Errorf("normalize concepts jsonl %s: %w", file.Path, err)
 		}
-		entry.Frontmatter = normalizedFrontmatter.(map[string]interface{})
+		entry.Frontmatter = normalizedFrontmatter
 		data, err := json.Marshal(entry)
 		if err != nil {
 			return nil, fmt.Errorf("encode concepts jsonl %s: %w", file.Path, err)
@@ -858,11 +858,11 @@ func buildSyntoConceptsJSONL(files []MarkdownFile, plan SyntoIdentityPlan) ([]by
 			entry.Frontmatter = make(map[string]interface{})
 		}
 		entry.Frontmatter["id"] = entityID
-		normalizedFrontmatter, err := normalizeJSONValue(entry.Frontmatter, 0)
+		normalizedFrontmatter, err := jsonutil.NormalizeMap(entry.Frontmatter)
 		if err != nil {
 			return nil, fmt.Errorf("normalize concepts jsonl %s: %w", file.Path, err)
 		}
-		entry.Frontmatter = normalizedFrontmatter.(map[string]interface{})
+		entry.Frontmatter = normalizedFrontmatter
 		data, err := json.Marshal(entry)
 		if err != nil {
 			return nil, fmt.Errorf("encode concepts jsonl %s: %w", file.Path, err)
@@ -878,51 +878,6 @@ func writeConceptsJSONL(ctx context.Context, store Store, data []byte) error {
 		return fmt.Errorf("write concepts.jsonl: %w", err)
 	}
 	return nil
-}
-
-func normalizeJSONValue(value interface{}, depth int) (interface{}, error) {
-	if depth > maxJSONNormalizationDepth {
-		return nil, fmt.Errorf("maximum nesting depth %d exceeded", maxJSONNormalizationDepth)
-	}
-
-	switch value := value.(type) {
-	case map[interface{}]interface{}:
-		result := make(map[string]interface{}, len(value))
-		for key, item := range value {
-			name, ok := key.(string)
-			if !ok {
-				return nil, fmt.Errorf("non-string map key type %T", key)
-			}
-			normalized, err := normalizeJSONValue(item, depth+1)
-			if err != nil {
-				return nil, err
-			}
-			result[name] = normalized
-		}
-		return result, nil
-	case map[string]interface{}:
-		result := make(map[string]interface{}, len(value))
-		for key, item := range value {
-			normalized, err := normalizeJSONValue(item, depth+1)
-			if err != nil {
-				return nil, err
-			}
-			result[key] = normalized
-		}
-		return result, nil
-	case []interface{}:
-		result := make([]interface{}, len(value))
-		for i, item := range value {
-			normalized, err := normalizeJSONValue(item, depth+1)
-			if err != nil {
-				return nil, err
-			}
-			result[i] = normalized
-		}
-		return result, nil
-	default:
-		return value, nil
-	}
 }
 
 func parseCacheEntry(slug, raw string) conceptcache.Entry {

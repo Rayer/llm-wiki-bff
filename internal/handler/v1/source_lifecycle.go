@@ -3,6 +3,7 @@ package v1
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -14,6 +15,13 @@ import (
 	"github.com/rayer/llm-wiki-bff/internal/sourcestatus"
 	store "github.com/rayer/llm-wiki-bff/internal/storage"
 )
+
+// errFrontmatterSerialize marks detail responses that cannot be made JSON-safe.
+var errFrontmatterSerialize = errors.New("frontmatter not JSON-serializable")
+
+func isFrontmatterSerializeError(err error) bool {
+	return errors.Is(err, errFrontmatterSerialize)
+}
 
 // sourceLifecycle loads the three collection-level artifacts used by all
 // lifecycle consumers. Missing or malformed worker receipts intentionally mean
@@ -75,7 +83,10 @@ func sourceByID(pages []store.WikiPage, id string) (store.WikiPage, bool) {
 }
 
 func (h *Handler) sourceDetailResponse(c *gin.Context, s store.Store, page store.WikiPage, data []byte) (handler.SourceDetailResponse, error) {
-	frontmatter, body := parseFrontmatter(string(data))
+	frontmatter, body, err := parseFrontmatterJSON(string(data))
+	if err != nil {
+		return handler.SourceDetailResponse{}, fmt.Errorf("%w: %v", errFrontmatterSerialize, err)
+	}
 	if page.ID == "" {
 		page.ID, _ = frontmatter["id"].(string)
 	}

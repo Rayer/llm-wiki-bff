@@ -662,10 +662,14 @@ func (h *Handler) GetSource(c *gin.Context) {
 
 	response, err := h.sourceDetailResponse(c, gcsClient, *page, data)
 	if err != nil {
+		if isFrontmatterSerializeError(err) {
+			writeFrontmatterSerializeError(c, err)
+			return
+		}
 		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "generated data unavailable"})
 		return
 	}
-	c.JSON(http.StatusOK, response)
+	writeJSON(c, http.StatusOK, response)
 }
 
 // ListConcepts handles GET /api/v1/concepts using the request's GCS scope.
@@ -756,8 +760,12 @@ func (h *Handler) GetConcept(c *gin.Context) {
 		return
 	}
 
-	frontmatter, body := parseFrontmatter(string(data))
-	c.JSON(http.StatusOK, handler.ConceptDetailResponse{
+	frontmatter, body, err := parseFrontmatterJSON(string(data))
+	if err != nil {
+		writeFrontmatterSerializeError(c, err)
+		return
+	}
+	writeJSON(c, http.StatusOK, handler.ConceptDetailResponse{
 		Slug:        slug,
 		ID:          page.ID,
 		Title:       slug,

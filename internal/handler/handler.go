@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"encoding/json"
 	"log"
 	"net/http"
 	"net/url"
@@ -13,6 +14,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/rayer/llm-wiki-bff/internal/firestore"
 	"github.com/rayer/llm-wiki-bff/internal/gcs"
+	"github.com/rayer/llm-wiki-bff/internal/jsonutil"
 	"github.com/rayer/llm-wiki-bff/internal/llm"
 	"github.com/rayer/llm-wiki-bff/internal/search"
 )
@@ -154,13 +156,17 @@ func (h *Handler) GetSource(c *gin.Context) {
 		return
 	}
 
-	fm, body := parseFrontmatter(string(data))
+	frontmatter, body, err := parseFrontmatterJSON(string(data))
+	if err != nil {
+		writeFrontmatterSerializeError(c, err)
+		return
+	}
 
-	c.JSON(http.StatusOK, SourceDetailResponse{
+	writeJSON(c, http.StatusOK, SourceDetailResponse{
 		Slug:        slug,
 		Title:       slug,
 		Type:        "source",
-		Frontmatter: fm,
+		Frontmatter: frontmatter,
 		Body:        body,
 		Raw:         string(data),
 	})
@@ -202,14 +208,18 @@ func (h *Handler) GetConcept(c *gin.Context) {
 		return
 	}
 
-	fm, body := parseFrontmatter(string(data))
+	frontmatter, body, err := parseFrontmatterJSON(string(data))
+	if err != nil {
+		writeFrontmatterSerializeError(c, err)
+		return
+	}
 
-	c.JSON(http.StatusOK, ConceptDetailResponse{
+	writeJSON(c, http.StatusOK, ConceptDetailResponse{
 		Slug:        slug,
 		Title:       slug,
 		Type:        "concept",
 		Status:      page.Status,
-		Frontmatter: fm,
+		Frontmatter: frontmatter,
 		Body:        body,
 		Raw:         string(data),
 	})
@@ -370,4 +380,28 @@ func parseFrontmatter(md string) (map[string]interface{}, string) {
 		return make(map[string]interface{}), md
 	}
 	return result, string(body)
+}
+
+func parseFrontmatterJSON(md string) (map[string]interface{}, string, error) {
+	frontmatter, body := parseFrontmatter(md)
+	normalized, err := jsonutil.NormalizeMap(frontmatter)
+	if err != nil {
+		return nil, body, err
+	}
+	return normalized, body, nil
+}
+
+func writeJSON(c *gin.Context, status int, payload interface{}) {
+	data, err := json.Marshal(payload)
+	if err != nil {
+		log.Printf("response serialization failed: %v", err)
+		c.JSON(http.StatusInternalServerError, ErrorResponse{Error: "response serialization failed"})
+		return
+	}
+	c.Data(status, "application/json; charset=utf-8", data)
+}
+
+func writeFrontmatterSerializeError(c *gin.Context, err error) {
+	log.Printf("frontmatter JSON normalization failed: %v", err)
+	c.JSON(http.StatusInternalServerError, ErrorResponse{Error: "response serialization failed"})
 }
