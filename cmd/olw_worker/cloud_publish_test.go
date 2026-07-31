@@ -1867,7 +1867,7 @@ func TestCloudMaterializationReadsManifestDirectlyAndNeverListsGenerations(t *te
 	}
 	store := &noFullProjectListStore{objectStore: m, prefix: prefix}
 	workspace := t.TempDir()
-	if _, _, _, err := materializeCloudWorkspace(context.Background(), store, prefix, workspace); err != nil {
+	if _, _, _, err := materializeCloudWorkspace(context.Background(), store, prefix, workspace, false); err != nil {
 		t.Fatal(err)
 	}
 	if store.listedGeneration || store.readHistorical {
@@ -1892,7 +1892,7 @@ func TestCloudMaterializationPreservesValidatedSyntoIndexAndState(t *testing.T) 
 		t.Fatal(err)
 	}
 	materialized := t.TempDir()
-	if _, _, _, err := materializeCloudWorkspace(context.Background(), m, prefix, materialized); err != nil {
+	if _, _, _, err := materializeCloudWorkspace(context.Background(), m, prefix, materialized, false); err != nil {
 		t.Fatal(err)
 	}
 	gotIndex, err := os.ReadFile(filepath.Join(materialized, ".synto", "INDEX.json"))
@@ -1905,6 +1905,41 @@ func TestCloudMaterializationPreservesValidatedSyntoIndexAndState(t *testing.T) 
 	}
 	if !bytes.Equal(gotIndex, originalIndex) || !bytes.Equal(gotState, originalState) {
 		t.Fatalf("materialized Synto artifacts changed: index=%v state=%v", bytes.Equal(gotIndex, originalIndex), bytes.Equal(gotState, originalState))
+	}
+}
+
+func TestCloudMaterializationCleanRebuildSkipsPriorGenerationOutputs(t *testing.T) {
+	workspace := t.TempDir()
+	writeCloudRequiredOutputs(t, workspace)
+	m := newMemoryObjects()
+	prefix := "users/user/projects/project/"
+	rawBody, annBody := "source-body", "note"
+	seedCloudSource(t, m, prefix, rawBody, annBody, sourcestatus.Receipt{
+		RawPath:               "raw/source.md",
+		LastIngestedRawSHA256: sha256Text(rawBody),
+		LastIngestedAnnSHA256: annotation.Digest(annBody),
+		LastIngestFingerprint: sourcestatus.Fingerprint(sha256Text(rawBody), annotation.Digest(annBody)),
+		LastSuccessAt:         time.Now().UTC().Format(time.RFC3339),
+	})
+	if _, _, err := publishCloudGeneration(context.Background(), m, prefix, workspace, nil); err != nil {
+		t.Fatal(err)
+	}
+	materialized := t.TempDir()
+	_, manifestData, attrs, err := materializeCloudWorkspace(context.Background(), m, prefix, materialized, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(manifestData) == 0 || attrs.Generation <= 0 {
+		t.Fatalf("clean rebuild must still load current manifest for CAS: data=%d gen=%d", len(manifestData), attrs.Generation)
+	}
+	if _, err := os.Stat(filepath.Join(materialized, ".synto", "state.db")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("clean rebuild installed prior .synto/state.db: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(materialized, "wiki", "old.md")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("clean rebuild installed prior wiki page: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(materialized, "raw", "source.md")); err != nil {
+		t.Fatalf("clean rebuild must keep raw source: %v", err)
 	}
 }
 

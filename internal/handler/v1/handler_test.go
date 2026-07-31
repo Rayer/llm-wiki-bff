@@ -277,7 +277,7 @@ func TestPipelineRequestsUseConfiguredJobTarget(t *testing.T) {
 	h.metadataTokenURL = "http://metadata.test/token"
 	h.SetPipelineJobURL("https://run.test/v2/projects/dev/locations/asia-east1/jobs/olw-pipeline-dev:run")
 
-	if _, err := h.invokePipelineJob(context.Background(), "user", "project"); err != nil {
+	if _, err := h.invokePipelineJob(context.Background(), "user", "project", false); err != nil {
 		t.Fatalf("invokePipelineJob() error = %v", err)
 	}
 	if _, err := h.pipelineExecutionStatus(context.Background(), ""); err != nil {
@@ -878,12 +878,15 @@ func TestAdminPipelineTriggerInvokesWorkerWithoutImmediateRebuild(t *testing.T) 
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusOK, recorder.Body.String())
 	}
-	var body map[string]string
+	var body map[string]any
 	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
 	if body["status"] != "ok" || body["execution_id"] != "olw-pipeline-admin" {
 		t.Fatalf("body = %#v", body)
+	}
+	if body["clean_rebuild"] != false {
+		t.Fatalf("default clean_rebuild = %#v, want false", body["clean_rebuild"])
 	}
 	override := runRequest.Overrides.ContainerOverrides[0]
 	if len(override.Args) != 2 || override.Args[0] != "run" || override.Args[1] != defaultWorkerCommands {
@@ -891,6 +894,76 @@ func TestAdminPipelineTriggerInvokesWorkerWithoutImmediateRebuild(t *testing.T) 
 	}
 	if override.Env[0].Value != "request-user" || override.Env[1].Value != "demo" || override.Env[2].Value != "pipeline" {
 		t.Fatalf("env = %#v", override.Env)
+	}
+	for _, env := range override.Env {
+		if env.Name == "CLEAN_REBUILD" {
+			t.Fatalf("default admin trigger must not set CLEAN_REBUILD: %#v", override.Env)
+		}
+	}
+}
+
+func TestAdminPipelineTriggerCleanRebuildSetsEnv(t *testing.T) {
+	var runRequest struct {
+		Overrides struct {
+			ContainerOverrides []struct {
+				Env []struct {
+					Name  string `json:"name"`
+					Value string `json:"value"`
+				} `json:"env"`
+			} `json:"containerOverrides"`
+		} `json:"overrides"`
+	}
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/token":
+			return testHTTPResponse(http.StatusOK, `{"access_token":"test-token"}`), nil
+		case "/run":
+			if err := json.NewDecoder(r.Body).Decode(&runRequest); err != nil {
+				t.Errorf("decode run request: %v", err)
+			}
+			return testHTTPResponse(http.StatusOK, `{
+				"metadata": {
+					"execution": "projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline/executions/olw-pipeline-clean"
+				}
+			}`), nil
+		default:
+			return testHTTPResponse(http.StatusNotFound, `not found`), nil
+		}
+	})}
+
+	h := &Handler{
+		index:            search.NewIndex(),
+		httpClient:       client,
+		metadataTokenURL: "http://metadata.test/token",
+		cloudRunJobURL:   "https://run.test/run",
+		projectExists:    func(context.Context, string) error { return nil },
+	}
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/api/v1/admin/projects/request-user_demo/pipeline", strings.NewReader(`{"clean_rebuild":true}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Params = gin.Params{{Key: "id", Value: "request-user_demo"}}
+
+	h.AdminPipelineTrigger(c)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if body["clean_rebuild"] != true {
+		t.Fatalf("body = %#v, want clean_rebuild true", body)
+	}
+	found := false
+	for _, env := range runRequest.Overrides.ContainerOverrides[0].Env {
+		if env.Name == "CLEAN_REBUILD" && env.Value == "true" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("env = %#v, want CLEAN_REBUILD=true", runRequest.Overrides.ContainerOverrides[0].Env)
 	}
 }
 

@@ -828,7 +828,7 @@ func (h *Handler) PipelineRun(c *gin.Context) {
 		return
 	}
 
-	executionID, err := h.invokePipelineJob(ctx, userID, projectID)
+	executionID, err := h.invokePipelineJob(ctx, userID, projectID, false)
 	if err != nil {
 		if reserved {
 			if qs := h.effectiveQuotaStore(); qs != nil {
@@ -854,22 +854,28 @@ func (h *Handler) PipelineRun(c *gin.Context) {
 
 // invokePipelineJob starts the shared Cloud Run pipeline job for userID/projectID.
 // Used by both user PipelineRun and AdminPipelineTrigger.
-func (h *Handler) invokePipelineJob(ctx context.Context, userID, projectID string) (executionID string, err error) {
+// cleanRebuild is opt-in; false preserves prior generation materialization.
+func (h *Handler) invokePipelineJob(ctx context.Context, userID, projectID string, cleanRebuild bool) (executionID string, err error) {
 	token, err := h.getMetadataAccessToken(ctx)
 	if err != nil {
 		return "", err
 	}
 
+	env := []gin.H{
+		{"name": "USER_ID", "value": userID},
+		{"name": "PROJECT_ID", "value": projectID},
+		{"name": "TASK_TYPE", "value": "pipeline"},
+	}
+	if cleanRebuild {
+		// Worker treats only explicit true as clean rebuild; omitted means false.
+		env = append(env, gin.H{"name": "CLEAN_REBUILD", "value": "true"})
+	}
 	body, err := json.Marshal(gin.H{
 		"overrides": gin.H{
 			"containerOverrides": []gin.H{
 				{
 					"args": []string{"run", defaultWorkerCommands},
-					"env": []gin.H{
-						{"name": "USER_ID", "value": userID},
-						{"name": "PROJECT_ID", "value": projectID},
-						{"name": "TASK_TYPE", "value": "pipeline"},
-					},
+					"env":  env,
 				},
 			},
 		},
@@ -2366,12 +2372,13 @@ func (h *Handler) handleGenerationRebuild(c *gin.Context, uid, pid string, rebui
 
 // AdminPipelineTrigger handles POST /admin/projects/{id}/pipeline.
 //
-//	@Summary		Trigger pipeline + rebuild for a project (admin)
-//	@Description	Invokes the Cloud Run worker job for the specified project, then rebuilds the search index.
+//	@Summary		Trigger pipeline for a project (admin)
+//	@Description	Invokes the Cloud Run worker job for the specified project. Optional body {"clean_rebuild":true} cold-starts Synto from raw without prior wiki/state.
 //	@Tags			admin
 //	@Accept			json
 //	@Produce		json
-//	@Param			id	path		string	true	"Project doc ID ({userID}_{projectID})"
+//	@Param			id		path	string	true	"Project doc ID ({userID}_{projectID})"
+//	@Param			body	body	object	false	"Optional flags"
 //	@Success		200	{object}	map[string]any
 //	@Failure		400	{object}	handler.ErrorResponse
 //	@Failure		401	{object}	handler.ErrorResponse
@@ -2387,6 +2394,16 @@ func (h *Handler) AdminPipelineTrigger(c *gin.Context) {
 	if pid == "" {
 		c.JSON(http.StatusBadRequest, handler.ErrorResponse{Error: "invalid project doc ID"})
 		return
+	}
+	var req struct {
+		CleanRebuild bool `json:"clean_rebuild"`
+	}
+	if c.Request.Body != nil && c.Request.ContentLength != 0 {
+		dec := json.NewDecoder(c.Request.Body)
+		if err := dec.Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+			c.JSON(http.StatusBadRequest, handler.ErrorResponse{Error: "invalid request body"})
+			return
+		}
 	}
 	ctx := c.Request.Context()
 	if err := h.verifyAdminProjectExists(ctx, docID); err != nil {
@@ -2413,16 +2430,21 @@ func (h *Handler) AdminPipelineTrigger(c *gin.Context) {
 		return
 	}
 
-	executionID, err := h.invokePipelineJob(ctx, uid, pid)
+	executionID, err := h.invokePipelineJob(ctx, uid, pid, req.CleanRebuild)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: pipelineUnavailableMessage})
 		return
 	}
-	log.Print("admin pipeline triggered")
+	if req.CleanRebuild {
+		log.Print("admin pipeline triggered clean_rebuild=true")
+	} else {
+		log.Print("admin pipeline triggered")
+	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"status":       "ok",
-		"execution_id": executionID,
+		"status":        "ok",
+		"execution_id":  executionID,
+		"clean_rebuild": req.CleanRebuild,
 	})
 }
 
