@@ -729,6 +729,7 @@ func TestPipelineRunExecutesCloudRunJob(t *testing.T) {
 						map[string]any{"name": "USER_ID", "value": "request-user"},
 						map[string]any{"name": "PROJECT_ID", "value": "demo"},
 						map[string]any{"name": "TASK_TYPE", "value": "pipeline"},
+						map[string]any{"name": "PIPELINE_STAGE", "value": "full"},
 					},
 				},
 			},
@@ -803,6 +804,9 @@ func TestPipelineRunDefaultsCommandAndUser(t *testing.T) {
 	}
 	if override.Env[0].Value != "request-user" || override.Env[1].Value != "demo" || override.Env[2].Value != "pipeline" {
 		t.Fatalf("env = %#v", override.Env)
+	}
+	if len(override.Env) < 4 || override.Env[3].Name != "PIPELINE_STAGE" || override.Env[3].Value != "full" {
+		t.Fatalf("PIPELINE_STAGE env = %#v, want full", override.Env)
 	}
 }
 
@@ -888,6 +892,9 @@ func TestAdminPipelineTriggerInvokesWorkerWithoutImmediateRebuild(t *testing.T) 
 	if body["clean_rebuild"] != false {
 		t.Fatalf("default clean_rebuild = %#v, want false", body["clean_rebuild"])
 	}
+	if body["stage"] != "full" {
+		t.Fatalf("default stage = %#v, want full", body["stage"])
+	}
 	override := runRequest.Overrides.ContainerOverrides[0]
 	if len(override.Args) != 2 || override.Args[0] != "run" || override.Args[1] != defaultWorkerCommands {
 		t.Fatalf("args = %#v, want [run %s]", override.Args, defaultWorkerCommands)
@@ -895,10 +902,116 @@ func TestAdminPipelineTriggerInvokesWorkerWithoutImmediateRebuild(t *testing.T) 
 	if override.Env[0].Value != "request-user" || override.Env[1].Value != "demo" || override.Env[2].Value != "pipeline" {
 		t.Fatalf("env = %#v", override.Env)
 	}
+	foundStage := false
 	for _, env := range override.Env {
 		if env.Name == "CLEAN_REBUILD" {
 			t.Fatalf("default admin trigger must not set CLEAN_REBUILD: %#v", override.Env)
 		}
+		if env.Name == "PIPELINE_STAGE" {
+			foundStage = true
+			if env.Value != "full" {
+				t.Fatalf("PIPELINE_STAGE = %q, want full", env.Value)
+			}
+		}
+	}
+	if !foundStage {
+		t.Fatalf("missing PIPELINE_STAGE env: %#v", override.Env)
+	}
+}
+
+func TestAdminPipelineTriggerSuggestedQueriesStage(t *testing.T) {
+	var runRequest struct {
+		Overrides struct {
+			ContainerOverrides []struct {
+				Args []string `json:"args"`
+				Env  []struct {
+					Name  string `json:"name"`
+					Value string `json:"value"`
+				} `json:"env"`
+			} `json:"containerOverrides"`
+		} `json:"overrides"`
+	}
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/token":
+			return testHTTPResponse(http.StatusOK, `{"access_token":"test-token"}`), nil
+		case "/run":
+			if err := json.NewDecoder(r.Body).Decode(&runRequest); err != nil {
+				t.Errorf("decode run request: %v", err)
+			}
+			return testHTTPResponse(http.StatusOK, `{
+				"metadata": {
+					"execution": "projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline/executions/olw-pipeline-suggest"
+				}
+			}`), nil
+		default:
+			return testHTTPResponse(http.StatusOK, `{"executions":[]}`), nil
+		}
+	})}
+
+	h := &Handler{
+		index:            search.NewIndex(),
+		httpClient:       client,
+		metadataTokenURL: "http://metadata.test/token",
+		cloudRunJobURL:   "https://run.test/run",
+		projectExists:    func(context.Context, string) error { return nil },
+	}
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/api/v1/admin/projects/request-user_demo/pipeline", strings.NewReader(`{"stage":"suggested-queries"}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Params = gin.Params{{Key: "id", Value: "request-user_demo"}}
+
+	h.AdminPipelineTrigger(c)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if body["stage"] != "suggested-queries" || body["execution_id"] != "olw-pipeline-suggest" {
+		t.Fatalf("body = %#v", body)
+	}
+	override := runRequest.Overrides.ContainerOverrides[0]
+	if len(override.Args) != 1 || override.Args[0] != "suggested-queries" {
+		t.Fatalf("args = %#v, want [suggested-queries]", override.Args)
+	}
+	foundStage := false
+	for _, env := range override.Env {
+		if env.Name == "PIPELINE_STAGE" {
+			foundStage = true
+			if env.Value != "suggested-queries" {
+				t.Fatalf("PIPELINE_STAGE = %q", env.Value)
+			}
+		}
+		if env.Name == "CLEAN_REBUILD" {
+			t.Fatalf("suggested-queries must not set CLEAN_REBUILD")
+		}
+	}
+	if !foundStage {
+		t.Fatal("missing PIPELINE_STAGE")
+	}
+}
+
+func TestAdminPipelineTriggerRejectsCleanRebuildWithSuggestedQueries(t *testing.T) {
+	h := &Handler{
+		index:            search.NewIndex(),
+		httpClient:       &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) { return testHTTPResponse(http.StatusOK, `{}`), nil })},
+		metadataTokenURL: "http://metadata.test/token",
+		cloudRunJobURL:   "https://run.test/run",
+		projectExists:    func(context.Context, string) error { return nil },
+	}
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/api/v1/admin/projects/request-user_demo/pipeline", strings.NewReader(`{"stage":"suggested-queries","clean_rebuild":true}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Params = gin.Params{{Key: "id", Value: "request-user_demo"}}
+
+	h.AdminPipelineTrigger(c)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body = %s", recorder.Code, recorder.Body.String())
 	}
 }
 

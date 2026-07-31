@@ -860,10 +860,37 @@ func (h *Handler) PipelineRun(c *gin.Context) {
 	})
 }
 
+// Pipeline stage identifiers for Cloud Run job overrides. TASK_TYPE stays
+// "pipeline" so ownership / already_running matching remains uniform; STAGE
+// discriminates full run vs single-stage repairs.
+const (
+	pipelineStageFull             = "full"
+	pipelineStageSuggestedQueries = "suggested-queries"
+	pipelineStageEnvName          = "PIPELINE_STAGE"
+)
+
 // invokePipelineJob starts the shared Cloud Run pipeline job for userID/projectID.
 // Used by both user PipelineRun and AdminPipelineTrigger.
 // cleanRebuild is opt-in; false preserves prior generation materialization.
+// stage selects worker entrypoint: empty/"full" runs the full Synto pipeline;
+// "suggested-queries" regenerates query chips only.
 func (h *Handler) invokePipelineJob(ctx context.Context, userID, projectID string, cleanRebuild bool) (executionID string, err error) {
+	return h.invokePipelineJobStage(ctx, userID, projectID, cleanRebuild, pipelineStageFull)
+}
+
+func (h *Handler) invokePipelineJobStage(ctx context.Context, userID, projectID string, cleanRebuild bool, stage string) (executionID string, err error) {
+	stage = strings.TrimSpace(stage)
+	if stage == "" {
+		stage = pipelineStageFull
+	}
+	args, err := workerArgsForStage(stage)
+	if err != nil {
+		return "", err
+	}
+	if cleanRebuild && stage != pipelineStageFull {
+		return "", fmt.Errorf("clean_rebuild is only valid for full pipeline stage")
+	}
+
 	token, err := h.getMetadataAccessToken(ctx)
 	if err != nil {
 		return "", err
@@ -872,7 +899,9 @@ func (h *Handler) invokePipelineJob(ctx context.Context, userID, projectID strin
 	env := []gin.H{
 		{"name": "USER_ID", "value": userID},
 		{"name": "PROJECT_ID", "value": projectID},
+		// Keep TASK_TYPE=pipeline for ownership matching across stages.
 		{"name": "TASK_TYPE", "value": "pipeline"},
+		{"name": pipelineStageEnvName, "value": stage},
 	}
 	if cleanRebuild {
 		// Worker treats only explicit true as clean rebuild; omitted means false.
@@ -882,7 +911,7 @@ func (h *Handler) invokePipelineJob(ctx context.Context, userID, projectID strin
 		"overrides": gin.H{
 			"containerOverrides": []gin.H{
 				{
-					"args": []string{"run", defaultWorkerCommands},
+					"args": args,
 					"env":  env,
 				},
 			},
@@ -917,6 +946,17 @@ func (h *Handler) invokePipelineJob(ctx context.Context, userID, projectID strin
 		return "", err
 	}
 	return executionID, nil
+}
+
+func workerArgsForStage(stage string) ([]string, error) {
+	switch stage {
+	case pipelineStageFull:
+		return []string{"run", defaultWorkerCommands}, nil
+	case pipelineStageSuggestedQueries:
+		return []string{"suggested-queries"}, nil
+	default:
+		return nil, fmt.Errorf("unsupported pipeline stage %q", stage)
+	}
 }
 
 type cloudRunJobRunResponse struct {
@@ -2404,7 +2444,8 @@ func (h *Handler) AdminPipelineTrigger(c *gin.Context) {
 		return
 	}
 	var req struct {
-		CleanRebuild bool `json:"clean_rebuild"`
+		CleanRebuild bool   `json:"clean_rebuild"`
+		Stage        string `json:"stage"`
 	}
 	if c.Request.Body != nil && c.Request.ContentLength != 0 {
 		dec := json.NewDecoder(c.Request.Body)
@@ -2412,6 +2453,18 @@ func (h *Handler) AdminPipelineTrigger(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, handler.ErrorResponse{Error: "invalid request body"})
 			return
 		}
+	}
+	stage := strings.TrimSpace(req.Stage)
+	if stage == "" {
+		stage = pipelineStageFull
+	}
+	if _, err := workerArgsForStage(stage); err != nil {
+		c.JSON(http.StatusBadRequest, handler.ErrorResponse{Error: "invalid stage; use full or suggested-queries"})
+		return
+	}
+	if req.CleanRebuild && stage != pipelineStageFull {
+		c.JSON(http.StatusBadRequest, handler.ErrorResponse{Error: "clean_rebuild is only valid for full pipeline stage"})
+		return
 	}
 	ctx := c.Request.Context()
 	if err := h.verifyAdminProjectExists(ctx, docID); err != nil {
@@ -2438,13 +2491,15 @@ func (h *Handler) AdminPipelineTrigger(c *gin.Context) {
 		return
 	}
 
-	executionID, err := h.invokePipelineJob(ctx, uid, pid, req.CleanRebuild)
+	executionID, err := h.invokePipelineJobStage(ctx, uid, pid, req.CleanRebuild, stage)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: pipelineUnavailableMessage})
 		return
 	}
 	if req.CleanRebuild {
 		log.Print("admin pipeline triggered clean_rebuild=true")
+	} else if stage == pipelineStageSuggestedQueries {
+		log.Print("admin pipeline triggered stage=suggested-queries")
 	} else {
 		log.Print("admin pipeline triggered")
 	}
@@ -2453,6 +2508,7 @@ func (h *Handler) AdminPipelineTrigger(c *gin.Context) {
 		"status":        "ok",
 		"execution_id":  executionID,
 		"clean_rebuild": req.CleanRebuild,
+		"stage":         stage,
 	})
 }
 

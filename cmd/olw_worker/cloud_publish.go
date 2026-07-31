@@ -317,6 +317,117 @@ func (l *cloudLease) Release(_ context.Context) error {
 	return nil
 }
 
+// runCloudSuggestedQueries materializes the current committed generation,
+// regenerates cache/suggested_queries.json only, and publishes a complete new
+// generation (all other artifacts carry-forwarded from the materialized workspace).
+func runCloudSuggestedQueries(ctx context.Context, cfg workerConfig, objects objectStore) (result error) {
+	cfg.cloudMode = true
+	cfg.SuggestedQueries = true
+	if cfg.Bucket == "" || cfg.UserID == "" || cfg.ProjectID == "" {
+		return errCloudWorkerConfigInvalid
+	}
+	if err := validateWorkerConfigBounds(cfg); err != nil {
+		return annotateError(errCloudWorkerInputInvalid, err)
+	}
+	defer objects.Close()
+	prefix := fmt.Sprintf("users/%s/projects/%s/", cfg.UserID, cfg.ProjectID)
+	lease, err := acquireCloudLease(ctx, objects, prefix, cfg.ExecutionID)
+	if err != nil {
+		return annotateError(errCloudLeaseUnavailable, err)
+	}
+	committed := false
+	workspace := ""
+	defer func() {
+		if cleanupErr := lease.Release(ctx); cleanupErr != nil {
+			recordingCtx, cancel := cloudFailureRecordingContext(ctx)
+			defer cancel()
+			if result == nil {
+				if committed {
+					failure := newWorkerFailure(nil, failureStageLeaseCleanup, failureClassIO, "", cleanupErr)
+					if diagnosticErr := writeCloudFailureDiagnosticWithContext(recordingCtx, objects, prefix, cfg, failure); diagnosticErr != nil {
+						result = errors.Join(annotateError(errCloudCommittedCleanup, cleanupErr), cloudFailureRecordingError{failureDiagnostic: true})
+					} else {
+						result = annotateError(errCloudCommittedCleanup, cleanupErr)
+					}
+				} else {
+					result = cleanupErr
+				}
+			} else {
+				result = errors.Join(result, cleanupErr)
+			}
+		}
+	}()
+	workspace, err = cloudMkdirTemp("/tmp", "olw-cloud-suggest-")
+	if err != nil {
+		failure := newWorkerFailure(ctx, failureStageInputMaterialization, failureClassIO, "", err)
+		primary := annotateError(errCloudWorkspaceUnavailable, err)
+		if recordErr := writeCloudFailureReceipts(ctx, objects, prefix, "", cfg, nil, failure); recordErr != nil {
+			return errors.Join(primary, recordErr)
+		}
+		return primary
+	}
+	defer os.RemoveAll(workspace)
+
+	// Suggest-only always needs the current generation (never CLEAN_REBUILD).
+	snapshots, manifestData, manifestAttrs, err := materializeCloudWorkspace(ctx, objects, prefix, workspace, false)
+	if err != nil {
+		failure := preserveWorkerFailure(err, failureStageInputMaterialization, failureClassUnknown)
+		primary := annotateError(errCloudMaterialization, failure)
+		if recordErr := writeCloudFailureReceipts(ctx, objects, prefix, workspace, cfg, snapshots, failure); recordErr != nil {
+			return errors.Join(primary, recordErr)
+		}
+		return primary
+	}
+	if manifestAttrs.Generation <= 0 || len(manifestData) == 0 {
+		failure := newWorkerFailure(ctx, failureStageInputMaterialization, failureClassStateInvalid, "", errors.New("suggested-queries requires a committed generation"))
+		primary := annotateError(errCloudMaterialization, failure)
+		if recordErr := writeCloudFailureReceipts(ctx, objects, prefix, workspace, cfg, snapshots, failure); recordErr != nil {
+			return errors.Join(primary, recordErr)
+		}
+		return primary
+	}
+
+	if err := runSuggestedQueriesStage(ctx, workspace, suggestedQueryProvider(cfg)); err != nil {
+		failure := preserveWorkerFailure(err, failureStagePostprocess, failureClassUnknown)
+		primary := annotateError(errCloudPipelineExecution, failure)
+		if recordErr := writeCloudFailureReceipts(ctx, objects, prefix, workspace, cfg, snapshots, failure, diagnosticSecrets(cfg, nil)); recordErr != nil {
+			return errors.Join(primary, recordErr)
+		}
+		return primary
+	}
+
+	if _, _, err := publishCloudGenerationFromStart(ctx, objects, prefix, workspace, snapshots, manifestData, manifestAttrs, true); err != nil {
+		if errors.Is(err, errManifestCommitOutcomeUnknown) {
+			recordingCtx, cancel := cloudFailureRecordingContext(ctx)
+			logErr := writeCloudPipelineLog(recordingCtx, objects, prefix, workspace, cfg)
+			cancel()
+			if logErr != nil {
+				return errors.Join(errManifestCommitOutcomeUnknown, errCloudPipelineLogRecording)
+			}
+			return errManifestCommitOutcomeUnknown
+		}
+		failureClass := failureClassIO
+		if errors.Is(err, errObjectGenerationConflict) {
+			failureClass = failureClassPublishConflict
+		}
+		failure := preserveWorkerFailure(err, failureStageGenerationPublish, failureClass)
+		primary := annotateError(errCloudPipelinePublish, failure)
+		if recordErr := writeCloudFailureReceipts(ctx, objects, prefix, workspace, cfg, snapshots, failure); recordErr != nil {
+			return errors.Join(primary, recordErr)
+		}
+		return primary
+	}
+	committed = true
+	if err := writeCloudReceipts(ctx, objects, prefix, workspace, cfg, snapshots); err != nil {
+		failure := preserveWorkerFailure(err, failureStageReceiptRecording, failureClassRecordingFailure)
+		if diagnosticErr := writeCloudFailureDiagnostic(ctx, objects, prefix, cfg, failure); diagnosticErr != nil {
+			return errors.Join(annotateError(errCloudCommittedReceipt, failure), cloudFailureRecordingError{failureDiagnostic: true})
+		}
+		return annotateError(errCloudCommittedReceipt, failure)
+	}
+	return nil
+}
+
 func runCloudWorkerBatch(ctx context.Context, cfg workerConfig, commands [][]string, objects objectStore) (result error) {
 	cfg.cloudMode = true
 	if err := validateWorkerInput(cfg, commands); err != nil {
