@@ -80,9 +80,12 @@ workspace publication/recovery path. Local mode does not use the cloud
    starting a child. The production contract is `[ ["run", "--auto-approve"] ]`.
 2. Acquire an exclusive create-only GCS lease at
    `users/{USER_ID}/projects/{PROJECT_ID}/.lwc/publish/lease.json` before
-   materialization. It records owner/execution metadata and is held through
-   publication, receipts, failure-log recording, and cleanup. Overlap fails
-   closed; an abandoned lease requires operator inspection.
+   materialization. The lease payload is JSON
+   `{"execution":"<execution-id>","started_at":"..."}` with the real pipeline
+   execution id (not redacted) so stuck locks can be attributed. It is held
+   through publication, receipts, failure-log recording, and cleanup. Overlap
+   fails closed with a stable public sentinel while preserving the root cause
+   via error wrapping; an abandoned lease requires operator inspection.
 3. Create a private `/tmp/olw-cloud-*` directory. Materialize canonical raw
    objects, annotations, source status, and the previously committed generation
    selected by `.lwc/publish/current.json` through the Storage API. If no current
@@ -130,31 +133,42 @@ publish generation outputs.
 For every owned cloud execution, the worker writes the bounded raw child
 stdout/stderr object `cache/pipeline-<execution>.log` alongside the typed
 operator diagnostic `cache/pipeline-<execution>.failure.json` when applicable.
-The raw log is captured locally while `SuppressOutput` keeps it out of Cloud
-Logging, then persisted on success and every failure after ownership is
-established. Its documented maximum is 4 MiB including the deterministic
-marker `\n[output truncated at 4194304 bytes]\n`; the marker replaces the tail
-when the child exceeds the cap. The
-failure object is versioned, deterministic JSON and is written create-only; it
-is not part of a generation, does not create a current pointer, and is never
-written on success. A diagnostic write failure is reported through the
-existing fixed failure-recording category and cannot publish a generation.
+Child Synto stdout/stderr is always captured into the execution-scoped pipeline
+log when an execution id is present. By default it is also teed to the process
+console (redacted). Cloud mode must not force console silence: local bucket
+runs and Cloud Logging both need live progress. Pass `--suppress-output` only
+when intentionally quiet. The log is persisted on success and every failure
+after ownership is established. Its documented maximum is 4 MiB including the
+deterministic marker `\n[output truncated at 4194304 bytes]\n`; the marker
+replaces the tail when the child exceeds the cap. The failure object is
+versioned JSON and is written create-only; it is not part of a generation,
+does not create a current pointer, and is never written on success. A
+diagnostic write failure is reported through the existing fixed
+failure-recording category and cannot publish a generation.
 
-The payload is bounded to 4 KiB and contains only `version: 1`,
-`status: "failed"`, a finite stage, a finite error class, and when proven at a
-child-process boundary a finite child command plus numeric exit code. Stages
-include input materialization, Synto migration/config/run/index export,
+The payload is bounded to 4 KiB and contains `version: 1`, `status: "failed"`,
+a finite stage, a finite error class, the pipeline `execution` id, a bounded
+redacted `message` (root cause text with credentials scrubbed), and when proven
+at a child-process boundary a finite child command plus numeric exit code.
+Stages include input materialization, Synto migration/config/run/index export,
 source/concept reconciliation, postprocess, generation publication, receipt
-recording, and lease cleanup. Error classes include validation, child exit, timeout,
-cancellation, I/O, invalid state, publication conflict, recording failure, and
-unknown. The accepted user command is only `run`; migration and index export
-are worker-owned child seams.
+recording, and lease cleanup. Error classes include validation, child exit,
+timeout, cancellation, I/O, invalid state, publication conflict, recording
+failure, and unknown. The accepted user command is only `run`; migration and
+index export are worker-owned child seams.
 
-The typed artifact never stores child stdout/stderr, error strings, provider
-HTTP status, URLs, paths, arguments, provider bodies, model responses, source
-or article text, credentials, tokens, tenant/user/project/execution IDs, or
-timestamps. The raw log deliberately preserves ordinary operational output;
-only known application API-key values are prevented from reaching the log.
+Credentials (`LLM_API_KEY` / `DEEPSEEK_API_KEY` / configured API key) are always
+redacted from `message`, pipeline logs, and process exit lines. Control-plane
+identity (execution id, tenant/project ids, paths, stage text) is retained for
+operators. Source receipt `error` remains the fixed tenant-facing string
+`pipeline failed`. Process exit logs preserve operational public boundaries and
+their unwrapped causes (for example
+`pipeline publish lease unavailable: object generation conflict`). Only
+cobra/CLI parse failures collapse to the fixed `worker command rejected` string
+so user-supplied tokens are not echoed. Operational failures use stable public
+boundary sentinels (so callers and tests can match `Error()` / `errors.Is`) but
+must wrap the root cause with `annotateError` rather than replacing it.
+
 The worker is the only producer-side cap: it publishes one complete bounded
 execution artifact of at most 4 MiB. The explicit PipelineLog fetch returns
 that artifact without head/tail sampling or a second API truncation marker.
