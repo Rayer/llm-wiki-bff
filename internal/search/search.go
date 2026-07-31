@@ -3,7 +3,6 @@ package search
 import (
 	"context"
 	"fmt"
-	"net/url"
 	"sort"
 	"strings"
 
@@ -417,61 +416,6 @@ func entryTitle(slug string, entry indexedPage) string {
 		return entry.title
 	}
 	return slug
-}
-
-// ParseCitations extracts [Name] citations from ai_synth and matches them to results.
-func ParseCitations(aiSynth string, results []Result) ([]Citation, []Result) {
-	if aiSynth == "" {
-		return nil, results
-	}
-
-	// Build lookup by title
-	byTitle := make(map[string]Result)
-	for _, r := range results {
-		byTitle[strings.ToLower(r.Title)] = r
-	}
-
-	var citations []Citation
-	cited := make(map[string]bool)
-	remaining := aiSynth
-
-	for {
-		start := strings.Index(remaining, "[")
-		if start < 0 {
-			break
-		}
-		end := strings.Index(remaining[start:], "]")
-		if end < 0 {
-			break
-		}
-		text := remaining[start+1 : start+end]
-		remaining = remaining[start+end+1:]
-
-		// Skip URLs and other bracket content
-		if strings.Contains(text, "http") || strings.Contains(text, "wiki") || strings.Contains(text, "general") {
-			continue
-		}
-
-		if r, ok := byTitle[strings.ToLower(text)]; ok {
-			collection := "concepts"
-			if r.Type == "source" {
-				collection = "sources"
-			}
-			path := "/" + collection + "/" + url.PathEscape(r.Slug)
-			citations = append(citations, Citation{Text: text, Slug: r.Slug, Type: r.Type, Path: path})
-			cited[r.Slug] = true
-		}
-	}
-
-	// Filter results to only cited
-	var filtered []Result
-	for _, r := range results {
-		if cited[r.Slug] {
-			filtered = append(filtered, r)
-		}
-	}
-
-	return citations, filtered
 }
 
 // matchScore returns the number of matching words found in text.

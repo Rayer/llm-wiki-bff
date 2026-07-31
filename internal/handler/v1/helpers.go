@@ -10,6 +10,8 @@ import (
 func buildSystemPrompt(mode string) string {
 	base := "CRITICAL: If the user asks about a specific location (city, district, area), ONLY include results relevant to that location. Ignore results from other locations even if they match on topic keywords." +
 		"\n\nCITATION FORMAT RULES (mandatory):" +
+		"\n- Each wiki block includes one server-issued internal reference in brackets. Use that exact reference in brackets when citing the block; the server will replace it with the canonical title." +
+		"\n- Never invent, alter, or reuse a citation reference for a different wiki block" +
 		"\n- EVERY factual claim from wiki content MUST have a bracketed citation: [Exact Source Name]" +
 		"\n- Use the EXACT full title from the wiki content inside brackets" +
 		"\n- Never use **bold** instead of brackets" +
@@ -24,6 +26,8 @@ func buildSystemPrompt(mode string) string {
 			"\n- NEVER say 'I cannot find this in the wiki' or apologize for missing information. Just answer the question." +
 			"\n- When mixing wiki and general knowledge, make it seamless — don't call out which is which in the text." +
 			"\n\nCITATION FORMAT RULES (mandatory):" +
+			"\n- Each wiki block includes one server-issued internal reference in brackets. Use that exact reference in brackets when citing the block; the server will replace it with the canonical title." +
+			"\n- Never invent, alter, or reuse a citation reference for a different wiki block" +
 			"\n- EVERY factual claim from wiki content MUST have a bracketed citation: [Exact Source Name]" +
 			"\n- Use the EXACT full title from the wiki content inside brackets" +
 			"\n- Never use **bold** instead of brackets" +
@@ -36,64 +40,13 @@ func buildSystemPrompt(mode string) string {
 func buildUserPrompt(query string, contexts []string) string {
 	var sb strings.Builder
 	sb.WriteString("User question: ")
-	sb.WriteString(query)
+	sb.WriteString(search.NeutralizeCitationReferences(query))
 	sb.WriteString("\n\nWiki content:\n")
 	for _, ctx := range contexts {
 		sb.WriteString("\n---\n")
 		sb.WriteString(ctx)
 	}
 	return sb.String()
-}
-
-func ensureBrackets(text string, results []search.Result) string {
-	names := make(map[string]bool)
-	var sorted []string
-	for _, result := range results {
-		if !names[result.Title] {
-			names[result.Title] = true
-			sorted = append(sorted, result.Title)
-		}
-	}
-	for i := 0; i < len(sorted); i++ {
-		for j := i + 1; j < len(sorted); j++ {
-			if len(sorted[j]) > len(sorted[i]) {
-				sorted[i], sorted[j] = sorted[j], sorted[i]
-			}
-		}
-	}
-
-	for _, name := range sorted {
-		if len(name) < 3 {
-			continue
-		}
-		bracketed := "[" + name + "]"
-		if strings.Contains(text, bracketed) {
-			continue
-		}
-		idx := 0
-		for {
-			pos := strings.Index(text[idx:], name)
-			if pos < 0 {
-				break
-			}
-			absPos := idx + pos
-			before := ""
-			if absPos > 0 {
-				before = text[absPos-1 : absPos]
-			}
-			after := ""
-			if absPos+len(name) < len(text) {
-				after = text[absPos+len(name) : absPos+len(name)+1]
-			}
-			if before == "[" && after == "]" {
-				idx = absPos + len(name)
-				continue
-			}
-			text = text[:absPos] + bracketed + text[absPos+len(name):]
-			idx = absPos + len(bracketed)
-		}
-	}
-	return text
 }
 
 func parseFrontmatter(md string) (map[string]interface{}, string) {

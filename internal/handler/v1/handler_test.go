@@ -543,12 +543,16 @@ func TestCachedContextsIncludeConceptSources(t *testing.T) {
 		raw:    "---\ntitle: Alpha Concept\nsources: [Source One, Source Two]\n---\nAlpha body.",
 	}
 	conceptCache := conceptcache.New()
+	authority, err := search.NewCitationAuthority()
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	contexts := cachedContexts(context.Background(), conceptCache, reader, []search.Result{{
 		Slug:  "alpha",
 		Title: "Alpha Concept",
 		Type:  "concept",
-	}})
+	}}, authority)
 
 	if len(contexts) != 1 {
 		t.Fatalf("len(contexts) = %d, want 1", len(contexts))

@@ -96,7 +96,8 @@ func TestQueryCancellationPropagatesToCachedContextRebuild(t *testing.T) {
 
 	completed := make(chan struct{})
 	go func() {
-		_ = cachedContexts(ctx, conceptCache, reader, []search.Result{{Slug: "coffee-shops", Title: "Coffee Shops"}})
+		authority, _ := search.NewCitationAuthority()
+		_ = cachedContexts(ctx, conceptCache, reader, []search.Result{{Slug: "coffee-shops", Title: "Coffee Shops"}}, authority)
 		close(completed)
 	}()
 	select {

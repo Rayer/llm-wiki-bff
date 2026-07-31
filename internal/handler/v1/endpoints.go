@@ -381,16 +381,21 @@ func (h *Handler) Query(c *gin.Context) {
 	}
 
 	if h.llm != nil && len(results) > 0 {
+		authority, err := search.NewCitationAuthority(results)
+		if err != nil {
+			log.Printf("citation capability issuance failed: %v", err)
+			c.JSON(http.StatusOK, resp)
+			return
+		}
 		topN := min(10, len(results))
-		contexts := cachedContexts(c.Request.Context(), h.cache, gcsClient, results[:topN])
+		contexts := cachedContexts(c.Request.Context(), h.cache, gcsClient, results[:topN], authority)
 
 		if len(contexts) > 0 {
 			systemPrompt := buildSystemPrompt(mode)
 			userPrompt := buildUserPrompt(query, contexts)
 			if answer, err := h.llm.Chat(c.Request.Context(), systemPrompt, userPrompt); err == nil {
-				answer = ensureBrackets(answer, results)
+				answer, citations, filtered := authority.Resolve(answer)
 				resp.AISynth = answer
-				citations, filtered := search.ParseCitations(answer, results)
 				resp.Citations = citations
 				resp.Results = filtered
 			} else {
@@ -402,9 +407,9 @@ func (h *Handler) Query(c *gin.Context) {
 	c.JSON(http.StatusOK, resp)
 }
 
-func cachedContexts(ctx context.Context, conceptCache *conceptcache.Cache, reader conceptcache.Reader, results []search.Result) []string {
+func cachedContexts(ctx context.Context, conceptCache *conceptcache.Cache, reader conceptcache.Reader, results []search.Result, authority *search.CitationAuthority) []string {
 	contexts := make([]string, 0, len(results))
-	for _, result := range results {
+	for rank, result := range results {
 		entry, ok := conceptCache.Entry(reader, result.Slug)
 		if !ok {
 			if _, err := conceptCache.Build(ctx, reader); err == nil {
@@ -418,13 +423,7 @@ func cachedContexts(ctx context.Context, conceptCache *conceptcache.Cache, reade
 		if len(entry.Sources) > 0 {
 			sourceContext = "Sources: [" + strings.Join(entry.Sources, ", ") + "]"
 		}
-		contexts = append(contexts, fmt.Sprintf(
-			"[%s] %s\n%s\n\n%s",
-			entry.Title,
-			entry.Slug,
-			sourceContext,
-			entry.Body,
-		))
+		contexts = append(contexts, authority.AddContext(rank, result, sourceContext+"\n\n"+entry.Body))
 	}
 	return contexts
 }
