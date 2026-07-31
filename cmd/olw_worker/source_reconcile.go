@@ -226,23 +226,32 @@ func collapseSyntoSourceRegeneration(workspace string, data []byte, prior []sour
 			return nil, nil, err
 		}
 		transientRel, err := safeSourcePagePath(transientSlug)
-		if err != nil || stableRel == transientRel {
+		if err != nil {
+			return nil, nil, fmt.Errorf("unprovable Synto source regeneration pair: %w", err)
+		}
+		if stableRel == transientRel {
 			return nil, nil, errors.New("unprovable Synto source regeneration pair")
 		}
 		stablePage, err := readBoundedRegularFileWithin(workspace, stableRel)
 		if err != nil {
-			return nil, nil, errors.New("legacy Synto source page is unavailable")
+			return nil, nil, fmt.Errorf("legacy Synto source page is unavailable: %w", err)
 		}
 		transientPage, err := readBoundedRegularFileWithin(workspace, transientRel)
 		if err != nil {
-			return nil, nil, errors.New("generated Synto source page is unavailable")
+			return nil, nil, fmt.Errorf("generated Synto source page is unavailable: %w", err)
 		}
 		stableMatter, err := parseSyntoSourcePage(stablePage)
-		if err != nil || !sourcePageMatches(stableMatter, priorID, rawPath) {
+		if err != nil {
+			return nil, nil, fmt.Errorf("unprovable Synto source regeneration pair: %w", err)
+		}
+		if !sourcePageMatches(stableMatter, priorID, rawPath) {
 			return nil, nil, errors.New("unprovable Synto source regeneration pair")
 		}
 		transientMatter, err := parseSyntoSourcePage(transientPage)
-		if err != nil || !isSyntoSourceSummary(transientMatter, rawPath) {
+		if err != nil {
+			return nil, nil, fmt.Errorf("unprovable Synto source regeneration pair: %w", err)
+		}
+		if !isSyntoSourceSummary(transientMatter, rawPath) {
 			return nil, nil, errors.New("unprovable Synto source regeneration pair")
 		}
 		if transientCurrent != wikiindex.ContentDerivedID(transientPage) {

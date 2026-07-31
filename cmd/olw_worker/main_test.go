@@ -1121,8 +1121,9 @@ func TestCappedRedactingWriterCapsAndRedacts(t *testing.T) {
 
 func TestDiagnosticSinkRedactsSplitAlternatingOutputAndArguments(t *testing.T) {
 	var output bytes.Buffer
-	sink := newDiagnosticSink([]io.Writer{&output}, []string{"api-secret", "user-secret", "project-secret", "/tmp/private", "--secret-arg"})
-	for _, part := range []string{strings.Repeat("safe", 3000), "api-", "secret user-", "secret project-", "secret /tmp/", "private --secret-", "arg"} {
+	// Only credentials belong in the redaction set; identity/path stay visible.
+	sink := newDiagnosticSink([]io.Writer{&output}, []string{"api-secret"})
+	for _, part := range []string{strings.Repeat("safe", 3000), "api-", "secret user-id-ok /tmp/private --arg-ok"} {
 		if _, err := sink.Write([]byte(part)); err != nil {
 			t.Fatal(err)
 		}
@@ -1131,13 +1132,14 @@ func TestDiagnosticSinkRedactsSplitAlternatingOutputAndArguments(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := output.String()
-	for _, raw := range []string{"api-secret", "user-secret", "project-secret", "/tmp/private", "--secret-arg"} {
-		if strings.Contains(text, raw) {
-			t.Fatalf("diagnostic leaked %q: %q", raw, text)
-		}
+	if strings.Contains(text, "api-secret") {
+		t.Fatalf("diagnostic leaked api credential: %q", text)
 	}
 	if !strings.Contains(text, "[REDACTED]") {
 		t.Fatalf("diagnostic was not redacted: %q", text)
+	}
+	if !strings.Contains(text, "user-id-ok") || !strings.Contains(text, "/tmp/private") || !strings.Contains(text, "--arg-ok") {
+		t.Fatalf("diagnostic over-redacted control-plane context: %q", text)
 	}
 }
 
@@ -1269,6 +1271,71 @@ func TestWorkerCommandErrorsAreFixedAndSilent(t *testing.T) {
 		if output.Len() != 0 || strings.Contains(err.Error(), "secret") {
 			t.Fatalf("args=%q output=%q error=%v", args, output.String(), err)
 		}
+	}
+}
+
+func TestWorkerOperationalExitLogKeepsLeaseCause(t *testing.T) {
+	err := annotateError(errCloudLeaseUnavailable, errObjectGenerationConflict)
+	if isWorkerCLIRejection(err) {
+		t.Fatal("lease conflict must not be treated as CLI rejection")
+	}
+	got := formatWorkerExitLog(err)
+	want := "pipeline publish lease unavailable: object generation conflict"
+	if got != want {
+		t.Fatalf("exit log=%q, want %q", got, want)
+	}
+	// Public Error() stays stable for callers/tests that match exact boundary text.
+	if err.Error() != "pipeline publish lease unavailable" {
+		t.Fatalf("public error changed: %q", err.Error())
+	}
+	if !errors.Is(err, errCloudLeaseUnavailable) || !errors.Is(err, errObjectGenerationConflict) {
+		t.Fatalf("unwrap/Is broken: %v", err)
+	}
+}
+
+func TestWorkerExitLogRedactsCredentialsInCause(t *testing.T) {
+	t.Setenv("LLM_API_KEY", "sk-super-secret-value")
+	err := annotateError(errCloudPipelineExecution, errors.New("provider rejected sk-super-secret-value"))
+	got := formatWorkerExitLog(err)
+	if strings.Contains(got, "sk-super-secret-value") {
+		t.Fatalf("credential leaked in exit log: %q", got)
+	}
+	if !strings.Contains(got, "pipeline execution failed") || !strings.Contains(got, "[REDACTED]") {
+		t.Fatalf("exit log missing boundary or redaction: %q", got)
+	}
+}
+
+func TestWorkerCLIRejectionClassification(t *testing.T) {
+	for _, msg := range []string{
+		"unknown command \"payload-secret\" for \"worker\"",
+		"invalid argument \"x\" for \"run\"",
+		"worker command rejected",
+	} {
+		if !isWorkerCLIRejection(errors.New(msg)) {
+			t.Fatalf("expected CLI rejection for %q", msg)
+		}
+	}
+	for _, err := range []error{
+		errCloudLeaseUnavailable,
+		errCloudPipelineExecution,
+		errors.New("worker input is invalid"),
+		annotateError(errCloudMaterialization, errors.New("gcs timeout")),
+	} {
+		if isWorkerCLIRejection(err) {
+			t.Fatalf("operational error misclassified as CLI: %v", err)
+		}
+	}
+}
+
+func TestWorkerRuntimeLeaseErrorIsNotCollapsedToRejected(t *testing.T) {
+	// Runtime annotated lease errors must pass through executeWorkerCommand unchanged.
+	// We exercise the classifier boundary used by executeWorkerCommand.
+	err := annotateError(errCloudLeaseUnavailable, annotateError(errCloudLeaseHeld, errObjectGenerationConflict))
+	if isWorkerCLIRejection(err) {
+		t.Fatalf("runtime lease error treated as CLI rejection: %v", err)
+	}
+	if err.Error() != "pipeline publish lease unavailable" {
+		t.Fatalf("public boundary changed: %q", err.Error())
 	}
 }
 
@@ -1616,4 +1683,88 @@ func writeWorkspaceStatus(t *testing.T, vault string, receipt sourcestatus.Recei
 func sha256Text(text string) string {
 	sum := sha256.Sum256([]byte(text))
 	return fmt.Sprintf("%x", sum[:])
+}
+
+func TestWorkerInputInvalidPreservesCause(t *testing.T) {
+	// Oversized API key is a bounds failure; public boundary stays stable.
+	cfg := workerConfig{APIKey: strings.Repeat("k", maxWorkerKeyBytes+1), apiKeySet: true, Bucket: "b", bucketSet: true, UserID: "u", ProjectID: "p", ExecutionID: "exec-1", Postprocess: true}
+	err := runWorkerBatch(context.Background(), cfg, `[["run","--auto-approve"]]`)
+	if err == nil || err.Error() != "worker input is invalid" {
+		t.Fatalf("error=%v", err)
+	}
+	if !errors.Is(err, errWorkerInputInvalid) {
+		t.Fatalf("missing sentinel: %v", err)
+	}
+	if got := formatWorkerExitLog(err); !strings.Contains(got, "worker input is invalid") || !strings.Contains(got, ":") {
+		t.Fatalf("cause concealed in exit log: %q", got)
+	}
+}
+
+func TestPipelineLogWritersTeesConsoleUnlessSuppressed(t *testing.T) {
+	vault := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(vault, "cache"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg := workerConfig{ExecutionID: "exec-console-tee"}
+	stdout, stderr, closeLog, err := pipelineLogWriters(vault, cfg, nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeLog()
+	if _, err := stdout.Write([]byte("hello-console-tee\n")); err != nil {
+		t.Fatal(err)
+	}
+	if stderr != stdout {
+		t.Fatal("stdout/stderr sinks should match")
+	}
+	if err := closeLog(); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(vault, "cache", "pipeline-exec-console-tee.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "hello-console-tee") {
+		t.Fatalf("log missing write: %q", data)
+	}
+
+	// Suppress path still writes the file.
+	vault2 := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(vault2, "cache"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	stdout2, _, close2, err := pipelineLogWriters(vault2, workerConfig{ExecutionID: "exec-quiet"}, nil, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stdout2.Write([]byte("quiet-only-file\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := close2(); err != nil {
+		t.Fatal(err)
+	}
+	data, err = os.ReadFile(filepath.Join(vault2, "cache", "pipeline-exec-quiet.log"))
+	if err != nil || !strings.Contains(string(data), "quiet-only-file") {
+		t.Fatalf("suppressed path lost file log: %v %q", err, data)
+	}
+}
+
+func TestDiagnosticSecretsAreCredentialsOnly(t *testing.T) {
+	cfg := workerConfig{
+		APIKey: "api-secret", apiKeySet: true,
+		UserID: "user-id", ProjectID: "project-id", ExecutionID: "exec-id",
+		VaultPath: "/vault/path", WorkspaceDir: "/ws", DataDir: "/data", Bucket: "bucket",
+	}
+	got := diagnosticSecrets(cfg, [][]string{{"run", "--arg", "/tmp/path"}})
+	joined := strings.Join(got, "\n")
+	if !strings.Contains(joined, "api-secret") {
+		t.Fatalf("missing api key: %v", got)
+	}
+	for _, forbidden := range []string{"user-id", "project-id", "exec-id", "/vault/path", "/ws", "/data", "bucket", "--arg", "/tmp/path", "run"} {
+		for _, value := range got {
+			if value == forbidden {
+				t.Fatalf("diagnosticSecrets scrubbed control-plane value %q: %v", forbidden, got)
+			}
+		}
+	}
 }

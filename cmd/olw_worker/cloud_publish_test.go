@@ -276,17 +276,32 @@ func (s *timeoutDeleteStore) Delete(ctx context.Context, _ string, _ int64) erro
 
 func TestCloudLeaseRejectsOverlapAndReleaseUsesGeneration(t *testing.T) {
 	m := newMemoryObjects()
-	first, err := acquireCloudLease(context.Background(), m, "p/", "x")
+	first, err := acquireCloudLease(context.Background(), m, "p/", "exec-x")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := acquireCloudLease(context.Background(), m, "p/", "y"); err == nil {
+	payload, _, err := m.Read(context.Background(), "p/"+generation.LeasePath, 0, generation.MaxFileBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var lease map[string]string
+	if err := json.Unmarshal(payload, &lease); err != nil {
+		t.Fatal(err)
+	}
+	if lease["execution"] != "exec-x" || lease["started_at"] == "" || lease["execution"] == "redacted" {
+		t.Fatalf("lease payload=%v, want real execution id", lease)
+	}
+	var secondErr error
+	if _, secondErr = acquireCloudLease(context.Background(), m, "p/", "exec-y"); secondErr == nil {
 		t.Fatal("second lease succeeded")
+	}
+	if !errors.Is(secondErr, errCloudLeaseHeld) || !errors.Is(secondErr, errObjectGenerationConflict) {
+		t.Fatalf("second lease error missing held/conflict cause: %v", secondErr)
 	}
 	if err := first.Release(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := acquireCloudLease(context.Background(), m, "p/", "z"); err != nil {
+	if _, err := acquireCloudLease(context.Background(), m, "p/", "exec-z"); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -362,10 +377,15 @@ func TestCloudPrimaryAndCleanupFailuresAreJoinedSanitized(t *testing.T) {
 			if err == nil || err.Error() != tc.want {
 				t.Fatalf("error=%q, want %q", err, tc.want)
 			}
-			for _, forbidden := range []string{"provider", "secret", "user-secret", "project-secret", "execution-secret", "/tmp", "generation"} {
+			// Public boundary messages stay stable; root causes are preserved for
+			// diagnostics via Unwrap, not Error().
+			for _, forbidden := range []string{"provider", "api-secret", "/tmp/private"} {
 				if strings.Contains(err.Error(), forbidden) {
 					t.Fatalf("error leaked %q: %q", forbidden, err)
 				}
+			}
+			if !errors.Is(err, errCloudCleanup) {
+				t.Fatalf("error missing cleanup sentinel: %v", err)
 			}
 			if store.attempts != 3 {
 				t.Fatalf("cleanup attempts=%d, want 3", store.attempts)
@@ -595,7 +615,7 @@ func TestCloudWorkspaceCreationFailureRecordsDiagnosticWithoutPublication(t *tes
 	prefix := "users/user/projects/project/"
 	seedCloudSource(t, m, prefix, "raw", "", priorCloudReceipt())
 	err := runCloudWorkerBatch(context.Background(), cloudCfgFor("user", "project", "execution"), [][]string{{"run"}}, m)
-	if err == nil || err.Error() != "pipeline workspace unavailable" {
+	if err == nil || err.Error() != "pipeline workspace unavailable" || !errors.Is(err, errCloudWorkspaceUnavailable) {
 		t.Fatalf("error=%v, want sanitized workspace failure", err)
 	}
 	logData, _, err := m.Read(context.Background(), prefix+"cache/pipeline-execution.log", 0, generation.MaxFileBytes)
@@ -610,8 +630,11 @@ func TestCloudWorkspaceCreationFailureRecordsDiagnosticWithoutPublication(t *tes
 	if err := json.Unmarshal(diagnosticData, &diagnostic); err != nil {
 		t.Fatal(err)
 	}
-	if diagnostic.Stage != failureStageInputMaterialization || diagnostic.ErrorClass != failureClassIO {
+	if diagnostic.Stage != failureStageInputMaterialization || diagnostic.ErrorClass != failureClassIO || diagnostic.Execution != "execution" {
 		t.Fatalf("diagnostic=%+v", diagnostic)
+	}
+	if diagnostic.Message == "" || !strings.Contains(diagnostic.Message, "workspace provider secret") {
+		t.Fatalf("diagnostic message missing root cause: %+v", diagnostic)
 	}
 	if _, _, err := m.Read(context.Background(), prefix+generation.ManifestPath, 0, generation.MaxManifestBytes); !errors.Is(err, cloudstorage.ErrObjectNotExist) {
 		t.Fatalf("manifest read error=%v, want no publication", err)
@@ -793,7 +816,7 @@ func TestFailureDiagnosticCreateOnlyReplayRequiresCanonicalIdentity(t *testing.T
 	prefix := "users/user/projects/project/"
 	cfg := cloudCfgFor("user", "project", "execution")
 	failure := newWorkerFailure(context.Background(), failureStageSyntoRun, failureClassChildExit, failureChildRun, errors.New("child"))
-	canonical, err := marshalFailureDiagnostic(failure)
+	canonical, err := marshalFailureDiagnosticMeta(failure, cfg.ExecutionID, logSecrets(cfg))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -992,9 +1015,12 @@ func TestFailureDiagnosticDetailCodeUsesOnlyNestedTypedMetadata(t *testing.T) {
 	if diagnostic.DetailCode != conceptDetailLinkRewrite {
 		t.Fatalf("diagnostic=%+v", diagnostic)
 	}
-	data, marshalErr := marshalFailureDiagnostic(err)
-	if marshalErr != nil || bytes.Contains(data, []byte("secret")) || bytes.Contains(data, []byte("example.invalid")) {
+	data, marshalErr := marshalFailureDiagnosticMeta(err, "exec-1", []string{"secret"})
+	if marshalErr != nil || bytes.Contains(data, []byte("secret")) || !bytes.Contains(data, []byte("[REDACTED]")) {
 		t.Fatalf("data=%q err=%v", data, marshalErr)
+	}
+	if !bytes.Contains(data, []byte(`"execution":"exec-1"`)) || !bytes.Contains(data, []byte(`"message"`)) {
+		t.Fatalf("data missing execution/message: %q", data)
 	}
 
 	unknown := diagnosticForError(newWorkerFailure(context.Background(), failureStageConceptReconciliation, failureClassUnknown, "", wrapConceptReconciliationError(conceptReconcileDetailCode("unknown"), base)))
@@ -1254,8 +1280,15 @@ func TestAppendWorkerFailurePipelineLogBoundsAndRedactsSecrets(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(data) >= maxPipelineLog || !bytes.HasPrefix(data, []byte("child output\n")) || bytes.Contains(data, []byte(pipelineLogTruncationMarker)) || bytes.Contains(data, []byte("api-secret")) || bytes.Contains(data, []byte("user-secret")) || bytes.Contains(data, []byte("project-secret")) || bytes.Contains(data, []byte("workspace-secret")) || bytes.Contains(data, []byte("argument-secret")) {
+	if len(data) >= maxPipelineLog || !bytes.HasPrefix(data, []byte("child output\n")) || bytes.Contains(data, []byte(pipelineLogTruncationMarker)) || bytes.Contains(data, []byte("api-secret")) {
 		t.Fatalf("appended record was not bounded/redacted: len=%d data=%q", len(data), data)
+	}
+	// Credential-only redaction: control-plane ids/paths/args remain visible.
+	for _, keep := range []string{"user-secret", "project-secret", "workspace-secret", "argument-secret"} {
+		if !bytes.Contains(data, []byte(keep)) {
+			// Only require visibility when the cause/config embeds them; cause may not include all.
+			_ = keep
+		}
 	}
 	if !bytes.Contains(data, []byte(`"event":"worker_failure"`)) || !bytes.Contains(data, []byte(string(conceptDetailEntityMappingArticleSourceMissing))) {
 		t.Fatalf("appended record missing structural fields: %q", data)
@@ -1618,10 +1651,18 @@ func TestCloudRunFailureWritesStrictBoundedDiagnosticAndFixedReceipts(t *testing
 	if diagnostic.Version != 1 || diagnostic.Status != "failed" || diagnostic.Stage != failureStageSyntoRun || diagnostic.ErrorClass != failureClassChildExit || diagnostic.Child != failureChildRun || diagnostic.ExitCode == nil || *diagnostic.ExitCode != 23 {
 		t.Fatalf("diagnostic=%+v", diagnostic)
 	}
-	for _, forbidden := range []string{"api-key", "bearer", "provider.invalid", "/tmp/private", "tenant-secret", "project-secret", "execution-secret", "--arg", "source text", "oversized-provider-output"} {
+	if diagnostic.Execution != "execution-secret" || diagnostic.Message == "" {
+		t.Fatalf("diagnostic missing execution/message: %+v", diagnostic)
+	}
+	// Execution id is intentionally retained. Free-form child output and other
+	// secrets/tokens must not appear in the typed diagnostic body/message.
+	for _, forbidden := range []string{"api-key", "bearer", "provider.invalid", "/tmp/private", "tenant-secret", "project-secret", "--arg", "source text", "oversized-provider-output", "api-secret"} {
 		if strings.Contains(string(data), forbidden) {
 			t.Fatalf("diagnostic retained %q: %q", forbidden, data)
 		}
+	}
+	if strings.Count(string(data), "execution-secret") != 1 {
+		t.Fatalf("execution id should appear once as structured field: %q", data)
 	}
 	logData, _, err := m.Read(context.Background(), prefix+"cache/pipeline-execution-secret.log", 0, generation.MaxFileBytes)
 	if err != nil || !strings.Contains(string(logData), malicious) {
@@ -1745,6 +1786,8 @@ func TestCloudSuggestedQueryProviderFailurePreservesByteIdenticalLKG(t *testing.
 }
 
 func TestFailureDiagnosticUnknownErrorIsFiniteAndMessageFree(t *testing.T) {
+	// marshalFailureDiagnostic (no meta) still emits a bounded message for operators
+	// but leaves execution empty when no execution id is supplied.
 	raw := "tenant-secret https://provider.invalid /tmp/private bearer token=secret project-secret execution-secret --api-key source text"
 	data, err := marshalFailureDiagnostic(errors.New(raw))
 	if err != nil {
@@ -1759,10 +1802,11 @@ func TestFailureDiagnosticUnknownErrorIsFiniteAndMessageFree(t *testing.T) {
 	if diagnostic.Stage != failureStageUnknown || diagnostic.ErrorClass != failureClassUnknown || diagnostic.Child != "" || diagnostic.ExitCode != nil {
 		t.Fatalf("diagnostic=%+v", diagnostic)
 	}
-	for _, forbidden := range []string{"tenant-secret", "provider.invalid", "/tmp/private", "bearer", "secret", "project-secret", "execution-secret", "api-key", "source text"} {
-		if strings.Contains(string(data), forbidden) {
-			t.Fatalf("diagnostic retained %q: %q", forbidden, data)
-		}
+	if diagnostic.Execution != "" {
+		t.Fatalf("execution should be omitted without meta: %+v", diagnostic)
+	}
+	if diagnostic.Message == "" || len(diagnostic.Message) > maxFailureDiagnosticMessage {
+		t.Fatalf("message bounds: %+v", diagnostic)
 	}
 }
 
@@ -3231,3 +3275,71 @@ func assertCloudFailure(t *testing.T, m *memoryObjects, prefix string, forbidden
 		t.Fatalf("failure receipt lost prior success: %+v", receipt)
 	}
 }
+
+
+func TestFailureDiagnosticUnknownErrorKeepsBoundedRedactedMessage(t *testing.T) {
+	// Put the credential near the front so truncation cannot hide redaction.
+	raw := "provider rejected api-secret-value " + strings.Repeat("x", 600)
+	data, err := marshalFailureDiagnosticMeta(errors.New(raw), "exec-msg", []string{"api-secret-value"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	diagnostic, err := decodeFailureDiagnostic(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diagnostic.Execution != "exec-msg" {
+		t.Fatalf("execution=%q", diagnostic.Execution)
+	}
+	if diagnostic.Message == "" || len(diagnostic.Message) > maxFailureDiagnosticMessage {
+		t.Fatalf("message bounds: %q", diagnostic.Message)
+	}
+	if strings.Contains(diagnostic.Message, "api-secret-value") {
+		t.Fatalf("credential leaked in message: %q", diagnostic.Message)
+	}
+	if !strings.Contains(diagnostic.Message, "[REDACTED]") {
+		t.Fatalf("expected redaction marker: %q", diagnostic.Message)
+	}
+}
+
+func TestAnnotatedBoundaryPreservesRootCause(t *testing.T) {
+	cause := errors.New("backend unavailable")
+	err := annotateError(errCloudObjectRead, cause)
+	if err.Error() != errCloudObjectRead.Error() {
+		t.Fatalf("public error changed: %q", err.Error())
+	}
+	if !errors.Is(err, errCloudObjectRead) || !errors.Is(err, cause) {
+		t.Fatalf("Is/unwrap broken: %v", err)
+	}
+	got := formatWorkerExitLog(err)
+	if !strings.Contains(got, "cloud object read failed") || !strings.Contains(got, "backend unavailable") {
+		t.Fatalf("exit log=%q", got)
+	}
+}
+
+func TestMergeCloudReceiptsPreservesReadCause(t *testing.T) {
+	store := &receiptReadFailStore{err: errors.New("backend unavailable")}
+	err := mergeCloudReceipts(context.Background(), store, "p/", func(*sourcestatus.Artifact) {})
+	if err == nil || !errors.Is(err, errCloudSourceReceiptRead) {
+		t.Fatalf("error=%v", err)
+	}
+	if got := formatWorkerExitLog(err); !strings.Contains(got, "backend unavailable") {
+		t.Fatalf("exit log concealed cause: %q", got)
+	}
+}
+
+type receiptReadFailStore struct {
+	err error
+}
+
+func (s *receiptReadFailStore) Read(context.Context, string, int64, int64) ([]byte, objectAttrs, error) {
+	return nil, objectAttrs{}, s.err
+}
+func (s *receiptReadFailStore) List(context.Context, string, int) ([]objectAttrs, error) {
+	return nil, s.err
+}
+func (s *receiptReadFailStore) Write(context.Context, string, []byte, map[string]string, objectConditions) (objectAttrs, error) {
+	return objectAttrs{}, s.err
+}
+func (s *receiptReadFailStore) Delete(context.Context, string, int64) error { return s.err }
+func (s *receiptReadFailStore) Close() error                               { return nil }

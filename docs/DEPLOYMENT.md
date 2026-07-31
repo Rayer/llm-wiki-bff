@@ -56,7 +56,10 @@ does not expire, steal, or automatically take over a lease.
 
    Continue only when the result is empty.
 
-2. Inspect the exact `.lwc/publish/lease.json` object and record its exact object generation. Replace every placeholder with the development values;
+2. Inspect the exact `.lwc/publish/lease.json` object and record its exact object generation
+   and `execution` holder. The payload is JSON like
+   `{"execution":"<cloud-run-execution-id>","started_at":"..."}` — use that id when
+   confirming step 1. Replace every placeholder with the development values;
    do not put real tenant IDs in a runbook or script.
 
    ```sh
@@ -66,7 +69,11 @@ does not expire, steal, or automatically take over a lease.
    ENCODED_OBJECT="$(printf '%s' "$LEASE_OBJECT" | jq -sRr @uri)"
    curl --fail-with-body \
      -H "Authorization: Bearer ${TOKEN}" \
-     "https://storage.googleapis.com/storage/v1/b/${BUCKET}/o/${ENCODED_OBJECT}?fields=name,generation"
+     "https://storage.googleapis.com/storage/v1/b/${BUCKET}/o/${ENCODED_OBJECT}?fields=name,generation,metadata"
+   # Also fetch object media to read {"execution","started_at"}:
+   curl --fail-with-body \
+     -H "Authorization: Bearer ${TOKEN}" \
+     "https://storage.googleapis.com/storage/v1/b/${BUCKET}/o/${ENCODED_OBJECT}?alt=media"
    LEASE_GENERATION="<exact-object-generation-from-the-inspection>"
    ```
 

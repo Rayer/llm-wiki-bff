@@ -81,7 +81,7 @@ const pipelineLogTruncationMarker = pipelinediagnostic.PipelineLogTruncationMark
 func main() {
 	printBuildNonce(os.Stdout)
 	if err := executeWorkerCommand(newRootCommand()); err != nil {
-		log.Printf("worker: %v", err)
+		log.Printf("worker: %s", formatWorkerExitLog(err))
 		os.Exit(1)
 	}
 }
@@ -90,11 +90,100 @@ func printBuildNonce(w io.Writer) {
 	fmt.Fprintf(w, "worker build_nonce=%s\n", buildNonce)
 }
 
+// errWorkerCommandRejected is the fixed CLI boundary for parse/usage failures.
+// Operational errors keep their public messages and are not collapsed into this.
+var errWorkerCommandRejected = errors.New("worker command rejected")
+var errWorkerInputInvalid = errors.New("worker input is invalid")
+var errWorkerConfigInvalid = errors.New("worker configuration is invalid")
+var errInvalidCommandBatch = errors.New("invalid command batch")
+
 func executeWorkerCommand(cmd *cobra.Command) error {
 	if err := cmd.Execute(); err != nil {
-		return errors.New("worker command rejected")
+		if isWorkerCLIRejection(err) {
+			return errWorkerCommandRejected
+		}
+		return err
 	}
 	return nil
+}
+
+// isWorkerCLIRejection identifies cobra/parse failures that may echo raw user
+// tokens (unknown commands, bad arity already normalized, flag parse). Those
+// stay opaque. Runtime pipeline errors must not match this path.
+func isWorkerCLIRejection(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.TrimSpace(err.Error())
+	if msg == "" || msg == errWorkerCommandRejected.Error() {
+		return true
+	}
+	// Cobra echoes the rejected token; never forward that to logs as-is.
+	if strings.HasPrefix(msg, "unknown command ") {
+		return true
+	}
+	if strings.HasPrefix(msg, "invalid argument ") {
+		return true
+	}
+	if strings.HasPrefix(msg, "accepts ") { // e.g. accepts 1 arg(s), received N
+		return true
+	}
+	return false
+}
+
+// formatWorkerExitLog builds an operator-facing exit line: stable public
+// boundary plus unwrapped cause chain, with credentials redacted.
+func formatWorkerExitLog(err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := formatWorkerExitMessage(err)
+	if msg == "" {
+		return errWorkerCommandRejected.Error()
+	}
+	secrets := []string{
+		os.Getenv("LLM_API_KEY"),
+		os.Getenv("DEEPSEEK_API_KEY"),
+		os.Getenv("SYNTO_API_KEY"),
+	}
+	return string(redactDiagnosticBytes([]byte(msg), secrets))
+}
+
+func formatWorkerExitMessage(err error) string {
+	if err == nil {
+		return ""
+	}
+	if multi, ok := err.(interface{ Unwrap() []error }); ok {
+		parts := make([]string, 0, 4)
+		seen := map[string]bool{}
+		for _, sub := range multi.Unwrap() {
+			if sub == nil {
+				continue
+			}
+			part := formatWorkerExitMessage(sub)
+			if part == "" || seen[part] {
+				continue
+			}
+			seen[part] = true
+			parts = append(parts, part)
+		}
+		return strings.Join(parts, "\n")
+	}
+	if ae, ok := err.(*annotatedError); ok && ae != nil {
+		public := strings.TrimSpace(ae.Error())
+		cause := formatWorkerExitMessage(ae.cause)
+		switch {
+		case public == "":
+			return cause
+		case cause == "" || cause == public:
+			return public
+		case strings.Contains(public, cause):
+			return public
+		default:
+			return public + ": " + cause
+		}
+	}
+	return strings.TrimSpace(err.Error())
 }
 
 func newRootCommand() *cobra.Command {
@@ -107,7 +196,7 @@ func newRootCommand() *cobra.Command {
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}
-	rootCmd.SetFlagErrorFunc(func(*cobra.Command, error) error { return errors.New("worker command rejected") })
+	rootCmd.SetFlagErrorFunc(func(*cobra.Command, error) error { return errWorkerCommandRejected })
 	rootCmd.PersistentFlags().StringVar(&cfg.VaultPath, "vault", "", "project vault path")
 	rootCmd.PersistentFlags().StringVar(&cfg.Bucket, "bucket", "", "GCS bucket")
 	rootCmd.PersistentFlags().StringVar(&cfg.DataDir, "data-dir", "", "local data root")
@@ -118,6 +207,7 @@ func newRootCommand() *cobra.Command {
 	rootCmd.PersistentFlags().BoolVar(&cfg.StopOnError, "stop-on-error", true, "stop on first failed Synto command")
 	rootCmd.PersistentFlags().BoolVar(&cfg.Workspace, "workspace", false, "run against a private copied workspace")
 	rootCmd.PersistentFlags().StringVar(&cfg.WorkspaceDir, "workspace-dir", "", "parent directory for private workspaces")
+	rootCmd.PersistentFlags().BoolVar(&cfg.SuppressOutput, "suppress-output", false, "write child output only to the durable pipeline log (skip console tee)")
 
 	runCmd := &cobra.Command{
 		Use:   "run <json array of arrays>",
@@ -169,7 +259,7 @@ func setWorkerFlagPresence(cfg *workerConfig, cmd *cobra.Command) {
 func fixedArgs(want int) cobra.PositionalArgs {
 	return func(_ *cobra.Command, args []string) error {
 		if len(args) != want {
-			return errors.New("worker command rejected")
+			return errWorkerCommandRejected
 		}
 		return nil
 	}
@@ -179,23 +269,26 @@ func runWorkerBatch(ctx context.Context, cfg workerConfig, rawCommands string) e
 	cfg = configFromEnvironment(cfg)
 	if cfg.Bucket != "" {
 		cfg.cloudMode = true
-		if err := validateWorkerConfigBounds(cfg); err != nil || len(rawCommands) > maxWorkerCommandBytes {
-			return errors.New("worker input is invalid")
+		if err := validateWorkerConfigBounds(cfg); err != nil {
+			return annotateError(errWorkerInputInvalid, err)
+		}
+		if len(rawCommands) > maxWorkerCommandBytes {
+			return annotateError(errWorkerInputInvalid, fmt.Errorf("command batch exceeds %d bytes", maxWorkerCommandBytes))
 		}
 	}
 	commands, err := parseCommandBatch(rawCommands)
 	if err != nil {
-		return errors.New("invalid command batch")
+		return annotateError(errInvalidCommandBatch, err)
 	}
 	if cfg.InitVault {
 		commands = append([][]string{{"init", "."}}, commands...)
 	}
 	if err := validateWorkerInput(cfg, commands); err != nil {
-		return errors.New("worker input is invalid")
+		return annotateError(errWorkerInputInvalid, err)
 	}
 	if cfg.Bucket != "" {
 		if cfg.VaultPath != "" || cfg.DataDir != "" || cfg.Workspace {
-			return errors.New("worker configuration is invalid")
+			return errWorkerConfigInvalid
 		}
 		return runCloudWorkerBatch(ctx, cfg, commands, newCloudObjectStore(cfg.Bucket))
 	}
@@ -799,17 +892,23 @@ func (w *cappedRedactingWriter) Write(data []byte) (int, error) {
 }
 
 func logSecrets(cfg workerConfig) []string {
-	values := []string{cfg.APIKey}
-	if !cfg.apiKeySet {
-		values = append(values, os.Getenv("LLM_API_KEY"), os.Getenv("DEEPSEEK_API_KEY"))
-	}
-	return values
+	// Only real credentials. Identity, paths, and command args stay visible.
+	return diagnosticSecrets(cfg, nil)
 }
 
-func diagnosticSecrets(cfg workerConfig, commands [][]string) []string {
-	values := logSecrets(cfg)
-	for _, command := range commands {
-		values = append(values, command...)
+// diagnosticSecrets returns only real credentials. Execution IDs, tenant IDs,
+// paths, and command args are control-plane observability and must remain visible.
+// When an explicit API key is set, oversized inherited env keys are ignored so
+// they cannot disable redaction or validation by sheer size.
+func diagnosticSecrets(cfg workerConfig, _ [][]string) []string {
+	values := []string{cfg.APIKey}
+	if cfg.apiKeySet {
+		return values
+	}
+	for _, value := range []string{os.Getenv("LLM_API_KEY"), os.Getenv("DEEPSEEK_API_KEY")} {
+		if value != "" && len(value) <= maxWorkerKeyBytes {
+			values = append(values, value)
+		}
 	}
 	return values
 }
@@ -1392,8 +1491,11 @@ func readSourceStatus(vault string) (sourcestatus.Artifact, error) {
 		return sourcestatus.Artifact{}, fmt.Errorf("read source status: %w", err)
 	}
 	artifact, err := sourcestatus.Decode(data)
-	if err != nil || artifact.Version != 1 {
-		return sourcestatus.Artifact{}, errors.New("invalid source status")
+	if err != nil {
+		return sourcestatus.Artifact{}, fmt.Errorf("invalid source status: %w", err)
+	}
+	if artifact.Version != 1 {
+		return sourcestatus.Artifact{}, fmt.Errorf("invalid source status: unsupported version %d", artifact.Version)
 	}
 	return artifact, nil
 }

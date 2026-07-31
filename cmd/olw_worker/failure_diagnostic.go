@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"os/exec"
+	"strings"
 
 	"github.com/rayer/llm-wiki-bff/internal/pipelinediagnostic"
 )
@@ -218,6 +219,8 @@ func preserveWorkerFailure(err error, stage failureStage, class failureErrorClas
 	return newWorkerFailure(nil, stage, class, "", err)
 }
 
+const maxFailureDiagnosticMessage = 512
+
 type failureDiagnostic struct {
 	Version    int                        `json:"version"`
 	Status     string                     `json:"status"`
@@ -226,6 +229,8 @@ type failureDiagnostic struct {
 	DetailCode conceptReconcileDetailCode `json:"detail_code,omitempty"`
 	Child      failureChildCommand        `json:"child_command,omitempty"`
 	ExitCode   *int                       `json:"exit_code,omitempty"`
+	Execution  string                     `json:"execution,omitempty"`
+	Message    string                     `json:"message,omitempty"`
 }
 
 func diagnosticForError(err error) failureDiagnostic {
@@ -311,11 +316,32 @@ func decodeFailureDiagnostic(data []byte) (failureDiagnostic, error) {
 	if diagnostic.ExitCode != nil && (*diagnostic.ExitCode < 0 || *diagnostic.ExitCode > maxWorkerExitCode) {
 		return failureDiagnostic{}, errors.New("invalid failure diagnostic exit code")
 	}
+	if raw, ok := fields["execution"]; ok {
+		if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) || diagnostic.Execution == "" || !validPipelineExecutionID(diagnostic.Execution) {
+			return failureDiagnostic{}, errors.New("invalid failure diagnostic execution")
+		}
+	}
+	if raw, ok := fields["message"]; ok {
+		if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) || diagnostic.Message == "" || len(diagnostic.Message) > maxFailureDiagnosticMessage {
+			return failureDiagnostic{}, errors.New("invalid failure diagnostic message")
+		}
+	}
 	return diagnostic, nil
 }
 
 func marshalFailureDiagnostic(err error) ([]byte, error) {
-	data, err := json.Marshal(diagnosticForError(err))
+	return marshalFailureDiagnosticMeta(err, "", nil)
+}
+
+func marshalFailureDiagnosticMeta(err error, execution string, secrets []string) ([]byte, error) {
+	diagnostic := diagnosticForError(err)
+	if execution = strings.TrimSpace(execution); validPipelineExecutionID(execution) {
+		diagnostic.Execution = execution
+	}
+	if message := diagnosticMessage(err, secrets); message != "" {
+		diagnostic.Message = message
+	}
+	data, err := json.Marshal(diagnostic)
 	if err != nil {
 		return nil, err
 	}
@@ -323,4 +349,19 @@ func marshalFailureDiagnostic(err error) ([]byte, error) {
 		return nil, errors.New("failure diagnostic exceeds size limit")
 	}
 	return data, nil
+}
+
+func diagnosticMessage(err error, secrets []string) string {
+	if err == nil {
+		return ""
+	}
+	msg := err.Error()
+	if msg == "" {
+		return ""
+	}
+	msg = string(redactDiagnosticBytes([]byte(msg), secrets))
+	if len(msg) > maxFailureDiagnosticMessage {
+		msg = msg[:maxFailureDiagnosticMessage]
+	}
+	return msg
 }
