@@ -854,14 +854,29 @@ func readSyntoIndexTruth(workspace string) (syntoIndexTruth, error) {
 	return index, nil
 }
 
+// enforceActiveEntityCoverage fails closed when every active source-concept
+// entity lacks an entity-bound article. Partial gaps remain soft-warned;
+// total emptiness would publish a successful generation with zero Concepts.
+func enforceActiveEntityCoverage(plan wikiindex.SyntoIdentityPlan) error {
+	if len(plan.ActiveEntities) == 0 {
+		return nil
+	}
+	unbound := wikiindex.UnboundActiveEntities(plan)
+	if len(unbound) == len(plan.ActiveEntities) {
+		return fmt.Errorf("identity_coverage_empty: all %d active Synto entity_id values lack entity-bound articles", len(unbound))
+	}
+	return nil
+}
+
 // reportUnboundActiveEntities records source_concepts entities that have no
-// explicit article.entity_id binding. These coverage gaps no longer fail the
+// explicit article.entity_id binding. Partial coverage gaps no longer fail the
 // run; they are written to the durable pipeline log (when warn is set) and to
 // the worker process log under a stable greppable code.
 //
 // Each warning includes the Synto concept name(s) and raw source_path(s) from
 // INDEX source_concepts so operators can map entity_id -> concept without
-// opening state.db.
+// opening state.db. Callers must still enforceActiveEntityCoverage for the
+// all-unbound case.
 func reportUnboundActiveEntities(plan wikiindex.SyntoIdentityPlan, index syntoIndexTruth, warn io.Writer) {
 	unbound := wikiindex.UnboundActiveEntities(plan)
 	if len(unbound) == 0 {
@@ -1086,9 +1101,11 @@ type syntoArticleProofKey struct {
 }
 
 // enrichSyntoIndexWithAgentConcepts joins the two artifacts produced by one
-// agents pack export. Agent concepts are the only supported proof for an
-// omitted INDEX article entity_id; source names and source-path sets are not
-// identity evidence.
+// agents pack export. Agent concepts with a complete canonical article binding
+// are the only supported proof for filling an omitted/null INDEX
+// article.entity_id. Source names and source-path sets are not identity
+// evidence. An explicit non-empty article.entity_id remains authoritative and
+// is never overwritten by a disagreeing agent proof.
 func enrichSyntoIndexWithAgentConcepts(indexData, conceptsData []byte) ([]byte, error) {
 	index, err := decodeSyntoIndex(indexData)
 	if err != nil {
@@ -1101,6 +1118,7 @@ func enrichSyntoIndexWithAgentConcepts(indexData, conceptsData []byte) ([]byte, 
 
 	byID := make(map[string]int, len(index.Articles))
 	byPath := make(map[string]int, len(index.Articles))
+	entityArticle := make(map[string]int, len(index.Articles))
 	for i, article := range index.Articles {
 		path, err := normalizeSyntoArticlePath(article.Path)
 		if err != nil {
@@ -1116,6 +1134,12 @@ func enrichSyntoIndexWithAgentConcepts(indexData, conceptsData []byte) ([]byte, 
 			return nil, fmt.Errorf("duplicate INDEX article path %q", article.Path)
 		}
 		byPath[path] = i
+		if article.EntityID != "" {
+			if previous, exists := entityArticle[article.EntityID]; exists && previous != i {
+				return nil, fmt.Errorf("INDEX article entity_id %q maps to multiple articles", article.EntityID)
+			}
+			entityArticle[article.EntityID] = i
+		}
 	}
 
 	proofs := make(map[syntoArticleProofKey]string, len(concepts))
@@ -1156,10 +1180,69 @@ func enrichSyntoIndexWithAgentConcepts(indexData, conceptsData []byte) ([]byte, 
 		entityOwners[concept.EntityID] = key
 	}
 
-	// Agent concepts are validated as a consistency/evidence artifact only.
-	// Released article.entity_id remains authoritative, including when it is
-	// null or omitted, so this join must never rewrite INDEX.json identity.
-	return indexData, nil
+	// Apply agent proofs only where INDEX omitted/null entity_id. Explicit
+	// released article.entity_id values stay authoritative.
+	fills := make(map[int]string)
+	for key, entityID := range proofs {
+		idx := byID[key.ID]
+		article := index.Articles[idx]
+		if article.EntityID != "" {
+			// Explicit INDEX identity wins; disagreeing agent proof is ignored.
+			continue
+		}
+		if previous, exists := entityArticle[entityID]; exists && previous != idx {
+			return nil, fmt.Errorf("agent entity_id %q already bound to another INDEX article", entityID)
+		}
+		if previous, exists := fills[idx]; exists && previous != entityID {
+			return nil, fmt.Errorf("agent concept article has multiple entity_id values: %q", article.ID)
+		}
+		fills[idx] = entityID
+		entityArticle[entityID] = idx
+	}
+	if len(fills) == 0 {
+		return indexData, nil
+	}
+	return applyAgentEntityFillsToIndex(indexData, fills)
+}
+
+// applyAgentEntityFillsToIndex rewrites only article.entity_id values for the
+// given article indices. Other INDEX fields are preserved as raw JSON.
+func applyAgentEntityFillsToIndex(indexData []byte, fills map[int]string) ([]byte, error) {
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(indexData, &root); err != nil {
+		return nil, fmt.Errorf("decode INDEX for agent fill: %w", err)
+	}
+	rawArticles, ok := root["articles"]
+	if !ok {
+		return nil, errors.New("INDEX.json missing articles")
+	}
+	var articles []map[string]json.RawMessage
+	if err := json.Unmarshal(rawArticles, &articles); err != nil {
+		return nil, fmt.Errorf("decode INDEX articles for agent fill: %w", err)
+	}
+	for idx, entityID := range fills {
+		if idx < 0 || idx >= len(articles) {
+			return nil, fmt.Errorf("agent fill index %d out of range", idx)
+		}
+		encoded, err := json.Marshal(entityID)
+		if err != nil {
+			return nil, err
+		}
+		articles[idx]["entity_id"] = encoded
+	}
+	encodedArticles, err := json.Marshal(articles)
+	if err != nil {
+		return nil, err
+	}
+	root["articles"] = encodedArticles
+	out, err := json.Marshal(root)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := decodeSyntoIndex(out); err != nil {
+		return nil, fmt.Errorf("agent-filled INDEX is invalid: %w", err)
+	}
+	return out, nil
 }
 
 func decodeSyntoAgentConcepts(data []byte) ([]syntoAgentConcept, error) {
