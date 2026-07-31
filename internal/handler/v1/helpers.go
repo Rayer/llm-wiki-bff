@@ -1,9 +1,15 @@
 package v1
 
 import (
+	"encoding/json"
+	"log"
+	"net/http"
 	"strings"
 
 	fm "github.com/adrg/frontmatter"
+	"github.com/gin-gonic/gin"
+	"github.com/rayer/llm-wiki-bff/internal/handler"
+	"github.com/rayer/llm-wiki-bff/internal/jsonutil"
 	"github.com/rayer/llm-wiki-bff/internal/search"
 )
 
@@ -60,4 +66,32 @@ func parseFrontmatter(md string) (map[string]interface{}, string) {
 		return make(map[string]interface{}), md
 	}
 	return result, string(body)
+}
+
+// parseFrontmatterJSON parses YAML frontmatter and normalizes nested maps so the
+// result is safe for encoding/json (yaml.v2 emits map[interface{}]interface{}).
+func parseFrontmatterJSON(md string) (map[string]interface{}, string, error) {
+	frontmatter, body := parseFrontmatter(md)
+	normalized, err := jsonutil.NormalizeMap(frontmatter)
+	if err != nil {
+		return nil, body, err
+	}
+	return normalized, body, nil
+}
+
+// writeJSON marshals before writing so a marshal failure never yields HTTP 200
+// with Content-Type application/json and an empty body (LWC-219).
+func writeJSON(c *gin.Context, status int, payload interface{}) {
+	data, err := json.Marshal(payload)
+	if err != nil {
+		log.Printf("response serialization failed: %v", err)
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "response serialization failed"})
+		return
+	}
+	c.Data(status, "application/json; charset=utf-8", data)
+}
+
+func writeFrontmatterSerializeError(c *gin.Context, err error) {
+	log.Printf("frontmatter JSON normalization failed: %v", err)
+	c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "response serialization failed"})
 }

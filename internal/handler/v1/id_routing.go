@@ -247,20 +247,28 @@ func (h *Handler) handleIDRoutedPage(c *gin.Context, gcsClient store.Store, curr
 		return true
 	}
 	data = []byte(rewriteWikilinks(string(data), dual))
-	frontmatter, body := parseFrontmatter(string(data))
 
 	if entry.Type == "source" {
 		page.ID = entry.ID
 		response, err := h.sourceDetailResponse(c, gcsClient, *page, data)
 		if err != nil {
+			if isFrontmatterSerializeError(err) {
+				writeFrontmatterSerializeError(c, err)
+				return true
+			}
 			c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: generatedDataUnavailableMessage})
 			return true
 		}
-		c.JSON(http.StatusOK, response)
+		writeJSON(c, http.StatusOK, response)
 		return true
 	}
 
-	c.JSON(http.StatusOK, handler.ConceptDetailResponse{
+	frontmatter, body, err := parseFrontmatterJSON(string(data))
+	if err != nil {
+		writeFrontmatterSerializeError(c, err)
+		return true
+	}
+	writeJSON(c, http.StatusOK, handler.ConceptDetailResponse{
 		ID:          entry.ID,
 		Slug:        entry.Slug,
 		Title:       entry.Slug,

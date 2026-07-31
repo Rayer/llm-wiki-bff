@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/rayer/llm-wiki-bff/internal/generation"
+	"github.com/rayer/llm-wiki-bff/internal/jsonutil"
 )
 
 const testEntityULID = "01JAZ5N7Y3K8M2Q4R6T9VWXABC"
@@ -891,32 +892,32 @@ func TestRebuildWithSyntoIdentityRejectsNestedUnsafeYAMLBeforeWrites(t *testing.
 }
 
 func TestNormalizeJSONValueRejectsNonStringMapKeys(t *testing.T) {
-	_, err := normalizeJSONValue(map[interface{}]interface{}{1: "value"}, 0)
+	_, err := jsonutil.Normalize(map[interface{}]interface{}{1: "value"}, 0)
 	if err == nil || !strings.Contains(err.Error(), "non-string map key") {
-		t.Fatalf("normalizeJSONValue() error = %v, want non-string map key rejection", err)
+		t.Fatalf("jsonutil.Normalize() error = %v, want non-string map key rejection", err)
 	}
 }
 
 func TestNormalizeJSONValueRejectsExcessiveDepth(t *testing.T) {
 	value := interface{}("leaf")
-	for i := 0; i <= maxJSONNormalizationDepth; i++ {
+	for i := 0; i <= jsonutil.MaxNormalizationDepth; i++ {
 		value = []interface{}{value}
 	}
-	_, err := normalizeJSONValue(value, 0)
+	_, err := jsonutil.Normalize(value, 0)
 	if err == nil || !strings.Contains(err.Error(), "maximum nesting depth") {
-		t.Fatalf("normalizeJSONValue() error = %v, want depth limit rejection", err)
+		t.Fatalf("jsonutil.Normalize() error = %v, want depth limit rejection", err)
 	}
 }
 
 func TestNormalizeJSONValueDoesNotLeakNonStringMapKey(t *testing.T) {
 	const sentinel = "confidential-sentinel"
 	key := struct{ Value string }{Value: sentinel}
-	_, err := normalizeJSONValue(map[interface{}]interface{}{key: "value"}, 0)
+	_, err := jsonutil.Normalize(map[interface{}]interface{}{key: "value"}, 0)
 	if err == nil {
-		t.Fatal("normalizeJSONValue() error = nil, want non-string map key rejection")
+		t.Fatal("jsonutil.Normalize() error = nil, want non-string map key rejection")
 	}
 	if strings.Contains(err.Error(), sentinel) {
-		t.Fatalf("normalizeJSONValue() error = %q, must not contain sentinel", err)
+		t.Fatalf("jsonutil.Normalize() error = %q, must not contain sentinel", err)
 	}
 }
 
