@@ -142,13 +142,6 @@ func TestV1QueryUsesIssuedCapabilityFromActualPromptContext(t *testing.T) {
 		t.Fatalf("V1 query did not resolve the issued token: %#v", response)
 	}
 
-	mutantResponse := []search.Result{
-		{Slug: "alpha-coffee", Title: "Alpha Coffee", Type: "concept"},
-		{Slug: "beta-coffee", Title: "Beta Coffee", Type: "concept"},
-	}
-	if len(mutantResponse) != 1 || mutantResponse[0].Slug != response.Results[0].Slug {
-		t.Logf("RED replay: mutated selector that returns ranked results after valid citation would fail len/identity checks (got %d results, first=%s)", len(mutantResponse), mutantResponse[0].Slug)
-	}
 }
 
 func TestV1CachedContextsSkippedResultCannotBindAndIncludedResultCan(t *testing.T) {
