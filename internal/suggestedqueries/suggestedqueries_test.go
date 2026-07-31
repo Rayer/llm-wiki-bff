@@ -194,6 +194,56 @@ func TestParseProviderCandidatesRejectsMalformedAndOversizedOutput(t *testing.T)
 	}
 }
 
+func TestParseProviderCandidatesAcceptsMarkdownCodeFence(t *testing.T) {
+	// Reproduces olw-pipeline-dev-g6dnz failure:
+	// decode suggested-query provider output: invalid character '`' looking for beginning of value
+	body := `{"candidates":[
+{"question":"哪些概念值得一起比較？","intent/use_case":"comparison","corpus_anchor_concept_ids":["c1"]},
+{"question":"如何探索這個主題的不同面向？","intent/use_case":"exploration","corpus_anchor_concept_ids":["c1"]},
+{"question":"哪些選擇適合進一步查找？","intent/use_case":"retrieval","corpus_anchor_concept_ids":["c1"]}
+]}`
+	for _, tc := range []struct {
+		name string
+		raw  string
+	}{
+		{name: "json language tag", raw: "```json\n" + body + "\n```"},
+		{name: "bare fence", raw: "```\n" + body + "\n```"},
+		{name: "trailing whitespace after fence", raw: "```json\n" + body + "\n```\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := parseProviderCandidates(tc.raw)
+			if err != nil {
+				t.Fatalf("parseProviderCandidates() error = %v", err)
+			}
+			if len(got) != 3 {
+				t.Fatalf("candidates = %d, want 3", len(got))
+			}
+			if got[0].Question != "哪些概念值得一起比較？" {
+				t.Fatalf("first question = %q", got[0].Question)
+			}
+		})
+	}
+}
+
+func TestGenerateAcceptsMarkdownFencedProviderOutput(t *testing.T) {
+	entries := []conceptcache.Entry{{Slug: "c1", Title: "Concept 1", Body: "Evidence"}}
+	provider := &fixtureProvider{raw: "```json\n" + `{"candidates":[
+{"question":"哪些概念值得一起比較？","intent/use_case":"comparison","corpus_anchor_concept_ids":["c1"]},
+{"question":"如何探索這個主題的不同面向？","intent/use_case":"exploration","corpus_anchor_concept_ids":["c1"]},
+{"question":"哪些選擇適合進一步查找？","intent/use_case":"retrieval","corpus_anchor_concept_ids":["c1"]}
+]}` + "\n```"}
+	artifact, err := Generate(context.Background(), provider, "", entries, nil, GenerationMetadata{Model: "fixture", PromptVersion: "v1"}, time.Now())
+	if err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+	if !IsPublishable(artifact) {
+		t.Fatalf("artifact not publishable: %#v", artifact)
+	}
+	if len(artifact.Queries) != 3 {
+		t.Fatalf("queries = %#v, want 3", artifact.Queries)
+	}
+}
+
 func TestParseProviderCandidatesRejectsDuplicateAndUnknownKeys(t *testing.T) {
 	for _, raw := range []string{
 		`{"candidates":[],"candidates":[]}`,
