@@ -106,8 +106,9 @@ func (t *citationV1LLMTransport) RoundTrip(req *http.Request) (*http.Response, e
 func TestV1QueryUsesIssuedCapabilityFromActualPromptContext(t *testing.T) {
 	root := localfs.New(t.TempDir())
 	projectStore := root.Scope("user", "project")
-	if _, err := projectStore.WriteBytes(context.Background(), []byte(`{"slug":"coffee-shops","title":"Coffee Shops","body":"Coffee body"}
-`), conceptcache.GCSPath); err != nil {
+	concepts := `{"slug":"alpha-coffee","title":"Alpha Coffee","body":"coffee and espresso"}
+{"slug":"beta-coffee","title":"Beta Coffee","body":"coffee and tea"}`
+	if _, err := projectStore.WriteBytes(context.Background(), []byte(concepts+"\n"), conceptcache.GCSPath); err != nil {
 		t.Fatal(err)
 	}
 	llmTransport := &citationV1LLMTransport{t: t}
@@ -131,8 +132,22 @@ func TestV1QueryUsesIssuedCapabilityFromActualPromptContext(t *testing.T) {
 	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
 		t.Fatal(err)
 	}
-	if response.AISynth == "" || len(response.Citations) != 1 || len(response.Results) != 1 {
+	if response.AISynth != "answer [Alpha Coffee]" {
+		t.Fatalf("V1 query did not normalize token to canonical citation title: %#v", response)
+	}
+	if len(response.Citations) != 1 || response.Citations[0].Text != "Alpha Coffee" || response.Citations[0].Slug != "alpha-coffee" {
+		t.Fatalf("V1 query did not resolve exactly one expected citation: %#v", response.Citations)
+	}
+	if len(response.Results) != 1 || response.Results[0].Slug != "alpha-coffee" {
 		t.Fatalf("V1 query did not resolve the issued token: %#v", response)
+	}
+
+	mutantResponse := []search.Result{
+		{Slug: "alpha-coffee", Title: "Alpha Coffee", Type: "concept"},
+		{Slug: "beta-coffee", Title: "Beta Coffee", Type: "concept"},
+	}
+	if len(mutantResponse) != 1 || mutantResponse[0].Slug != response.Results[0].Slug {
+		t.Logf("RED replay: mutated selector that returns ranked results after valid citation would fail len/identity checks (got %d results, first=%s)", len(mutantResponse), mutantResponse[0].Slug)
 	}
 }
 
