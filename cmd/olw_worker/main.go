@@ -1045,6 +1045,9 @@ func runPostprocessWithProvider(ctx context.Context, vault string, provider sugg
 			return fmt.Errorf("build Synto identity authority: %w", err)
 		}
 		reportUnboundActiveEntities(plan, index, warn)
+		if err := enforceActiveEntityCoverage(plan); err != nil {
+			return fmt.Errorf("postprocess Synto index: %w", err)
+		}
 		if _, err := wikiindex.RebuildWithSyntoIdentity(ctx, store, plan); err != nil {
 			return fmt.Errorf("postprocess Synto index: %w", err)
 		}

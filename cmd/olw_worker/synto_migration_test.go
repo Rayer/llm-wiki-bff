@@ -1121,11 +1121,12 @@ func TestWorkerProductionSequenceInstallsPackExportIndexBeforePostprocess(t *tes
 }
 
 func TestSyntoOfflineExportJoinsAgentConceptIdentity(t *testing.T) {
+	const entity = "01JAZ5N7Y3K8M2Q4R6T9VWXABC"
 	old := execOLW
 	t.Cleanup(func() { execOLW = old })
 	vault := t.TempDir()
-	index := strings.Replace(syntoIndexFixture("article", "01JAZ5N7Y3K8M2Q4R6T9VWXABC", "alpha", false), `"entity_id":"01JAZ5N7Y3K8M2Q4R6T9VWXABC",`, "", 1)
-	concepts := `{"schema_version":1,"concepts":[{"name":"Alpha","entity_id":"01JAZ5N7Y3K8M2Q4R6T9VWXABC","aliases":[],"canonical_article_id":"article","article_path":"articles/alpha.md","related_names":[]}]}`
+	index := strings.Replace(syntoIndexFixture("article", entity, "alpha", false), `"entity_id":"`+entity+`",`, "", 1)
+	concepts := `{"schema_version":1,"concepts":[{"name":"Alpha","entity_id":"` + entity + `","aliases":[],"canonical_article_id":"article","article_path":"articles/alpha.md","related_names":[]}]}`
 	execOLW = func(_ context.Context, _ string, command []string, _ []string, _, _ io.Writer) error {
 		if len(command) != 6 || command[0] != "pack" || command[1] != "export" {
 			return fmt.Errorf("unexpected command %v", command)
@@ -1142,8 +1143,15 @@ func TestSyntoOfflineExportJoinsAgentConceptIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(truth.Articles) != 1 || truth.Articles[0].EntityID != "" {
-		t.Fatalf("joined INDEX articles = %#v, want omitted entity to remain ordinary", truth.Articles)
+	if len(truth.Articles) != 1 || truth.Articles[0].EntityID != entity {
+		t.Fatalf("joined INDEX articles = %#v, want agent proof to fill entity_id %q", truth.Articles, entity)
+	}
+	plan, err := syntoIdentityPlanFromIndex(truth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := plan.ByPath["wiki/alpha.md"]; got != entity {
+		t.Fatalf("ByPath[wiki/alpha.md] = %q, want %q", got, entity)
 	}
 }
 
@@ -1167,7 +1175,7 @@ func exportSyntoIndexFixture(t *testing.T, index, concepts string) []byte {
 	return joined
 }
 
-func TestSyntoOfflineExportPreservesNullArticleEntity(t *testing.T) {
+func TestSyntoOfflineExportFillsNullArticleEntityFromAgent(t *testing.T) {
 	const entity = "01JAZ5N7Y3K8M2Q4R6T9VWXABC"
 	index := strings.Replace(syntoIndexFixture("article", entity, "alpha", false), `"entity_id":"`+entity+`",`, `"entity_id":null,`, 1)
 	concepts := `{"schema_version":1,"concepts":[{"name":"Alpha","entity_id":"` + entity + `","aliases":[],"canonical_article_id":"article","article_path":"articles/alpha.md","related_names":[]}]}`
@@ -1176,19 +1184,19 @@ func TestSyntoOfflineExportPreservesNullArticleEntity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if truth.Articles[0].EntityID != "" {
-		t.Fatalf("null article entity was populated: %#v", truth.Articles[0])
+	if truth.Articles[0].EntityID != entity {
+		t.Fatalf("null article entity was not filled: %#v", truth.Articles[0])
 	}
 	plan, err := syntoIdentityPlanFromIndex(truth)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(plan.ByPath) != 0 {
-		t.Fatalf("null article entered worker Concept plan: %#v", plan.ByPath)
+	if got := plan.ByPath["wiki/alpha.md"]; got != entity {
+		t.Fatalf("ByPath after null fill = %#v, want %q", plan.ByPath, entity)
 	}
 }
 
-func TestSyntoOfflineExportPreservesOmittedArticleEntity(t *testing.T) {
+func TestSyntoOfflineExportFillsOmittedArticleEntityFromAgent(t *testing.T) {
 	const entity = "01JAZ5N7Y3K8M2Q4R6T9VWXABC"
 	index := strings.Replace(syntoIndexFixture("article", entity, "alpha", false), `"entity_id":"`+entity+`",`, "", 1)
 	concepts := `{"schema_version":1,"concepts":[{"name":"Alpha","entity_id":"` + entity + `","aliases":[],"canonical_article_id":"article","article_path":"articles/alpha.md","related_names":[]}]}`
@@ -1197,15 +1205,32 @@ func TestSyntoOfflineExportPreservesOmittedArticleEntity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if truth.Articles[0].EntityID != "" {
-		t.Fatalf("omitted article entity was populated: %#v", truth.Articles[0])
+	if truth.Articles[0].EntityID != entity {
+		t.Fatalf("omitted article entity was not filled: %#v", truth.Articles[0])
 	}
 	plan, err := syntoIdentityPlanFromIndex(truth)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(plan.ByPath) != 0 {
-		t.Fatalf("omitted article entered worker Concept plan: %#v", plan.ByPath)
+	if got := plan.ByPath["wiki/alpha.md"]; got != entity {
+		t.Fatalf("ByPath after omitted fill = %#v, want %q", plan.ByPath, entity)
+	}
+}
+
+func TestEnforceActiveEntityCoverageFailsWhenAllUnbound(t *testing.T) {
+	plan := wikiindex.SyntoIdentityPlan{
+		ByPath:         map[string]string{},
+		ActiveEntities: map[string]bool{"01JAZ5N7Y3K8M2Q4R6T9VWXABG": true, "01JAZ5N7Y3K8M2Q4R6T9VWXABH": true},
+	}
+	if err := enforceActiveEntityCoverage(plan); err == nil || !strings.Contains(err.Error(), "identity_coverage_empty") {
+		t.Fatalf("enforceActiveEntityCoverage() = %v, want identity_coverage_empty", err)
+	}
+	plan.ByPath["wiki/alpha.md"] = "01JAZ5N7Y3K8M2Q4R6T9VWXABG"
+	if err := enforceActiveEntityCoverage(plan); err != nil {
+		t.Fatalf("partial coverage should soft-warn only: %v", err)
+	}
+	if err := enforceActiveEntityCoverage(wikiindex.SyntoIdentityPlan{}); err != nil {
+		t.Fatalf("empty plan should pass: %v", err)
 	}
 }
 
@@ -1340,12 +1365,13 @@ func TestSyntoOmittedArticleDoesNotUseExactSourceNameAsIdentity(t *testing.T) {
 	}
 }
 
-func TestSyntoDirectAgentProofAcceptsTitleDriftWithConsistentSourceEdge(t *testing.T) {
-	base := syntoIndexFixture("article-a", "01JAZ5N7Y3K8M2Q4R6T9VWXAC0", "alpha", true)
-	base = strings.Replace(base, `"entity_id":"01JAZ5N7Y3K8M2Q4R6T9VWXAC0",`, "", 1)
+func TestSyntoDirectAgentProofFillsTitleDriftedArticleEntity(t *testing.T) {
+	const entity = "01JAZ5N7Y3K8M2Q4R6T9VWXAC0"
+	base := syntoIndexFixture("article-a", entity, "alpha", true)
+	base = strings.Replace(base, `"entity_id":"`+entity+`",`, "", 1)
 	base = strings.ReplaceAll(base, `"path":"wiki/alpha.md"`, `"path":"articles/alpha.md"`)
 	base = strings.ReplaceAll(base, `"name":"alpha"`, `"name":"INDEX Title Drift"`)
-	concepts := agentConceptsFixture(`"canonical_article_id":"article-a","article_path":"articles/alpha.md"`, `"entity_id":"01JAZ5N7Y3K8M2Q4R6T9VWXAC0"`)
+	concepts := agentConceptsFixture(`"canonical_article_id":"article-a","article_path":"articles/alpha.md"`, `"entity_id":"`+entity+`"`)
 	joined, err := enrichSyntoIndexWithAgentConcepts([]byte(base), []byte(concepts))
 	if err != nil {
 		t.Fatal(err)
@@ -1354,9 +1380,15 @@ func TestSyntoDirectAgentProofAcceptsTitleDriftWithConsistentSourceEdge(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := mapSyntoEntityIDsFromIndexTruth(truth, map[string]string{"article-a": "alpha"})
-	if err != nil || len(got) != 0 {
-		t.Fatalf("agent proof populated ordinary article identity: map=%#v error=%v", got, err)
+	if truth.Articles[0].EntityID != entity {
+		t.Fatalf("title-drifted article entity = %q, want agent fill %q", truth.Articles[0].EntityID, entity)
+	}
+	plan, err := syntoIdentityPlanFromIndex(truth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := plan.ByPath["wiki/alpha.md"]; got != entity {
+		t.Fatalf("ByPath after title-drift fill = %#v, want %q", plan.ByPath, entity)
 	}
 }
 
@@ -2102,9 +2134,10 @@ func TestSyntoEntityMappingSkipsReservedRootPagesBeforeMandatoryMapping(t *testi
 	}
 }
 
-func TestSyntoEntityMappingReservedRootsPreservesAgentIdentityJoin(t *testing.T) {
-	indexData := `{"schema_version":1,"pack":{"id":"fixture","name":"fixture","version":"0","language":["en"],"capabilities":["articles","concepts"]},"articles":[{"id":"root-index","name":"Index","path":"wiki/index.md","summary":null,"tags":[],"aliases":[],"confidence":"high"},{"id":"root-log","name":"Log","path":"wiki/log.md","summary":null,"tags":[],"aliases":[],"confidence":"high"},{"id":"generated-alpha","name":"Current Alpha","path":"articles/alpha.md","summary":null,"tags":[],"aliases":[],"confidence":"high"}],"terms":[],"papers":[],"sources":[],"source_concepts":[{"source_path":"raw/source.md","content_hash":"` + strings.Repeat("0", 64) + `","concepts":[{"name":"Current Alpha","entity_id":"01JAZ5N7Y3K8M2Q4R6T9VWXABC"}]}],"synthesis":[],"stats":{"article_count":3,"draft_count":0,"concept_count":1,"alias_count":0,"knowledge_item_count":0,"source_count":1,"source_segment_count":0,"failed_note_count":0,"failed_concept_count":0}}`
-	conceptsData := agentConceptsFixture(`"canonical_article_id":"generated-alpha","article_path":"articles/alpha.md"`, `"entity_id":"01JAZ5N7Y3K8M2Q4R6T9VWXABC"`)
+func TestSyntoEntityMappingReservedRootsFillsAgentIdentityJoin(t *testing.T) {
+	const entity = "01JAZ5N7Y3K8M2Q4R6T9VWXABC"
+	indexData := `{"schema_version":1,"pack":{"id":"fixture","name":"fixture","version":"0","language":["en"],"capabilities":["articles","concepts"]},"articles":[{"id":"root-index","name":"Index","path":"wiki/index.md","summary":null,"tags":[],"aliases":[],"confidence":"high"},{"id":"root-log","name":"Log","path":"wiki/log.md","summary":null,"tags":[],"aliases":[],"confidence":"high"},{"id":"generated-alpha","name":"Current Alpha","path":"articles/alpha.md","summary":null,"tags":[],"aliases":[],"confidence":"high"}],"terms":[],"papers":[],"sources":[],"source_concepts":[{"source_path":"raw/source.md","content_hash":"` + strings.Repeat("0", 64) + `","concepts":[{"name":"Current Alpha","entity_id":"` + entity + `"}]}],"synthesis":[],"stats":{"article_count":3,"draft_count":0,"concept_count":1,"alias_count":0,"knowledge_item_count":0,"source_count":1,"source_segment_count":0,"failed_note_count":0,"failed_concept_count":0}}`
+	conceptsData := agentConceptsFixture(`"canonical_article_id":"generated-alpha","article_path":"articles/alpha.md"`, `"entity_id":"`+entity+`"`)
 	joined, err := enrichSyntoIndexWithAgentConcepts([]byte(indexData), []byte(conceptsData))
 	if err != nil {
 		t.Fatalf("agent identity join failed: %v", err)
@@ -2113,14 +2146,30 @@ func TestSyntoEntityMappingReservedRootsPreservesAgentIdentityJoin(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
+	if len(index.Articles) != 3 || index.Articles[2].EntityID != entity {
+		t.Fatalf("agent join did not fill normal article entity: %#v", index.Articles)
+	}
+	plan, err := syntoIdentityPlanFromIndex(index)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := plan.ByPath["wiki/alpha.md"]; got != entity {
+		t.Fatalf("ByPath after agent join = %#v, want wiki/alpha.md -> %q", plan.ByPath, entity)
+	}
+	if _, hasIndex := plan.ByPath["wiki/index.md"]; hasIndex {
+		t.Fatalf("root pages must not enter Concept ByPath: %#v", plan.ByPath)
+	}
 	got, err := mapSyntoEntityIDsFromIndexTruth(index, map[string]string{"generated-alpha": "alpha"}, []conceptSnapshot{{
 		ConceptID:   "stable-alpha",
 		Slug:        "alpha",
-		EntityID:    "01JAZ5N7Y3K8M2Q4R6T9VWXABC",
+		EntityID:    entity,
 		SourcePaths: []string{"raw/source.md"},
 	}})
-	if err != nil || len(got) != 0 {
-		t.Fatalf("agent-joined normal article was mapped: map=%#v error=%v", got, err)
+	if err != nil {
+		t.Fatalf("map after agent fill: %v", err)
+	}
+	if got["generated-alpha"] != entity {
+		t.Fatalf("map after agent fill = %#v, want generated-alpha -> %q", got, entity)
 	}
 }
 
