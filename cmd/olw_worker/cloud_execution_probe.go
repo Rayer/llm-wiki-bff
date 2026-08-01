@@ -274,6 +274,12 @@ func classifyCloudRunExecutionJSON(body []byte) leaseHolderLiveness {
 			return livenessFromStatus(status)
 		}
 	}
+	// Prefer live signals over task counters. Multi-task executions can report a
+	// positive succeeded/failed/cancelled count while other tasks are still
+	// running or reconciling; reclaiming then would break exclusive publish.
+	if execution.RunningCount > 0 || execution.Reconciling {
+		return leaseHolderRunning
+	}
 	if execution.FailedCount > 0 {
 		return leaseHolderTerminal
 	}
@@ -282,9 +288,6 @@ func classifyCloudRunExecutionJSON(body []byte) leaseHolderLiveness {
 	}
 	if execution.SucceededCount > 0 {
 		return leaseHolderTerminal
-	}
-	if execution.RunningCount > 0 || execution.Reconciling {
-		return leaseHolderRunning
 	}
 	// Empty / unknown body: fail closed (do not reclaim).
 	return leaseHolderLookupFailed

@@ -403,6 +403,9 @@ func TestClassifyCloudRunExecutionJSON(t *testing.T) {
 		{name: "history completed failedCount+condition", body: `{"failedCount":1,"conditions":[{"type":"Completed","state":"CONDITION_FAILED"}]}`, want: leaseHolderTerminal},
 		{name: "reconciling", body: `{"reconciling":true}`, want: leaseHolderRunning},
 		{name: "running count", body: `{"runningCount":1}`, want: leaseHolderRunning},
+		// Multi-task partial progress: counters must not win over live signals.
+		{name: "partial failed still running", body: `{"failedCount":1,"runningCount":1}`, want: leaseHolderRunning},
+		{name: "partial succeeded still reconciling", body: `{"succeededCount":1,"reconciling":true}`, want: leaseHolderRunning},
 		{name: "empty unknown", body: `{}`, want: leaseHolderLookupFailed},
 		{name: "garbage", body: `not-json`, want: leaseHolderLookupFailed},
 	}
