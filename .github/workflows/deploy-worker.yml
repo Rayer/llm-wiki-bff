@@ -174,12 +174,20 @@ jobs:
           gcloud run jobs update "${JOB_NAME}" \
             --image "$IMMUTABLE_IMAGE" \
             --update-secrets "DEEPSEEK_API_KEY=deepseek-apikey:latest" \
-            --update-env-vars "BUCKET=${BUCKET}" \
+            --update-env-vars "BUCKET=${BUCKET},PIPELINE_JOB_NAME=${JOB_NAME},PIPELINE_JOB_LOCATION=${REGION}" \
             --remove-env-vars "DATA_DIR,WORKSPACE,VAULT_PATH,WORKSPACE_DIR" \
             --args "^@^run@[[\"run\",\"--auto-approve\"]]" \
             --clear-volume-mounts \
             --clear-volumes \
             --region "${REGION}" \
+            --quiet
+
+          # LWC-222: worker must executions.get holder liveness for lease reclaim.
+          PIPELINE_SA="lwc-pipeline-dev@llm-wiki-cloud.iam.gserviceaccount.com"
+          gcloud run jobs add-iam-policy-binding "${JOB_NAME}" \
+            --region="${REGION}" \
+            --member="serviceAccount:${PIPELINE_SA}" \
+            --role="roles/run.viewer" \
             --quiet
 
           JOB_CONTRACT=$(gcloud run jobs describe "${JOB_NAME}" \

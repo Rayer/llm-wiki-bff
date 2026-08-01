@@ -40,7 +40,7 @@ func TestDeployWorkerWorkflowContract(t *testing.T) {
 		"--image \"$IMMUTABLE_IMAGE\"",
 		"gcloud run jobs describe \"${JOB_NAME}\"",
 		"BUCKET: llm-wiki-data-dev",
-		"--update-env-vars \"BUCKET=${BUCKET}\"",
+		"--update-env-vars \"BUCKET=${BUCKET},PIPELINE_JOB_NAME=${JOB_NAME},PIPELINE_JOB_LOCATION=${REGION}\"",
 		"--remove-env-vars \"DATA_DIR,WORKSPACE,VAULT_PATH,WORKSPACE_DIR\"",
 		"--args \"^@^run@[[\\\"run\\\",\\\"--auto-approve\\\"]]\"",
 		"--clear-volume-mounts",
@@ -48,6 +48,9 @@ func TestDeployWorkerWorkflowContract(t *testing.T) {
 		"--update-secrets \"DEEPSEEK_API_KEY=deepseek-apikey:latest\"",
 		"DEEPSEEK_API_KEY",
 		"deepseek-apikey",
+		// LWC-222: lease owner-liveness reclaim requires executions.get on the job.
+		"roles/run.viewer",
+		"lwc-pipeline-dev@llm-wiki-cloud.iam.gserviceaccount.com",
 		"worker must not retain GCSFuse volumes",
 		"worker args do not match the cloud worker contract",
 		"${DEPLOYED}\" != \"${IMMUTABLE_IMAGE}",
@@ -191,8 +194,22 @@ func TestWorkerPromotionWorkflowsContract(t *testing.T) {
 			t.Fatalf("release workflow must not rebuild or replace images: found %q", forbidden)
 		}
 	}
-	if strings.Contains(release, "add-iam-policy-binding") || strings.Contains(release, "roles/") {
-		t.Fatal("release workflow must not expand IAM")
+	// LWC-222: least-privilege job viewer for lease liveness reclaim only.
+	// Broader project IAM / executor roles remain forbidden.
+	if !strings.Contains(release, "roles/run.viewer") || !strings.Contains(release, "lwc-pipeline-prod@llm-wiki-cloud.iam.gserviceaccount.com") {
+		t.Fatal("release workflow must grant pipeline SA roles/run.viewer for lease reclaim")
+	}
+	for _, forbidden := range []string{
+		"roles/editor",
+		"roles/owner",
+		"roles/run.admin",
+		"roles/run.developer",
+		"roles/run.jobsExecutorWithOverrides",
+		"gcloud projects add-iam-policy-binding",
+	} {
+		if strings.Contains(release, forbidden) {
+			t.Fatalf("release workflow must not expand broad IAM %q", forbidden)
+		}
 	}
 	if strings.Contains(release, "--allow-unauthenticated") {
 		t.Fatal("production worker job must remain private")

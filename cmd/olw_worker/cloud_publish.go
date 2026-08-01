@@ -288,26 +288,8 @@ type cloudLease struct {
 	generation int64
 }
 
-func acquireCloudLease(ctx context.Context, store objectStore, prefix, execution string) (*cloudLease, error) {
-	holder := strings.TrimSpace(execution)
-	if !validPipelineExecutionID(holder) {
-		return nil, errors.New("invalid lease execution id")
-	}
-	payload, err := json.Marshal(map[string]string{
-		"execution":  holder,
-		"started_at": time.Now().UTC().Format(time.RFC3339),
-	})
-	if err != nil {
-		return nil, err
-	}
-	a, err := store.Write(ctx, prefix+generation.LeasePath, payload, nil, objectConditions{DoesNotExist: true})
-	if err != nil {
-		// Keep a stable public sentinel while preserving the root cause (typically
-		// object generation conflict from DoesNotExist precondition failure).
-		return nil, annotateError(errCloudLeaseHeld, err)
-	}
-	return &cloudLease{store: store, name: prefix + generation.LeasePath, generation: a.Generation}, nil
-}
+// acquireCloudLease lives in lease_liveness.go (LWC-222 owner-liveness reclaim).
+
 func (l *cloudLease) Release(_ context.Context) error {
 	if err := storage.RetryGenerationCleanup(l.generation, generation.LeaseReleaseTimeout, cloudLeaseReleaseAttempts, func(ctx context.Context, objectGeneration int64) error {
 		return l.store.Delete(ctx, l.name, objectGeneration)
