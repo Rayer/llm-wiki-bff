@@ -97,6 +97,100 @@ func TestExecutionBelongsToJob(t *testing.T) {
 	}
 }
 
+// TestLWC222AcceptanceHappyPathOrphanHistoryReclaim is the LWC-222 acceptance
+// gate (unit, not live orphan pipeline):
+//
+//	existing lease.json held by a Cloud Run history execution that is no longer
+//	RUNNING → CAS reclaim → create-only acquire succeeds for the challenger.
+//
+// Holder ids are real DEV history names (gcloud run jobs executions list
+// olw-pipeline-dev, 2026-08-01). Probe responses are the v2 Admin API shapes
+// observed for those completed executions (no live network).
+func TestLWC222AcceptanceHappyPathOrphanHistoryReclaim(t *testing.T) {
+	const (
+		jobName    = "olw-pipeline-dev"
+		// From DEV history: Completed, failedCount=1 (exit 1). Not RUNNING.
+		historyID  = "olw-pipeline-dev-bwqhz"
+		challenger = "olw-pipeline-dev-acceptance-challenger"
+	)
+	// Sanitized v2 GET executions/{id} body for olw-pipeline-dev-bwqhz
+	// (completion via conditions + failedCount; no completionStatus field).
+	historyBody := []byte(`{
+		"name": "projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline-dev/executions/olw-pipeline-dev-bwqhz",
+		"failedCount": 1,
+		"conditions": [
+			{"type": "Started", "state": "CONDITION_SUCCEEDED"},
+			{"type": "Completed", "state": "CONDITION_FAILED", "executionReason": "NON_ZERO_EXIT_CODE"}
+		]
+	}`)
+
+	m := newMemoryObjects()
+	seedLease(t, m, "p/", historyID)
+
+	probe := &cloudRunExecutionProbe{
+		project:  "llm-wiki-cloud",
+		location: "asia-east1",
+		getToken: func(context.Context) (string, error) { return "tok", nil },
+		get: func(_ context.Context, rawURL, token string) (int, []byte, error) {
+			if token != "tok" {
+				t.Fatalf("token=%q", token)
+			}
+			if !strings.Contains(rawURL, "/jobs/"+jobName+"/executions/"+historyID) {
+				t.Fatalf("probe url=%s, want history holder %s", rawURL, historyID)
+			}
+			return 200, historyBody, nil
+		},
+	}
+	withLeaseProbe(t, probe, jobName)
+
+	if got := classifyCloudRunExecutionJSON(historyBody); got != leaseHolderTerminal {
+		t.Fatalf("history body classified %s, want terminal (acceptance precondition)", got)
+	}
+
+	lease, err := acquireCloudLease(context.Background(), m, "p/", challenger)
+	if err != nil {
+		t.Fatalf("happy path reclaim/acquire: %v", err)
+	}
+	if lease == nil || lease.generation <= 0 {
+		t.Fatal("expected lease after reclaim")
+	}
+	payload, _, err := m.Read(context.Background(), "p/"+generation.LeasePath, 0, generation.MaxFileBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var body leasePayload
+	if err := json.Unmarshal(payload, &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Execution != challenger {
+		t.Fatalf("lease holder=%q, want challenger %q (orphan history reclaimed)", body.Execution, challenger)
+	}
+}
+
+func TestLWC222AcceptanceGateWhileHistoryWouldBeRunning(t *testing.T) {
+	// Control case for the same acceptance suite: if probe says RUNNING, gate.
+	const historyID = "olw-pipeline-dev-lplb8" // real DEV history name used only as id
+	m := newMemoryObjects()
+	seedLease(t, m, "p/", historyID)
+	withLeaseProbe(t, &fixedLivenessProbe{state: leaseHolderRunning}, "olw-pipeline-dev")
+
+	_, err := acquireCloudLease(context.Background(), m, "p/", "olw-pipeline-dev-acceptance-blocked")
+	if err == nil || !errors.Is(err, errCloudLeaseHeld) {
+		t.Fatalf("RUNNING holder must gate, err=%v", err)
+	}
+	payload, _, err := m.Read(context.Background(), "p/"+generation.LeasePath, 0, generation.MaxFileBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var body leasePayload
+	if err := json.Unmarshal(payload, &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Execution != historyID {
+		t.Fatalf("gated lease must keep holder %q, got %q", historyID, body.Execution)
+	}
+}
+
 func TestAcquireCloudLeaseReclaimsTerminalHolder(t *testing.T) {
 	m := newMemoryObjects()
 	seedLease(t, m, "p/", "olw-pipeline-dev-old1")
@@ -305,6 +399,8 @@ func TestClassifyCloudRunExecutionJSON(t *testing.T) {
 		{name: "completion succeeded", body: `{"completionStatus":"EXECUTION_SUCCEEDED"}`, want: leaseHolderTerminal},
 		{name: "completion failed", body: `{"completionStatus":"EXECUTION_FAILED"}`, want: leaseHolderTerminal},
 		{name: "completion cancelled", body: `{"completionStatus":"EXECUTION_CANCELLED"}`, want: leaseHolderTerminal},
+		// Real DEV history (olw-pipeline-dev-bwqhz): v2 often has no completionStatus.
+		{name: "history completed failedCount+condition", body: `{"failedCount":1,"conditions":[{"type":"Completed","state":"CONDITION_FAILED"}]}`, want: leaseHolderTerminal},
 		{name: "reconciling", body: `{"reconciling":true}`, want: leaseHolderRunning},
 		{name: "running count", body: `{"runningCount":1}`, want: leaseHolderRunning},
 		{name: "empty unknown", body: `{}`, want: leaseHolderLookupFailed},

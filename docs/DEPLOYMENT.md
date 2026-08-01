@@ -44,6 +44,13 @@ The Makefile `deploy-dev` target hardcodes the dev service, data resources, runt
 Cloud publish uses create-only `.lwc/publish/lease.json` with payload
 `{"execution":"<cloud-run-execution-id>","started_at":"..."}`.
 
+**Acceptance (unit, not live orphan pipeline):** focused tests
+`TestLWC222AcceptanceHappyPathOrphanHistoryReclaim` and
+`TestLWC222AcceptanceGateWhileHistoryWouldBeRunning` cover the product gate —
+orphan lease held by a finished Cloud Run history execution is reclaimed;
+a still-RUNNING holder continues to block. Deliberately failing a long pipeline
+solely to manufacture an orphan lease is not required to close this ticket.
+
 On acquire conflict the **worker** (not age/TTL) decides reclaim from Cloud Run
 Jobs execution status of the holder id:
 
