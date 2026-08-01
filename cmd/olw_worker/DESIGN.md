@@ -105,9 +105,15 @@ workspace publication/recovery path. Local mode does not use the cloud
    materialization. The lease payload is JSON
    `{"execution":"<execution-id>","started_at":"..."}` with the real pipeline
    execution id (not redacted) so stuck locks can be attributed. It is held
-   through publication, receipts, failure-log recording, and cleanup. Overlap
-   fails closed with a stable public sentinel while preserving the root cause
-   via error wrapping; an abandoned lease requires operator inspection.
+   through publication, receipts, failure-log recording, and cleanup. On
+   create-only conflict the worker probes the holder execution via the Cloud
+   Run Jobs Admin API (`executions.get`, scoped to `CLOUD_RUN_JOB` /
+   `PIPELINE_JOB_NAME`). **RUNNING** (or uncertain lookup) fails closed with
+   the stable public sentinel. **Terminal** holders (`SUCCEEDED` / `FAILED` /
+   `CANCELLED`) or proven **not found** job-scoped ids are reclaimed once via
+   generation-matched delete + create-only rewrite (LWC-222). Pure age/TTL
+   steal is forbidden. Malformed / foreign / redacted holders still need
+   operator break-glass (`docs/DEPLOYMENT.md`).
 3. Create a private `/tmp/olw-cloud-*` directory. Materialize canonical raw
    objects, annotations, source status, and the previously committed generation
    selected by `.lwc/publish/current.json` through the Storage API. If no current

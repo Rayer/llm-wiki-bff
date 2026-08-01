@@ -39,10 +39,54 @@ make docker-build docker-push deploy-dev
 
 The Makefile `deploy-dev` target hardcodes the dev service, data resources, runtime service account, Secret Manager references, and `DEV_JWT=false`; command-line environment overrides cannot redirect it to production. `deploy` is only an alias for `deploy-dev`. `make deploy-prod` fails closed; production must use the `Promote BFF to Cloud Run (production)` GitHub workflow with a verified full commit SHA.
 
-## Stuck dev publish lease
+## Publish lease liveness (LWC-222)
 
-Use this break-glass procedure only for a stuck development publish lease. It
-does not expire, steal, or automatically take over a lease.
+Cloud publish uses create-only `.lwc/publish/lease.json` with payload
+`{"execution":"<cloud-run-execution-id>","started_at":"..."}`.
+
+On acquire conflict the **worker** (not age/TTL) decides reclaim from Cloud Run
+Jobs execution status of the holder id:
+
+| Holder execution state | Action |
+| --- | --- |
+| `RUNNING` (or live equivalent) | refuse; fail closed |
+| `SUCCEEDED` / `FAILED` / `CANCELLED` | CAS delete + one create-only retry |
+| Not found (well-formed id under the job) | allow CAS reclaim |
+| Permission / 5xx / timeout / parse failure | refuse (`lookup_failed`) |
+| Malformed / empty / foreign job prefix | refuse (manual break-glass) |
+
+### IAM
+
+The pipeline worker runtime service account must be able to
+`run.jobs.executions.get` on the environment's job (dev: `olw-pipeline-dev`,
+prod: `olw-pipeline`). Granting `roles/run.viewer` on the job is sufficient and
+least-privilege relative to executor roles.
+
+```sh
+# DEV example — pipeline worker SA may probe holder liveness
+gcloud run jobs add-iam-policy-binding olw-pipeline-dev \
+  --region=asia-east1 --project=llm-wiki-cloud \
+  --member="serviceAccount:lwc-pipeline-dev@llm-wiki-cloud.iam.gserviceaccount.com" \
+  --role="roles/run.viewer"
+```
+
+BFF already uses `roles/run.viewer` for status listing; worker reclaim needs the
+same class of read on the job.
+
+Optional env for scope (defaults work on Cloud Run Jobs in-region):
+
+| Variable | Purpose |
+| --- | --- |
+| `CLOUD_RUN_JOB` / `PIPELINE_JOB_NAME` | Expected job name (holder prefix check) |
+| `PIPELINE_JOB_URL` | Same BFF HTTPS `:run` URL; project/location parsed when set |
+| `PIPELINE_JOB_LOCATION` / `CLOUD_RUN_LOCATION` | Region override (default `asia-east1`) |
+| `GOOGLE_CLOUD_PROJECT` / `GCP_PROJECT` | Project override (else metadata) |
+
+## Stuck dev publish lease (manual break-glass)
+
+Use this break-glass procedure only when automatic liveness reclaim cannot run:
+malformed holder payload, foreign job id, or `lookup_failed` (IAM / API). It
+does not expire, steal, or automatically take over a lease by age.
 
 1. Confirm that no Cloud Run execution owned by the development publisher is
    `RUNNING`. Stop and investigate if any such execution exists; do not delete
