@@ -10,12 +10,60 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
 	cloudstorage "cloud.google.com/go/storage"
 	"github.com/rayer/llm-wiki-bff/internal/generation"
 )
+
+func TestLWC237LiveChildOutputIsTextPayloadCompatible(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	pipeline := newLivePipeline(nil, map[pipelineStream]io.Writer{
+		stdoutStream: &stdout,
+		stderrStream: &stderr,
+	}, workerConfig{UserID: "user-1", ProjectID: "project-1", ExecutionID: "exec-1"}, nil)
+	if _, err := pipeline.writer(stdoutStream).Write([]byte("hello\nworld\n")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pipeline.writer(stderrStream).Write([]byte("warning\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := pipeline.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	for stream, data := range map[pipelineStream][]byte{stdoutStream: stdout.Bytes(), stderrStream: stderr.Bytes()} {
+		for _, physicalLine := range bytes.Split(bytes.TrimSuffix(data, []byte("\n")), []byte("\n")) {
+			textPayload := installedGcloudTextPayload(physicalLine)
+			if textPayload == "" {
+				t.Fatalf("%s child line=%q is blank under installed gcloud formatter", stream, physicalLine)
+			}
+			for _, field := range []string{"event=child_output", "user_id=", "project_id=", "execution_id=", "stream=", "severity=", "sequence=", "frame_id=", "fragment_index=", "output_encoding=", "newline=", "output="} {
+				if !strings.Contains(textPayload, field) {
+					t.Fatalf("%s child line=%q missing %q", stream, textPayload, field)
+				}
+			}
+			wantText := `output="hello\nworld\n"`
+			if stream == stderrStream {
+				wantText = `output="warning\n"`
+			}
+			if !strings.Contains(textPayload, wantText) {
+				t.Fatalf("%s child line=%q missing escaped child text %q", stream, textPayload, wantText)
+			}
+		}
+	}
+}
+
+// installedGcloudTextPayload characterizes formatter.go: stdout/stderr records
+// are rendered from LogEntry.textPayload and ignore jsonPayload.
+func installedGcloudTextPayload(physicalLine []byte) string {
+	if json.Valid(physicalLine) {
+		return ""
+	}
+	return string(physicalLine)
+}
 
 func TestLWC237RunningChildSentinelReachesContainerBeforeClose(t *testing.T) {
 	var stdout, stderr, control bytes.Buffer
@@ -31,12 +79,11 @@ func TestLWC237RunningChildSentinelReachesContainerBeforeClose(t *testing.T) {
 		if _, err := stdoutWriter.Write([]byte("running-child-sentinel\n")); err != nil {
 			t.Fatal(err)
 		}
-		line := bytes.TrimSpace(stdout.Bytes())
-		var record map[string]any
-		if err := json.Unmarshal(line, &record); err != nil || record["event"] != "child_output" {
-			t.Fatalf("container output=%q record=%v err=%v", line, record, err)
+		records := parseLWC237OutputLines(t, stdout.Bytes())
+		if len(records) != 1 || records[0]["event"] != "child_output" {
+			t.Fatalf("container output=%q records=%v", stdout.Bytes(), records)
 		}
-		if got := reconstructLWC237Output(t, record); string(got) != "running-child-sentinel\n" {
+		if got := reconstructLWC237Output(t, records[0]); string(got) != "running-child-sentinel\n" {
 			t.Fatalf("container payload=%q, want sentinel", got)
 		}
 		if err := closeLog(); err != nil {
@@ -79,8 +126,8 @@ func TestLWC237StdoutStderrAreStructuredIndependentAndExactlyOnce(t *testing.T) 
 		if got := stderr.String(); len(got) == 0 {
 			t.Fatal("stderr pipeline had no data")
 		}
-		assertLWC237JSONStream(t, stdout.Bytes(), "stdout-part-1-part-2\n", "INFO", "stdout")
-		assertLWC237JSONStream(t, stderr.Bytes(), "stderr-part-1-part-2\n", "WARNING", "stderr")
+		assertLWC237TextStream(t, stdout.Bytes(), "stdout-part-1-part-2\n", "INFO", "stdout")
+		assertLWC237TextStream(t, stderr.Bytes(), "stderr-part-1-part-2\n", "WARNING", "stderr")
 		if bytes.Contains(stdout.Bytes(), []byte("stderr-part")) || bytes.Contains(stderr.Bytes(), []byte("stdout-part")) {
 			t.Fatalf("combined output was duplicated: stdout=%q stderr=%q", stdout.Bytes(), stderr.Bytes())
 		}
@@ -101,12 +148,11 @@ func TestLWC237CancellationKeepsAlreadyEmittedOutput(t *testing.T) {
 		if _, err := stdoutWriter.Write([]byte("before-cancellation\n")); err != nil {
 			t.Fatal(err)
 		}
-		line := bytes.TrimSpace(stdout.Bytes())
-		var record map[string]any
-		if err := json.Unmarshal(line, &record); err != nil || record["event"] != "child_output" {
-			t.Fatalf("container output=%q record=%v err=%v", line, record, err)
+		records := parseLWC237OutputLines(t, stdout.Bytes())
+		if len(records) != 1 || records[0]["event"] != "child_output" {
+			t.Fatalf("container output=%q records=%v", stdout.Bytes(), records)
 		}
-		if got := reconstructLWC237Output(t, record); string(got) != "before-cancellation\n" {
+		if got := reconstructLWC237Output(t, records[0]); string(got) != "before-cancellation\n" {
 			t.Fatalf("container payload=%q, want before-cancellation\n", got)
 		}
 		if err := closeLog(); err != nil {
@@ -140,11 +186,7 @@ func TestLWC237LiveOutputExceedsDurableArtifactBoundLosslessly(t *testing.T) {
 		t.Fatalf("live output length=%d, want > durable bound %d", len(data), maxPipelineLog)
 	}
 	var reconstructed strings.Builder
-	for _, line := range bytes.Split(bytes.TrimSpace(data), []byte("\n")) {
-		var record map[string]any
-		if err := json.Unmarshal(line, &record); err != nil {
-			t.Fatalf("live fragment is not JSON: %v", err)
-		}
+	for _, record := range parseLWC237OutputLines(t, data) {
 		if got := int(record["output_bytes"].(float64)); got > liveFrameBytes {
 			t.Fatalf("fragment bytes=%d, want <= %d", got, liveFrameBytes)
 		}
@@ -200,10 +242,11 @@ func TestLWC237FramingMetadataIsTruthfulAndImmediate(t *testing.T) {
 	if live.Len() == 0 {
 		t.Fatal("short no-newline output was buffered until Close")
 	}
-	var immediate map[string]any
-	if err := json.Unmarshal(bytes.TrimSpace(live.Bytes()), &immediate); err != nil {
-		t.Fatal(err)
+	records := parseLWC237OutputLines(t, live.Bytes())
+	if len(records) != 1 {
+		t.Fatalf("records=%d, want 1", len(records))
 	}
+	immediate := records[0]
 	if immediate["event"] != "child_output" || immediate["fragment_final"] != true || immediate["fragmented"] != false || immediate["newline"] != false {
 		t.Fatalf("immediate metadata=%v, want final unfragmented no-newline frame", immediate)
 	}
@@ -218,10 +261,7 @@ func TestLWC237FramingMetadataIsTruthfulAndImmediate(t *testing.T) {
 	}
 	var frame uint64
 	for index, line := range lines {
-		var record map[string]any
-		if err := json.Unmarshal(line, &record); err != nil {
-			t.Fatal(err)
-		}
+		record := parseLWC237TextLine(t, line)
 		if index == 0 {
 			frame = uint64(record["frame_id"].(float64))
 		}
@@ -254,14 +294,11 @@ func TestLWC237InvalidUTF8OutputReconstructsLosslessly(t *testing.T) {
 	if err := pipeline.Close(); err != nil {
 		t.Fatal(err)
 	}
-	var record map[string]any
-	if err := json.Unmarshal(bytes.TrimSpace(live.Bytes()), &record); err != nil {
-		t.Fatal(err)
+	records := parseLWC237OutputLines(t, live.Bytes())
+	if len(records) != 1 || records[0]["event"] != "child_output" || records[0]["output_encoding"] != "base64" {
+		t.Fatalf("records=%v, want event=child_output/output_encoding=base64", records)
 	}
-	if record["event"] != "child_output" || record["output_encoding"] != "base64" {
-		t.Fatalf("record=%v, want event=child_output/output_encoding=base64", record)
-	}
-	if got := reconstructLWC237Output(t, record); !bytes.Equal(got, want) {
+	if got := reconstructLWC237Output(t, records[0]); !bytes.Equal(got, want) {
 		t.Fatalf("reconstructed=%v, want %v", got, want)
 	}
 }
@@ -279,24 +316,42 @@ func TestLWC237UTF8FrameMessageEqualsSafePayloadAndEventStaysChildOutput(t *test
 		t.Fatal(err)
 	}
 	var reconstructed strings.Builder
-	for _, record := range parseLWC237JSONRecords(t, live.Bytes()) {
+	for _, record := range parseLWC237OutputLines(t, live.Bytes()) {
 		if got := record["event"]; got != "child_output" {
 			t.Fatalf("record=%v, want event=child_output", record)
 		}
 		output, ok := record["output"].(string)
-		if !ok {
+		if !ok || output == "" {
 			t.Fatalf("record=%v, want output string", record)
 		}
 		if got := record["output_encoding"]; got != "utf-8" {
 			t.Fatalf("record=%v, want output_encoding=utf-8", record)
 		}
-		if got := record["message"]; got != output {
-			t.Fatalf("record=%v, want message=%q output=%q", record, output, output)
-		}
 		reconstructed.Write(reconstructLWC237Output(t, record))
 	}
 	if got, want := reconstructed.String(), string(input); got != want {
 		t.Fatalf("reconstructed=%q, want %q", got, want)
+	}
+}
+
+func TestLWC237ParseLWC237TextLineQuotedBackslashQuote(t *testing.T) {
+	var live bytes.Buffer
+	pipeline := newLivePipeline(nil, map[pipelineStream]io.Writer{
+		stdoutStream: &live,
+	}, workerConfig{}, nil)
+	input := []byte(`prefix \\\"quoted\\\" sequence`)
+	if _, err := pipeline.writer(stdoutStream).Write(input); err != nil {
+		t.Fatal(err)
+	}
+	if err := pipeline.Close(); err != nil {
+		t.Fatal(err)
+	}
+	records := parseLWC237OutputLines(t, live.Bytes())
+	if len(records) != 1 || records[0]["event"] != "child_output" {
+		t.Fatalf("child output=%q records=%v", live.Bytes(), records)
+	}
+	if got := reconstructLWC237Output(t, records[0]); !bytes.Equal(got, input) {
+		t.Fatalf("reconstructed=%q, want=%q", got, input)
 	}
 }
 
@@ -328,11 +383,7 @@ func TestLWC237StructuredIdentityAndCredentialRedaction(t *testing.T) {
 		t.Fatalf("credential leaked: %q", data)
 	}
 	var messages strings.Builder
-	for _, line := range bytes.Split(bytes.TrimSpace(data), []byte("\n")) {
-		var record map[string]any
-		if err := json.Unmarshal(line, &record); err != nil {
-			t.Fatalf("live output is not JSON: %v; output=%q", err, data)
-		}
+	for _, record := range parseLWC237OutputLines(t, data) {
 		for key, want := range map[string]string{
 			"component": "olw_worker", "child_component": "synto", "user_id": "user-visible", "project_id": "project-visible", "execution_id": "execution-visible",
 			"stream": "stdout", "severity": "INFO",
@@ -551,14 +602,10 @@ func captureWorkerStderr(t *testing.T) (*os.File, *os.File, func()) {
 	return reader, writer, func() { os.Stderr = original; _ = writer.Close(); _ = reader.Close() }
 }
 
-func assertLWC237JSONStream(t *testing.T, data []byte, wantMessage, wantSeverity, wantStream string) {
+func assertLWC237TextStream(t *testing.T, data []byte, wantMessage, wantSeverity, wantStream string) {
 	t.Helper()
 	var messages strings.Builder
-	for _, line := range bytes.Split(bytes.TrimSpace(data), []byte("\n")) {
-		var record map[string]any
-		if err := json.Unmarshal(line, &record); err != nil {
-			t.Fatalf("output line=%q is not JSON: %v", line, err)
-		}
+	for _, record := range parseLWC237OutputLines(t, data) {
 		if record["severity"] != wantSeverity || record["stream"] != wantStream {
 			t.Fatalf("record=%v, want severity=%q stream=%q", record, wantSeverity, wantStream)
 		}
@@ -611,7 +658,70 @@ func parseLWC237JSONRecords(t *testing.T, data []byte) []map[string]any {
 }
 
 func parseLWC237OutputLines(t *testing.T, data []byte) []map[string]any {
-	return parseLWC237JSONRecords(t, data)
+	t.Helper()
+	trimmed := bytes.TrimSuffix(data, []byte("\n"))
+	if len(trimmed) == 0 {
+		return nil
+	}
+	lines := bytes.Split(trimmed, []byte("\n"))
+	records := make([]map[string]any, 0, len(lines))
+	for _, line := range lines {
+		records = append(records, parseLWC237TextLine(t, line))
+	}
+	return records
+}
+
+func parseLWC237TextLine(t *testing.T, line []byte) map[string]any {
+	t.Helper()
+	record := make(map[string]any)
+	for len(line) > 0 {
+		line = bytes.TrimLeft(line, " ")
+		keyEnd := bytes.IndexByte(line, '=')
+		if keyEnd <= 0 {
+			t.Fatalf("invalid child output line=%q", line)
+		}
+		key := string(line[:keyEnd])
+		line = line[keyEnd+1:]
+		var value string
+		if len(line) > 0 && line[0] == '"' {
+			quoted, err := strconv.QuotedPrefix(string(line))
+			if err != nil {
+				t.Fatalf("invalid quoted value in line=%q: %v", line, err)
+			}
+			if quoted == "" {
+				t.Fatalf("unterminated quoted value in line=%q", line)
+			}
+			value, err = strconv.Unquote(quoted)
+			if err != nil {
+				t.Fatalf("invalid quoted value in line=%q: %v", line, err)
+			}
+			line = line[len(quoted):]
+		} else {
+			end := bytes.IndexByte(line, ' ')
+			if end < 0 {
+				value, line = string(line), nil
+			} else {
+				value, line = string(line[:end]), line[end:]
+			}
+		}
+		switch key {
+		case "sequence", "frame_id", "fragment_index", "output_bytes":
+			n, err := strconv.ParseUint(value, 10, 64)
+			if err != nil {
+				t.Fatalf("invalid numeric %s=%q: %v", key, value, err)
+			}
+			record[key] = float64(n)
+		case "fragment_final", "fragmented", "newline":
+			b, err := strconv.ParseBool(value)
+			if err != nil {
+				t.Fatalf("invalid boolean %s=%q: %v", key, value, err)
+			}
+			record[key] = b
+		default:
+			record[key] = value
+		}
+	}
+	return record
 }
 
 type failingWriter struct{ err error }

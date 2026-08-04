@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -43,7 +44,7 @@ type livePipeline struct {
 }
 
 type liveDestination struct {
-	handler  slog.Handler
+	writer   io.Writer
 	disabled bool
 }
 
@@ -59,7 +60,7 @@ func newLivePipeline(durable io.Writer, live map[pipelineStream]io.Writer, cfg w
 			continue
 		}
 		destinations[stream] = &liveDestination{
-			handler: slog.NewJSONHandler(writer, &slog.HandlerOptions{ReplaceAttr: cloudLoggingAttr}),
+			writer: writer,
 		}
 	}
 	redactors := map[pipelineStream]*streamRedactor{
@@ -171,36 +172,36 @@ func (p *livePipeline) emitChildLocked(stream pipelineStream, frame uint64, data
 func (p *livePipeline) writeLiveLocked(stream pipelineStream, destination *liveDestination, data []byte, frame uint64, frameBytes int, fragmented bool, fragmentIndex int) error {
 	output, encoding := liveOutputMessage(data)
 	p.nextSequence++
-	record := slog.NewRecord(time.Now(), liveLevel(stream), output, 0)
-	record.AddAttrs(
-		slog.String("component", "olw_worker"),
-		slog.String("child_component", "synto"),
-		slog.String("user_id", p.cfg.UserID),
-		slog.String("project_id", p.cfg.ProjectID),
-		slog.String("execution_id", p.cfg.ExecutionID),
-		slog.String("stream", string(stream)),
-		slog.Uint64("sequence", p.nextSequence),
-		slog.Uint64("frame_id", frame),
-		slog.Int("fragment_index", fragmentIndex),
-		slog.Bool("fragment_final", (fragmentIndex+1)*liveFrameBytes >= frameBytes),
-		slog.Bool("fragmented", fragmented),
-		slog.Int("output_bytes", len(data)),
-		slog.String("output_encoding", encoding),
-		slog.String("output", output),
-		slog.Bool("newline", bytes.HasSuffix(data, []byte{'\n'})),
-		slog.String("event", "child_output"),
-	)
-	if err := destination.handler.Handle(context.Background(), record); err != nil {
+	line := strings.Join([]string{
+		"event=child_output",
+		"component=olw_worker",
+		"child_component=synto",
+		"user_id=" + strconv.Quote(p.cfg.UserID),
+		"project_id=" + strconv.Quote(p.cfg.ProjectID),
+		"execution_id=" + strconv.Quote(p.cfg.ExecutionID),
+		"stream=" + strconv.Quote(string(stream)),
+		"severity=" + strconv.Quote(liveSeverity(stream)),
+		"sequence=" + strconv.FormatUint(p.nextSequence, 10),
+		"frame_id=" + strconv.FormatUint(frame, 10),
+		"fragment_index=" + strconv.Itoa(fragmentIndex),
+		"fragment_final=" + strconv.FormatBool((fragmentIndex+1)*liveFrameBytes >= frameBytes),
+		"fragmented=" + strconv.FormatBool(fragmented),
+		"output_bytes=" + strconv.Itoa(len(data)),
+		"output_encoding=" + strconv.Quote(encoding),
+		"newline=" + strconv.FormatBool(bytes.HasSuffix(data, []byte{'\n'})),
+		"output=" + strconv.Quote(output),
+	}, " ") + "\n"
+	if _, err := io.WriteString(destination.writer, line); err != nil {
 		return fmt.Errorf("write live %s output: %w", stream, err)
 	}
 	return nil
 }
 
-func liveLevel(stream pipelineStream) slog.Level {
+func liveSeverity(stream pipelineStream) string {
 	if stream == stderrStream {
-		return slog.LevelWarn
+		return "WARNING"
 	}
-	return slog.LevelInfo
+	return "INFO"
 }
 
 func liveOutputMessage(data []byte) (string, string) {
