@@ -171,7 +171,7 @@ func (p *livePipeline) emitChildLocked(stream pipelineStream, frame uint64, data
 func (p *livePipeline) writeLiveLocked(stream pipelineStream, destination *liveDestination, data []byte, frame uint64, frameBytes int, fragmented bool, fragmentIndex int) error {
 	output, encoding := liveOutputMessage(data)
 	p.nextSequence++
-	record := slog.NewRecord(time.Now(), liveLevel(stream), "child_output", 0)
+	record := slog.NewRecord(time.Now(), liveLevel(stream), output, 0)
 	record.AddAttrs(
 		slog.String("component", "olw_worker"),
 		slog.String("child_component", "synto"),

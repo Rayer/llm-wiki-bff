@@ -33,7 +33,7 @@ func TestLWC237RunningChildSentinelReachesContainerBeforeClose(t *testing.T) {
 		}
 		line := bytes.TrimSpace(stdout.Bytes())
 		var record map[string]any
-		if err := json.Unmarshal(line, &record); err != nil || record["message"] != "child_output" {
+		if err := json.Unmarshal(line, &record); err != nil || record["event"] != "child_output" {
 			t.Fatalf("container output=%q record=%v err=%v", line, record, err)
 		}
 		if got := reconstructLWC237Output(t, record); string(got) != "running-child-sentinel\n" {
@@ -103,7 +103,7 @@ func TestLWC237CancellationKeepsAlreadyEmittedOutput(t *testing.T) {
 		}
 		line := bytes.TrimSpace(stdout.Bytes())
 		var record map[string]any
-		if err := json.Unmarshal(line, &record); err != nil || record["message"] != "child_output" {
+		if err := json.Unmarshal(line, &record); err != nil || record["event"] != "child_output" {
 			t.Fatalf("container output=%q record=%v err=%v", line, record, err)
 		}
 		if got := reconstructLWC237Output(t, record); string(got) != "before-cancellation\n" {
@@ -204,7 +204,7 @@ func TestLWC237FramingMetadataIsTruthfulAndImmediate(t *testing.T) {
 	if err := json.Unmarshal(bytes.TrimSpace(live.Bytes()), &immediate); err != nil {
 		t.Fatal(err)
 	}
-	if immediate["message"] != "child_output" || immediate["fragment_final"] != true || immediate["fragmented"] != false || immediate["newline"] != false {
+	if immediate["event"] != "child_output" || immediate["fragment_final"] != true || immediate["fragmented"] != false || immediate["newline"] != false {
 		t.Fatalf("immediate metadata=%v, want final unfragmented no-newline frame", immediate)
 	}
 	live.Reset()
@@ -258,11 +258,45 @@ func TestLWC237InvalidUTF8OutputReconstructsLosslessly(t *testing.T) {
 	if err := json.Unmarshal(bytes.TrimSpace(live.Bytes()), &record); err != nil {
 		t.Fatal(err)
 	}
-	if record["message"] != "child_output" || record["output_encoding"] != "base64" {
-		t.Fatalf("record=%v, want child_output/base64", record)
+	if record["event"] != "child_output" || record["output_encoding"] != "base64" {
+		t.Fatalf("record=%v, want event=child_output/output_encoding=base64", record)
 	}
 	if got := reconstructLWC237Output(t, record); !bytes.Equal(got, want) {
 		t.Fatalf("reconstructed=%v, want %v", got, want)
+	}
+}
+
+func TestLWC237UTF8FrameMessageEqualsSafePayloadAndEventStaysChildOutput(t *testing.T) {
+	var live bytes.Buffer
+	pipeline := newLivePipeline(nil, map[pipelineStream]io.Writer{
+		stdoutStream: &live,
+	}, workerConfig{}, nil)
+	input := bytes.Repeat([]byte("abcdef"), 2048)
+	if _, err := pipeline.writer(stdoutStream).Write(input); err != nil {
+		t.Fatal(err)
+	}
+	if err := pipeline.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var reconstructed strings.Builder
+	for _, record := range parseLWC237JSONRecords(t, live.Bytes()) {
+		if got := record["event"]; got != "child_output" {
+			t.Fatalf("record=%v, want event=child_output", record)
+		}
+		output, ok := record["output"].(string)
+		if !ok {
+			t.Fatalf("record=%v, want output string", record)
+		}
+		if got := record["output_encoding"]; got != "utf-8" {
+			t.Fatalf("record=%v, want output_encoding=utf-8", record)
+		}
+		if got := record["message"]; got != output {
+			t.Fatalf("record=%v, want message=%q output=%q", record, output, output)
+		}
+		reconstructed.Write(reconstructLWC237Output(t, record))
+	}
+	if got, want := reconstructed.String(), string(input); got != want {
+		t.Fatalf("reconstructed=%q, want %q", got, want)
 	}
 }
 
@@ -310,8 +344,8 @@ func TestLWC237StructuredIdentityAndCredentialRedaction(t *testing.T) {
 		if _, ok := record["sequence"]; !ok {
 			t.Fatalf("record missing sequence: %v", record)
 		}
-		if record["message"] != "child_output" {
-			t.Fatalf("message=%v, want child_output", record["message"])
+		if record["event"] != "child_output" {
+			t.Fatalf("record=%v, want event=child_output", record)
 		}
 		messages.Write(reconstructLWC237Output(t, record))
 	}
@@ -342,8 +376,8 @@ func TestLWC237DurableFailureDoesNotAffectHealthyLiveOutput(t *testing.T) {
 	}
 	var payload strings.Builder
 	for _, record := range lines {
-		if got := record["message"]; got != "child_output" {
-			t.Fatalf("record=%v, want child_output", record)
+		if got := record["event"]; got != "child_output" {
+			t.Fatalf("record=%v, want event=child_output", record)
 		}
 		payload.Write(reconstructLWC237Output(t, record))
 	}
@@ -528,8 +562,8 @@ func assertLWC237JSONStream(t *testing.T, data []byte, wantMessage, wantSeverity
 		if record["severity"] != wantSeverity || record["stream"] != wantStream {
 			t.Fatalf("record=%v, want severity=%q stream=%q", record, wantSeverity, wantStream)
 		}
-		if record["message"] != "child_output" {
-			t.Fatalf("record message=%v, want child_output", record["message"])
+		if record["event"] != "child_output" {
+			t.Fatalf("record event=%v, want child_output", record["event"])
 		}
 		messages.Write(reconstructLWC237Output(t, record))
 	}
