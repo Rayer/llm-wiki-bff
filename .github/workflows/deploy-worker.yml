@@ -101,6 +101,23 @@ jobs:
         with:
           project_id: ${{ env.PROJECT_ID }}
 
+      - name: Verify existing dev worker IAM prerequisites
+        run: |
+          set -euo pipefail
+          # The validator requires exactly one roles/run.viewer binding for serviceAccount:lwc-pipeline-dev@llm-wiki-cloud.iam.gserviceaccount.com.
+          if ! IAM_POLICY=$(gcloud run jobs get-iam-policy olw-pipeline-dev \
+            --project llm-wiki-cloud \
+            --region asia-east1 \
+            --format=json \
+            --quiet); then
+            echo "unable to read IAM policy for Cloud Run Job olw-pipeline-dev"
+            exit 1
+          fi
+          if ! printf '%s\n' "$IAM_POLICY" | python3 scripts/validate_cloud_run_job_iam_policy.py; then
+            echo "Cloud Run Job olw-pipeline-dev IAM policy is missing the required read-only worker binding"
+            exit 1
+          fi
+
       - name: Configure Artifact Registry Docker auth
         run: gcloud auth configure-docker asia-east1-docker.pkg.dev --quiet
 
@@ -180,14 +197,6 @@ jobs:
             --clear-volume-mounts \
             --clear-volumes \
             --region "${REGION}" \
-            --quiet
-
-          # LWC-222: worker must executions.get holder liveness for lease reclaim.
-          PIPELINE_SA="lwc-pipeline-dev@llm-wiki-cloud.iam.gserviceaccount.com"
-          gcloud run jobs add-iam-policy-binding "${JOB_NAME}" \
-            --region="${REGION}" \
-            --member="serviceAccount:${PIPELINE_SA}" \
-            --role="roles/run.viewer" \
             --quiet
 
           JOB_CONTRACT=$(gcloud run jobs describe "${JOB_NAME}" \
