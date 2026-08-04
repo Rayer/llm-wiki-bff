@@ -150,7 +150,7 @@ class WorkerDeploymentEvidenceTest(unittest.TestCase):
                 "--bucket",
                 "llm-wiki-data",
                 "--expected-runtime-service-account",
-                "lwc-worker@llm-wiki-cloud.iam.gserviceaccount.com",
+                "lwc-pipeline-prod@llm-wiki-cloud.iam.gserviceaccount.com",
                 "--rollback-contract",
                 str(self.root / "rollback.json"),
                 "--metadata",
@@ -233,7 +233,7 @@ class WorkerDeploymentEvidenceTest(unittest.TestCase):
         self.assertEqual(document["image"], {"digest": "sha256:" + "b" * 64, "reference": IMAGE})
         self.assertEqual(document["observed_job"]["generation"], 42)
         self.assertEqual(document["observed_job"]["image_reference"], IMAGE)
-        self.assertEqual(document["observed_job"]["runtime_service_account"], "lwc-worker@llm-wiki-cloud.iam.gserviceaccount.com")
+        self.assertEqual(document["observed_job"]["runtime_service_account"], "lwc-pipeline-prod@llm-wiki-cloud.iam.gserviceaccount.com")
         self.assertEqual(document["provider"]["rollback_artifact_name"], ROLLBACK_ARTIFACT_NAME)
         self.assertEqual(document["config"]["result"], "verified")
         self.assertRegex(document["config"]["fingerprint"], r"^sha256:[0-9a-f]{64}$")
