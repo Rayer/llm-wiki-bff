@@ -1,15 +1,12 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -18,6 +15,8 @@ import (
 
 const liveFrameBytes = 16 << 10
 const liveRedactionChunkBytes = 32 << 10
+const lwc237EscapeToken = "␞"
+const lwc237ContinuationToken = lwc237EscapeToken + "c\n"
 
 type pipelineStream string
 
@@ -27,11 +26,14 @@ const (
 )
 
 type livePipeline struct {
-	durable io.Writer
-	live    map[pipelineStream]*liveDestination
-	redact  map[pipelineStream]*streamRedactor
-	secrets []string
-	cfg     workerConfig
+	durable      io.Writer
+	live         map[pipelineStream]*liveDestination
+	redact       map[pipelineStream]*streamRedactor
+	utf8Pending  map[pipelineStream][]byte
+	framePending map[pipelineStream][]byte
+	frameBytes   map[pipelineStream]int
+	secrets      []string
+	cfg          workerConfig
 
 	durableDisabled bool
 	durableClose    func() error
@@ -73,8 +75,20 @@ func newLivePipeline(durable io.Writer, live map[pipelineStream]io.Writer, cfg w
 		live:     destinations,
 		degraded: make(map[string]bool),
 		redact:   redactors,
-		secrets:  append([]string(nil), secrets...),
-		cfg:      cfg,
+		utf8Pending: map[pipelineStream][]byte{
+			stdoutStream: nil,
+			stderrStream: nil,
+		},
+		framePending: map[pipelineStream][]byte{
+			stdoutStream: nil,
+			stderrStream: nil,
+		},
+		frameBytes: map[pipelineStream]int{
+			stdoutStream: 0,
+			stderrStream: 0,
+		},
+		secrets: append([]string(nil), secrets...),
+		cfg:     cfg,
 	}
 	if controlWriter != nil {
 		pipeline.degradedWriter = slog.NewJSONHandler(controlWriter, &slog.HandlerOptions{ReplaceAttr: cloudLoggingAttr})
@@ -140,7 +154,7 @@ func (p *livePipeline) write(stream pipelineStream, data []byte) (int, error) {
 			return nil
 		}
 		p.nextFrame++
-		return p.emitChildLocked(stream, p.nextFrame, output)
+		return p.emitChildLocked(stream, output)
 	})
 	if err != nil {
 		return len(data), nil
@@ -148,67 +162,92 @@ func (p *livePipeline) write(stream pipelineStream, data []byte) (int, error) {
 	return len(data), nil
 }
 
-func (p *livePipeline) emitChildLocked(stream pipelineStream, frame uint64, data []byte) error {
-	frameBytes := len(data)
-	fragmented := frameBytes > liveFrameBytes
-	fragmentIndex := 0
-	for len(data) > 0 {
-		n := len(data)
-		if n > liveFrameBytes {
-			n = liveFrameBytes
-		}
-		part := data[:n]
-		if destination := p.live[stream]; destination != nil && !destination.disabled {
-			if err := p.writeLiveLocked(stream, destination, part, frame, frameBytes, fragmented, fragmentIndex); err != nil {
-				p.disableLiveLocked(stream, destination, err)
-			}
-		}
-		data = data[n:]
-		fragmentIndex++
+func (p *livePipeline) emitChildLocked(stream pipelineStream, data []byte) error {
+	p.encodedLiveDataLocked(stream, data, false)
+	if len(p.framePending[stream]) > 0 {
+		p.writePhysicalLineLocked(stream, p.framePending[stream])
+		p.framePending[stream] = nil
 	}
 	return nil
 }
 
-func (p *livePipeline) writeLiveLocked(stream pipelineStream, destination *liveDestination, data []byte, frame uint64, frameBytes int, fragmented bool, fragmentIndex int) error {
-	output, encoding := liveOutputMessage(data)
-	p.nextSequence++
-	line := strings.Join([]string{
-		"event=child_output",
-		"component=olw_worker",
-		"child_component=synto",
-		"user_id=" + strconv.Quote(p.cfg.UserID),
-		"project_id=" + strconv.Quote(p.cfg.ProjectID),
-		"execution_id=" + strconv.Quote(p.cfg.ExecutionID),
-		"stream=" + strconv.Quote(string(stream)),
-		"severity=" + strconv.Quote(liveSeverity(stream)),
-		"sequence=" + strconv.FormatUint(p.nextSequence, 10),
-		"frame_id=" + strconv.FormatUint(frame, 10),
-		"fragment_index=" + strconv.Itoa(fragmentIndex),
-		"fragment_final=" + strconv.FormatBool((fragmentIndex+1)*liveFrameBytes >= frameBytes),
-		"fragmented=" + strconv.FormatBool(fragmented),
-		"output_bytes=" + strconv.Itoa(len(data)),
-		"output_encoding=" + strconv.Quote(encoding),
-		"newline=" + strconv.FormatBool(bytes.HasSuffix(data, []byte{'\n'})),
-		"output=" + strconv.Quote(output),
-	}, " ") + "\n"
-	if _, err := io.WriteString(destination.writer, line); err != nil {
+func (p *livePipeline) flushChildLocked(stream pipelineStream) {
+	p.encodedLiveDataLocked(stream, nil, true)
+	if len(p.framePending[stream]) > 0 {
+		p.writePhysicalLineLocked(stream, p.framePending[stream])
+		p.framePending[stream] = nil
+	}
+}
+
+func (p *livePipeline) writeLiveLocked(stream pipelineStream, destination *liveDestination, data []byte) error {
+	n, err := destination.writer.Write(data)
+	if err != nil {
 		return fmt.Errorf("write live %s output: %w", stream, err)
 	}
+	if n != len(data) {
+		return fmt.Errorf("write live %s output: short write (%d/%d)", stream, n, len(data))
+	}
 	return nil
 }
 
-func liveSeverity(stream pipelineStream) string {
-	if stream == stderrStream {
-		return "WARNING"
+func (p *livePipeline) encodedLiveDataLocked(stream pipelineStream, data []byte, final bool) {
+	p.utf8Pending[stream] = append(p.utf8Pending[stream], data...)
+	input := p.utf8Pending[stream]
+	for len(input) > 0 {
+		if !utf8.FullRune(input) {
+			if !final {
+				break
+			}
+			p.appendEncodedTokenLocked(stream, fmt.Sprintf("%sx%02X", lwc237EscapeToken, input[0]))
+			input = input[1:]
+			continue
+		}
+		r, size := utf8.DecodeRune(input)
+		if r == utf8.RuneError && size == 1 {
+			p.appendEncodedTokenLocked(stream, fmt.Sprintf("%sx%02X", lwc237EscapeToken, input[0]))
+		} else if r == '␞' {
+			p.appendEncodedTokenLocked(stream, lwc237EscapeToken+lwc237EscapeToken)
+		} else {
+			p.appendEncodedTokenLocked(stream, string(input[:size]))
+		}
+		input = input[size:]
 	}
-	return "INFO"
+	if len(input) == 0 {
+		p.utf8Pending[stream] = nil
+	} else {
+		p.utf8Pending[stream] = append(p.utf8Pending[stream][:0], input...)
+	}
 }
 
-func liveOutputMessage(data []byte) (string, string) {
-	if utf8.Valid(data) {
-		return string(data), "utf-8"
+func (p *livePipeline) appendEncodedTokenLocked(stream pipelineStream, token string) {
+	for len(token) > 0 {
+		if token[0] == '\n' {
+			p.framePending[stream] = append(p.framePending[stream], '\n')
+			p.frameBytes[stream]++
+			p.writePhysicalLineLocked(stream, p.framePending[stream])
+			p.frameBytes[stream] = 0
+			p.framePending[stream] = nil
+			token = token[1:]
+			continue
+		}
+		if p.frameBytes[stream] > 0 && len(token) > liveFrameBytes-len(lwc237ContinuationToken)-p.frameBytes[stream] {
+			p.framePending[stream] = append(p.framePending[stream], []byte(lwc237ContinuationToken)...)
+			p.writePhysicalLineLocked(stream, p.framePending[stream])
+			p.frameBytes[stream] = 0
+			p.framePending[stream] = nil
+		}
+		p.framePending[stream] = append(p.framePending[stream], token...)
+		p.frameBytes[stream] += len(token)
+		token = ""
 	}
-	return base64.StdEncoding.EncodeToString(data), "base64"
+}
+
+func (p *livePipeline) writePhysicalLineLocked(stream pipelineStream, data []byte) {
+	if destination := p.live[stream]; destination != nil && !destination.disabled {
+		if err := p.writeLiveLocked(stream, destination, data); err != nil {
+			p.disableLiveLocked(stream, destination, err)
+		}
+	}
 }
 
 func (p *livePipeline) disableDurableLocked(err error) {
@@ -272,9 +311,9 @@ func (p *livePipeline) Close() error {
 			if len(data) == 0 {
 				return nil
 			}
-			p.nextFrame++
-			return p.emitChildLocked(stream, p.nextFrame, data)
+			return p.emitChildLocked(stream, data)
 		})
+		p.flushChildLocked(stream)
 	}
 	if p.durableClose != nil && !p.durableDisabled {
 		if err := p.durableClose(); err != nil {
