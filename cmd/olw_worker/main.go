@@ -63,6 +63,16 @@ type execOLWFunc func(ctx context.Context, vault string, command []string, env [
 
 var execOLW execOLWFunc = execOLWCommand
 
+var pipelineLiveDestination = func(stream pipelineStream) io.Writer {
+	if stream == stderrStream {
+		return os.Stderr
+	}
+	return os.Stdout
+}
+
+var pipelineDurableDestination = func(file *os.File) io.Writer { return file }
+var pipelineControlDestination = func() io.Writer { return os.Stderr }
+
 var buildNonce = "local"
 
 const (
@@ -764,32 +774,38 @@ func allowlistedSyntoEnvironment(extra []string) []string {
 }
 
 func pipelineLogWriters(vault string, cfg workerConfig, commands [][]string, suppressOutput bool) (io.Writer, io.Writer, func() error, error) {
+	secrets := logSecrets(cfg)
+	live := map[pipelineStream]io.Writer{}
+	if !suppressOutput {
+		live[stdoutStream] = pipelineLiveDestination(stdoutStream)
+		live[stderrStream] = pipelineLiveDestination(stderrStream)
+	}
+	pipeline := newLivePipeline(nil, live, cfg, secrets)
 	if strings.TrimSpace(cfg.ExecutionID) == "" {
-		sink := newDiagnosticSink([]io.Writer{os.Stdout, os.Stderr}, logSecrets(cfg))
-		return sink, sink, sink.Close, nil
+		return pipeline.writer(stdoutStream), pipeline.writer(stderrStream), pipeline.Close, nil
 	}
 	path, err := pipelineLogPath(vault, cfg.ExecutionID)
 	if err != nil {
 		return nil, nil, nil, err
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return nil, nil, nil, fmt.Errorf("mkdir pipeline log dir: %w", err)
+		pipeline.recordDegraded("durable", fmt.Errorf("mkdir pipeline log dir: %w", err))
+		return pipeline.writer(stdoutStream), pipeline.writer(stderrStream), pipeline.Close, nil
 	}
 	file, err := os.Create(path)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("create pipeline log: %w", err)
+		pipeline.recordDegraded("durable", fmt.Errorf("create pipeline log: %w", err))
+		return pipeline.writer(stdoutStream), pipeline.writer(stderrStream), pipeline.Close, nil
 	}
-	destinations := []io.Writer{file}
-	if !suppressOutput {
-		destinations = append(destinations, os.Stdout, os.Stderr)
-	}
-	sink := newDiagnosticSink(destinations, logSecrets(cfg))
-	return sink, sink, func() error {
-		if err := sink.Close(); err != nil {
-			_ = file.Close()
-			return err
+	durable := newDiagnosticSink([]io.Writer{pipelineDurableDestination(file)}, secrets)
+	pipeline = newLivePipeline(durable, live, cfg, secrets)
+	return pipeline.writer(stdoutStream), pipeline.writer(stderrStream), func() error {
+		pipelineErr := pipeline.Close()
+		fileErr := file.Close()
+		if fileErr != nil {
+			pipeline.recordDegraded("durable", fileErr)
 		}
-		return file.Close()
+		return pipelineErr
 	}, nil
 }
 

@@ -1856,8 +1856,8 @@ func TestPipelineLogWritersTeesConsoleUnlessSuppressed(t *testing.T) {
 	if _, err := stdout.Write([]byte("hello-console-tee\n")); err != nil {
 		t.Fatal(err)
 	}
-	if stderr != stdout {
-		t.Fatal("stdout/stderr sinks should match")
+	if stderr == stdout {
+		t.Fatal("stdout/stderr writers should remain independent")
 	}
 	if err := closeLog(); err != nil {
 		t.Fatal(err)
