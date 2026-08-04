@@ -156,6 +156,119 @@ func TestWorkerDevWorkflowBindsManualDispatchToExactCanonicalDevelopSHA(t *testi
 	}
 }
 
+func TestWorkerDevWorkflowUsesReadOnlyIAMPreflight(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/deploy-worker.yml")
+	preflight := workflowSection(t, contents, "      - name: Verify existing dev worker IAM prerequisites", "      - name: Configure Artifact Registry Docker auth")
+	for _, want := range []string{
+		"gcloud run jobs get-iam-policy olw-pipeline-dev",
+		"--project llm-wiki-cloud",
+		"--region asia-east1",
+		"--format=json",
+		"roles/run.viewer",
+		"serviceAccount:lwc-pipeline-dev@llm-wiki-cloud.iam.gserviceaccount.com",
+	} {
+		if !strings.Contains(preflight, want) {
+			t.Errorf("worker IAM preflight is missing %q", want)
+		}
+	}
+	if !hasWorkerIAMPolicyValidatorPipeline(preflight) {
+		t.Fatal("worker IAM preflight must pipe $IAM_POLICY to the policy validator and fail closed")
+	}
+	mutatedPreflight := strings.Replace(preflight,
+		`if ! printf '%s\n' "$IAM_POLICY" | python3 scripts/validate_cloud_run_job_iam_policy.py; then`,
+		"if ! true; then", 1)
+	if hasWorkerIAMPolicyValidatorPipeline(mutatedPreflight) {
+		t.Fatal("worker IAM preflight assertion accepts a no-op replacement for the validator pipeline")
+	}
+	for _, forbidden := range []string{
+		"add-iam-policy-binding",
+		"remove-iam-policy-binding",
+		"set-iam-policy",
+	} {
+		if strings.Contains(contents, forbidden) {
+			t.Errorf("worker deploy workflow must not mutate IAM with %q", forbidden)
+		}
+	}
+	for _, mutation := range []string{
+		"gcloud projects add-iam-policy-binding --member serviceAccount:attacker@example.com",
+		"gcloud run jobs remove-iam-policy-binding --member serviceAccount:attacker@example.com",
+		"gcloud projects \\\n		  set-iam-policy policy.json",
+	} {
+		if !containsForbiddenWorkerIAMMutator(mutation) {
+			t.Fatalf("worker IAM mutation assertion accepts %q", mutation)
+		}
+	}
+	authAt := strings.Index(contents, "      - name: Authenticate to Google Cloud")
+	sdkAt := strings.Index(contents, "      - name: Set up Cloud SDK")
+	preflightAt := strings.Index(contents, "      - name: Verify existing dev worker IAM prerequisites")
+	dockerAt := strings.Index(contents, "      - name: Configure Artifact Registry Docker auth")
+	updateAt := strings.Index(contents, "      - name: Update dev worker without GCSFuse")
+	if authAt < 0 || sdkAt < 0 || preflightAt < 0 || dockerAt < 0 || updateAt < 0 || !(authAt < sdkAt && sdkAt < preflightAt && preflightAt < dockerAt && dockerAt < updateAt) {
+		t.Fatalf("worker deployment order must be auth < SDK < IAM preflight < docker auth < update: auth=%d sdk=%d preflight=%d docker=%d update=%d", authAt, sdkAt, preflightAt, dockerAt, updateAt)
+	}
+}
+
+func hasWorkerIAMPolicyValidatorPipeline(preflight string) bool {
+	const pipeline = `if ! printf '%s\n' "$IAM_POLICY" | python3 scripts/validate_cloud_run_job_iam_policy.py; then`
+	return strings.Contains(preflight, pipeline) &&
+		regexp.MustCompile(`(?s)`+regexp.QuoteMeta(pipeline)+`.*?exit 1\s+fi`).MatchString(preflight)
+}
+
+func containsForbiddenWorkerIAMMutator(contents string) bool {
+	for _, name := range []string{
+		"add-iam-policy-binding",
+		"remove-iam-policy-binding",
+		"set-iam-policy",
+	} {
+		if strings.Contains(contents, name) {
+			return true
+		}
+	}
+	return false
+}
+
+func TestCloudRunJobIAMPolicyValidator(t *testing.T) {
+	testCases := []struct {
+		name    string
+		policy  string
+		wantErr bool
+	}{
+		{
+			name:    "required member only in different role",
+			policy:  `{"bindings":[{"role":"roles/run.viewer","members":["serviceAccount:other@llm-wiki-cloud.iam.gserviceaccount.com"]},{"role":"roles/run.invoker","members":["serviceAccount:lwc-pipeline-dev@llm-wiki-cloud.iam.gserviceaccount.com"]}]}`,
+			wantErr: true,
+		},
+		{
+			name:   "valid",
+			policy: `{"bindings":[{"role":"roles/run.viewer","members":["serviceAccount:lwc-pipeline-dev@llm-wiki-cloud.iam.gserviceaccount.com"]}]}`,
+		},
+		{name: "malformed JSON", policy: `{`, wantErr: true},
+		{name: "missing bindings", policy: `{}`, wantErr: true},
+		{name: "bindings wrong shape", policy: `{"bindings":{}}`, wantErr: true},
+		{name: "binding wrong shape", policy: `{"bindings":["bad"]}`, wantErr: true},
+		{name: "members wrong shape", policy: `{"bindings":[{"role":"roles/run.viewer","members":"bad"}]}`, wantErr: true},
+		{name: "missing binding", policy: `{"bindings":[{"role":"roles/run.invoker","members":["serviceAccount:lwc-pipeline-dev@llm-wiki-cloud.iam.gserviceaccount.com"]}]}`, wantErr: true},
+		{name: "wrong role", policy: `{"bindings":[{"role":"roles/run.admin","members":["serviceAccount:lwc-pipeline-dev@llm-wiki-cloud.iam.gserviceaccount.com"]}]}`, wantErr: true},
+		{name: "wrong member", policy: `{"bindings":[{"role":"roles/run.viewer","members":["serviceAccount:other@llm-wiki-cloud.iam.gserviceaccount.com"]}]}`, wantErr: true},
+		{name: "duplicate role binding", policy: `{"bindings":[{"role":"roles/run.viewer","members":[]},{"role":"roles/run.viewer","members":["serviceAccount:lwc-pipeline-dev@llm-wiki-cloud.iam.gserviceaccount.com"]}]}`, wantErr: true},
+		{name: "duplicate required member", policy: `{"bindings":[{"role":"roles/run.viewer","members":["serviceAccount:lwc-pipeline-dev@llm-wiki-cloud.iam.gserviceaccount.com","serviceAccount:lwc-pipeline-dev@llm-wiki-cloud.iam.gserviceaccount.com"]}]}`, wantErr: true},
+		{name: "required member in another binding", policy: `{"bindings":[{"role":"roles/run.viewer","members":["serviceAccount:lwc-pipeline-dev@llm-wiki-cloud.iam.gserviceaccount.com"]},{"role":"roles/run.invoker","members":["serviceAccount:lwc-pipeline-dev@llm-wiki-cloud.iam.gserviceaccount.com"]}]}`, wantErr: true},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := exec.Command("python3", "scripts/validate_cloud_run_job_iam_policy.py")
+			cmd.Stdin = strings.NewReader(tc.policy)
+			output, err := cmd.CombinedOutput()
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("validator error = %v, wantErr=%t; output=%s", err, tc.wantErr, output)
+			}
+			if strings.Contains(string(output), "lwc-pipeline-dev@llm-wiki-cloud.iam.gserviceaccount.com") {
+				t.Fatal("validator must not print policy contents")
+			}
+		})
+	}
+}
+
 func TestWorkerDevWorkflowYAMLAndRunBlocksAreExecutable(t *testing.T) {
 	contents := readWorkflow(t, ".github/workflows/deploy-worker.yml")
 	var document any
