@@ -10,12 +10,14 @@ import (
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"cloud.google.com/go/storage"
 	"github.com/gin-gonic/gin"
@@ -23,7 +25,9 @@ import (
 	conceptcache "github.com/rayer/llm-wiki-bff/internal/cache"
 	"github.com/rayer/llm-wiki-bff/internal/firestore"
 	"github.com/rayer/llm-wiki-bff/internal/gcs"
+	"github.com/rayer/llm-wiki-bff/internal/handler"
 	"github.com/rayer/llm-wiki-bff/internal/localfs"
+	"github.com/rayer/llm-wiki-bff/internal/pipelinediagnostic"
 	"github.com/rayer/llm-wiki-bff/internal/pipelinequota"
 	"github.com/rayer/llm-wiki-bff/internal/search"
 	store "github.com/rayer/llm-wiki-bff/internal/storage"
@@ -273,7 +277,7 @@ func TestPipelineRequestsUseConfiguredJobTarget(t *testing.T) {
 	h.metadataTokenURL = "http://metadata.test/token"
 	h.SetPipelineJobURL("https://run.test/v2/projects/dev/locations/asia-east1/jobs/olw-pipeline-dev:run")
 
-	if _, err := h.invokePipelineJob(context.Background(), "user", "project"); err != nil {
+	if _, err := h.invokePipelineJob(context.Background(), "user", "project", false); err != nil {
 		t.Fatalf("invokePipelineJob() error = %v", err)
 	}
 	if _, err := h.pipelineExecutionStatus(context.Background(), ""); err != nil {
@@ -539,12 +543,16 @@ func TestCachedContextsIncludeConceptSources(t *testing.T) {
 		raw:    "---\ntitle: Alpha Concept\nsources: [Source One, Source Two]\n---\nAlpha body.",
 	}
 	conceptCache := conceptcache.New()
+	authority, err := search.NewCitationAuthority()
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	contexts := cachedContexts(conceptCache, reader, []search.Result{{
+	contexts := cachedContexts(context.Background(), conceptCache, reader, []search.Result{{
 		Slug:  "alpha",
 		Title: "Alpha Concept",
 		Type:  "concept",
-	}})
+	}}, authority)
 
 	if len(contexts) != 1 {
 		t.Fatalf("len(contexts) = %d, want 1", len(contexts))
@@ -721,6 +729,7 @@ func TestPipelineRunExecutesCloudRunJob(t *testing.T) {
 						map[string]any{"name": "USER_ID", "value": "request-user"},
 						map[string]any{"name": "PROJECT_ID", "value": "demo"},
 						map[string]any{"name": "TASK_TYPE", "value": "pipeline"},
+						map[string]any{"name": "PIPELINE_STAGE", "value": "full"},
 					},
 				},
 			},
@@ -796,6 +805,9 @@ func TestPipelineRunDefaultsCommandAndUser(t *testing.T) {
 	if override.Env[0].Value != "request-user" || override.Env[1].Value != "demo" || override.Env[2].Value != "pipeline" {
 		t.Fatalf("env = %#v", override.Env)
 	}
+	if len(override.Env) < 4 || override.Env[3].Name != "PIPELINE_STAGE" || override.Env[3].Value != "full" {
+		t.Fatalf("PIPELINE_STAGE env = %#v, want full", override.Env)
+	}
 }
 
 func TestDefaultWorkerCommandsRunsPipelineWithoutInit(t *testing.T) {
@@ -870,12 +882,18 @@ func TestAdminPipelineTriggerInvokesWorkerWithoutImmediateRebuild(t *testing.T) 
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusOK, recorder.Body.String())
 	}
-	var body map[string]string
+	var body map[string]any
 	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
 	if body["status"] != "ok" || body["execution_id"] != "olw-pipeline-admin" {
 		t.Fatalf("body = %#v", body)
+	}
+	if body["clean_rebuild"] != false {
+		t.Fatalf("default clean_rebuild = %#v, want false", body["clean_rebuild"])
+	}
+	if body["stage"] != "full" {
+		t.Fatalf("default stage = %#v, want full", body["stage"])
 	}
 	override := runRequest.Overrides.ContainerOverrides[0]
 	if len(override.Args) != 2 || override.Args[0] != "run" || override.Args[1] != defaultWorkerCommands {
@@ -883,6 +901,182 @@ func TestAdminPipelineTriggerInvokesWorkerWithoutImmediateRebuild(t *testing.T) 
 	}
 	if override.Env[0].Value != "request-user" || override.Env[1].Value != "demo" || override.Env[2].Value != "pipeline" {
 		t.Fatalf("env = %#v", override.Env)
+	}
+	foundStage := false
+	for _, env := range override.Env {
+		if env.Name == "CLEAN_REBUILD" {
+			t.Fatalf("default admin trigger must not set CLEAN_REBUILD: %#v", override.Env)
+		}
+		if env.Name == "PIPELINE_STAGE" {
+			foundStage = true
+			if env.Value != "full" {
+				t.Fatalf("PIPELINE_STAGE = %q, want full", env.Value)
+			}
+		}
+	}
+	if !foundStage {
+		t.Fatalf("missing PIPELINE_STAGE env: %#v", override.Env)
+	}
+}
+
+func TestAdminPipelineTriggerSuggestedQueriesStage(t *testing.T) {
+	var runRequest struct {
+		Overrides struct {
+			ContainerOverrides []struct {
+				Args []string `json:"args"`
+				Env  []struct {
+					Name  string `json:"name"`
+					Value string `json:"value"`
+				} `json:"env"`
+			} `json:"containerOverrides"`
+		} `json:"overrides"`
+	}
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/token":
+			return testHTTPResponse(http.StatusOK, `{"access_token":"test-token"}`), nil
+		case "/run":
+			if err := json.NewDecoder(r.Body).Decode(&runRequest); err != nil {
+				t.Errorf("decode run request: %v", err)
+			}
+			return testHTTPResponse(http.StatusOK, `{
+				"metadata": {
+					"execution": "projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline/executions/olw-pipeline-suggest"
+				}
+			}`), nil
+		default:
+			return testHTTPResponse(http.StatusOK, `{"executions":[]}`), nil
+		}
+	})}
+
+	h := &Handler{
+		index:            search.NewIndex(),
+		httpClient:       client,
+		metadataTokenURL: "http://metadata.test/token",
+		cloudRunJobURL:   "https://run.test/run",
+		projectExists:    func(context.Context, string) error { return nil },
+	}
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/api/v1/admin/projects/request-user_demo/pipeline", strings.NewReader(`{"stage":"suggested-queries"}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Params = gin.Params{{Key: "id", Value: "request-user_demo"}}
+
+	h.AdminPipelineTrigger(c)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if body["stage"] != "suggested-queries" || body["execution_id"] != "olw-pipeline-suggest" {
+		t.Fatalf("body = %#v", body)
+	}
+	override := runRequest.Overrides.ContainerOverrides[0]
+	if len(override.Args) != 1 || override.Args[0] != "suggested-queries" {
+		t.Fatalf("args = %#v, want [suggested-queries]", override.Args)
+	}
+	foundStage := false
+	for _, env := range override.Env {
+		if env.Name == "PIPELINE_STAGE" {
+			foundStage = true
+			if env.Value != "suggested-queries" {
+				t.Fatalf("PIPELINE_STAGE = %q", env.Value)
+			}
+		}
+		if env.Name == "CLEAN_REBUILD" {
+			t.Fatalf("suggested-queries must not set CLEAN_REBUILD")
+		}
+	}
+	if !foundStage {
+		t.Fatal("missing PIPELINE_STAGE")
+	}
+}
+
+func TestAdminPipelineTriggerRejectsCleanRebuildWithSuggestedQueries(t *testing.T) {
+	h := &Handler{
+		index:            search.NewIndex(),
+		httpClient:       &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) { return testHTTPResponse(http.StatusOK, `{}`), nil })},
+		metadataTokenURL: "http://metadata.test/token",
+		cloudRunJobURL:   "https://run.test/run",
+		projectExists:    func(context.Context, string) error { return nil },
+	}
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/api/v1/admin/projects/request-user_demo/pipeline", strings.NewReader(`{"stage":"suggested-queries","clean_rebuild":true}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Params = gin.Params{{Key: "id", Value: "request-user_demo"}}
+
+	h.AdminPipelineTrigger(c)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body = %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestAdminPipelineTriggerCleanRebuildSetsEnv(t *testing.T) {
+	var runRequest struct {
+		Overrides struct {
+			ContainerOverrides []struct {
+				Env []struct {
+					Name  string `json:"name"`
+					Value string `json:"value"`
+				} `json:"env"`
+			} `json:"containerOverrides"`
+		} `json:"overrides"`
+	}
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/token":
+			return testHTTPResponse(http.StatusOK, `{"access_token":"test-token"}`), nil
+		case "/run":
+			if err := json.NewDecoder(r.Body).Decode(&runRequest); err != nil {
+				t.Errorf("decode run request: %v", err)
+			}
+			return testHTTPResponse(http.StatusOK, `{
+				"metadata": {
+					"execution": "projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline/executions/olw-pipeline-clean"
+				}
+			}`), nil
+		default:
+			return testHTTPResponse(http.StatusNotFound, `not found`), nil
+		}
+	})}
+
+	h := &Handler{
+		index:            search.NewIndex(),
+		httpClient:       client,
+		metadataTokenURL: "http://metadata.test/token",
+		cloudRunJobURL:   "https://run.test/run",
+		projectExists:    func(context.Context, string) error { return nil },
+	}
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/api/v1/admin/projects/request-user_demo/pipeline", strings.NewReader(`{"clean_rebuild":true}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Params = gin.Params{{Key: "id", Value: "request-user_demo"}}
+
+	h.AdminPipelineTrigger(c)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if body["clean_rebuild"] != true {
+		t.Fatalf("body = %#v, want clean_rebuild true", body)
+	}
+	found := false
+	for _, env := range runRequest.Overrides.ContainerOverrides[0].Env {
+		if env.Name == "CLEAN_REBUILD" && env.Value == "true" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("env = %#v, want CLEAN_REBUILD=true", runRequest.Overrides.ContainerOverrides[0].Env)
 	}
 }
 
@@ -1211,7 +1405,7 @@ func TestPipelineStatusIncludesSuggestedQueries(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(projectRoot, "cache"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	queriesJSON := `{"queries":["Beta","Alpha"],"updated_at":"2026-07-10T00:00:00Z"}`
+	queriesJSON := validSuggestedQueriesJSON()
 	if err := os.WriteFile(filepath.Join(projectRoot, "cache", "suggested_queries.json"), []byte(queriesJSON), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -1244,8 +1438,8 @@ func TestPipelineStatusIncludesSuggestedQueries(t *testing.T) {
 	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if len(body.SuggestedQueries) != 2 || body.SuggestedQueries[0] != "Beta" {
-		t.Fatalf("suggested_queries = %#v, want [Beta Alpha]", body.SuggestedQueries)
+	if len(body.SuggestedQueries) != 3 || body.SuggestedQueries[0] != "哪些概念值得一起比較？" {
+		t.Fatalf("suggested_queries = %#v, want three generated questions", body.SuggestedQueries)
 	}
 }
 
@@ -1974,7 +2168,7 @@ func TestPipelineLogReturnsOwnedExecutionLog(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(logPath), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(logPath, []byte("owned output\n"), 0o644); err != nil {
+	if err := os.WriteFile(logPath, []byte("pipeline completed\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	owned := pipelineOwnershipExecution("projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline/executions/owned-log", "request-user", "demo-project", "pipeline")
@@ -1997,8 +2191,151 @@ func TestPipelineLogReturnsOwnedExecutionLog(t *testing.T) {
 
 	h.PipelineLog(c)
 
-	if recorder.Code != http.StatusOK || recorder.Body.String() != "owned output\n" {
+	if recorder.Code != http.StatusOK || recorder.Body.String() != "pipeline completed\n" {
 		t.Fatalf("status = %d; body = %q", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestPipelineLogReturnsOwnedArbitraryOperationalOutput(t *testing.T) {
+	root := t.TempDir()
+	logPath := filepath.Join(root, "users", "request-user", "projects", "demo-project", "cache", "pipeline-owned-raw.log")
+	if err := os.MkdirAll(filepath.Dir(logPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	want := "source: notes/meeting.md\nwarning: /tmp/cache path\nprovider output: keep this line\n"
+	if err := os.WriteFile(logPath, []byte(want), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	owned := pipelineOwnershipExecution("projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline/executions/owned-raw", "request-user", "demo-project", "pipeline")
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == "/token" {
+			return testHTTPResponse(http.StatusOK, `{"access_token":"test-token"}`), nil
+		}
+		return testHTTPResponse(http.StatusOK, owned), nil
+	})}
+
+	h := New(localfs.New(root), nil, search.NewIndex(), conceptcache.New(), nil, nil)
+	h.httpClient = client
+	h.metadataTokenURL = "http://metadata.test/token"
+	h.cloudRunJobURL = "https://run.googleapis.com/v2/projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline:run"
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/api/v1/pipeline/log?execution_id=owned-raw", nil)
+	c.Set("userID", "request-user")
+	c.Set("projectID", "demo-project")
+
+	h.PipelineLog(c)
+
+	if recorder.Code != http.StatusOK || recorder.Body.String() != want {
+		t.Fatalf("status = %d; body = %q, want %q", recorder.Code, recorder.Body.String(), want)
+	}
+}
+
+func TestReadPipelineLogNormalizesInvalidUTF8(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "users", "u", "projects", "p", "cache")
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(path, "pipeline-run.log"), []byte("prefix \xff\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := readPipelineLog(context.Background(), localfs.New(root).Scope("u", "p"), "projects/p/locations/l/jobs/j/executions/run")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "prefix ?\n" || !utf8.Valid(got) {
+		t.Fatalf("normalized log = %q, want valid replacement", got)
+	}
+}
+
+func TestReadPipelineLogNormalizesInvalidUTF8WithoutExpandingBound(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "users", "u", "projects", "p", "cache")
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	data := make([]byte, pipelinediagnostic.MaxPipelineLogBytes)
+	for i := range data {
+		if i%2 == 0 {
+			data[i] = 0xff
+		} else {
+			data[i] = 'A'
+		}
+	}
+	if err := os.WriteFile(filepath.Join(path, "pipeline-run.log"), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := readPipelineLog(context.Background(), localfs.New(root).Scope("u", "p"), "projects/p/locations/l/jobs/j/executions/run")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) > pipelinediagnostic.MaxPipelineLogBytes || !utf8.Valid(got) {
+		t.Fatalf("normalized log len=%d valid=%v, want valid <= %d", len(got), utf8.Valid(got), pipelinediagnostic.MaxPipelineLogBytes)
+	}
+	if len(got) != len(data) || got[0] != '?' || got[1] != 'A' || got[len(got)-2] != '?' || got[len(got)-1] != 'A' {
+		t.Fatalf("normalized log boundary/content = %q...%q, len=%d", got[:2], got[len(got)-2:], len(got))
+	}
+}
+
+func TestReadPipelineLogRejectsOverLimitArtifact(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "users", "u", "projects", "p", "cache")
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	data := bytes.Repeat([]byte("x"), pipelinediagnostic.MaxPipelineLogBytes+1)
+	if err := os.WriteFile(filepath.Join(path, "pipeline-run.log"), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readPipelineLog(context.Background(), localfs.New(root).Scope("u", "p"), "projects/p/locations/l/jobs/j/executions/run"); err == nil {
+		t.Fatal("over-limit pipeline log was accepted")
+	}
+}
+
+func TestPipelineLogReturnsCompleteNearLimitWorkerArtifact(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "users", "request-user", "projects", "demo-project", "cache")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	begin := []byte("BEGIN\n")
+	middle := []byte("MIDDLE: Synto emitted the decisive diagnostic here\n")
+	end := []byte("END\n")
+	data := bytes.Repeat([]byte{'x'}, pipelinediagnostic.MaxPipelineLogBytes)
+	copy(data, begin)
+	copy(data[len(data)/2:], middle)
+	copy(data[len(data)-len(end):], end)
+	if err := os.WriteFile(filepath.Join(dir, "pipeline-owned-tail.log"), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	owned := pipelineOwnershipExecution("projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline/executions/owned-tail", "request-user", "demo-project", "pipeline")
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == "/token" {
+			return testHTTPResponse(http.StatusOK, `{"access_token":"test-token"}`), nil
+		}
+		return testHTTPResponse(http.StatusOK, owned), nil
+	})}
+	h := New(localfs.New(root), nil, search.NewIndex(), conceptcache.New(), nil, nil)
+	h.httpClient = client
+	h.metadataTokenURL = "http://metadata.test/token"
+	h.cloudRunJobURL = "https://run.googleapis.com/v2/projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline:run"
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/api/v1/pipeline/log?execution_id=owned-tail", nil)
+	c.Set("userID", "request-user")
+	c.Set("projectID", "demo-project")
+
+	h.PipelineLog(c)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d; body = %s", recorder.Code, recorder.Body.String())
+	}
+	if recorder.Body.String() != string(data) {
+		t.Fatalf("body did not preserve complete worker artifact: len=%d want=%d", recorder.Body.Len(), len(data))
+	}
+	if !strings.Contains(recorder.Body.String(), string(begin)) || !strings.Contains(recorder.Body.String(), string(middle)) || !strings.Contains(recorder.Body.String(), string(end)) {
+		t.Fatalf("body omitted BEGIN, MIDDLE, or END marker")
 	}
 }
 
@@ -2084,13 +2421,521 @@ func TestPipelineStatusReturnsSpecificExecution(t *testing.T) {
 	}
 }
 
+func TestPipelineStatusProjectsOwnedFailureDiagnostic(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "users", "request-user", "projects", "demo-project", "cache", "pipeline-owned-failure.failure.json")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(`{"version":1,"status":"failed","stage":"concept_reconciliation","error_class":"child_exit","detail_code":"entity_mapping_article_source_missing","child_command":"run","exit_code":23}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "users", "request-user", "projects", "demo-project", "cache", "pipeline-owned-failure.log"), []byte("child stderr: source missing\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	owned := strings.Replace(pipelineOwnershipExecution("projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline/executions/owned-failure", "request-user", "demo-project", "pipeline"), "EXECUTION_SUCCEEDED", "EXECUTION_FAILED", 1)
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == "/token" {
+			return testHTTPResponse(http.StatusOK, `{"access_token":"test-token"}`), nil
+		}
+		return testHTTPResponse(http.StatusOK, owned), nil
+	})}
+	h := New(localfs.New(root), nil, search.NewIndex(), conceptcache.New(), nil, nil)
+	h.httpClient = client
+	h.metadataTokenURL = "http://metadata.test/token"
+	h.cloudRunJobURL = "https://run.googleapis.com/v2/projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline:run"
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/api/v1/pipeline/status?execution_id=owned-failure", nil)
+	c.Set("userID", "request-user")
+	c.Set("projectID", "demo-project")
+
+	h.PipelineStatus(c)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var body struct {
+		LastExecution *struct {
+			LogState   string `json:"log_state"`
+			Diagnostic *struct {
+				Version    int    `json:"version"`
+				Status     string `json:"status"`
+				Stage      string `json:"stage"`
+				ErrorClass string `json:"error_class"`
+				DetailCode string `json:"detail_code"`
+				Child      string `json:"child_command"`
+				ExitCode   int    `json:"exit_code"`
+			} `json:"diagnostic"`
+		} `json:"last_execution"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if body.LastExecution == nil || body.LastExecution.LogState != "available" || body.LastExecution.Diagnostic == nil {
+		t.Fatalf("last_execution = %#v, want available diagnostic", body.LastExecution)
+	}
+	diagnostic := body.LastExecution.Diagnostic
+	if diagnostic.Version != 1 || diagnostic.Status != "failed" || diagnostic.Stage != "concept_reconciliation" || diagnostic.ErrorClass != "child_exit" || diagnostic.DetailCode != "entity_mapping_article_source_missing" || diagnostic.Child != "run" || diagnostic.ExitCode != 23 {
+		t.Fatalf("diagnostic = %#v", diagnostic)
+	}
+}
+
+func TestPipelineFailureDiagnosticAcceptsEveryWorkerProducedSchemaValue(t *testing.T) {
+	stages := []string{
+		"input_materialization", "synto_migration", "synto_config_normalization",
+		"synto_config_validation", "synto_run", "synto_index_export",
+		"source_reconciliation", "concept_reconciliation", "postprocess",
+		"generation_publish", "receipt_recording", "lease_cleanup", "unknown",
+	}
+	classes := []string{
+		"validation", "child_exit", "timeout", "cancelled", "io", "state_invalid",
+		"publish_conflict", "recording_failure", "unknown",
+	}
+	details := []string{
+		"generated_map_read_decode", "synto_index_truth", "entity_mapping",
+		"entity_mapping_index_truth", "entity_mapping_source_concept_identity",
+		"entity_mapping_article_identity", "entity_mapping_article_path",
+		"entity_mapping_article_source_ambiguity", "entity_mapping_article_source_missing",
+		"entity_mapping_article_source_disagreement", "entity_mapping_duplicate_article_id",
+		"entity_mapping_duplicate_article_path", "entity_mapping_duplicate_entity_id",
+		"entity_mapping_active_entity_unknown", "entity_mapping_concept_slug_case",
+		"entity_mapping_concept_id_path_disagreement", "entity_mapping_concept_missing_mapping",
+		"entity_mapping_concept_entity_collision", "entity_merge", "identity_reconciliation",
+		"lifecycle_planning", "concept_page_rewrite", "link_rewrite", "cache_rewrite",
+		"artifact_write", "artifact_remove",
+	}
+	children := []string{"migrate-olw", "run", "pack-export"}
+
+	tests := make([]struct {
+		name       string
+		stage      string
+		class      string
+		detailCode string
+		child      string
+	}, 0, len(stages)+len(classes)+len(details)+len(children))
+	for _, stage := range stages {
+		tests = append(tests, struct {
+			name       string
+			stage      string
+			class      string
+			detailCode string
+			child      string
+		}{"stage/" + stage, stage, "unknown", "", ""})
+	}
+	for _, class := range classes {
+		tests = append(tests, struct {
+			name       string
+			stage      string
+			class      string
+			detailCode string
+			child      string
+		}{"class/" + class, "unknown", class, "", ""})
+	}
+	for _, detail := range details {
+		tests = append(tests, struct {
+			name       string
+			stage      string
+			class      string
+			detailCode string
+			child      string
+		}{"detail/" + detail, "concept_reconciliation", "unknown", detail, ""})
+	}
+	for _, child := range children {
+		tests = append(tests, struct {
+			name       string
+			stage      string
+			class      string
+			detailCode string
+			child      string
+		}{"child/" + child, "synto_run", "child_exit", "", child})
+	}
+
+	root := t.TempDir()
+	project := localfs.New(root).WithScope("u", "p")
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			data, err := json.Marshal(handler.PipelineFailureDiagnostic{
+				Version: 1, Status: "failed", Stage: tc.stage, ErrorClass: tc.class,
+				DetailCode: tc.detailCode, Child: tc.child,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(root, "users", "u", "projects", "p", "cache", "pipeline-schema.failure.json")
+			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, data, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := readPipelineFailureDiagnostic(context.Background(), project, "projects/p/locations/l/jobs/j/executions/schema"); err != nil {
+				t.Fatalf("worker-produced value rejected: %s: %v", string(data), err)
+			}
+		})
+	}
+}
+
+func TestPipelineStatusDiagnosticStates(t *testing.T) {
+	tests := []struct {
+		name       string
+		statusBody string
+		diagnostic string
+		raw        string
+		wantState  string
+		wantReason string
+	}{
+		{name: "running pending", statusBody: pipelineRunningOwnershipExecution("projects/p/locations/l/jobs/j/executions/running", "u", "p"), wantState: "pending"},
+		{name: "success available", statusBody: pipelineOwnershipExecution("projects/p/locations/l/jobs/j/executions/success", "u", "p", "pipeline"), raw: "success output\n", wantState: "available"},
+		{name: "succeeded missing", statusBody: pipelineOwnershipExecution("projects/p/locations/l/jobs/j/executions/succeeded-missing", "u", "p", "pipeline"), wantState: "unavailable", wantReason: "log_unavailable"},
+		{name: "failed delayed", statusBody: strings.Replace(pipelineOwnershipExecution("projects/p/locations/l/jobs/j/executions/delayed", "u", "p", "pipeline"), "EXECUTION_SUCCEEDED", "EXECUTION_FAILED", 1), wantState: "unavailable", wantReason: "log_unavailable"},
+		{name: "cancelled missing", statusBody: strings.Replace(pipelineOwnershipExecution("projects/p/locations/l/jobs/j/executions/cancelled-missing", "u", "p", "pipeline"), "EXECUTION_SUCCEEDED", "EXECUTION_CANCELLED", 1), wantState: "unavailable", wantReason: "log_unavailable"},
+		{name: "failed malformed", statusBody: strings.Replace(pipelineOwnershipExecution("projects/p/locations/l/jobs/j/executions/malformed", "u", "p", "pipeline"), "EXECUTION_SUCCEEDED", "EXECUTION_FAILED", 1), diagnostic: `{"version":1,"status":"failed","stage":"unknown","error_class":"unknown","unknown":"nope"}`, raw: "raw survives malformed diagnostic\n", wantState: "available"},
+		{name: "failed oversized", statusBody: strings.Replace(pipelineOwnershipExecution("projects/p/locations/l/jobs/j/executions/oversized", "u", "p", "pipeline"), "EXECUTION_SUCCEEDED", "EXECUTION_FAILED", 1), diagnostic: strings.Repeat("x", maxPipelineDiagnosticBytes+1), raw: "raw survives oversized diagnostic\n", wantState: "available"},
+		{name: "succeeded oversized log", statusBody: pipelineOwnershipExecution("projects/p/locations/l/jobs/j/executions/oversized-log", "u", "p", "pipeline"), raw: strings.Repeat("x", pipelinediagnostic.MaxPipelineLogBytes+1), wantState: "unavailable", wantReason: "log_too_large"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := t.TempDir()
+			if tt.diagnostic != "" {
+				id := shortCloudRunExecutionName(executionNameFromJSON(t, tt.statusBody), true)
+				path := filepath.Join(root, "users", "u", "projects", "p", "cache", "pipeline-"+id+".failure.json")
+				if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, []byte(tt.diagnostic), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tt.raw != "" {
+				id := shortCloudRunExecutionName(executionNameFromJSON(t, tt.statusBody), true)
+				path := filepath.Join(root, "users", "u", "projects", "p", "cache", "pipeline-"+id+".log")
+				if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, []byte(tt.raw), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				if r.URL.Path == "/token" {
+					return testHTTPResponse(http.StatusOK, `{"access_token":"test-token"}`), nil
+				}
+				return testHTTPResponse(http.StatusOK, tt.statusBody), nil
+			})}
+			h := New(localfs.New(root), nil, search.NewIndex(), conceptcache.New(), nil, nil)
+			h.httpClient = client
+			h.metadataTokenURL = "http://metadata.test/token"
+			h.cloudRunJobURL = "https://run.googleapis.com/v2/projects/p/locations/l/jobs/j:run"
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodGet, "/api/v1/pipeline/status?execution_id="+url.QueryEscape(shortCloudRunExecutionName(executionNameFromJSON(t, tt.statusBody), true)), nil)
+			c.Set("userID", "u")
+			c.Set("projectID", "p")
+
+			h.PipelineStatus(c)
+
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("status = %d; body = %s", recorder.Code, recorder.Body.String())
+			}
+			var body struct {
+				LastExecution *struct {
+					LogState       string `json:"log_state"`
+					LogStateReason string `json:"log_state_reason"`
+				} `json:"last_execution"`
+			}
+			if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+				t.Fatal(err)
+			}
+			if body.LastExecution == nil || body.LastExecution.LogState != tt.wantState || body.LastExecution.LogStateReason != tt.wantReason {
+				t.Fatalf("last_execution = %#v, want state=%q reason=%q", body.LastExecution, tt.wantState, tt.wantReason)
+			}
+		})
+	}
+}
+
+func TestAttachPipelineDiagnosticTerminalUnavailableStoreIsFinite(t *testing.T) {
+	for _, status := range []string{"FAILED", "SUCCEEDED", "CANCELLED"} {
+		t.Run(status, func(t *testing.T) {
+			h := New(nil, nil, search.NewIndex(), conceptcache.New(), nil, nil)
+			response := &handler.PipelineExecutionResponse{Status: status}
+			h.attachPipelineDiagnostic(context.Background(), response, &pipelineExecutionOwner{userID: "u", projectID: "p"})
+			if response.LogState != pipelineLogStateUnavailable || response.LogStateReason != "storage_unavailable" {
+				t.Fatalf("response=%+v, want finite unavailable storage state", response)
+			}
+		})
+	}
+}
+
+type pipelineLogErrorRoot struct {
+	store.RootStore
+	err error
+}
+
+func (r pipelineLogErrorRoot) Scope(userID, projectID string) store.Store {
+	return pipelineLogErrorStore{Store: r.RootStore.Scope(userID, projectID), err: r.err}
+}
+
+type pipelineLogErrorStore struct {
+	store.Store
+	err error
+}
+
+func (s pipelineLogErrorStore) ReadFileLimited(context.Context, string, int64) ([]byte, error) {
+	return nil, s.err
+}
+
+type pipelineLogMetadataSpyRoot struct {
+	store.RootStore
+	statCalls int
+	readCalls int
+	statSize  int64
+	statErr   error
+}
+
+func (r *pipelineLogMetadataSpyRoot) Scope(userID, projectID string) store.Store {
+	return &pipelineLogMetadataSpyStore{Store: r.RootStore.Scope(userID, projectID), root: r}
+}
+
+type pipelineLogMetadataSpyStore struct {
+	store.Store
+	root *pipelineLogMetadataSpyRoot
+}
+
+func (s *pipelineLogMetadataSpyStore) StatFile(context.Context, string) (int64, error) {
+	s.root.statCalls++
+	return s.root.statSize, s.root.statErr
+}
+
+func (s *pipelineLogMetadataSpyStore) ReadFileLimited(context.Context, string, int64) ([]byte, error) {
+	s.root.readCalls++
+	return nil, errors.New("body read must not occur during status")
+}
+
+type pipelineStatusMetadataRoot struct {
+	store.RootStore
+	diagnostic      []byte
+	statSize        int64
+	rawReads        int
+	diagnosticReads int
+}
+
+func (r *pipelineStatusMetadataRoot) Scope(userID, projectID string) store.Store {
+	return &pipelineStatusMetadataStore{Store: r.RootStore.Scope(userID, projectID), root: r}
+}
+
+type pipelineStatusMetadataStore struct {
+	store.Store
+	root *pipelineStatusMetadataRoot
+}
+
+func (s *pipelineStatusMetadataStore) StatFile(context.Context, string) (int64, error) {
+	return s.root.statSize, nil
+}
+
+func (s *pipelineStatusMetadataStore) ReadFileLimited(_ context.Context, path string, _ int64) ([]byte, error) {
+	if strings.HasSuffix(path, ".log") {
+		s.root.rawReads++
+		return nil, errors.New("raw log body read must not occur during status")
+	}
+	if strings.HasSuffix(path, ".failure.json") {
+		s.root.diagnosticReads++
+		return append([]byte(nil), s.root.diagnostic...), nil
+	}
+	return nil, errors.New("unexpected bounded status read")
+}
+
+type pipelineFailureDiagnosticSpyRoot struct {
+	store.RootStore
+	data         []byte
+	genericReads int
+	limitedReads int
+	limit        int64
+}
+
+func (r *pipelineFailureDiagnosticSpyRoot) Scope(userID, projectID string) store.Store {
+	return &pipelineFailureDiagnosticSpyStore{Store: r.RootStore.Scope(userID, projectID), root: r}
+}
+
+type pipelineFailureDiagnosticSpyStore struct {
+	store.Store
+	root *pipelineFailureDiagnosticSpyRoot
+}
+
+func (s *pipelineFailureDiagnosticSpyStore) ReadFile(context.Context, string) ([]byte, error) {
+	s.root.genericReads++
+	return append([]byte(nil), s.root.data...), nil
+}
+
+func (s *pipelineFailureDiagnosticSpyStore) ReadFileLimited(_ context.Context, _ string, limit int64) ([]byte, error) {
+	s.root.limitedReads++
+	s.root.limit = limit
+	data := s.root.data
+	if int64(len(data)) > limit {
+		data = data[:limit]
+	}
+	return append([]byte(nil), data...), nil
+}
+
+func TestReadPipelineFailureDiagnosticUsesExactBoundedReader(t *testing.T) {
+	root := &pipelineFailureDiagnosticSpyRoot{
+		RootStore: localfs.New(t.TempDir()),
+		data:      []byte(`{"version":1,"status":"failed","stage":"synto_run","error_class":"child_exit","child_command":"run"}`),
+	}
+	if _, err := readPipelineFailureDiagnostic(context.Background(), root.Scope("u", "p"), "projects/p/locations/l/jobs/j/executions/run"); err != nil {
+		t.Fatal(err)
+	}
+	if root.genericReads != 0 || root.limitedReads != 1 || root.limit != maxPipelineDiagnosticBytes+1 {
+		t.Fatalf("generic reads=%d limited reads=%d limit=%d, want 0/1/%d", root.genericReads, root.limitedReads, root.limit, maxPipelineDiagnosticBytes+1)
+	}
+}
+
+func TestReadPipelineFailureDiagnosticRejectsOversizedObjectAfterBoundedRead(t *testing.T) {
+	root := &pipelineFailureDiagnosticSpyRoot{
+		RootStore: localfs.New(t.TempDir()),
+		data:      append([]byte(`{"version":1,"status":"failed","stage":"synto_run","error_class":"child_exit","child_command":"run"}`), bytes.Repeat([]byte{'x'}, maxPipelineDiagnosticBytes)...),
+	}
+	if _, err := readPipelineFailureDiagnostic(context.Background(), root.Scope("u", "p"), "projects/p/locations/l/jobs/j/executions/run"); err == nil {
+		t.Fatal("oversized diagnostic was accepted")
+	}
+	if root.genericReads != 0 || root.limitedReads != 1 || root.limit != maxPipelineDiagnosticBytes+1 || len(root.data) <= int(root.limit) {
+		t.Fatalf("generic reads=%d limited reads=%d limit=%d object bytes=%d, want bounded 4097-byte request", root.genericReads, root.limitedReads, root.limit, len(root.data))
+	}
+}
+
+type pipelineFailureDiagnosticGenericOnlyRoot struct {
+	store.RootStore
+}
+
+func (r pipelineFailureDiagnosticGenericOnlyRoot) Scope(userID, projectID string) store.Store {
+	return pipelineFailureDiagnosticGenericOnlyStore{Store: r.RootStore.Scope(userID, projectID)}
+}
+
+type pipelineFailureDiagnosticGenericOnlyStore struct {
+	store.Store
+}
+
+func (pipelineFailureDiagnosticGenericOnlyStore) ReadFile(context.Context, string) ([]byte, error) {
+	return []byte(`{"version":1,"status":"failed","stage":"synto_run","error_class":"child_exit","child_command":"run"}`), nil
+}
+
+func TestReadPipelineFailureDiagnosticFailsClosedWithoutLimitedReader(t *testing.T) {
+	root := pipelineFailureDiagnosticGenericOnlyRoot{RootStore: localfs.New(t.TempDir())}
+	if _, err := readPipelineFailureDiagnostic(context.Background(), root.Scope("u", "p"), "projects/p/locations/l/jobs/j/executions/run"); err == nil {
+		t.Fatal("diagnostic reader fell back to generic ReadFile")
+	}
+}
+
+func TestAttachPipelineDiagnosticUsesMetadataWithoutReadingLog(t *testing.T) {
+	root := &pipelineLogMetadataSpyRoot{RootStore: localfs.New(t.TempDir()), statSize: 3}
+	h := New(root, nil, search.NewIndex(), conceptcache.New(), nil, nil)
+	response := &handler.PipelineExecutionResponse{
+		Name:   "projects/p/locations/l/jobs/j/executions/metadata-only",
+		Status: "SUCCEEDED",
+	}
+	h.attachPipelineDiagnostic(context.Background(), response, &pipelineExecutionOwner{userID: "u", projectID: "p"})
+	if response.LogState != pipelineLogStateAvailable || response.LogStateReason != "" {
+		t.Fatalf("response=%+v, want available", response)
+	}
+	if root.statCalls != 1 || root.readCalls != 0 {
+		t.Fatalf("stat calls=%d, body reads=%d, want one metadata probe and no body reads", root.statCalls, root.readCalls)
+	}
+}
+
+func TestAttachPipelineDiagnosticTerminalMalformedStoreIsFinite(t *testing.T) {
+	h := New(pipelineLogErrorRoot{RootStore: localfs.New(t.TempDir()), err: errors.New("malformed provider response")}, nil, search.NewIndex(), conceptcache.New(), nil, nil)
+	for _, status := range []string{"FAILED", "SUCCEEDED", "CANCELLED"} {
+		t.Run(status, func(t *testing.T) {
+			response := &handler.PipelineExecutionResponse{Status: status}
+			h.attachPipelineDiagnostic(context.Background(), response, &pipelineExecutionOwner{userID: "u", projectID: "p"})
+			if response.LogState != pipelineLogStateUnavailable || response.LogStateReason != "storage_unavailable" {
+				t.Fatalf("response=%+v, want finite unavailable log state", response)
+			}
+		})
+	}
+}
+
+func TestPipelineStatusDoesNotUseDiagnosticFromAnotherProject(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "users", "u", "projects", "other", "cache", "pipeline-isolated.failure.json")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(`{"version":1,"status":"failed","stage":"unknown","error_class":"unknown"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	failed := strings.Replace(pipelineOwnershipExecution("projects/p/locations/l/jobs/j/executions/isolated", "u", "p", "pipeline"), "EXECUTION_SUCCEEDED", "EXECUTION_FAILED", 1)
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == "/token" {
+			return testHTTPResponse(http.StatusOK, `{"access_token":"test-token"}`), nil
+		}
+		return testHTTPResponse(http.StatusOK, failed), nil
+	})}
+	h := New(localfs.New(root), nil, search.NewIndex(), conceptcache.New(), nil, nil)
+	h.httpClient = client
+	h.metadataTokenURL = "http://metadata.test/token"
+	h.cloudRunJobURL = "https://run.googleapis.com/v2/projects/p/locations/l/jobs/j:run"
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/api/v1/pipeline/status?execution_id=isolated", nil)
+	c.Set("userID", "u")
+	c.Set("projectID", "p")
+	h.PipelineStatus(c)
+	if recorder.Code != http.StatusOK || strings.Contains(recorder.Body.String(), `"stage":"unknown"`) {
+		t.Fatalf("cross-project diagnostic leaked: status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestPipelineLogReturnsRawFailedOutputIndependentlyOfDiagnostic(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "users", "u", "projects", "p", "cache")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "pipeline-render.failure.json"), []byte(`{"version":1,"status":"failed","stage":"concept_reconciliation","error_class":"child_exit","detail_code":"entity_mapping_article_source_missing","child_command":"run","exit_code":23}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "pipeline-render.log"), []byte("pipeline failed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	failed := strings.Replace(pipelineOwnershipExecution("projects/p/locations/l/jobs/j/executions/render", "u", "p", "pipeline"), "EXECUTION_SUCCEEDED", "EXECUTION_FAILED", 1)
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == "/token" {
+			return testHTTPResponse(http.StatusOK, `{"access_token":"test-token"}`), nil
+		}
+		return testHTTPResponse(http.StatusOK, failed), nil
+	})}
+	h := New(localfs.New(root), nil, search.NewIndex(), conceptcache.New(), nil, nil)
+	h.httpClient = client
+	h.metadataTokenURL = "http://metadata.test/token"
+	h.cloudRunJobURL = "https://run.googleapis.com/v2/projects/p/locations/l/jobs/j:run"
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/api/v1/pipeline/log?execution_id=render", nil)
+	c.Set("userID", "u")
+	c.Set("projectID", "p")
+	h.PipelineLog(c)
+	if recorder.Code != http.StatusOK || recorder.Body.String() != "pipeline failed\n" {
+		t.Fatalf("raw failed log: status=%d body=%q", recorder.Code, recorder.Body.String())
+	}
+}
+
+func executionNameFromJSON(t *testing.T, data string) string {
+	t.Helper()
+	var execution cloudRunExecution
+	if err := json.Unmarshal([]byte(data), &execution); err != nil {
+		t.Fatal(err)
+	}
+	return execution.Name
+}
+
 func TestPipelineLogReturnsProjectScopedLog(t *testing.T) {
 	root := t.TempDir()
 	logPath := filepath.Join(root, "users", "request-user", "projects", "demo-project", "cache", "pipeline-olw-pipeline-abc123.log")
 	if err := os.MkdirAll(filepath.Dir(logPath), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(logPath, []byte("pipeline output\nstderr output\n"), 0o644); err != nil {
+	if err := os.WriteFile(logPath, []byte("pipeline completed\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -2119,7 +2964,7 @@ func TestPipelineLogReturnsProjectScopedLog(t *testing.T) {
 	if contentType := recorder.Header().Get("Content-Type"); !strings.HasPrefix(contentType, "text/plain") {
 		t.Fatalf("Content-Type = %q, want text/plain", contentType)
 	}
-	if body := recorder.Body.String(); body != "pipeline output\nstderr output\n" {
+	if body := recorder.Body.String(); body != "pipeline completed\n" {
 		t.Fatalf("body = %q", body)
 	}
 }
@@ -2179,14 +3024,9 @@ func TestStatusIncludesLatestPipelineExecutionWhenAvailable(t *testing.T) {
 		case "/token":
 			return testHTTPResponse(http.StatusOK, `{"access_token":"test-token"}`), nil
 		case "/v2/projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline/executions":
-			return testHTTPResponse(http.StatusOK, `{
-				"executions": [{
-					"name": "projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline/executions/exec-1",
-					"startTime": "2026-06-29T01:02:03Z",
-					"completionTime": "2026-06-29T01:02:13Z",
-					"completionStatus": "EXECUTION_SUCCEEDED"
-				}]
-			}`), nil
+			return testHTTPResponse(http.StatusOK, `{"executions":[`+pipelineOwnershipExecution(
+				"projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline/executions/exec-1",
+				"request-user", "demo-project", "pipeline")+"]}"), nil
 		default:
 			return testHTTPResponse(http.StatusNotFound, `not found`), nil
 		}
@@ -2222,6 +3062,505 @@ func TestStatusIncludesLatestPipelineExecutionWhenAvailable(t *testing.T) {
 	if body.LastExecution.Status != "SUCCEEDED" || body.LastExecution.LogURL != "/api/v1/pipeline/log?execution_id=exec-1" {
 		t.Fatalf("last_execution = %#v", body.LastExecution)
 	}
+}
+
+func TestStatusRequiresAuthenticatedOwnerContext(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		userID    string
+		projectID string
+		wantCode  int
+		wantBody  string
+	}{
+		{name: "missing user", projectID: "demo-project", wantCode: http.StatusUnauthorized, wantBody: `{"error":"user not authenticated"}`},
+		{name: "missing project", userID: "request-user", wantCode: http.StatusBadRequest, wantBody: `{"error":"project is required"}`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			h := New(localfs.New(t.TempDir()), nil, search.NewIndex(), conceptcache.New(), nil, nil)
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodGet, "/api/v1/status", nil)
+			if tt.userID != "" {
+				c.Set("userID", tt.userID)
+			}
+			if tt.projectID != "" {
+				c.Set("projectID", tt.projectID)
+			}
+
+			h.Status(c)
+
+			if recorder.Code != tt.wantCode || recorder.Body.String() != tt.wantBody {
+				t.Fatalf("status=%d body=%s, want status=%d body=%s", recorder.Code, recorder.Body.String(), tt.wantCode, tt.wantBody)
+			}
+		})
+	}
+}
+
+func TestStatusProjectsOnlyOwnedExecutionAndMetadata(t *testing.T) {
+	root := t.TempDir()
+	unrelated := pipelineOwnershipExecution(
+		"projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline/executions/unrelated",
+		"other-user", "other-project", "pipeline")
+	owned := pipelineOwnershipExecution(
+		"projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline/executions/owned",
+		"request-user", "demo-project", "pipeline")
+	h := newStatusHandlerForTest(localfs.New(root), `{"executions":[`+unrelated+`,`+owned+`]}`)
+
+	recorder := invokeStatusForTest(t, h, "request-user", "demo-project")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var body struct {
+		LastExecution *struct {
+			Name           string `json:"name"`
+			LogURL         string `json:"log_url"`
+			LogState       string `json:"log_state"`
+			LogStateReason string `json:"log_state_reason"`
+		} `json:"last_execution"`
+		SuggestedQueries []string `json:"suggested_queries"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if body.LastExecution == nil {
+		t.Fatal("last_execution = nil, want owned execution")
+	}
+	if body.LastExecution.Name != "projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline/executions/owned" {
+		t.Fatalf("last_execution.name = %q, want owned execution", body.LastExecution.Name)
+	}
+	if body.LastExecution.LogURL != "/api/v1/pipeline/log?execution_id=owned" {
+		t.Fatalf("last_execution.log_url = %q, want authenticated owned execution URL", body.LastExecution.LogURL)
+	}
+	if body.LastExecution.LogState != pipelineLogStateUnavailable || body.LastExecution.LogStateReason != "log_unavailable" {
+		t.Fatalf("last_execution log metadata = %#v, want unavailable/log_unavailable", body.LastExecution)
+	}
+	if body.SuggestedQueries == nil {
+		t.Fatal("suggested_queries = nil, want explicit empty list")
+	}
+}
+
+func TestStatusProjectsTerminalMissingLogWithoutReadingBody(t *testing.T) {
+	root := &pipelineLogMetadataSpyRoot{
+		RootStore: localfs.New(t.TempDir()),
+		statErr:   store.ErrObjectNotExist,
+	}
+	owned := pipelineOwnershipExecution(
+		"projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline/executions/missing-log",
+		"request-user", "demo-project", "pipeline")
+	h := newStatusHandlerForTest(root, `{"executions":[`+owned+`]}`)
+
+	recorder := invokeStatusForTest(t, h, "request-user", "demo-project")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var body struct {
+		LastExecution *struct {
+			LogURL         string `json:"log_url"`
+			LogState       string `json:"log_state"`
+			LogStateReason string `json:"log_state_reason"`
+		} `json:"last_execution"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if body.LastExecution == nil || body.LastExecution.LogState != pipelineLogStateUnavailable || body.LastExecution.LogStateReason != "log_unavailable" {
+		t.Fatalf("last_execution = %#v, want unavailable/log_unavailable", body.LastExecution)
+	}
+	if body.LastExecution.LogURL != "/api/v1/pipeline/log?execution_id=missing-log" {
+		t.Fatalf("last_execution.log_url = %q, want owned execution URL", body.LastExecution.LogURL)
+	}
+	if root.statCalls != 1 || root.readCalls != 0 {
+		t.Fatalf("stat calls=%d, body reads=%d, want one stat and no raw body read", root.statCalls, root.readCalls)
+	}
+}
+
+func TestStatusProjectsAvailableLogMetadataWithoutReadingBody(t *testing.T) {
+	root := &pipelineLogMetadataSpyRoot{RootStore: localfs.New(t.TempDir()), statSize: 3}
+	owned := pipelineOwnershipExecution(
+		"projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline/executions/available-log",
+		"request-user", "demo-project", "pipeline")
+	h := newStatusHandlerForTest(root, `{"executions":[`+owned+`]}`)
+
+	recorder := invokeStatusForTest(t, h, "request-user", "demo-project")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var body struct {
+		LastExecution *struct {
+			LogState       string `json:"log_state"`
+			LogStateReason string `json:"log_state_reason"`
+		} `json:"last_execution"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if body.LastExecution == nil || body.LastExecution.LogState != pipelineLogStateAvailable || body.LastExecution.LogStateReason != "" {
+		t.Fatalf("last_execution = %#v, want available metadata", body.LastExecution)
+	}
+	if root.statCalls != 1 || root.readCalls != 0 {
+		t.Fatalf("stat calls=%d, body reads=%d, want one stat and no raw body read", root.statCalls, root.readCalls)
+	}
+}
+
+func TestStatusProjectsOwnedFailureDiagnostic(t *testing.T) {
+	exitCode := 42
+	root := &pipelineStatusMetadataRoot{
+		RootStore:  localfs.New(t.TempDir()),
+		statSize:   3,
+		diagnostic: []byte(`{"version":1,"status":"failed","stage":"concept_reconciliation","error_class":"child_exit","detail_code":"entity_mapping_article_source_missing","child_command":"run","exit_code":42}`),
+	}
+	failed := strings.Replace(pipelineOwnershipExecution(
+		"projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline/executions/failed-diagnostic",
+		"request-user", "demo-project", "pipeline"), "EXECUTION_SUCCEEDED", "EXECUTION_FAILED", 1)
+	h := newStatusHandlerForTest(root, `{"executions":[`+failed+`]}`)
+
+	recorder := invokeStatusForTest(t, h, "request-user", "demo-project")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var body struct {
+		LastExecution *struct {
+			LogState   string                             `json:"log_state"`
+			Diagnostic *handler.PipelineFailureDiagnostic `json:"diagnostic"`
+		} `json:"last_execution"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if body.LastExecution == nil || body.LastExecution.LogState != pipelineLogStateAvailable || body.LastExecution.Diagnostic == nil {
+		t.Fatalf("last_execution = %#v, want available diagnostic", body.LastExecution)
+	}
+	diagnostic := body.LastExecution.Diagnostic
+	if diagnostic.Version != 1 || diagnostic.Status != "failed" || diagnostic.Stage != "concept_reconciliation" || diagnostic.ErrorClass != "child_exit" || diagnostic.DetailCode != "entity_mapping_article_source_missing" || diagnostic.Child != "run" || diagnostic.ExitCode == nil || *diagnostic.ExitCode != exitCode {
+		t.Fatalf("diagnostic = %#v, want all typed fields projected", diagnostic)
+	}
+	if root.rawReads != 0 || root.diagnosticReads != 1 {
+		t.Fatalf("raw log reads=%d diagnostic reads=%d, want 0/1", root.rawReads, root.diagnosticReads)
+	}
+}
+
+func TestStatusRetainsFiniteMetadataForRunningAndUnsupportedStates(t *testing.T) {
+	unsupported := strings.Replace(pipelineOwnershipExecution(
+		"projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline/executions/unsupported",
+		"request-user", "demo-project", "pipeline"), "EXECUTION_SUCCEEDED", "EXECUTION_MYSTERY", 1)
+	for _, tt := range []struct {
+		name       string
+		execution  string
+		wantState  string
+		wantReason string
+	}{
+		{name: "running", execution: pipelineRunningOwnershipExecution("projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline/executions/running", "request-user", "demo-project"), wantState: pipelineLogStatePending},
+		{name: "unsupported", execution: unsupported, wantState: pipelineLogStateUnavailable, wantReason: "unsupported_execution_status"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newStatusHandlerForTest(localfs.New(t.TempDir()), `{"executions":[`+tt.execution+`]}`)
+			recorder := invokeStatusForTest(t, h, "request-user", "demo-project")
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusOK, recorder.Body.String())
+			}
+			var body struct {
+				SourcesCount     int      `json:"sources_count"`
+				ConceptsCount    int      `json:"concepts_count"`
+				SuggestedQueries []string `json:"suggested_queries"`
+				LastExecution    *struct {
+					LogState       string `json:"log_state"`
+					LogStateReason string `json:"log_state_reason"`
+				} `json:"last_execution"`
+			}
+			if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+				t.Fatalf("decode response: %v", err)
+			}
+			if body.LastExecution == nil || body.LastExecution.LogState != tt.wantState || body.LastExecution.LogStateReason != tt.wantReason {
+				t.Fatalf("last_execution = %#v, want state=%q reason=%q", body.LastExecution, tt.wantState, tt.wantReason)
+			}
+			if body.SourcesCount != 0 || body.ConceptsCount != 0 || body.SuggestedQueries == nil {
+				t.Fatalf("aggregate status fields regressed: sources=%d concepts=%d suggestions=%#v", body.SourcesCount, body.ConceptsCount, body.SuggestedQueries)
+			}
+		})
+	}
+}
+
+func newStatusHandlerForTest(root store.RootStore, executions string) *Handler {
+	h := New(root, nil, search.NewIndex(), conceptcache.New(), nil, nil)
+	h.httpClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == "/token" {
+			return testHTTPResponse(http.StatusOK, `{"access_token":"test-token"}`), nil
+		}
+		return testHTTPResponse(http.StatusOK, executions), nil
+	})}
+	h.metadataTokenURL = "http://metadata.test/token"
+	h.cloudRunJobURL = "https://run.googleapis.com/v2/projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline:run"
+	return h
+}
+
+func invokeStatusForTest(t *testing.T, h *Handler, userID, projectID string) *httptest.ResponseRecorder {
+	t.Helper()
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/api/v1/status", nil)
+	c.Set("userID", userID)
+	c.Set("projectID", projectID)
+	h.Status(c)
+	return recorder
+}
+
+func TestStatusIncludesEmptySuggestedQueriesWhenMissingArtifact(t *testing.T) {
+	root := t.TempDir()
+	h := New(localfs.New(root), nil, search.NewIndex(), conceptcache.New(), nil, nil)
+	h.metadataTokenURL = "http://metadata.test/token"
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/api/v1/status", nil)
+	c.Set("userID", "request-user")
+	c.Set("projectID", "demo-project")
+
+	h.Status(c)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var body struct {
+		SuggestedQueries []string `json:"suggested_queries"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if body.SuggestedQueries == nil {
+		t.Fatal("suggested_queries = nil, want explicit empty array")
+	}
+	if len(body.SuggestedQueries) != 0 {
+		t.Fatalf("suggested_queries = %#v, want []", body.SuggestedQueries)
+	}
+}
+
+func TestStatusSuggestedQueriesPathDoesNotWriteStorage(t *testing.T) {
+	writes := 0
+	root := &readOnlySuggestedRoot{Client: localfs.New(t.TempDir()), writes: &writes}
+	h := New(root, nil, search.NewIndex(), conceptcache.New(), nil, nil)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/api/v1/status", nil)
+	c.Set("userID", "request-user")
+	c.Set("projectID", "demo-project")
+
+	h.Status(c)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	if writes != 0 {
+		t.Fatalf("status suggested-query path writes = %d, want 0", writes)
+	}
+}
+
+type readOnlySuggestedRoot struct {
+	*localfs.Client
+	writes *int
+}
+
+func (r *readOnlySuggestedRoot) Scope(userID, projectID string) store.Store {
+	return &readOnlySuggestedStore{Store: r.Client.Scope(userID, projectID), writes: r.writes}
+}
+
+type readOnlySuggestedStore struct {
+	store.Store
+	writes *int
+}
+
+func (s *readOnlySuggestedStore) WriteBytes(context.Context, []byte, string) (string, error) {
+	*s.writes++
+	return "", errors.New("unexpected status write")
+}
+
+func (s *readOnlySuggestedStore) WriteBytesAtomic(context.Context, []byte, string, string) (string, error) {
+	*s.writes++
+	return "", errors.New("unexpected status atomic write")
+}
+
+func readSuggestedQueriesFromStatusEndpoints(t *testing.T, root string) []string {
+	t.Helper()
+
+	h := New(localfs.New(root), nil, search.NewIndex(), conceptcache.New(), nil, nil)
+	h.httpClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == "/token" {
+			return testHTTPResponse(http.StatusOK, `{"access_token":"test-token"}`), nil
+		}
+		return testHTTPResponse(http.StatusOK, `{}`), nil
+	})}
+	h.metadataTokenURL = "http://metadata.test/token"
+	h.cloudRunJobURL = "https://run.googleapis.com/v2/projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline:run"
+
+	read := func(path string) []string {
+		recorder := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(recorder)
+		c.Request = httptest.NewRequest(http.MethodGet, path, nil)
+		c.Set("userID", "request-user")
+		c.Set("projectID", "demo-project")
+
+		switch path {
+		case "/api/v1/pipeline/status":
+			h.PipelineStatus(c)
+		default:
+			h.Status(c)
+		}
+
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status endpoint %s: status = %d, want %d; body = %s", path, recorder.Code, http.StatusOK, recorder.Body.String())
+		}
+		var body struct {
+			SuggestedQueries []string `json:"suggested_queries"`
+		}
+		if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+			t.Fatalf("decode %s response: %v", path, err)
+		}
+		if body.SuggestedQueries == nil {
+			t.Fatalf("suggested_queries = nil for %s, want explicit []", path)
+		}
+		return body.SuggestedQueries
+	}
+
+	statusQueries := read("/api/v1/status")
+	pipelineQueries := read("/api/v1/pipeline/status")
+	if !reflect.DeepEqual(statusQueries, pipelineQueries) {
+		t.Fatalf("parity mismatch: status=%#v pipeline=%#v", statusQueries, pipelineQueries)
+	}
+	return statusQueries
+}
+
+func writeSuggestionFixtures(t *testing.T, projectRoot string, suggestedJSON string, conceptsJSONL string) {
+	t.Helper()
+
+	cacheRoot := filepath.Join(projectRoot, "cache")
+	if err := os.MkdirAll(cacheRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if suggestedJSON != "" {
+		if err := os.WriteFile(filepath.Join(cacheRoot, "suggested_queries.json"), []byte(suggestedJSON), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if conceptsJSONL != "" {
+		if err := os.WriteFile(filepath.Join(cacheRoot, "concepts.jsonl"), []byte(conceptsJSONL), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestStatusAndPipelineStatusSuggestedQueriesUsePresentArtifact(t *testing.T) {
+	root := t.TempDir()
+	projectRoot := filepath.Join(root, "users", "request-user", "projects", "demo-project")
+	writeSuggestionFixtures(t, projectRoot, validSuggestedQueriesJSON(), "")
+
+	got := readSuggestedQueriesFromStatusEndpoints(t, root)
+	if !reflect.DeepEqual(got, []string{"哪些概念值得一起比較？", "如何探索這個主題的不同面向？", "哪些選擇適合進一步查找？"}) {
+		t.Fatalf("suggested_queries = %#v, want generated questions", got)
+	}
+}
+
+func TestStatusAndPipelineStatusSuggestedQueriesRejectLegacyTitleArtifact(t *testing.T) {
+	root := t.TempDir()
+	projectRoot := filepath.Join(root, "users", "request-user", "projects", "demo-project")
+	writeSuggestionFixtures(t, projectRoot, `{"queries":["咖啡廳","公園"]}`, `{"slug":"cafe","title":"咖啡廳"}`+"\n")
+
+	got := readSuggestedQueriesFromStatusEndpoints(t, root)
+	if !reflect.DeepEqual(got, []string{}) {
+		t.Fatalf("suggested_queries = %#v, want [] for legacy title-only artifact", got)
+	}
+}
+
+func TestStatusAndPipelineStatusSuggestedQueriesTreatInvalidArtifactsAsEmpty(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		data string
+	}{
+		{name: "malformed truncated", data: `{"version":2,"queries":[`},
+		{name: "duplicate key", data: `{"version":2,"version":2,"queries":[],"candidates":[],"updated_at":""}`},
+		{name: "unknown key", data: `{"version":2,"queries":[],"candidates":[],"updated_at":"","extra":true}`},
+		{name: "wrong shape", data: `{"version":2,"queries":{},"candidates":[],"updated_at":""}`},
+		{name: "trailing json", data: validSuggestedQueriesJSON() + ` {"extra":true}`},
+		{name: "unsupported version", data: `{"version":1,"queries":[],"candidates":[],"updated_at":""}`},
+		{name: "legacy title-only", data: `{"queries":["咖啡廳","公園"]}`},
+		{name: "invalid v2", data: `{"version":2,"queries":["q?"],"candidates":[],"updated_at":""}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			projectRoot := filepath.Join(root, "users", "request-user", "projects", "demo-project")
+			writeSuggestionFixtures(t, projectRoot, tc.data, "")
+			got := readSuggestedQueriesFromStatusEndpoints(t, root)
+			if !reflect.DeepEqual(got, []string{}) {
+				t.Fatalf("suggested_queries = %#v, want [] for invalid artifact", got)
+			}
+		})
+	}
+}
+
+func TestStatusAndPipelineStatusKeepReadStateErrorsAsHTTP500(t *testing.T) {
+	for _, endpoint := range []string{"/api/v1/status", "/api/v1/pipeline/status"} {
+		t.Run(endpoint, func(t *testing.T) {
+			root := &suggestedQueriesStateFailureRoot{Client: localfs.New(t.TempDir()), err: errors.New("read state unavailable")}
+			h := New(root, nil, search.NewIndex(), conceptcache.New(), nil, nil)
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodGet, endpoint, nil)
+			c.Set("userID", "request-user")
+			c.Set("projectID", "demo-project")
+			if endpoint == "/api/v1/pipeline/status" {
+				h.PipelineStatus(c)
+			} else {
+				h.Status(c)
+			}
+			want := `{"error":"generated data unavailable"}`
+			if endpoint == "/api/v1/pipeline/status" {
+				want = `{"error":"pipeline status unavailable"}`
+			}
+			if recorder.Code != http.StatusInternalServerError || recorder.Body.String() != want {
+				t.Fatalf("status=%d body=%s, want fixed read-state error", recorder.Code, recorder.Body.String())
+			}
+		})
+	}
+}
+
+func TestStatusAndPipelineStatusSuggestedQueriesFromConceptsWhenArtifactMissing(t *testing.T) {
+	root := t.TempDir()
+	projectRoot := filepath.Join(root, "users", "request-user", "projects", "demo-project")
+	writeSuggestionFixtures(t, projectRoot, "", `{"slug":"a","title":"Newest","frontmatter":{"updated":"2026-07-12T00:00:00Z"}}`+"\n"+
+		`{"slug":"b","title":"Newest-2","frontmatter":{"updated":"2026-07-11T00:00:00Z"}}`+"\n"+
+		`{"slug":"c","title":"Newest-3","frontmatter":{"updated":"2026-07-10T00:00:00Z"}}`+"\n"+
+		`{"slug":"d","title":"Newest-4","frontmatter":{"updated":"2026-07-09T00:00:00Z"}}`+"\n"+
+		`{"slug":"e","title":"Newest-5","frontmatter":{"updated":"2026-07-08T00:00:00Z"}}`+"\n"+
+		`{"slug":"f","title":"Newest-6","frontmatter":{"updated":"2026-07-07T00:00:00Z"}}`)
+
+	got := readSuggestedQueriesFromStatusEndpoints(t, root)
+	if !reflect.DeepEqual(got, []string{}) {
+		t.Fatalf("suggested_queries = %#v, want [] without a published artifact", got)
+	}
+}
+
+func TestStatusAndPipelineStatusSuggestedQueriesFromConceptsWhenArtifactEmpty(t *testing.T) {
+	root := t.TempDir()
+	projectRoot := filepath.Join(root, "users", "request-user", "projects", "demo-project")
+	writeSuggestionFixtures(t, projectRoot, `{"queries":[],"updated_at":"2026-07-10T00:00:00Z"}`, `{"slug":"a","title":"Alpha","frontmatter":{"updated":"2026-07-10T00:00:00Z"}}`+"\n"+
+		`{"slug":"b","title":"Beta","frontmatter":{"updated":"2026-07-09T00:00:00Z"}}`)
+
+	got := readSuggestedQueriesFromStatusEndpoints(t, root)
+	if !reflect.DeepEqual(got, []string{}) {
+		t.Fatalf("suggested_queries = %#v, want [] for an empty artifact", got)
+	}
+}
+
+func TestStatusAndPipelineStatusSuggestedQueriesNoDataReturnsEmptySlice(t *testing.T) {
+	root := t.TempDir()
+	got := readSuggestedQueriesFromStatusEndpoints(t, root)
+	if got == nil || len(got) != 0 {
+		t.Fatalf("suggested_queries = %#v, want explicit []", got)
+	}
+}
+
+func validSuggestedQueriesJSON() string {
+	return `{"version":2,"queries":["哪些概念值得一起比較？","如何探索這個主題的不同面向？","哪些選擇適合進一步查找？"],"candidates":[
+{"question":"哪些概念值得一起比較？","intent/use_case":"comparison","corpus_anchor_concept_ids":["c1"],"generation":{"model":"fixture","prompt_version":"v1"}},
+{"question":"如何探索這個主題的不同面向？","intent/use_case":"exploration","corpus_anchor_concept_ids":["c1"],"generation":{"model":"fixture","prompt_version":"v1"}},
+{"question":"哪些選擇適合進一步查找？","intent/use_case":"retrieval","corpus_anchor_concept_ids":["c1"],"generation":{"model":"fixture","prompt_version":"v1"}}],"updated_at":"2026-07-10T00:00:00Z"}`
 }
 
 func TestStatusRawCountUsesLiveRawListing(t *testing.T) {

@@ -1,88 +1,155 @@
 # Local Development
 
-## Quickstart
+## First-time setup
 
-```sh
-make seed
-make dev
+Keep both repositories under `~/Develop`, then run:
+
+```bash
+cd ~/Develop/llm-wiki-bff
+make setup
 ```
 
-BFF listens on `http://localhost:8080`. Frontend listens on `http://localhost:3000`.
+## Choose the component you are developing
 
-The quickstart uses Docker Compose as the integration path. It mounts `./local-data` into the BFF container and starts BFF with `--local /data`.
+### BFF
 
-## Inner Loop
+Start everything except the BFF:
 
-For faster BFF-only development:
+```bash
+make support-bff
+```
 
-```sh
-make seed
+This starts the Frontend and prepares seeded pipeline data. Run the BFF separately from your terminal, IDE, or debugger:
+
+```bash
 make bff-local
 ```
 
-Local scoped API calls use these headers:
+### Frontend
+
+Start everything except the Frontend:
+
+```bash
+make support-frontend
+```
+
+This starts the BFF and prepares seeded pipeline data. Run the Frontend separately from your terminal or debugger:
+
+```bash
+make frontend-local
+```
+
+### Pipeline
+
+Start everything except the Pipeline:
+
+```bash
+make support-pipeline
+```
+
+This starts the BFF and Frontend. Run Pipeline tests separately:
+
+```bash
+make pipeline-test
+```
+
+Run the full Synto pipeline only when provider-backed execution is needed:
+
+```bash
+LLM_API_KEY=... make pipeline-run
+```
+
+## Run the normal app
+
+If you are not isolating one component:
+
+```bash
+make dev
+```
+
+## Ports
+
+Defaults:
 
 ```text
-X-User-ID: local-user
-X-Project-ID: demo
+BFF_PORT=8080
+FRONTEND_PORT=3000
 ```
 
-Example:
+Override them on any Make target:
 
-```sh
-curl -H 'X-User-ID: local-user' http://localhost:8080/api/v1/projects
-curl -H 'X-User-ID: local-user' -H 'X-Project-ID: demo' http://localhost:8080/api/v1/concepts
+```bash
+make dev BFF_PORT=18080 FRONTEND_PORT=13000
 ```
 
-## Demo Data
+The generated Frontend `.env.local` automatically uses `BFF_PORT`.
 
-`make seed` copies `demo/` to `local-data/`.
-
-The seeded demo includes prebuilt artifacts:
-
-- `cache/concepts.jsonl`
-- `cache/id_map.json`
-- `wiki/*.md`
-- `wiki/sources/*.md`
-- `raw/*.md`
-- `wiki.toml`
-- `index.md`
-
-The app should load concepts and sources immediately after seeding. Worker and OLW regeneration are outside this local app development flow.
-
-## Frontend Context
-
-Compose builds the frontend from `../llm-wiki-frontend` by default. Override it when the frontend repo is elsewhere:
-
-```sh
-FRONTEND_CONTEXT=/path/to/llm-wiki-frontend make dev
-```
-
-The compose file exposes these frontend env vars for local header wiring:
+## URLs
 
 ```text
+Frontend: http://127.0.0.1:3000
+BFF:      http://127.0.0.1:8080
+```
+
+## Local authentication
+
+Local mode provides one admin-capable demo account:
+
+```text
+email:    demo@llm-wiki.dev
+password: demo123456
+user ID:  local-user
+role:     admin
+```
+
+Get a fresh 15-minute JWT from the running BFF:
+
+```bash
+TOKEN="$(make local-token)"
+```
+
+Use it for normal or admin APIs:
+
+```bash
+curl -fsS \
+  -H "Authorization: Bearer $TOKEN" \
+  http://127.0.0.1:8080/api/v1/admin/settings
+```
+
+When overriding the BFF port:
+
+```bash
+TOKEN="$(make local-token BFF_PORT=18080)"
+```
+
+The credential and `JWT_SECRET=dev-secret` are local-only. Do not use them for deployed environments, and do not commit a generated JWT.
+
+Press `Ctrl-C` to stop the support processes.
+
+If local processes were orphaned, stop every listener on the configured local ports:
+
+```bash
+make kill-local
+```
+
+For overridden ports:
+
+```bash
+make kill-local BFF_PORT=18080 FRONTEND_PORT=13000
+```
+
+## Generated local config
+
+`make setup` creates `~/Develop/llm-wiki-frontend/.env.local`:
+
+```dotenv
+NEXT_PUBLIC_API_URL=http://localhost:8080
 NEXT_PUBLIC_DEV_USER_ID=local-user
 NEXT_PUBLIC_DEV_PROJECT_ID=demo
 ```
 
-## Frontend Login
+The Makefile supplies the BFF local environment automatically. Reset demo data with:
 
-BFF local mode supports a local-only demo account so the frontend login flow can be tested without Firestore:
-
-```text
-email: demo@llm-wiki.dev
-password: demo123456
+```bash
+make seed
 ```
-
-The frontend "Try demo" button uses the same credentials. After login, the access token identifies `local-user`, so project listing reads `local-data/users/local-user/projects/demo`.
-
-## Troubleshooting
-
-- Port `8080` is busy: run `lsof -i :8080`.
-- Port `3000` is busy: run `lsof -i :3000`.
-- Demo data is empty: run `make seed`.
-- Projects return unauthorized: include `X-User-ID: local-user`.
-- Scoped endpoints fail: include `X-Project-ID: demo`.
-- Concepts or sources are empty: verify `local-data/users/local-user/projects/demo/cache`.
-- Login fails in local mode: use `demo@llm-wiki.dev` / `demo123456`.
-- Register returns 503 in local mode: registration still requires the production Firestore-backed path.

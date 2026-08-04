@@ -23,9 +23,9 @@ its `BUCKET` value, and that both `volumes` and `volumeMounts` are empty.
 
 ## GitHub Actions
 
-- `CI` runs vet and tests on `main`, `develop/1.0`, and pull requests targeting either branch. It has no legacy k3s deployment step.
-- `Deploy BFF to Cloud Run (dev)` runs from `develop/1.0`, vets and tests the commit, builds one image tagged with the full commit SHA, and deploys that exact image only to `llm-wiki-bff-dev` with the dev bucket, named database, pipeline job, CORS origins, and `DEV_JWT=false`.
-- `Promote BFF to Cloud Run (production)` is manually dispatched with a full commit SHA. Configure required reviewers on the `production` GitHub environment to enforce the release gate; the workflow requires that SHA to be an ancestor of `develop/1.0`, verifies a successful exact-SHA dev run, downloads its SHA-named digest artifact, and deploys that digest without rebuilding or resolving an environment tag. After each successful deployment, the workflow adds a unique immutable `:dev-${GITHUB_SHA}` or `:prod-<validated commit SHA>` tag to the exact deployed digest for observability only; these tags are never build or promotion inputs.
+- `CI` integrates changes on `main` and `develop` and pull requests targeting either branch. It has no legacy k3s deployment step.
+- Development feature releases are manually dispatched from canonical `develop` for the BFF and worker. Each release vets and tests the commit, builds one image tagged with the full commit SHA, and deploys that exact image to the development resources. Pushes to `main` still run the dev build/deploy workflows to create exact-main development provenance.
+- `Promote BFF to Cloud Run (production)` is manually dispatched with a full commit SHA. Configure required reviewers on the `production` GitHub environment to enforce the release gate; the workflow requires that SHA to be an ancestor of `main`, verifies a successful exact-SHA `main` dev run, downloads its SHA-named digest artifact, and deploys that digest without rebuilding or resolving an environment tag. After each successful deployment, the workflow adds a unique immutable `:dev-${GITHUB_SHA}` or `:prod-<validated commit SHA>` tag to the exact deployed digest for observability only; these tags are never build or promotion inputs.
 
 The commit-SHA image tag identifies the immutable dev build, and the validated `repository@sha256:...` digest identifies the immutable image promoted to production. The `:dev-${GITHUB_SHA}` and `:prod-<validated commit SHA>` tags are unique immutable deployment records; the digest remains the source of truth.
 
@@ -39,10 +39,61 @@ make docker-build docker-push deploy-dev
 
 The Makefile `deploy-dev` target hardcodes the dev service, data resources, runtime service account, Secret Manager references, and `DEV_JWT=false`; command-line environment overrides cannot redirect it to production. `deploy` is only an alias for `deploy-dev`. `make deploy-prod` fails closed; production must use the `Promote BFF to Cloud Run (production)` GitHub workflow with a verified full commit SHA.
 
-## Stuck dev publish lease
+## Publish lease liveness (LWC-222)
 
-Use this break-glass procedure only for a stuck development publish lease. It
-does not expire, steal, or automatically take over a lease.
+Cloud publish uses create-only `.lwc/publish/lease.json` with payload
+`{"execution":"<cloud-run-execution-id>","started_at":"..."}`.
+
+**Acceptance (unit, not live orphan pipeline):** focused tests
+`TestLWC222AcceptanceHappyPathOrphanHistoryReclaim` and
+`TestLWC222AcceptanceGateWhileHistoryWouldBeRunning` cover the product gate —
+orphan lease held by a finished Cloud Run history execution is reclaimed;
+a still-RUNNING holder continues to block. Deliberately failing a long pipeline
+solely to manufacture an orphan lease is not required to close this ticket.
+
+On acquire conflict the **worker** (not age/TTL) decides reclaim from Cloud Run
+Jobs execution status of the holder id:
+
+| Holder execution state | Action |
+| --- | --- |
+| `RUNNING` (or live equivalent) | refuse; fail closed |
+| `SUCCEEDED` / `FAILED` / `CANCELLED` | CAS delete + one create-only retry |
+| Not found (well-formed id under the job) | allow CAS reclaim |
+| Permission / 5xx / timeout / parse failure | refuse (`lookup_failed`) |
+| Malformed / empty / foreign job prefix | refuse (manual break-glass) |
+
+### IAM
+
+The pipeline worker runtime service account must be able to
+`run.jobs.executions.get` on the environment's job (dev: `olw-pipeline-dev`,
+prod: `olw-pipeline`). Granting `roles/run.viewer` on the job is sufficient and
+least-privilege relative to executor roles.
+
+```sh
+# DEV example — pipeline worker SA may probe holder liveness
+gcloud run jobs add-iam-policy-binding olw-pipeline-dev \
+  --region=asia-east1 --project=llm-wiki-cloud \
+  --member="serviceAccount:lwc-pipeline-dev@llm-wiki-cloud.iam.gserviceaccount.com" \
+  --role="roles/run.viewer"
+```
+
+BFF already uses `roles/run.viewer` for status listing; worker reclaim needs the
+same class of read on the job.
+
+Optional env for scope (defaults work on Cloud Run Jobs in-region):
+
+| Variable | Purpose |
+| --- | --- |
+| `CLOUD_RUN_JOB` / `PIPELINE_JOB_NAME` | Expected job name (holder prefix check) |
+| `PIPELINE_JOB_URL` | Same BFF HTTPS `:run` URL; project/location parsed when set |
+| `PIPELINE_JOB_LOCATION` / `CLOUD_RUN_LOCATION` | Region override (default `asia-east1`) |
+| `GOOGLE_CLOUD_PROJECT` / `GCP_PROJECT` | Project override (else metadata) |
+
+## Stuck dev publish lease (manual break-glass)
+
+Use this break-glass procedure only when automatic liveness reclaim cannot run:
+malformed holder payload, foreign job id, or `lookup_failed` (IAM / API). It
+does not expire, steal, or automatically take over a lease by age.
 
 1. Confirm that no Cloud Run execution owned by the development publisher is
    `RUNNING`. Stop and investigate if any such execution exists; do not delete
@@ -56,7 +107,10 @@ does not expire, steal, or automatically take over a lease.
 
    Continue only when the result is empty.
 
-2. Inspect the exact `.lwc/publish/lease.json` object and record its exact object generation. Replace every placeholder with the development values;
+2. Inspect the exact `.lwc/publish/lease.json` object and record its exact object generation
+   and `execution` holder. The payload is JSON like
+   `{"execution":"<cloud-run-execution-id>","started_at":"..."}` — use that id when
+   confirming step 1. Replace every placeholder with the development values;
    do not put real tenant IDs in a runbook or script.
 
    ```sh
@@ -66,7 +120,11 @@ does not expire, steal, or automatically take over a lease.
    ENCODED_OBJECT="$(printf '%s' "$LEASE_OBJECT" | jq -sRr @uri)"
    curl --fail-with-body \
      -H "Authorization: Bearer ${TOKEN}" \
-     "https://storage.googleapis.com/storage/v1/b/${BUCKET}/o/${ENCODED_OBJECT}?fields=name,generation"
+     "https://storage.googleapis.com/storage/v1/b/${BUCKET}/o/${ENCODED_OBJECT}?fields=name,generation,metadata"
+   # Also fetch object media to read {"execution","started_at"}:
+   curl --fail-with-body \
+     -H "Authorization: Bearer ${TOKEN}" \
+     "https://storage.googleapis.com/storage/v1/b/${BUCKET}/o/${ENCODED_OBJECT}?alt=media"
    LEASE_GENERATION="<exact-object-generation-from-the-inspection>"
    ```
 

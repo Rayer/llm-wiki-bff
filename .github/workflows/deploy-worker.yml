@@ -2,8 +2,13 @@ name: Deploy OLW worker to Cloud Run (dev)
 
 on:
   push:
-    branches: [develop/1.0, main]
+    branches: [main]
   workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: Full lowercase commit SHA to deploy from canonical develop
+        required: true
+        type: string
 
 concurrency:
   group: deploy-olw-pipeline-dev
@@ -20,7 +25,52 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 1
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.commit_sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate deployment source
+        id: source
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          REF_NAME: ${{ github.ref_name }}
+          COMMIT_SHA: ${{ inputs.commit_sha }}
+          GITHUB_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            if [[ "$REF" != "refs/heads/develop" || "$REF_NAME" != "develop" ]]; then
+              echo "manual deployment must use the canonical develop branch"
+              exit 1
+            fi
+            if [[ ! "$COMMIT_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "malformed commit_sha: must be a 40-character lowercase commit SHA"
+              exit 1
+            fi
+            CANDIDATE_SHA="$COMMIT_SHA"
+            git fetch origin develop --force --no-tags
+            REMOTE_DEVELOP_SHA=$(git rev-parse origin/develop)
+            if [[ "$CANDIDATE_SHA" != "$REMOTE_DEVELOP_SHA" ]]; then
+              echo "input commit SHA does not match current origin/develop"
+              exit 1
+            fi
+          elif [[ "$EVENT_NAME" == "push" ]]; then
+            if [[ ! "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "github.sha must be a 40-character lowercase commit SHA"
+              exit 1
+            fi
+            CANDIDATE_SHA="$GITHUB_SHA"
+          else
+            echo "unsupported deployment event: $EVENT_NAME"
+            exit 1
+          fi
+          CHECKED_OUT_SHA=$(git rev-parse HEAD)
+          if [[ "$CANDIDATE_SHA" != "$CHECKED_OUT_SHA" ]]; then
+            echo "input commit SHA does not match checked-out HEAD"
+            exit 1
+          fi
+          echo "candidate_sha=$CANDIDATE_SHA" >> "$GITHUB_OUTPUT"
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -51,23 +101,54 @@ jobs:
         with:
           project_id: ${{ env.PROJECT_ID }}
 
+      - name: Verify existing dev worker IAM prerequisites
+        run: |
+          set -euo pipefail
+          # The validator requires exactly one roles/run.viewer binding for serviceAccount:lwc-pipeline-dev@llm-wiki-cloud.iam.gserviceaccount.com.
+          if ! IAM_POLICY=$(gcloud run jobs get-iam-policy olw-pipeline-dev \
+            --project llm-wiki-cloud \
+            --region asia-east1 \
+            --format=json \
+            --quiet); then
+            echo "unable to read IAM policy for Cloud Run Job olw-pipeline-dev"
+            exit 1
+          fi
+          if ! printf '%s\n' "$IAM_POLICY" | python3 scripts/validate_cloud_run_job_iam_policy.py; then
+            echo "Cloud Run Job olw-pipeline-dev IAM policy is missing the required read-only worker binding"
+            exit 1
+          fi
+
       - name: Configure Artifact Registry Docker auth
         run: gcloud auth configure-docker asia-east1-docker.pkg.dev --quiet
+
+      - name: Generate worker build nonce
+        id: nonce
+        run: |
+          set -euo pipefail
+          BUILD_TIMESTAMP_NS=$(date -u +%s%N)
+          printf -v BUILD_NONCE '%032d' "$BUILD_TIMESTAMP_NS"
+          if [[ ! "$BUILD_NONCE" =~ ^[0-9a-f]{32}$ ]]; then
+            echo "generated worker build nonce is invalid"
+            exit 1
+          fi
+          echo "build_nonce=$BUILD_NONCE" >> "$GITHUB_OUTPUT"
+          echo "Generated worker build nonce $BUILD_NONCE"
 
       - name: Build and push immutable worker image
         id: image
         env:
           AR_REPO: asia-east1-docker.pkg.dev/llm-wiki-cloud/cloud-run-images
+          BUILD_NONCE: ${{ steps.nonce.outputs.build_nonce }}
         run: |
           set -euo pipefail
-          SHA="${GITHUB_SHA}"
+          SHA="${{ steps.source.outputs.candidate_sha }}"
           if [[ ! "$SHA" =~ ^[0-9a-f]{40}$ ]]; then
             echo "GITHUB_SHA is invalid"
             exit 1
           fi
           TAG="${SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           IMAGE="${AR_REPO}/olw-pipeline:${TAG}"
-          docker build --target worker -f cmd/olw_worker/Dockerfile -t "$IMAGE" .
+          docker build --build-arg BUILD_NONCE="$BUILD_NONCE" --target worker -f cmd/olw_worker/Dockerfile -t "$IMAGE" .
           docker push "$IMAGE"
           DIGEST=$(gcloud artifacts docker images describe "$IMAGE" --format='value(image_summary.digest)' --quiet)
           if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
@@ -75,13 +156,13 @@ jobs:
             exit 1
           fi
           echo "immutable_image=${AR_REPO}/olw-pipeline@${DIGEST}" >> "$GITHUB_OUTPUT"
-          printf '%s\n' "$DIGEST" > "worker-image-digest-${GITHUB_SHA}.txt"
+          printf '%s\n' "$DIGEST" > "worker-image-digest-${SHA}.txt"
 
       - name: Upload exact image digest provenance
         uses: actions/upload-artifact@v4
         with:
-          name: worker-image-digest-${{ github.sha }}
-          path: worker-image-digest-${{ github.sha }}.txt
+          name: worker-image-digest-${{ steps.source.outputs.candidate_sha }}
+          path: worker-image-digest-${{ steps.source.outputs.candidate_sha }}.txt
           if-no-files-found: error
           retention-days: 90
 
@@ -93,13 +174,13 @@ jobs:
           BUCKET: llm-wiki-data-dev
         run: |
           set -euo pipefail
-          SHA="${GITHUB_SHA}"
+          SHA="${{ steps.source.outputs.candidate_sha }}"
           if [[ ! "$SHA" =~ ^[0-9a-f]{40}$ ]]; then
             echo "GITHUB_SHA is invalid"
             exit 1
           fi
           case "${GITHUB_REF_NAME}" in
-            develop/1.0|main) SOURCE_BRANCH="${GITHUB_REF_NAME}" ;;
+            develop|main) SOURCE_BRANCH="${GITHUB_REF_NAME}" ;;
             *) echo "unsupported source branch: ${GITHUB_REF_NAME}"; exit 1 ;;
           esac
           git fetch --no-tags origin "${SOURCE_BRANCH}"
@@ -109,7 +190,8 @@ jobs:
           fi
           gcloud run jobs update "${JOB_NAME}" \
             --image "$IMMUTABLE_IMAGE" \
-            --update-env-vars "BUCKET=${BUCKET}" \
+            --update-secrets "DEEPSEEK_API_KEY=deepseek-apikey:latest" \
+            --update-env-vars "BUCKET=${BUCKET},PIPELINE_JOB_NAME=${JOB_NAME},PIPELINE_JOB_LOCATION=${REGION}" \
             --remove-env-vars "DATA_DIR,WORKSPACE,VAULT_PATH,WORKSPACE_DIR" \
             --args "^@^run@[[\"run\",\"--auto-approve\"]]" \
             --clear-volume-mounts \
@@ -147,6 +229,21 @@ jobs:
           fi
           if [[ $(jq -r '.spec.template.spec.template.spec.containers[0].env[]? | select(.name == "BUCKET") | .value' <<<"$JOB_CONTRACT") != "${BUCKET}" ]]; then
             echo "worker BUCKET is missing or incorrect"
+            exit 1
+          fi
+          if ! jq -e --arg secret_name "projects/llm-wiki-cloud/secrets/deepseek-apikey" '
+            [.spec.template.spec.template.spec.containers[0].env[]? | select(.name == "DEEPSEEK_API_KEY")] as $entries
+            | if ($entries | length) != 1 then error("worker DEEPSEEK_API_KEY must have exactly one entry") else $entries[0] end
+            | if has("value") then error("worker DEEPSEEK_API_KEY must not contain plaintext value") else . end
+            | (if (.valueSource.secretKeyRef? // null) != null
+               then {name: .valueSource.secretKeyRef.secret, version: .valueSource.secretKeyRef.version}
+               elif (.valueFrom.secretKeyRef? // null) != null
+               then {name: .valueFrom.secretKeyRef.name, version: .valueFrom.secretKeyRef.key}
+               else {} end) as $ref
+            | if $ref.version != "latest" then error("worker DEEPSEEK_API_KEY must use latest secret version") else . end
+            | if $ref.name != "deepseek-apikey" and $ref.name != $secret_name then error("worker DEEPSEEK_API_KEY references the wrong secret") else . end
+          ' <<<"$JOB_CONTRACT" >/dev/null; then
+            echo "worker DEEPSEEK_API_KEY is not the expected secret-backed env entry"
             exit 1
           fi
           if jq -e '.spec.template.spec.template.spec.containers[0].env[]? | select(.name == "DATA_DIR" or .name == "WORKSPACE" or .name == "VAULT_PATH" or .name == "WORKSPACE_DIR")' <<<"$JOB_CONTRACT" >/dev/null; then

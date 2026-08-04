@@ -2,10 +2,13 @@ name: Deploy BFF to Cloud Run (dev)
 
 on:
   push:
-    branches:
-      - develop/1.0
-      - main
+    branches: [main]
   workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: Full lowercase commit SHA to deploy from canonical develop
+        required: true
+        type: string
 
 env:
   PROJECT_ID: llm-wiki-cloud
@@ -27,7 +30,52 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.commit_sha || github.sha }}
           fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate deployment source
+        id: source
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          REF_NAME: ${{ github.ref_name }}
+          COMMIT_SHA: ${{ inputs.commit_sha }}
+          GITHUB_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            if [[ "$REF" != "refs/heads/develop" || "$REF_NAME" != "develop" ]]; then
+              echo "manual deployment must use the canonical develop branch"
+              exit 1
+            fi
+            if [[ ! "$COMMIT_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "commit_sha must be a 40-character lowercase commit SHA"
+              exit 1
+            fi
+            CANDIDATE_SHA="$COMMIT_SHA"
+            git fetch origin develop --force --no-tags
+            REMOTE_DEVELOP_SHA=$(git rev-parse origin/develop)
+            if [[ "$CANDIDATE_SHA" != "$REMOTE_DEVELOP_SHA" ]]; then
+              echo "input commit SHA does not match current origin/develop"
+              exit 1
+            fi
+          elif [[ "$EVENT_NAME" == "push" ]]; then
+            if [[ ! "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "github.sha must be a 40-character lowercase commit SHA"
+              exit 1
+            fi
+            CANDIDATE_SHA="$GITHUB_SHA"
+          else
+            echo "unsupported deployment event: $EVENT_NAME"
+            exit 1
+          fi
+          CHECKED_OUT_SHA=$(git rev-parse HEAD)
+          if [[ "$CANDIDATE_SHA" != "$CHECKED_OUT_SHA" ]]; then
+            echo "input commit SHA does not match checked-out HEAD"
+            exit 1
+          fi
+          echo "candidate_sha=$CANDIDATE_SHA" >> "$GITHUB_OUTPUT"
 
       - name: Setup Go
         uses: actions/setup-go@v5
@@ -52,6 +100,39 @@ jobs:
         uses: google-github-actions/setup-gcloud@v2
         with:
           project_id: ${{ env.PROJECT_ID }}
+
+      - name: Verify existing dev IAM prerequisites
+        run: |
+          set -euo pipefail
+          if ! JOB_IAM_POLICY=$(gcloud run jobs get-iam-policy "olw-pipeline-dev" \
+            --region "${{ env.REGION }}" \
+            --project "${{ env.PROJECT_ID }}" \
+            --format=json \
+            --quiet); then
+            echo "unable to read IAM policy for olw-pipeline-dev; refusing to deploy"
+            exit 1
+          fi
+          if ! jq -e --arg member "serviceAccount:lwc-bff-dev@llm-wiki-cloud.iam.gserviceaccount.com" \
+            'any(.bindings[]?; .role == "roles/run.jobsExecutorWithOverrides" and any(.members[]?; . == $member))' \
+            <<<"$JOB_IAM_POLICY" >/dev/null; then
+            echo "pipeline Job IAM policy does not grant the required executor role; refusing to deploy"
+            exit 1
+          fi
+
+          if ! SERVICE_IAM_POLICY=$(gcloud run services get-iam-policy "${{ env.SERVICE_NAME }}" \
+            --region "${{ env.REGION }}" \
+            --project "${{ env.PROJECT_ID }}" \
+            --format=json \
+            --quiet); then
+            echo "unable to read IAM policy for ${{ env.SERVICE_NAME }}; refusing to deploy"
+            exit 1
+          fi
+          if ! jq -e \
+            'any(.bindings[]?; .role == "roles/run.invoker" and any(.members[]?; . == "allUsers"))' \
+            <<<"$SERVICE_IAM_POLICY" >/dev/null; then
+            echo "BFF service IAM policy does not grant the required public invoker role; refusing to deploy"
+            exit 1
+          fi
 
       - name: Resolve build identity
         id: identity
@@ -182,15 +263,8 @@ jobs:
             --service-account "${{ env.RUNTIME_SERVICE_ACCOUNT }}" \
             --network default --subnet default \
             --vpc-egress private-ranges-only \
-            --allow-unauthenticated \
             --update-secrets "JWT_SECRET=${{ env.JWT_SECRET_NAME }}:latest,DEEPSEEK_API_KEY=deepseek-apikey:latest" \
             --update-env-vars "^@^GCP_PROJECT=${{ env.PROJECT_ID }}@BUCKET=${{ env.BUCKET }}@FIRESTORE_DATABASE_ID=${{ env.FIRESTORE_DATABASE_ID }}@PIPELINE_JOB_URL=https://run.googleapis.com/v2/projects/${{ env.PROJECT_ID }}/locations/${{ env.REGION }}/jobs/${{ env.PIPELINE_JOB_NAME }}:run@ALLOWED_ORIGINS=${{ env.ALLOWED_ORIGINS }}@DEV_JWT=false" \
-            --quiet
-          gcloud run jobs add-iam-policy-binding "${{ env.PIPELINE_JOB_NAME }}" \
-            --region "${{ env.REGION }}" \
-            --project "${{ env.PROJECT_ID }}" \
-            --member "serviceAccount:${{ env.RUNTIME_SERVICE_ACCOUNT }}" \
-            --role roles/run.jobsExecutorWithOverrides \
             --quiet
           echo "✅ Deployed ${{ env.SERVICE_NAME }} ($GIT_SHA)"
 

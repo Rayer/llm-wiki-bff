@@ -2,6 +2,7 @@
 bin/
 lwc-test-server
 llm-wiki-bff
+backfill
 *.exe
 *.test
 .worktrees/

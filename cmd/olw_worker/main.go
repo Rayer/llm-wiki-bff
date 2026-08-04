@@ -19,6 +19,10 @@ import (
 	"time"
 
 	"github.com/rayer/llm-wiki-bff/internal/annotation"
+	conceptcache "github.com/rayer/llm-wiki-bff/internal/cache"
+	"github.com/rayer/llm-wiki-bff/internal/generation"
+	"github.com/rayer/llm-wiki-bff/internal/llm"
+	"github.com/rayer/llm-wiki-bff/internal/pipelinediagnostic"
 	"github.com/rayer/llm-wiki-bff/internal/rawstatus"
 	"github.com/rayer/llm-wiki-bff/internal/sourcestatus"
 	"github.com/rayer/llm-wiki-bff/internal/storage"
@@ -29,20 +33,25 @@ import (
 )
 
 type workerConfig struct {
-	VaultPath      string
-	Bucket         string
-	DataDir        string
-	UserID         string
-	ProjectID      string
-	ExecutionID    string
-	APIKey         string
-	InitVault      bool
-	Postprocess    bool
-	StopOnError    bool
-	Workspace      bool
-	WorkspaceDir   string
-	SuppressOutput bool
-	cloudMode      bool
+	VaultPath        string
+	Bucket           string
+	DataDir          string
+	UserID           string
+	ProjectID        string
+	ExecutionID      string
+	APIKey           string
+	InitVault        bool
+	Postprocess      bool
+	StopOnError      bool
+	Workspace        bool
+	WorkspaceDir     string
+	SuppressOutput   bool
+	SuggestedQueries bool
+	// CleanRebuild skips materializing prior generation outputs (wiki/.synto/
+	// cache artifacts) so Synto cold-starts from raw only. Default false.
+	CleanRebuild             bool
+	cloudMode                bool
+	suggestedQueriesProvider suggestedqueries.Provider
 	// These record Cobra presence, rather than a truthy value, so an explicit
 	// false or empty local-routing flag cannot be replaced by inherited env.
 	vaultSet, dataDirSet, workspaceSet         bool
@@ -53,6 +62,18 @@ type workerConfig struct {
 type execOLWFunc func(ctx context.Context, vault string, command []string, env []string, stdout, stderr io.Writer) error
 
 var execOLW execOLWFunc = execOLWCommand
+
+var pipelineLiveDestination = func(stream pipelineStream) io.Writer {
+	if stream == stderrStream {
+		return os.Stderr
+	}
+	return os.Stdout
+}
+
+var pipelineDurableDestination = func(file *os.File) io.Writer { return file }
+var pipelineControlDestination = func() io.Writer { return os.Stderr }
+
+var buildNonce = "local"
 
 const (
 	maxDiagnosticPending            = 8192
@@ -65,25 +86,123 @@ const (
 	maxWorkerArgBytes               = 4096
 	maxWorkerCommandBytes           = 1 << 20
 	maxWorkerCommandCumulativeBytes = 256 << 10
+	suggestedQueryModel             = "deepseek-chat"
 )
 
+const pipelineLogTruncationMarker = pipelinediagnostic.PipelineLogTruncationMarker
+
 func main() {
+	printBuildNonce(os.Stdout)
 	if err := executeWorkerCommand(newRootCommand()); err != nil {
-		log.Printf("worker: %v", err)
+		log.Printf("worker: %s", formatWorkerExitLog(err))
 		os.Exit(1)
 	}
 }
 
+func printBuildNonce(w io.Writer) {
+	fmt.Fprintf(w, "worker build_nonce=%s\n", buildNonce)
+}
+
+// errWorkerCommandRejected is the fixed CLI boundary for parse/usage failures.
+// Operational errors keep their public messages and are not collapsed into this.
+var errWorkerCommandRejected = errors.New("worker command rejected")
+var errWorkerInputInvalid = errors.New("worker input is invalid")
+var errWorkerConfigInvalid = errors.New("worker configuration is invalid")
+var errInvalidCommandBatch = errors.New("invalid command batch")
+
 func executeWorkerCommand(cmd *cobra.Command) error {
 	if err := cmd.Execute(); err != nil {
-		return errors.New("worker command rejected")
+		if isWorkerCLIRejection(err) {
+			return errWorkerCommandRejected
+		}
+		return err
 	}
 	return nil
 }
 
+// isWorkerCLIRejection identifies cobra/parse failures that may echo raw user
+// tokens (unknown commands, bad arity already normalized, flag parse). Those
+// stay opaque. Runtime pipeline errors must not match this path.
+func isWorkerCLIRejection(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.TrimSpace(err.Error())
+	if msg == "" || msg == errWorkerCommandRejected.Error() {
+		return true
+	}
+	// Cobra echoes the rejected token; never forward that to logs as-is.
+	if strings.HasPrefix(msg, "unknown command ") {
+		return true
+	}
+	if strings.HasPrefix(msg, "invalid argument ") {
+		return true
+	}
+	if strings.HasPrefix(msg, "accepts ") { // e.g. accepts 1 arg(s), received N
+		return true
+	}
+	return false
+}
+
+// formatWorkerExitLog builds an operator-facing exit line: stable public
+// boundary plus unwrapped cause chain, with credentials redacted.
+func formatWorkerExitLog(err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := formatWorkerExitMessage(err)
+	if msg == "" {
+		return errWorkerCommandRejected.Error()
+	}
+	secrets := []string{
+		os.Getenv("LLM_API_KEY"),
+		os.Getenv("DEEPSEEK_API_KEY"),
+		os.Getenv("SYNTO_API_KEY"),
+	}
+	return string(redactDiagnosticBytes([]byte(msg), secrets))
+}
+
+func formatWorkerExitMessage(err error) string {
+	if err == nil {
+		return ""
+	}
+	if multi, ok := err.(interface{ Unwrap() []error }); ok {
+		parts := make([]string, 0, 4)
+		seen := map[string]bool{}
+		for _, sub := range multi.Unwrap() {
+			if sub == nil {
+				continue
+			}
+			part := formatWorkerExitMessage(sub)
+			if part == "" || seen[part] {
+				continue
+			}
+			seen[part] = true
+			parts = append(parts, part)
+		}
+		return strings.Join(parts, "\n")
+	}
+	if ae, ok := err.(*annotatedError); ok && ae != nil {
+		public := strings.TrimSpace(ae.Error())
+		cause := formatWorkerExitMessage(ae.cause)
+		switch {
+		case public == "":
+			return cause
+		case cause == "" || cause == public:
+			return public
+		case strings.Contains(public, cause):
+			return public
+		default:
+			return public + ": " + cause
+		}
+	}
+	return strings.TrimSpace(err.Error())
+}
+
 func newRootCommand() *cobra.Command {
-	cfg := workerConfig{Postprocess: true, StopOnError: true}
+	cfg := workerConfig{Postprocess: true, StopOnError: true, SuggestedQueries: true}
 	var noPostprocess bool
+	var noSuggestedQueries bool
 
 	rootCmd := &cobra.Command{
 		Use:           "worker",
@@ -91,7 +210,7 @@ func newRootCommand() *cobra.Command {
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}
-	rootCmd.SetFlagErrorFunc(func(*cobra.Command, error) error { return errors.New("worker command rejected") })
+	rootCmd.SetFlagErrorFunc(func(*cobra.Command, error) error { return errWorkerCommandRejected })
 	rootCmd.PersistentFlags().StringVar(&cfg.VaultPath, "vault", "", "project vault path")
 	rootCmd.PersistentFlags().StringVar(&cfg.Bucket, "bucket", "", "GCS bucket")
 	rootCmd.PersistentFlags().StringVar(&cfg.DataDir, "data-dir", "", "local data root")
@@ -102,6 +221,7 @@ func newRootCommand() *cobra.Command {
 	rootCmd.PersistentFlags().BoolVar(&cfg.StopOnError, "stop-on-error", true, "stop on first failed Synto command")
 	rootCmd.PersistentFlags().BoolVar(&cfg.Workspace, "workspace", false, "run against a private copied workspace")
 	rootCmd.PersistentFlags().StringVar(&cfg.WorkspaceDir, "workspace-dir", "", "parent directory for private workspaces")
+	rootCmd.PersistentFlags().BoolVar(&cfg.SuppressOutput, "suppress-output", false, "write child output only to the durable pipeline log (skip console tee)")
 
 	runCmd := &cobra.Command{
 		Use:   "run <json array of arrays>",
@@ -127,11 +247,27 @@ func newRootCommand() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			postprocessCfg := cfg
 			setWorkerFlagPresence(&postprocessCfg, cmd)
+			if noSuggestedQueries {
+				postprocessCfg.SuggestedQueries = false
+			}
 			return runPostprocessCommand(cmd.Context(), postprocessCfg)
 		},
 	}
+	postprocessCmd.Flags().BoolVar(&noSuggestedQueries, "no-suggested-queries", false, "skip query-chip regeneration during postprocess")
 
-	rootCmd.AddCommand(runCmd, postprocessCmd)
+	suggestedQueriesCmd := &cobra.Command{
+		Use:   "suggested-queries",
+		Short: "Regenerate cache/suggested_queries.json query chips only",
+		Args:  fixedArgs(0),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			suggestCfg := cfg
+			setWorkerFlagPresence(&suggestCfg, cmd)
+			suggestCfg.SuggestedQueries = true
+			return runSuggestedQueriesCommand(cmd.Context(), suggestCfg)
+		},
+	}
+
+	rootCmd.AddCommand(runCmd, postprocessCmd, suggestedQueriesCmd)
 	return rootCmd
 }
 
@@ -153,7 +289,7 @@ func setWorkerFlagPresence(cfg *workerConfig, cmd *cobra.Command) {
 func fixedArgs(want int) cobra.PositionalArgs {
 	return func(_ *cobra.Command, args []string) error {
 		if len(args) != want {
-			return errors.New("worker command rejected")
+			return errWorkerCommandRejected
 		}
 		return nil
 	}
@@ -163,23 +299,26 @@ func runWorkerBatch(ctx context.Context, cfg workerConfig, rawCommands string) e
 	cfg = configFromEnvironment(cfg)
 	if cfg.Bucket != "" {
 		cfg.cloudMode = true
-		if err := validateWorkerConfigBounds(cfg); err != nil || len(rawCommands) > maxWorkerCommandBytes {
-			return errors.New("worker input is invalid")
+		if err := validateWorkerConfigBounds(cfg); err != nil {
+			return annotateError(errWorkerInputInvalid, err)
+		}
+		if len(rawCommands) > maxWorkerCommandBytes {
+			return annotateError(errWorkerInputInvalid, fmt.Errorf("command batch exceeds %d bytes", maxWorkerCommandBytes))
 		}
 	}
 	commands, err := parseCommandBatch(rawCommands)
 	if err != nil {
-		return errors.New("invalid command batch")
+		return annotateError(errInvalidCommandBatch, err)
 	}
 	if cfg.InitVault {
 		commands = append([][]string{{"init", "."}}, commands...)
 	}
 	if err := validateWorkerInput(cfg, commands); err != nil {
-		return errors.New("worker input is invalid")
+		return annotateError(errWorkerInputInvalid, err)
 	}
 	if cfg.Bucket != "" {
 		if cfg.VaultPath != "" || cfg.DataDir != "" || cfg.Workspace {
-			return errors.New("worker configuration is invalid")
+			return errWorkerConfigInvalid
 		}
 		return runCloudWorkerBatch(ctx, cfg, commands, newCloudObjectStore(cfg.Bucket))
 	}
@@ -224,7 +363,7 @@ func configFromEnvironment(cfg workerConfig) workerConfig {
 		cfg.ExecutionID = envOr("EXECUTION_ID", envOr("CLOUD_RUN_EXECUTION", ""))
 	}
 	if cfg.APIKey == "" && !cfg.apiKeySet {
-		cfg.APIKey = envOr("LLM_API_KEY", "")
+		cfg.APIKey = envOr("LLM_API_KEY", envOr("DEEPSEEK_API_KEY", ""))
 	}
 	if cfg.WorkspaceDir == "" && !cfg.workspaceDirSet {
 		cfg.WorkspaceDir = envOr("WORKSPACE_DIR", "/tmp")
@@ -232,44 +371,57 @@ func configFromEnvironment(cfg workerConfig) workerConfig {
 	if !cfg.Workspace && !cfg.workspaceSet && !cloud {
 		cfg.Workspace = envBool("WORKSPACE")
 	}
+	// CLEAN_REBUILD is opt-in only (never implied by other flags). Explicit
+	// true on the config struct wins; otherwise env may enable it.
+	if !cfg.CleanRebuild {
+		cfg.CleanRebuild = envBool("CLEAN_REBUILD")
+	}
 	return cfg
 }
 
-func runWorkerBatchAtVault(ctx context.Context, cfg workerConfig, commands [][]string, vault string) error {
+func runWorkerBatchAtVault(ctx context.Context, cfg workerConfig, commands [][]string, vault string) (runErr error) {
+	var err error
 	if err := cleanStaleLock(vault, 5*time.Minute); err != nil {
-		return err
+		return preserveWorkerFailure(err, failureStageLeaseCleanup, failureClassStateInvalid)
 	}
 	olwEnv, err := prepareOLWEnvironment(cfg)
 	if err != nil {
-		return err
+		return preserveWorkerFailure(err, failureStageSyntoConfigValidation, failureClassIO)
 	}
 	defer cleanupOLWEnvironment(olwEnv)
-	if err := ensureSyntoVault(ctx, vault, cfg, olwEnv); err != nil {
-		return err
-	}
-
 	stdout, stderr, closeLog, err := pipelineLogWriters(vault, cfg, commands, cfg.SuppressOutput)
 	if err != nil {
-		return err
+		return preserveWorkerFailure(err, failureStageReceiptRecording, failureClassIO)
 	}
-	runErr := runOLWBatch(ctx, vault, commands, cfg.StopOnError, olwEnv, stdout, stderr)
-	if err := closeLog(); err != nil {
-		return fmt.Errorf("close pipeline log: %w", err)
+	defer func() {
+		if err := closeLog(); err != nil {
+			closeFailure := preserveWorkerFailure(fmt.Errorf("close pipeline log: %w", err), failureStageReceiptRecording, failureClassIO)
+			if runErr == nil {
+				runErr = closeFailure
+			} else {
+				runErr = errors.Join(runErr, closeFailure)
+			}
+		}
+	}()
+	if err := ensureSyntoVault(ctx, vault, cfg, olwEnv, stdout, stderr); err != nil {
+		return preserveWorkerFailure(err, failureStageSyntoConfigValidation, failureClassUnknown)
 	}
+
+	runErr = runOLWBatch(ctx, vault, commands, cfg.StopOnError, olwEnv, stdout, stderr)
 	if runErr != nil {
-		return runErr
+		return preserveWorkerFailure(runErr, failureStageSyntoRun, failureClassUnknown)
 	}
 	if cfg.Postprocess {
-		if err := ensureSyntoIndex(ctx, vault, olwEnv); err != nil {
-			return err
+		if err := ensureSyntoIndex(ctx, vault, olwEnv, stdout, stderr); err != nil {
+			return preserveWorkerFailure(err, failureStageSyntoIndexExport, failureClassStateInvalid)
 		}
 	}
 	if err := validateSyntoPipelineSafety(filepath.Join(vault, "synto.toml")); err != nil {
-		return err
+		return preserveWorkerFailure(err, failureStageSyntoConfigValidation, failureClassValidation)
 	}
 	if cfg.Postprocess {
-		if err := runPostprocess(ctx, vault); err != nil {
-			return err
+		if err := runPostprocessWithProvider(ctx, vault, suggestedQueryProvider(cfg), stderr); err != nil {
+			return preserveWorkerFailure(err, failureStagePostprocess, failureClassIO)
 		}
 	}
 	return nil
@@ -305,7 +457,7 @@ func runWorkerBatchWorkspace(ctx context.Context, cfg workerConfig, commands [][
 	if err != nil {
 		return err
 	}
-	priorConcepts, err := snapshotConcepts(vault)
+	priorConcepts, err := snapshotConcepts(vault, snapshots)
 	if err != nil {
 		return err
 	}
@@ -322,7 +474,8 @@ func runWorkerBatchWorkspace(ctx context.Context, cfg workerConfig, commands [][
 	if err := materializeSnapshots(workspace, snapshots); err != nil {
 		return err
 	}
-	if err := runWorkerBatchAtVault(ctx, cfg, commands, workspace); err != nil {
+	err = runWorkerBatchAtVault(ctx, cfg, commands, workspace)
+	if err != nil {
 		logErr := publishWorkspaceFailureLog(workspace, vault, cfg)
 		var recordErr error
 		recordErr = recordFailure(vault, snapshots, err)
@@ -356,6 +509,7 @@ func runWorkerBatchWorkspace(ctx context.Context, cfg workerConfig, commands [][
 }
 
 func runPostprocessCommand(ctx context.Context, cfg workerConfig) (runErr error) {
+	cfg = configFromEnvironment(cfg)
 	vault, err := resolveVaultPath(cfg)
 	if err != nil {
 		return err
@@ -381,7 +535,54 @@ func runPostprocessCommand(ctx context.Context, cfg workerConfig) (runErr error)
 		return err
 	}
 	defer os.RemoveAll(workspace)
-	if err := runPostprocess(ctx, workspace); err != nil {
+	if err := runPostprocessWithProvider(ctx, workspace, suggestedQueryProvider(cfg), nil); err != nil {
+		return err
+	}
+	return syncWorkspaceOutputs(workspace, vault, cfg.ExecutionID)
+}
+
+// runSuggestedQueriesCommand regenerates query chips only, then publishes.
+// Cloud mode materializes the current generation, rewrites suggested_queries,
+// and CAS-publishes a complete carry-forward generation. Local mode uses the
+// vault workspace path. It never runs Synto, index rebuild, or reconcile.
+func runSuggestedQueriesCommand(ctx context.Context, cfg workerConfig) (runErr error) {
+	cfg = configFromEnvironment(cfg)
+	if cfg.Bucket != "" {
+		cfg.cloudMode = true
+		if cfg.VaultPath != "" || cfg.DataDir != "" || cfg.Workspace {
+			return errWorkerConfigInvalid
+		}
+		if err := validateWorkerConfigBounds(cfg); err != nil {
+			return annotateError(errWorkerInputInvalid, err)
+		}
+		return runCloudSuggestedQueries(ctx, cfg, newCloudObjectStore(cfg.Bucket))
+	}
+	vault, err := resolveVaultPath(cfg)
+	if err != nil {
+		return err
+	}
+	vault, err = canonicalExistingDir(vault)
+	if err != nil {
+		return err
+	}
+	lease, err := acquireVaultLease(vault, cfg.ExecutionID)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := lease.Release(); err != nil && runErr == nil {
+			runErr = err
+		}
+	}()
+	if err := recoverInterruptedPublish(vault); err != nil {
+		return err
+	}
+	workspace, err := createWorkspace(cfg.WorkspaceDir, vault)
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(workspace)
+	if err := runSuggestedQueriesStage(ctx, workspace, suggestedQueryProvider(cfg)); err != nil {
 		return err
 	}
 	return syncWorkspaceOutputs(workspace, vault, cfg.ExecutionID)
@@ -519,7 +720,7 @@ func prepareOLWEnvironment(cfg workerConfig) ([]string, error) {
 
 func runOLWBatch(ctx context.Context, vault string, commands [][]string, stopOnError bool, env []string, stdout, stderr io.Writer) error {
 	if err := validateSyntoCommandBatch(commands); err != nil {
-		return err
+		return newWorkerFailure(ctx, failureStageSyntoConfigValidation, failureClassValidation, "", err)
 	}
 	if stdout == nil {
 		stdout = os.Stdout
@@ -531,10 +732,10 @@ func runOLWBatch(ctx context.Context, vault string, commands [][]string, stopOnE
 	for i, command := range commands {
 		log.Printf("[%d/%d] synto command", i+1, len(commands))
 		if err := validateSyntoPipelineSafety(filepath.Join(vault, "synto.toml")); err != nil {
-			return err
+			return newWorkerFailure(ctx, failureStageSyntoConfigValidation, failureClassValidation, "", err)
 		}
 		if err := execOLW(ctx, vault, command, env, stdout, stderr); err != nil {
-			wrapped := fmt.Errorf("synto command failed: %w", err)
+			wrapped := fmt.Errorf("synto command failed: %w", newWorkerFailure(ctx, failureStageSyntoRun, failureClassChildExit, failureChildRun, err))
 			if stopOnError {
 				return wrapped
 			}
@@ -573,45 +774,49 @@ func allowlistedSyntoEnvironment(extra []string) []string {
 }
 
 func pipelineLogWriters(vault string, cfg workerConfig, commands [][]string, suppressOutput bool) (io.Writer, io.Writer, func() error, error) {
-	if cfg.cloudMode {
-		return io.Discard, io.Discard, func() error { return nil }, nil
+	secrets := logSecrets(cfg)
+	live := map[pipelineStream]io.Writer{}
+	if !suppressOutput {
+		live[stdoutStream] = pipelineLiveDestination(stdoutStream)
+		live[stderrStream] = pipelineLiveDestination(stderrStream)
 	}
+	pipeline := newLivePipeline(nil, live, cfg, secrets)
 	if strings.TrimSpace(cfg.ExecutionID) == "" {
-		sink := newDiagnosticSink([]io.Writer{os.Stdout, os.Stderr}, diagnosticSecrets(cfg, commands))
-		return sink, sink, sink.Close, nil
+		return pipeline.writer(stdoutStream), pipeline.writer(stderrStream), pipeline.Close, nil
 	}
 	path, err := pipelineLogPath(vault, cfg.ExecutionID)
 	if err != nil {
 		return nil, nil, nil, err
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return nil, nil, nil, fmt.Errorf("mkdir pipeline log dir: %w", err)
+		pipeline.recordDegraded("durable", fmt.Errorf("mkdir pipeline log dir: %w", err))
+		return pipeline.writer(stdoutStream), pipeline.writer(stderrStream), pipeline.Close, nil
 	}
 	file, err := os.Create(path)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("create pipeline log: %w", err)
+		pipeline.recordDegraded("durable", fmt.Errorf("create pipeline log: %w", err))
+		return pipeline.writer(stdoutStream), pipeline.writer(stderrStream), pipeline.Close, nil
 	}
-	destinations := []io.Writer{file}
-	if !suppressOutput {
-		destinations = append(destinations, os.Stdout, os.Stderr)
-	}
-	sink := newDiagnosticSink(destinations, diagnosticSecrets(cfg, commands))
-	return sink, sink, func() error {
-		if err := sink.Close(); err != nil {
-			_ = file.Close()
-			return err
+	durable := newDiagnosticSink([]io.Writer{pipelineDurableDestination(file)}, secrets)
+	pipeline = newLivePipeline(durable, live, cfg, secrets)
+	return pipeline.writer(stdoutStream), pipeline.writer(stderrStream), func() error {
+		pipelineErr := pipeline.Close()
+		fileErr := file.Close()
+		if fileErr != nil {
+			pipeline.recordDegraded("durable", fileErr)
 		}
-		return file.Close()
+		return pipelineErr
 	}, nil
 }
 
 type diagnosticSink struct {
-	writers []io.Writer
-	secrets []string
-	pending []byte
-	written int
-	mu      sync.Mutex
-	closed  bool
+	writers   []io.Writer
+	secrets   []string
+	pending   []byte
+	output    []byte
+	mu        sync.Mutex
+	closed    bool
+	truncated bool
 }
 
 func newDiagnosticSink(writers []io.Writer, secrets []string) *diagnosticSink {
@@ -624,6 +829,9 @@ func (w *diagnosticSink) Write(data []byte) (int, error) {
 		return 0, errors.New("diagnostic sink closed")
 	}
 	original := len(data)
+	if w.truncated {
+		return original, nil
+	}
 	for len(data) > 0 {
 		n := maxDiagnosticPending
 		if room := maxDiagnosticBuffered - len(w.pending); room < n {
@@ -661,23 +869,25 @@ func (w *diagnosticSink) Close() error {
 	return w.emitLocked(w.pending, true)
 }
 func (w *diagnosticSink) emitLocked(data []byte, final bool) error {
-	if len(data) == 0 {
-		return nil
+	if len(data) > 0 && !w.truncated {
+		// Retain the full bounded output until close so an overflow can replace
+		// the final marker-sized suffix without changing the total size.
+		text := redactDiagnosticBytes(data, w.secrets)
+		remaining := maxPipelineLog - len(w.output)
+		if len(text) > remaining {
+			w.output = append(w.output, text[:remaining]...)
+			w.truncated = true
+			copy(w.output[maxPipelineLog-len(pipelineLogTruncationMarker):], pipelineLogTruncationMarker)
+		} else {
+			w.output = append(w.output, text...)
+		}
 	}
-	// Retain the fixed-size tail until close so a secret split across writes or
-	// stdout/stderr cannot reach any destination before redaction.
-	text := string(redactDiagnosticBytes(data, w.secrets))
-	if w.written < maxPipelineLog {
-		remaining := maxPipelineLog - w.written
-		text = truncateDiagnostic(text, remaining)
+	if final {
 		for _, dst := range w.writers {
-			if _, err := io.WriteString(dst, text); err != nil {
+			if _, err := dst.Write(w.output); err != nil {
 				return err
 			}
 		}
-		w.written += len(text)
-	}
-	if final {
 		w.pending = nil
 	} else {
 		w.pending = append(w.pending[:0], w.pending[len(data):]...)
@@ -770,17 +980,23 @@ func (w *cappedRedactingWriter) Write(data []byte) (int, error) {
 }
 
 func logSecrets(cfg workerConfig) []string {
-	values := []string{cfg.APIKey, os.Getenv("LLM_API_KEY"), os.Getenv("DEEPSEEK_API_KEY")}
-	return values
+	// Only real credentials. Identity, paths, and command args stay visible.
+	return diagnosticSecrets(cfg, nil)
 }
 
-func diagnosticSecrets(cfg workerConfig, commands [][]string) []string {
-	values := []string{cfg.APIKey, cfg.UserID, cfg.ProjectID, cfg.ExecutionID, cfg.VaultPath, cfg.WorkspaceDir, cfg.DataDir, cfg.Bucket}
-	if !cfg.apiKeySet {
-		values = append(values, os.Getenv("LLM_API_KEY"), os.Getenv("DEEPSEEK_API_KEY"))
+// diagnosticSecrets returns only real credentials. Execution IDs, tenant IDs,
+// paths, and command args are control-plane observability and must remain visible.
+// When an explicit API key is set, oversized inherited env keys are ignored so
+// they cannot disable redaction or validation by sheer size.
+func diagnosticSecrets(cfg workerConfig, _ [][]string) []string {
+	values := []string{cfg.APIKey}
+	if cfg.apiKeySet {
+		return values
 	}
-	for _, command := range commands {
-		values = append(values, command...)
+	for _, value := range []string{os.Getenv("LLM_API_KEY"), os.Getenv("DEEPSEEK_API_KEY")} {
+		if value != "" && len(value) <= maxWorkerKeyBytes {
+			values = append(values, value)
+		}
 	}
 	return values
 }
@@ -892,8 +1108,53 @@ func cleanStaleLock(vault string, maxAge time.Duration) error {
 }
 
 func runPostprocess(ctx context.Context, vault string) error {
+	return runPostprocessWithProvider(ctx, vault, nil, nil)
+}
+
+func suggestedQueryProvider(cfg workerConfig) suggestedqueries.Provider {
+	if cfg.suggestedQueriesProvider != nil {
+		return cfg.suggestedQueriesProvider
+	}
+	if !cfg.SuggestedQueries {
+		return nil
+	}
+	return llm.NewClient(cfg.APIKey)
+}
+
+// runPostprocessWithProvider rebuilds cache/index artifacts, then regenerates
+// query chips when provider is non-nil (or ensures empty/last-known-good when nil).
+// Query-chip work is also available alone via runSuggestedQueriesStage / CLI.
+func runPostprocessWithProvider(ctx context.Context, vault string, provider suggestedqueries.Provider, warn io.Writer) error {
+	if err := runCacheIndexStage(ctx, vault, warn); err != nil {
+		return err
+	}
+	if err := runSuggestedQueriesStage(ctx, vault, provider); err != nil {
+		return err
+	}
+	return nil
+}
+
+// runCacheIndexStage rebuilds id_map/concepts, dormant cache, and raw_status.
+// It does not touch suggested_queries.json.
+func runCacheIndexStage(ctx context.Context, vault string, warn io.Writer) error {
 	store := fsstore.New(vault)
-	if _, err := wikiindex.Rebuild(ctx, store); err != nil {
+	index, err := readSyntoIndexTruth(vault)
+	if err != nil {
+		return fmt.Errorf("read Synto identity authority: %w", err)
+	}
+	if index.Present {
+		plan, err := syntoIdentityPlanFromIndex(index)
+		if err != nil {
+			return fmt.Errorf("build Synto identity authority: %w", err)
+		}
+		reportUnboundActiveEntities(plan, index, warn)
+		if err := enforceActiveEntityCoverage(plan); err != nil {
+			return fmt.Errorf("postprocess Synto index: %w", err)
+		}
+		if _, err := wikiindex.RebuildWithSyntoIdentity(ctx, store, plan); err != nil {
+			return fmt.Errorf("postprocess Synto index: %w", err)
+		}
+	} else if _, err := wikiindex.Rebuild(ctx, store); err != nil {
 		return fmt.Errorf("postprocess: %w", err)
 	}
 	if err := ensureDormantConceptCache(vault); err != nil {
@@ -902,8 +1163,14 @@ func runPostprocess(ctx context.Context, vault string) error {
 	if err := writeRawStatus(ctx, vault); err != nil {
 		return fmt.Errorf("postprocess raw status: %w", err)
 	}
-	if err := writeSuggestedQueries(ctx, vault); err != nil {
-		return fmt.Errorf("postprocess suggested queries: %w", err)
+	return nil
+}
+
+// runSuggestedQueriesStage regenerates cache/suggested_queries.json only.
+// Provider nil preserves last-known-good or writes a valid empty v2 artifact.
+func runSuggestedQueriesStage(ctx context.Context, vault string, provider suggestedqueries.Provider) error {
+	if err := writeSuggestedQueries(ctx, vault, provider); err != nil {
+		return fmt.Errorf("suggested queries: %w", err)
 	}
 	return nil
 }
@@ -918,9 +1185,12 @@ func ensureDormantConceptCache(vault string) error {
 	return writeFileAtomicWithin(vault, path, nil)
 }
 
-func writeSuggestedQueries(ctx context.Context, vault string) error {
+func writeSuggestedQueries(ctx context.Context, vault string, provider suggestedqueries.Provider) error {
+	if provider == nil {
+		return ensureEmptySuggestedQueries(ctx, vault)
+	}
 	store := fsstore.New(vault)
-	data, err := store.ReadFile(ctx, wikiindex.ConceptsJSONLPath)
+	data, err := readBoundedRegularFileWithin(vault, wikiindex.ConceptsJSONLPath)
 	if err != nil {
 		if errors.Is(err, wikiindex.ErrNotFound) || errors.Is(err, os.ErrNotExist) {
 			data = nil
@@ -934,15 +1204,17 @@ func writeSuggestedQueries(ctx context.Context, vault string) error {
 		return fmt.Errorf("list concept mtimes: %w", err)
 	}
 
-	now := time.Now()
-	var artifact suggestedqueries.Artifact
-	if len(data) > 0 {
-		artifact, err = suggestedqueries.BuildFromConceptsJSONL(data, mtimes, now)
-		if err != nil {
-			return fmt.Errorf("build suggested queries: %w", err)
-		}
-	} else {
-		artifact = suggestedqueries.Build(nil, mtimes, now)
+	entries, err := decodeSuggestedQueryConcepts(data)
+	if err != nil {
+		return fmt.Errorf("decode suggested query concepts: %w", err)
+	}
+	artifact, err := suggestedqueries.Generate(ctx, provider, "", entries, mtimes, suggestedqueries.GenerationMetadata{
+		Model:         suggestedQueryModel,
+		PromptVersion: suggestedqueries.PromptVersion,
+	}, time.Now())
+	if err != nil {
+		log.Printf("postprocess suggested queries: generation failed; preserving last-known-good artifact: %v", err)
+		return ensureEmptySuggestedQueries(ctx, vault)
 	}
 
 	payload, err := json.MarshalIndent(artifact, "", "  ")
@@ -953,6 +1225,51 @@ func writeSuggestedQueries(ctx context.Context, vault string) error {
 		return fmt.Errorf("write suggested queries: %w", err)
 	}
 	return nil
+}
+
+func ensureEmptySuggestedQueries(ctx context.Context, vault string) error {
+	store := fsstore.New(vault)
+	if _, err := store.ReadFile(ctx, suggestedqueries.Path); err == nil {
+		return nil
+	} else if !errors.Is(err, wikiindex.ErrNotFound) && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("read existing suggested queries: %w", err)
+	}
+	artifact := suggestedqueries.Artifact{
+		Version:    2,
+		Queries:    []string{},
+		Candidates: []suggestedqueries.Candidate{},
+		UpdatedAt:  time.Now().UTC().Format(time.RFC3339),
+	}
+	payload, err := json.MarshalIndent(artifact, "", "  ")
+	if err != nil {
+		return err
+	}
+	if _, err := store.WriteBytesAtomic(ctx, payload, "cache/suggested_queries.json.tmp", suggestedqueries.Path); err != nil {
+		return fmt.Errorf("write empty suggested queries: %w", err)
+	}
+	return nil
+}
+
+func decodeSuggestedQueryConcepts(data []byte) ([]conceptcache.Entry, error) {
+	if len(data) == 0 {
+		return nil, nil
+	}
+	entries := make([]conceptcache.Entry, 0)
+	for _, line := range bytes.Split(data, []byte{'\n'}) {
+		line = bytes.TrimSpace(line)
+		if len(line) == 0 {
+			continue
+		}
+		if len(entries) >= generation.MaxFiles {
+			return nil, generation.ErrLogicalEntryLimit
+		}
+		var entry conceptcache.Entry
+		if err := json.Unmarshal(line, &entry); err != nil {
+			return nil, err
+		}
+		entries = append(entries, entry)
+	}
+	return entries, nil
 }
 
 func listConceptMtTimes(vault string) (map[string]time.Time, error) {
@@ -1096,28 +1413,31 @@ func snapshotSources(vault string) ([]sourceSnapshot, error) {
 		return nil, fmt.Errorf("decode source map: %w", err)
 	}
 
-	snapshots := make([]sourceSnapshot, 0, len(ids.SourceMeta))
-	mappedRawPaths := make(map[string]string, len(ids.SourceMeta))
-	for sourceID, meta := range ids.SourceMeta {
-		rawPath := strings.TrimSpace(meta.SourceFile)
+	capacity := len(ids.SourceMeta)
+	if len(ids.Source) > capacity {
+		capacity = len(ids.Source)
+	}
+	snapshots := make([]sourceSnapshot, 0, capacity)
+	mappedRawPaths := make(map[string]string, capacity)
+	addSnapshot := func(sourceID, rawPath string) error {
 		if !annotation.ValidSourceID(sourceID) || !safeMappedRawPath(rawPath) {
-			return nil, fmt.Errorf("unsafe source mapping %q -> %q", sourceID, rawPath)
+			return fmt.Errorf("unsafe source mapping %q -> %q", sourceID, rawPath)
 		}
 		if prior, exists := mappedRawPaths[rawPath]; exists {
-			return nil, fmt.Errorf("duplicate source mapping %q and %q -> %q", prior, sourceID, rawPath)
+			return fmt.Errorf("duplicate source mapping %q and %q -> %q", prior, sourceID, rawPath)
 		}
 		mappedRawPaths[rawPath] = sourceID
 		raw, err := readRegularFileWithin(vault, rawPath)
 		if errors.Is(err, os.ErrNotExist) {
 			snapshots = append(snapshots, sourceSnapshot{SourceID: sourceID, RawPath: rawPath, Tombstone: true})
-			continue
+			return nil
 		}
 		if err != nil {
-			return nil, fmt.Errorf("read source raw %q: %w", rawPath, err)
+			return fmt.Errorf("read source raw %q: %w", rawPath, err)
 		}
 		ann, err := readAnnotation(vault, sourceID, rawPath)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		rawSum := sha256.Sum256(raw)
 		rawSHA := fmt.Sprintf("%x", rawSum[:])
@@ -1130,6 +1450,69 @@ func snapshotSources(vault string) ([]sourceSnapshot, error) {
 		}
 		snapshot.SyntoContentHash = syntoSourceContentHash(snapshot)
 		snapshots = append(snapshots, snapshot)
+		return nil
+	}
+
+	if len(ids.Source) == 0 {
+		for sourceID, meta := range ids.SourceMeta {
+			if err := addSnapshot(sourceID, strings.TrimSpace(meta.SourceFile)); err != nil {
+				return nil, err
+			}
+		}
+	} else {
+		for sourceID := range ids.SourceMeta {
+			if _, exists := ids.Source[sourceID]; !exists {
+				return nil, fmt.Errorf("source metadata %q has no source mapping", sourceID)
+			}
+		}
+		sourceIDs := make([]string, 0, len(ids.Source))
+		for sourceID := range ids.Source {
+			sourceIDs = append(sourceIDs, sourceID)
+		}
+		sort.Strings(sourceIDs)
+		mappedSlugs := make(map[string]string, len(ids.Source))
+		for _, sourceID := range sourceIDs {
+			if !annotation.ValidSourceID(sourceID) {
+				return nil, fmt.Errorf("unsafe source mapping %q -> %q", sourceID, ids.Source[sourceID])
+			}
+			slug := ids.Source[sourceID]
+			pagePath, err := safeSourcePagePath(slug)
+			if err != nil || strings.TrimSpace(slug) != slug {
+				return nil, fmt.Errorf("unsafe source mapping %q -> %q", sourceID, slug)
+			}
+			if prior, exists := mappedSlugs[slug]; exists {
+				return nil, fmt.Errorf("duplicate legacy source slug %q for %q and %q", slug, prior, sourceID)
+			}
+			mappedSlugs[slug] = sourceID
+
+			meta, hasMeta := ids.SourceMeta[sourceID]
+			rawPath := strings.TrimSpace(meta.SourceFile)
+			if hasMeta {
+				if meta.Slug != "" && meta.Slug != slug {
+					return nil, fmt.Errorf("source metadata slug disagrees for %q: %q != %q", sourceID, meta.Slug, slug)
+				}
+			} else {
+				page, readErr := readBoundedRegularFileWithin(vault, pagePath)
+				if errors.Is(readErr, os.ErrNotExist) {
+					return nil, fmt.Errorf("missing legacy source page %q: %w", pagePath, readErr)
+				}
+				if readErr != nil {
+					return nil, fmt.Errorf("read legacy source page %q: %w", pagePath, readErr)
+				}
+				parsed, parseErr := parseSyntoSourcePage(page)
+				if parseErr != nil {
+					return nil, fmt.Errorf("parse legacy source page %q: %w", pagePath, parseErr)
+				}
+				value, ok := parsed.fields["source_file"].(string)
+				rawPath = strings.TrimSpace(value)
+				if !ok || !safeMappedRawPath(rawPath) {
+					return nil, fmt.Errorf("missing or unsafe legacy source_file for %q", pagePath)
+				}
+			}
+			if err := addSnapshot(sourceID, rawPath); err != nil {
+				return nil, err
+			}
+		}
 	}
 	sort.Slice(snapshots, func(i, j int) bool { return snapshots[i].SourceID < snapshots[j].SourceID })
 	return snapshots, nil
@@ -1221,8 +1604,11 @@ func readSourceStatus(vault string) (sourcestatus.Artifact, error) {
 		return sourcestatus.Artifact{}, fmt.Errorf("read source status: %w", err)
 	}
 	artifact, err := sourcestatus.Decode(data)
-	if err != nil || artifact.Version != 1 {
-		return sourcestatus.Artifact{}, errors.New("invalid source status")
+	if err != nil {
+		return sourcestatus.Artifact{}, fmt.Errorf("invalid source status: %w", err)
+	}
+	if artifact.Version != 1 {
+		return sourcestatus.Artifact{}, fmt.Errorf("invalid source status: unsupported version %d", artifact.Version)
 	}
 	return artifact, nil
 }

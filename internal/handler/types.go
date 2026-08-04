@@ -132,6 +132,7 @@ type StatusResponse struct {
 	RawCount         int                        `json:"raw_count"`
 	IndexSources     int                        `json:"index_sources"`
 	IndexConcepts    int                        `json:"index_concepts"`
+	SuggestedQueries []string                   `json:"suggested_queries"`
 	RunningPipelines int                        `json:"running_pipelines"`
 	LastExecution    *PipelineExecutionResponse `json:"last_execution,omitempty"`
 	Locked           bool                       `json:"locked,omitempty"`
@@ -141,12 +142,27 @@ type StatusResponse struct {
 
 // PipelineExecutionResponse is a normalized Cloud Run execution summary.
 type PipelineExecutionResponse struct {
-	Name      string `json:"name"`
-	Status    string `json:"status"`
-	StartTime string `json:"start_time"`
-	EndTime   string `json:"end_time"`
-	Duration  string `json:"duration"`
-	LogURL    string `json:"log_url,omitempty"`
+	Name           string                     `json:"name"`
+	Status         string                     `json:"status"`
+	StartTime      string                     `json:"start_time"`
+	EndTime        string                     `json:"end_time"`
+	Duration       string                     `json:"duration"`
+	LogURL         string                     `json:"log_url,omitempty"`
+	Diagnostic     *PipelineFailureDiagnostic `json:"diagnostic,omitempty"`
+	LogState       string                     `json:"log_state,omitempty"`
+	LogStateReason string                     `json:"log_state_reason,omitempty"`
+}
+
+// PipelineFailureDiagnostic is the allowlisted, worker-produced failure
+// receipt exposed to an authenticated owner.
+type PipelineFailureDiagnostic struct {
+	Version    int    `json:"version"`
+	Status     string `json:"status"`
+	Stage      string `json:"stage"`
+	ErrorClass string `json:"error_class"`
+	DetailCode string `json:"detail_code,omitempty"`
+	Child      string `json:"child_command,omitempty"`
+	ExitCode   *int   `json:"exit_code,omitempty"`
 }
 
 // MetricsResponse is for GET /api/metrics (Grafana).

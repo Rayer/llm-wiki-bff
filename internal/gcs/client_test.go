@@ -16,6 +16,25 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+func TestStatFileUsesScopedMetadataOnly(t *testing.T) {
+	client, backend := newMemoryClient()
+	backend.put("users/user/projects/project/cache/pipeline-execution.log", []byte("log"), 7, nil)
+
+	size, err := client.StatFile(context.Background(), "cache/pipeline-execution.log")
+	if err != nil || size != 3 {
+		t.Fatalf("StatFile() = %d, %v; want size 3", size, err)
+	}
+	requests, _ := backend.snapshots()
+	if len(requests) != 0 {
+		t.Fatalf("StatFile read body requests = %d, want 0", len(requests))
+	}
+
+	other := client.WithScope("user", "other")
+	if _, err := other.StatFile(context.Background(), "cache/pipeline-execution.log"); !errors.Is(err, store.ErrObjectNotExist) {
+		t.Fatalf("foreign StatFile error = %v, want object not exist", err)
+	}
+}
+
 func TestNewScopedClientUsesRequestedPrefixWithoutChangingDefault(t *testing.T) {
 	defaultClient := &Client{userID: "default-user", projectID: "default-project"}
 
@@ -60,6 +79,40 @@ func TestProductionAtomicCopyCASConflictIsNormalized(t *testing.T) {
 func TestObjectNotFoundPreservesStorageSentinel(t *testing.T) {
 	if !objectNotFound(cloudstorage.ErrObjectNotExist) || !objectNotFound(status.Error(codes.NotFound, "missing")) {
 		t.Fatal("missing object errors were not recognized")
+	}
+}
+
+func TestReadFileAcceptsWorkerFailureDiagnosticFromMemoryGCS(t *testing.T) {
+	client, backend := newMemoryClient()
+	path := "cache/pipeline-run.failure.json"
+	want := []byte(`{"version":1,"status":"failed","stage":"synto_run","error_class":"child_exit","child_command":"run"}`)
+	backend.put(projectObject(path), want, 11, nil)
+
+	got, err := client.ReadFile(context.Background(), path)
+	if err != nil {
+		t.Fatalf("ReadFileLimited() error = %v, want worker diagnostic object", err)
+	}
+	if string(got) != string(want) {
+		t.Fatalf("diagnostic = %q, want %q", got, want)
+	}
+	if _, err := client.WithScope("other-user", "project").ReadFile(context.Background(), path); err == nil {
+		t.Fatal("cross-tenant diagnostic read unexpectedly succeeded")
+	}
+	if _, err := client.ReadFile(context.Background(), "cache/pipeline-run.failure.json/../secret"); err == nil {
+		t.Fatal("unsafe diagnostic path was accepted")
+	}
+}
+
+func TestReadFileLimitedRequestsExactFailureDiagnosticBound(t *testing.T) {
+	client, backend := newMemoryClient()
+	backend.put(projectObject("cache/pipeline-run.failure.json"), []byte("diagnostic"), 11, nil)
+	if _, err := client.ReadFileLimited(context.Background(), "cache/pipeline-run.failure.json", 4097); err != nil {
+		t.Fatal(err)
+	}
+	backend.mu.Lock()
+	defer backend.mu.Unlock()
+	if len(backend.requestedLimits) == 0 || backend.requestedLimits[len(backend.requestedLimits)-1] != 4097 {
+		t.Fatalf("requested limits=%v, want final request 4097", backend.requestedLimits)
 	}
 }
 

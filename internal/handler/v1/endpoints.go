@@ -23,6 +23,7 @@ import (
 	"github.com/rayer/llm-wiki-bff/internal/gcs"
 	"github.com/rayer/llm-wiki-bff/internal/handler"
 	"github.com/rayer/llm-wiki-bff/internal/llm"
+	"github.com/rayer/llm-wiki-bff/internal/pipelinediagnostic"
 	"github.com/rayer/llm-wiki-bff/internal/pipelinequota"
 	"github.com/rayer/llm-wiki-bff/internal/search"
 	store "github.com/rayer/llm-wiki-bff/internal/storage"
@@ -42,8 +43,16 @@ const (
 var (
 	errIndexNotFound             = errors.New("index not found")
 	errFirestoreNotConfigured    = errors.New("Firestore client is not configured")
+	errInvalidAdminProjectRecord = errors.New("invalid admin project record")
 	errPipelineExecutionNotFound = errors.New("pipeline execution not found")
 	errWikiStorageNotConfigured  = errors.New("wiki storage is not configured")
+)
+
+const (
+	pipelineLogStatePending     = "pending"
+	pipelineLogStateAvailable   = "available"
+	pipelineLogStateUnavailable = "unavailable"
+	maxPipelineDiagnosticBytes  = 4 << 10
 )
 
 // Health handles GET /api/v1/health.
@@ -345,7 +354,7 @@ func (h *Handler) Query(c *gin.Context) {
 	searchQuery := query
 	var expandResult *llm.ExpandResult
 	if h.expander != nil {
-		if result, err := h.expander.Expand(query); err != nil {
+		if result, err := h.expander.Expand(c.Request.Context(), query); err != nil {
 			log.Printf("[expander] query expansion failed for %q: %v — falling back to raw query", query, err)
 		} else if result != nil {
 			expandResult = result
@@ -372,16 +381,21 @@ func (h *Handler) Query(c *gin.Context) {
 	}
 
 	if h.llm != nil && len(results) > 0 {
+		authority, err := search.NewCitationAuthority(results)
+		if err != nil {
+			log.Printf("citation capability issuance failed: %v", err)
+			c.JSON(http.StatusOK, resp)
+			return
+		}
 		topN := min(10, len(results))
-		contexts := cachedContexts(h.cache, gcsClient, results[:topN])
+		contexts := cachedContexts(c.Request.Context(), h.cache, gcsClient, results[:topN], authority)
 
 		if len(contexts) > 0 {
 			systemPrompt := buildSystemPrompt(mode)
 			userPrompt := buildUserPrompt(query, contexts)
-			if answer, err := h.llm.Chat(systemPrompt, userPrompt); err == nil {
-				answer = ensureBrackets(answer, results)
+			if answer, err := h.llm.Chat(c.Request.Context(), systemPrompt, userPrompt); err == nil {
+				answer, citations, filtered := authority.Resolve(answer)
 				resp.AISynth = answer
-				citations, filtered := search.ParseCitations(answer, results)
 				resp.Citations = citations
 				resp.Results = filtered
 			} else {
@@ -393,12 +407,12 @@ func (h *Handler) Query(c *gin.Context) {
 	c.JSON(http.StatusOK, resp)
 }
 
-func cachedContexts(conceptCache *conceptcache.Cache, reader conceptcache.Reader, results []search.Result) []string {
+func cachedContexts(ctx context.Context, conceptCache *conceptcache.Cache, reader conceptcache.Reader, results []search.Result, authority *search.CitationAuthority) []string {
 	contexts := make([]string, 0, len(results))
-	for _, result := range results {
+	for rank, result := range results {
 		entry, ok := conceptCache.Entry(reader, result.Slug)
 		if !ok {
-			if _, err := conceptCache.Build(context.Background(), reader); err == nil {
+			if _, err := conceptCache.Build(ctx, reader); err == nil {
 				entry, ok = conceptCache.Entry(reader, result.Slug)
 			}
 		}
@@ -409,13 +423,7 @@ func cachedContexts(conceptCache *conceptcache.Cache, reader conceptcache.Reader
 		if len(entry.Sources) > 0 {
 			sourceContext = "Sources: [" + strings.Join(entry.Sources, ", ") + "]"
 		}
-		contexts = append(contexts, fmt.Sprintf(
-			"[%s] %s\n%s\n\n%s",
-			entry.Title,
-			entry.Slug,
-			sourceContext,
-			entry.Body,
-		))
+		contexts = append(contexts, authority.AddContext(rank, result, sourceContext+"\n\n"+entry.Body))
 	}
 	return contexts
 }
@@ -654,10 +662,14 @@ func (h *Handler) GetSource(c *gin.Context) {
 
 	response, err := h.sourceDetailResponse(c, gcsClient, *page, data)
 	if err != nil {
+		if isFrontmatterSerializeError(err) {
+			writeFrontmatterSerializeError(c, err)
+			return
+		}
 		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "generated data unavailable"})
 		return
 	}
-	c.JSON(http.StatusOK, response)
+	writeJSON(c, http.StatusOK, response)
 }
 
 // ListConcepts handles GET /api/v1/concepts using the request's GCS scope.
@@ -748,8 +760,12 @@ func (h *Handler) GetConcept(c *gin.Context) {
 		return
 	}
 
-	frontmatter, body := parseFrontmatter(string(data))
-	c.JSON(http.StatusOK, handler.ConceptDetailResponse{
+	frontmatter, body, err := parseFrontmatterJSON(string(data))
+	if err != nil {
+		writeFrontmatterSerializeError(c, err)
+		return
+	}
+	writeJSON(c, http.StatusOK, handler.ConceptDetailResponse{
 		Slug:        slug,
 		ID:          page.ID,
 		Title:       slug,
@@ -820,7 +836,7 @@ func (h *Handler) PipelineRun(c *gin.Context) {
 		return
 	}
 
-	executionID, err := h.invokePipelineJob(ctx, userID, projectID)
+	executionID, err := h.invokePipelineJob(ctx, userID, projectID, false)
 	if err != nil {
 		if reserved {
 			if qs := h.effectiveQuotaStore(); qs != nil {
@@ -844,24 +860,59 @@ func (h *Handler) PipelineRun(c *gin.Context) {
 	})
 }
 
+// Pipeline stage identifiers for Cloud Run job overrides. TASK_TYPE stays
+// "pipeline" so ownership / already_running matching remains uniform; STAGE
+// discriminates full run vs single-stage repairs.
+const (
+	pipelineStageFull             = "full"
+	pipelineStageSuggestedQueries = "suggested-queries"
+	pipelineStageEnvName          = "PIPELINE_STAGE"
+)
+
 // invokePipelineJob starts the shared Cloud Run pipeline job for userID/projectID.
 // Used by both user PipelineRun and AdminPipelineTrigger.
-func (h *Handler) invokePipelineJob(ctx context.Context, userID, projectID string) (executionID string, err error) {
+// cleanRebuild is opt-in; false preserves prior generation materialization.
+// stage selects worker entrypoint: empty/"full" runs the full Synto pipeline;
+// "suggested-queries" regenerates query chips only.
+func (h *Handler) invokePipelineJob(ctx context.Context, userID, projectID string, cleanRebuild bool) (executionID string, err error) {
+	return h.invokePipelineJobStage(ctx, userID, projectID, cleanRebuild, pipelineStageFull)
+}
+
+func (h *Handler) invokePipelineJobStage(ctx context.Context, userID, projectID string, cleanRebuild bool, stage string) (executionID string, err error) {
+	stage = strings.TrimSpace(stage)
+	if stage == "" {
+		stage = pipelineStageFull
+	}
+	args, err := workerArgsForStage(stage)
+	if err != nil {
+		return "", err
+	}
+	if cleanRebuild && stage != pipelineStageFull {
+		return "", fmt.Errorf("clean_rebuild is only valid for full pipeline stage")
+	}
+
 	token, err := h.getMetadataAccessToken(ctx)
 	if err != nil {
 		return "", err
 	}
 
+	env := []gin.H{
+		{"name": "USER_ID", "value": userID},
+		{"name": "PROJECT_ID", "value": projectID},
+		// Keep TASK_TYPE=pipeline for ownership matching across stages.
+		{"name": "TASK_TYPE", "value": "pipeline"},
+		{"name": pipelineStageEnvName, "value": stage},
+	}
+	if cleanRebuild {
+		// Worker treats only explicit true as clean rebuild; omitted means false.
+		env = append(env, gin.H{"name": "CLEAN_REBUILD", "value": "true"})
+	}
 	body, err := json.Marshal(gin.H{
 		"overrides": gin.H{
 			"containerOverrides": []gin.H{
 				{
-					"args": []string{"run", defaultWorkerCommands},
-					"env": []gin.H{
-						{"name": "USER_ID", "value": userID},
-						{"name": "PROJECT_ID", "value": projectID},
-						{"name": "TASK_TYPE", "value": "pipeline"},
-					},
+					"args": args,
+					"env":  env,
 				},
 			},
 		},
@@ -895,6 +946,17 @@ func (h *Handler) invokePipelineJob(ctx context.Context, userID, projectID strin
 		return "", err
 	}
 	return executionID, nil
+}
+
+func workerArgsForStage(stage string) ([]string, error) {
+	switch stage {
+	case pipelineStageFull:
+		return []string{"run", defaultWorkerCommands}, nil
+	case pipelineStageSuggestedQueries:
+		return []string{"suggested-queries"}, nil
+	default:
+		return nil, fmt.Errorf("unsupported pipeline stage %q", stage)
+	}
 }
 
 type cloudRunJobRunResponse struct {
@@ -957,7 +1019,7 @@ type cloudRunCondition struct {
 // PipelineStatus handles GET /api/v1/pipeline/status.
 //
 //	@Summary		Pipeline execution status
-//	@Description	Returns the latest Cloud Run pipeline execution for the current project. Pass execution_id to fetch a specific execution. When an execution is available, last_execution.log_url points to the authenticated log endpoint.
+//	@Description	Returns the latest Cloud Run pipeline execution for the current project, including a bounded typed failure diagnostic when available. Pass execution_id to fetch a specific execution. When an execution is available, last_execution.log_url points to the authenticated log endpoint.
 //	@Tags			pipeline
 //	@Produce		json
 //	@Param			execution_id	query		string	false	"Cloud Run execution ID"
@@ -1038,7 +1100,8 @@ func (h *Handler) RebuildIndex(c *gin.Context) {
 		return
 	}
 	if h.store != nil {
-		if guarded, ok := h.store.Scope(userID, projectID).(store.GenerationAware); ok {
+		projectStore := h.store.Scope(userID, projectID)
+		if guarded, ok := projectStore.(store.GenerationAware); ok {
 			exists, err := guarded.HasCurrentManifest(c.Request.Context())
 			if err != nil {
 				c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "generated output unavailable"})
@@ -1259,10 +1322,17 @@ func (h *Handler) pipelineExecutionStatusWithOwner(ctx context.Context, executio
 		if err != nil {
 			return nil, err
 		}
+		if shortCloudRunExecutionName(execution.Name, true) != executionID {
+			return nil, errPipelineExecutionNotFound
+		}
 		if owner != nil && !cloudRunExecutionOwnedBy(execution, owner.userID, owner.projectID) {
 			return nil, errPipelineExecutionNotFound
 		}
-		return newPipelineExecutionResponse(execution), nil
+		response := newPipelineExecutionResponse(execution)
+		if owner != nil {
+			h.attachPipelineDiagnostic(ctx, response, owner)
+		}
+		return response, nil
 	}
 
 	pageToken := ""
@@ -1279,7 +1349,9 @@ func (h *Handler) pipelineExecutionStatusWithOwner(ctx context.Context, executio
 		}
 		for _, execution := range executions.Executions {
 			if cloudRunExecutionOwnedBy(execution, owner.userID, owner.projectID) {
-				return newPipelineExecutionResponse(execution), nil
+				response := newPipelineExecutionResponse(execution)
+				h.attachPipelineDiagnostic(ctx, response, owner)
+				return response, nil
 			}
 		}
 		if executions.NextPageToken == "" {
@@ -1287,6 +1359,143 @@ func (h *Handler) pipelineExecutionStatusWithOwner(ctx context.Context, executio
 		}
 		pageToken = executions.NextPageToken
 	}
+}
+
+func (h *Handler) attachPipelineDiagnostic(ctx context.Context, response *handler.PipelineExecutionResponse, owner *pipelineExecutionOwner) {
+	if response == nil || owner == nil {
+		return
+	}
+	switch response.Status {
+	case "RUNNING", "UNKNOWN":
+		response.LogState = pipelineLogStatePending
+		return
+	case "SUCCEEDED", "CANCELLED", "FAILED":
+		// Raw log availability is independent from the typed diagnostic.
+	default:
+		response.LogState = pipelineLogStateUnavailable
+		response.LogStateReason = "unsupported_execution_status"
+		return
+	}
+
+	projectStore := h.store
+	if projectStore == nil {
+		response.LogState = pipelineLogStateUnavailable
+		response.LogStateReason = "storage_unavailable"
+		return
+	}
+	project := projectStore.Scope(owner.userID, owner.projectID)
+	stat, ok := project.(pipelineLogStatter)
+	if !ok {
+		response.LogState = pipelineLogStateUnavailable
+		response.LogStateReason = "storage_unavailable"
+	} else {
+		executionID := shortCloudRunExecutionName(response.Name, true)
+		size, err := stat.StatFile(ctx, "cache/pipeline-"+executionID+".log")
+		switch {
+		case errors.Is(err, store.ErrObjectNotExist), errors.Is(err, storage.ErrObjectNotExist):
+			response.LogState = pipelineLogStateUnavailable
+			response.LogStateReason = "log_unavailable"
+		case err != nil:
+			response.LogState = pipelineLogStateUnavailable
+			response.LogStateReason = "storage_unavailable"
+		case size < 0 || size > pipelinediagnostic.MaxPipelineLogBytes:
+			response.LogState = pipelineLogStateUnavailable
+			response.LogStateReason = "log_too_large"
+		default:
+			response.LogState = pipelineLogStateAvailable
+		}
+	}
+	if response.Status == "FAILED" {
+		if diagnostic, err := readPipelineFailureDiagnostic(ctx, project, response.Name); err == nil {
+			response.Diagnostic = diagnostic
+		}
+	}
+}
+
+// pipelineLogStatter is intentionally optional so the main storage contract
+// remains stable. Implementations must return metadata only; status polling
+// must never fetch the raw log body.
+type pipelineLogStatter interface {
+	StatFile(context.Context, string) (int64, error)
+}
+
+type limitedPipelineLogReader interface {
+	ReadFileLimited(context.Context, string, int64) ([]byte, error)
+}
+
+func readPipelineLog(ctx context.Context, projectStore store.Store, executionName string) ([]byte, error) {
+	executionID := shortCloudRunExecutionName(executionName, true)
+	if executionID == "" {
+		return nil, errors.New("invalid execution name")
+	}
+	reader, ok := projectStore.(limitedPipelineLogReader)
+	if !ok {
+		return nil, errors.New("bounded pipeline log reader unavailable")
+	}
+	data, err := reader.ReadFileLimited(ctx, "cache/pipeline-"+executionID+".log", pipelinediagnostic.MaxPipelineLogBytes+1)
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > pipelinediagnostic.MaxPipelineLogBytes {
+		return nil, errors.New("pipeline log exceeds worker contract")
+	}
+	return []byte(strings.ToValidUTF8(string(data), "?")), nil
+}
+
+func readPipelineFailureDiagnostic(ctx context.Context, projectStore store.Store, executionName string) (*handler.PipelineFailureDiagnostic, error) {
+	executionID := shortCloudRunExecutionName(executionName, true)
+	if executionID == "" {
+		return nil, errors.New("invalid execution name")
+	}
+	reader, ok := projectStore.(limitedPipelineLogReader)
+	if !ok {
+		return nil, errors.New("bounded pipeline diagnostic reader unavailable")
+	}
+	data, err := reader.ReadFileLimited(ctx, "cache/pipeline-"+executionID+".failure.json", maxPipelineDiagnosticBytes+1)
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > maxPipelineDiagnosticBytes {
+		return nil, errors.New("diagnostic too large")
+	}
+	var diagnostic handler.PipelineFailureDiagnostic
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&diagnostic); err != nil {
+		return nil, err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		return nil, errors.New("diagnostic has trailing data")
+	}
+	if diagnostic.Version != 1 || diagnostic.Status != "failed" {
+		return nil, errors.New("unsupported diagnostic")
+	}
+	if _, ok := pipelinediagnostic.ValidStages[pipelinediagnostic.Stage(diagnostic.Stage)]; !ok {
+		return nil, errors.New("invalid diagnostic stage")
+	}
+	if _, ok := pipelinediagnostic.ValidErrorClasses[pipelinediagnostic.ErrorClass(diagnostic.ErrorClass)]; !ok {
+		return nil, errors.New("invalid diagnostic class")
+	}
+	if diagnostic.DetailCode != "" {
+		if diagnostic.Stage != "concept_reconciliation" {
+			return nil, errors.New("invalid diagnostic detail")
+		}
+		if _, ok := pipelinediagnostic.ValidDetailCodes[pipelinediagnostic.DetailCode(diagnostic.DetailCode)]; !ok {
+			return nil, errors.New("invalid diagnostic detail")
+		}
+	}
+	if diagnostic.Child != "" {
+		if _, ok := pipelinediagnostic.ValidChildCommands[pipelinediagnostic.ChildCommand(diagnostic.Child)]; !ok {
+			return nil, errors.New("invalid diagnostic child")
+		}
+	} else if diagnostic.ExitCode != nil {
+		return nil, errors.New("diagnostic exit code without child")
+	}
+	if diagnostic.ExitCode != nil && (*diagnostic.ExitCode < 0 || *diagnostic.ExitCode > 255) {
+		return nil, errors.New("invalid diagnostic exit code")
+	}
+	return &diagnostic, nil
 }
 
 func (h *Handler) fetchCloudRunExecution(ctx context.Context, token, executionID string) (cloudRunExecution, error) {
@@ -1395,7 +1604,7 @@ func pipelineLogURLForExecution(execution cloudRunExecution) string {
 // PipelineLog handles GET /api/v1/pipeline/log.
 //
 //	@Summary		Read pipeline log
-//	@Description	Returns the stdout and stderr log captured by the pipeline worker for the current project execution.
+//	@Description	Returns bounded raw pipeline stdout/stderr for the authenticated owning project execution.
 //	@Tags			pipeline
 //	@Produce		plain
 //	@Param			execution_id	query		string	true	"Cloud Run execution ID"
@@ -1420,12 +1629,13 @@ func (h *Handler) PipelineLog(c *gin.Context) {
 	}
 
 	executionID := strings.TrimSpace(c.Query("execution_id"))
-	logPath, err := pipelineLogPath(executionID)
+	_, err := pipelineLogPath(executionID)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, handler.ErrorResponse{Error: err.Error()})
 		return
 	}
-	if _, err := h.pipelineExecutionStatusForOwner(c.Request.Context(), executionID, userID, projectID); err != nil {
+	execution, err := h.pipelineExecutionStatusForOwner(c.Request.Context(), executionID, userID, projectID)
+	if err != nil {
 		if errors.Is(err, errPipelineExecutionNotFound) {
 			c.JSON(http.StatusNotFound, handler.ErrorResponse{Error: errPipelineExecutionNotFound.Error()})
 			return
@@ -1439,7 +1649,7 @@ func (h *Handler) PipelineLog(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: generatedDataUnavailableMessage})
 		return
 	}
-	data, err := wikiStore.ReadFile(c.Request.Context(), logPath)
+	data, err := readPipelineLog(c.Request.Context(), wikiStore, execution.Name)
 	if err != nil {
 		if errors.Is(err, storage.ErrObjectNotExist) {
 			c.JSON(http.StatusNotFound, handler.ErrorResponse{Error: "pipeline log not found"})
@@ -1552,6 +1762,17 @@ func executionDuration(startTime, endTime string) string {
 //	@Security		ProjectHeader
 //	@Router			/api/v1/status [get]
 func (h *Handler) Status(c *gin.Context) {
+	userID := strings.TrimSpace(c.GetString("userID"))
+	if userID == "" {
+		c.JSON(http.StatusUnauthorized, handler.ErrorResponse{Error: "user not authenticated"})
+		return
+	}
+	projectID := strings.TrimSpace(c.GetString("projectID"))
+	if projectID == "" {
+		c.JSON(http.StatusBadRequest, handler.ErrorResponse{Error: "project is required"})
+		return
+	}
+
 	gcsClient, err := h.GetGCSClient(c)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "generated data unavailable"})
@@ -1563,14 +1784,22 @@ func (h *Handler) Status(c *gin.Context) {
 	concepts, _ := listConceptsCacheFirst(ctx, gcsClient, true)
 
 	resp := handler.StatusResponse{
-		SourcesCount:  len(sources),
-		ConceptsCount: len(concepts),
-		RawCount:      rawFileCount(ctx, gcsClient),
-		IndexSources:  h.index.SourceCount(),
-		IndexConcepts: h.index.ConceptCount(),
+		SourcesCount:     len(sources),
+		ConceptsCount:    len(concepts),
+		RawCount:         rawFileCount(ctx, gcsClient),
+		IndexSources:     h.index.SourceCount(),
+		IndexConcepts:    h.index.ConceptCount(),
+		SuggestedQueries: []string{},
 	}
 
-	if lastExecution, err := h.pipelineExecutionStatus(ctx, ""); err == nil {
+	suggestedQueries, err := h.loadSuggestedQueries(ctx, c)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "generated data unavailable"})
+		return
+	}
+	resp.SuggestedQueries = suggestedQueries
+
+	if lastExecution, err := h.pipelineExecutionStatusForOwner(ctx, "", userID, projectID); err == nil {
 		resp.LastExecution = lastExecution
 	}
 
@@ -1602,14 +1831,20 @@ func (h *Handler) loadSuggestedQueries(ctx context.Context, c *gin.Context) ([]s
 	if err != nil {
 		if errors.Is(err, storage.ErrObjectNotExist) {
 			return []string{}, nil
+		} else {
+			return nil, err
 		}
-		return nil, err
+	} else {
+		artifact, err := suggestedqueries.Decode(data)
+		if err != nil {
+			return []string{}, nil
+		}
+		if !suggestedqueries.IsPublishable(artifact) {
+			return []string{}, nil
+		}
+		queries := suggestedqueries.Queries(artifact)
+		return queries, nil
 	}
-	artifact, err := suggestedqueries.Decode(data)
-	if err != nil {
-		return nil, err
-	}
-	return suggestedqueries.Queries(artifact), nil
 }
 
 // rawFileCount returns the live number of files under project raw/ (ListRawFiles).
@@ -1644,6 +1879,32 @@ func (h *Handler) verifyAdminProjectExists(ctx context.Context, docID string) er
 	}
 	_, err := h.firestore.Raw().Collection("projects").Doc(docID).Get(ctx)
 	return err
+}
+
+func (h *Handler) resolveAdminProjectRecord(ctx context.Context, docID string) (adminProjectRecord, error) {
+	if h.adminProjectRecordLoader != nil {
+		record, err := h.adminProjectRecordLoader(ctx, docID)
+		if err != nil {
+			return adminProjectRecord{}, err
+		}
+		expectedUserID, expectedProjectID := splitProjectDocID(docID)
+		if record.id != docID || record.userID != expectedUserID || record.projectID != expectedProjectID || !auth.ValidPathSegment(record.userID) || !auth.ValidPathSegment(record.projectID) {
+			return adminProjectRecord{}, errInvalidAdminProjectRecord
+		}
+		return record, nil
+	}
+	if h.firestore == nil || h.firestore.Raw() == nil {
+		return adminProjectRecord{}, errFirestoreNotConfigured
+	}
+	doc, err := h.firestore.Raw().Collection("projects").Doc(docID).Get(ctx)
+	if err != nil {
+		return adminProjectRecord{}, err
+	}
+	record, ok := adminProjectRecordFromFirestoreDoc(docID, doc.Data())
+	if !ok {
+		return adminProjectRecord{}, errInvalidAdminProjectRecord
+	}
+	return record, nil
 }
 
 type adminProjectEntry struct {
@@ -1682,11 +1943,15 @@ func adminProjectRecordFromFirestoreDoc(docID string, data map[string]interface{
 	if !auth.ValidPathSegment(userID) || !auth.ValidPathSegment(docProjectID) || !strings.Contains(docID, "_") {
 		return adminProjectRecord{}, false
 	}
+	storedProjectID, ok := data["project_id"].(string)
+	if !ok || strings.TrimSpace(storedProjectID) == "" {
+		return adminProjectRecord{}, false
+	}
 	project, userID, ok := projectResponseFromFirestoreDoc(docID, data)
 	if !ok {
 		return adminProjectRecord{}, false
 	}
-	if !auth.ValidPathSegment(userID) || !auth.ValidPathSegment(project.ID) {
+	if !auth.ValidPathSegment(userID) || !auth.ValidPathSegment(project.ID) || project.ID != docProjectID {
 		return adminProjectRecord{}, false
 	}
 	return adminProjectRecord{
@@ -2025,36 +2290,39 @@ func (h *Handler) AdminRenameProject(c *gin.Context) {
 //	@Router			/api/v1/admin/projects/{id}/rebuild-index [post]
 func (h *Handler) AdminRebuildIndex(c *gin.Context) {
 	docID := c.Param("id")
-	uid, pid := splitProjectDocID(docID)
-	if pid == "" {
+	parsedUID, parsedPID := splitProjectDocID(docID)
+	if parsedPID == "" || !auth.ValidPathSegment(parsedUID) || !auth.ValidPathSegment(parsedPID) {
 		c.JSON(http.StatusBadRequest, handler.ErrorResponse{Error: "invalid project doc ID"})
 		return
 	}
 	ctx := c.Request.Context()
-	// Production verifies the project before touching storage. The injected
-	// rebuild seam is a local/test-only authorization substitute.
-	if h.rebuildIndex == nil || h.projectExists != nil {
-		if err := h.verifyAdminProjectExists(ctx, docID); err != nil {
-			if errors.Is(err, errFirestoreNotConfigured) {
-				c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "Firestore client is not configured"})
-				return
-			}
-			if status.Code(err) == codes.NotFound {
-				c.JSON(http.StatusNotFound, handler.ErrorResponse{Error: "project not found"})
-				return
-			}
-			c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: generatedDataUnavailableMessage})
+	record, err := h.resolveAdminProjectRecord(ctx, docID)
+	if err != nil {
+		if errors.Is(err, errFirestoreNotConfigured) {
+			c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "Firestore client is not configured"})
 			return
 		}
+		if status.Code(err) == codes.NotFound {
+			c.JSON(http.StatusNotFound, handler.ErrorResponse{Error: "project not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: generatedDataUnavailableMessage})
+		return
 	}
+	uid, pid := record.userID, record.projectID
 	if h.store != nil {
-		if guarded, ok := h.store.Scope(uid, pid).(store.GenerationAware); ok {
+		projectStore := h.store.Scope(uid, pid)
+		if guarded, ok := projectStore.(store.GenerationAware); ok {
 			exists, err := guarded.HasCurrentManifest(ctx)
 			if err != nil {
 				c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "generated output unavailable"})
 				return
 			}
 			if exists {
+				if rebuilder, ok := projectStore.(store.GenerationRebuilder); ok {
+					h.handleGenerationRebuild(c, uid, pid, rebuilder)
+					return
+				}
 				c.JSON(http.StatusConflict, handler.ErrorResponse{Error: "generated output is managed by the pipeline; run the pipeline"})
 				return
 			}
@@ -2134,14 +2402,31 @@ func (h *Handler) AdminRebuildIndex(c *gin.Context) {
 	})
 }
 
+func (h *Handler) handleGenerationRebuild(c *gin.Context, uid, pid string, rebuilder store.GenerationRebuilder) {
+	result, err := rebuilder.RebuildIndexGeneration(c.Request.Context(), planSyntoGeneration)
+	if err != nil {
+		statusCode := http.StatusInternalServerError
+		failure := "generation_rebuild_failed"
+		if errors.Is(err, store.ErrGenerationMismatch) {
+			statusCode = http.StatusConflict
+			failure = "cas_conflict"
+		}
+		c.JSON(statusCode, gin.H{"status": failure, "error": "generated data unavailable"})
+		return
+	}
+	h.invalidateCachesAfterRebuild(uid, pid)
+	c.JSON(http.StatusOK, result)
+}
+
 // AdminPipelineTrigger handles POST /admin/projects/{id}/pipeline.
 //
-//	@Summary		Trigger pipeline + rebuild for a project (admin)
-//	@Description	Invokes the Cloud Run worker job for the specified project, then rebuilds the search index.
+//	@Summary		Trigger pipeline for a project (admin)
+//	@Description	Invokes the Cloud Run worker job for the specified project. Optional body {"clean_rebuild":true} cold-starts Synto from raw without prior wiki/state.
 //	@Tags			admin
 //	@Accept			json
 //	@Produce		json
-//	@Param			id	path		string	true	"Project doc ID ({userID}_{projectID})"
+//	@Param			id		path	string	true	"Project doc ID ({userID}_{projectID})"
+//	@Param			body	body	object	false	"Optional flags"
 //	@Success		200	{object}	map[string]any
 //	@Failure		400	{object}	handler.ErrorResponse
 //	@Failure		401	{object}	handler.ErrorResponse
@@ -2156,6 +2441,29 @@ func (h *Handler) AdminPipelineTrigger(c *gin.Context) {
 	uid, pid := splitProjectDocID(docID)
 	if pid == "" {
 		c.JSON(http.StatusBadRequest, handler.ErrorResponse{Error: "invalid project doc ID"})
+		return
+	}
+	var req struct {
+		CleanRebuild bool   `json:"clean_rebuild"`
+		Stage        string `json:"stage"`
+	}
+	if c.Request.Body != nil && c.Request.ContentLength != 0 {
+		dec := json.NewDecoder(c.Request.Body)
+		if err := dec.Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+			c.JSON(http.StatusBadRequest, handler.ErrorResponse{Error: "invalid request body"})
+			return
+		}
+	}
+	stage := strings.TrimSpace(req.Stage)
+	if stage == "" {
+		stage = pipelineStageFull
+	}
+	if _, err := workerArgsForStage(stage); err != nil {
+		c.JSON(http.StatusBadRequest, handler.ErrorResponse{Error: "invalid stage; use full or suggested-queries"})
+		return
+	}
+	if req.CleanRebuild && stage != pipelineStageFull {
+		c.JSON(http.StatusBadRequest, handler.ErrorResponse{Error: "clean_rebuild is only valid for full pipeline stage"})
 		return
 	}
 	ctx := c.Request.Context()
@@ -2183,16 +2491,24 @@ func (h *Handler) AdminPipelineTrigger(c *gin.Context) {
 		return
 	}
 
-	executionID, err := h.invokePipelineJob(ctx, uid, pid)
+	executionID, err := h.invokePipelineJobStage(ctx, uid, pid, req.CleanRebuild, stage)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: pipelineUnavailableMessage})
 		return
 	}
-	log.Print("admin pipeline triggered")
+	if req.CleanRebuild {
+		log.Print("admin pipeline triggered clean_rebuild=true")
+	} else if stage == pipelineStageSuggestedQueries {
+		log.Print("admin pipeline triggered stage=suggested-queries")
+	} else {
+		log.Print("admin pipeline triggered")
+	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"status":       "ok",
-		"execution_id": executionID,
+		"status":        "ok",
+		"execution_id":  executionID,
+		"clean_rebuild": req.CleanRebuild,
+		"stage":         stage,
 	})
 }
 

@@ -107,7 +107,12 @@ func TestGeneratedPipelineSecurityBoundaryMatrix(t *testing.T) {
 		{
 			name: "admin rebuild failure",
 			invoke: func() *httptest.ResponseRecorder {
-				h := &Handler{rebuildIndex: func(context.Context, string, string) (idMap, error) { return idMap{}, errors.New(securitySentinel) }}
+				h := &Handler{
+					adminProjectRecordLoader: func(context.Context, string) (adminProjectRecord, error) {
+						return adminProjectRecord{}, errors.New(securitySentinel)
+					},
+					rebuildIndex: func(context.Context, string, string) (idMap, error) { return idMap{}, errors.New(securitySentinel) },
+				}
 				return invokeHandlerWithParams(h.AdminRebuildIndex, http.MethodPost, "/api/v1/admin/projects/tenant-secret_project-secret/rebuild-index", ginParams("id", "tenant-secret_project-secret"))
 			},
 			wantStatus: http.StatusInternalServerError,

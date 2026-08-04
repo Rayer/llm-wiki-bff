@@ -3,18 +3,19 @@
 ## Summary
 
 This change adds `cmd/olw_worker` as the Cloud Run Job entrypoint for running
-Synto 0.7.0 against a project vault mounted from GCS. The worker is filesystem-first:
-it does not write to GCS through the Storage API. In Cloud Run, gcsfuse mounts
-the bucket at `/data`; locally, `--vault` points at a project directory. Every
-generation, including local usage, runs in a private workspace and publishes
-only validated worker-owned outputs.
+Synto 0.7.0 against a project selected by user and project IDs. The production
+cloud path uses a scoped GCS `objectStore` through the Cloud Storage API. It
+materializes the selected project into a private `/tmp/olw-cloud-*` workspace,
+runs Synto and postprocess there, and publishes validated immutable generation
+objects back to that project prefix.
 
 The active pipeline path is now:
 
 ```text
-BFF v1 endpoint -> Cloud Run Jobs API -> olw-pipeline-dev job -> mounted /data vault
-  -> per-vault exclusive lease -> private copied workspace -> Synto + postprocess
-  -> staged atomic durable-output publish -> worker-owned receipt
+BFF v1 endpoint -> Cloud Run Jobs API -> olw-pipeline-dev job
+  -> scoped GCS Storage API objectStore -> private /tmp/olw-cloud-* workspace
+  -> bounded Synto + postprocess -> immutable generation objects
+  -> current.json CAS commit -> worker-owned receipts
 ```
 
 The old trigger-file path has been removed. BFF no longer writes
@@ -54,63 +55,97 @@ Postprocess-only command:
 worker postprocess --vault /path/to/project
 ```
 
+Query-chip-only command (regenerates `cache/suggested_queries.json` without
+Synto, index rebuild, or reconcile):
+
+```bash
+worker suggested-queries --vault /path/to/project
+```
+
+`worker postprocess` still runs cache/index rebuild and then the suggested-queries
+stage. Pass `--no-suggested-queries` to rebuild index artifacts without calling
+the LLM chip generator.
+
+Cloud mode supports the standalone stage on the same Job image:
+
+```bash
+# Cloud Run containerOverrides.args
+["suggested-queries"]
+# with USER_ID, PROJECT_ID, BUCKET (job env), EXECUTION_ID from Cloud Run
+```
+
+Admin BFF: `POST /api/v1/admin/projects/{id}/pipeline` with
+`{"stage":"suggested-queries"}` (see LWC-232).
+
 The worker rejects every second command, `--force` in any position, and
 mutation-capable Synto commands such as compile, ingest, identity curation,
 undo, import/export, watch, query, or MCP. It creates a safe `synto.toml` only
 for a fresh Synto-only vault; it never overwrites an existing config.
 
-## Vault Resolution
+## Execution Modes
 
-The worker resolves the vault in this order:
+Cloud production requires `--bucket`, `--user-id`, and `--project-id`. The
+worker rejects `--vault`, `--data-dir`, and `--workspace` in this mode; cloud
+workers do not use a mounted project filesystem. The object-store prefix is
+`users/{USER_ID}/projects/{PROJECT_ID}/`, and all reads, writes, lists, leases,
+generations, and receipts are scoped to that prefix.
 
-1. `--vault`
-2. `VAULT_PATH`
-3. `DATA_DIR/users/{USER_ID}/projects/{PROJECT_ID}`
+Local `--vault` mode remains separately supported for local review and repair.
+It resolves `--vault` or `VAULT_PATH` (with the legacy `DATA_DIR` project layout
+as a fallback), uses the local project directory, and retains the local private
+workspace publication/recovery path. Local mode does not use the cloud
+`current.json` object manifest.
 
-`DATA_DIR` defaults to `/data`.
-
-## Run Flow
+## Cloud Run Flow
 
 1. Parse and validate the complete command batch before taking a lease or
    starting a child. The production contract is `[ ["run", "--auto-approve"] ]`.
-2. Acquire an exclusive create-only per-vault lease in
-   `.olw/lwc-worker-lease.json` before taking any snapshot. The lease records
-   owner/execution metadata and is held through success/failure receipts and
-   failure-log publication. It fails closed on overlap and is never
-   automatically stolen based only on age; an abandoned lease needs operator
-   inspection rather than risking a live long-running job.
-3. Snapshot mapped source raw bytes and annotation
-   digests, then copy `raw/`, `wiki/`, `cache/`, `.olw/`, `.synto/`,
-   `wiki.toml`, and `synto.toml` when present into a private directory under
-   `WORKSPACE_DIR` (default `/tmp`). Symlinks and escaping paths are rejected.
-4. Every mapped source with a non-empty annotation receives one deterministic,
-   timestamp-free human annotation trailer on every fresh workspace run,
-   independent of its receipt. Empty annotations receive no trailer. Stored
-   `raw/**` is never changed or synced back.
-5. Remove a stale workspace pipeline lock, validate coherent Synto/legacy state,
-   migrate only in the workspace, run `synto run`, then invoke the exact-release
-   offline `synto pack export --target agents --out …` step. Install and validate
-   its `index/INDEX.json` as `.synto/INDEX.json` before postprocess/reconcile.
-   A migrated vault retains the coherent `wiki.toml` + `.olw/state.db`
-   rollback pair; a fresh Synto vault creates neither legacy artifact.
-6. On success, stage and validate the complete explicit output set under a
-   sibling directory in the mounted vault, then publish it using same-filesystem
-   atomic renames and a journal/backup. `wiki/` is mirrored so removed
-   pages are removed. The allowlist is `wiki/`, `wiki.toml` when migrated,
-   `synto.toml`, `cache/id_map.json`, `cache/concepts.jsonl`,
-   `cache/dormant_concepts.jsonl`, `cache/raw_status.json`,
-   `cache/suggested_queries.json`, `.synto/state.db`, `.synto/INDEX.json`,
-   `.olw/state.db` when migrated, and the current bounded pipeline log.
-   Uncommitted journals are rolled back when the next lease
-   holder starts; committed journals only clean up their stage and backup files.
-   This is recovery for normal filesystem interruption, not a
-   claim of a crash-proof global transaction on every mounted filesystem.
-7. After that publish succeeds, atomically merge `cache/source_status.json` with
-   exact start raw/annotation fingerprints. Concurrent raw or annotation edits
-   remain dirty because the receipt retains the start pair. Failures retain the
-   last success and record only the attempted fingerprint/error. On workspace
-   failure, the closed current execution log alone is atomically published with
-   a size cap and configured-secret redaction before cleanup.
+2. Acquire an exclusive create-only GCS lease at
+   `users/{USER_ID}/projects/{PROJECT_ID}/.lwc/publish/lease.json` before
+   materialization. The lease payload is JSON
+   `{"execution":"<execution-id>","started_at":"..."}` with the real pipeline
+   execution id (not redacted) so stuck locks can be attributed. It is held
+   through publication, receipts, failure-log recording, and cleanup. On
+   create-only conflict the worker probes the holder execution via the Cloud
+   Run Jobs Admin API (`executions.get`, scoped to `CLOUD_RUN_JOB` /
+   `PIPELINE_JOB_NAME`). **RUNNING** (or uncertain lookup) fails closed with
+   the stable public sentinel. **Terminal** holders (`SUCCEEDED` / `FAILED` /
+   `CANCELLED`) or proven **not found** job-scoped ids are reclaimed once via
+   generation-matched delete + create-only rewrite (LWC-222). Pure age/TTL
+   steal is forbidden. Malformed / foreign / redacted holders still need
+   operator break-glass (`docs/DEPLOYMENT.md`).
+3. Create a private `/tmp/olw-cloud-*` directory. Materialize canonical raw
+   objects, annotations, source status, and the previously committed generation
+   selected by `.lwc/publish/current.json` through the Storage API. If no current
+   manifest exists, bounded legacy generation-owned objects are materialized.
+   Symlinks and escaping workspace paths are rejected.
+4. Snapshot mapped source bytes and annotation digests. Add deterministic
+   annotation trailers only in the workspace; stored raw objects are never
+   modified. Validate coherent Synto/legacy state, migrate only in the
+   workspace, run the bounded `synto run`, export the exact-release pack, and
+   install/validate its `index/INDEX.json` as `.synto/INDEX.json` before
+   postprocess and reconciliation.
+5. Preflight the complete explicit output allowlist. Upload each validated file
+   under the new immutable `.lwc/publish/generations/{generation_id}/` prefix.
+   The `.lwc/publish/current.json` object is the generation commit point: write
+   it with a create-only or prior-object-generation CAS condition, and include
+   `previous_generation_id` when replacing an existing current manifest.
+6. A definite CAS conflict leaves the prior/current competing manifest intact;
+   any already-uploaded immutable objects are unreachable staging leftovers, not
+   a partial live generation, and failure receipts are written. If the manifest
+   write or its readback is ambiguous, return `errManifestCommitOutcomeUnknown`:
+   the manifest may already be committed, so do not write a failure receipt or
+   typed failure diagnostic that could falsify publication truth. Publish the
+   raw execution log on a best-effort recording context. Once `current.json` is
+   confirmed committed, later receipt or lease-cleanup failures preserve that
+   committed generation and are reported as committed-with-recording/cleanup
+   errors.
+7. After a confirmed commit, write the complete bounded raw execution log and
+   merge the source-status receipt using the exact start raw/annotation
+   fingerprints. On pre-commit failure, retain the last committed generation,
+   write the failure receipt/diagnostic and raw log, and clean up only the
+   private workspace. The raw log is never a generation member and remains
+   subject to the documented 4 MiB contract below.
 
 `--stop-on-error` defaults to true. When false, the worker continues through the
 batch, records failures, skips postprocess if any command failed, and exits
@@ -120,6 +155,60 @@ The default production generation includes INDEX generation, postprocess,
 reconciliation, and preflight before publication. Local `--no-postprocess`
 compatibility runs still execute only in a private scratch workspace and never
 publish generation outputs.
+
+## Cloud Failure Diagnostic Artifact
+
+For every owned cloud execution, the worker writes the bounded raw child
+stdout/stderr object `cache/pipeline-<execution>.log` alongside the typed
+operator diagnostic `cache/pipeline-<execution>.failure.json` when applicable.
+Child Synto stdout/stderr is always captured into the execution-scoped pipeline
+log when an execution id is present. By default it is also teed to the process
+console (redacted). Cloud mode must not force console silence: local bucket
+runs and Cloud Logging both need live progress. Pass `--suppress-output` only
+when intentionally quiet. The log is persisted on success and every failure
+after ownership is established. Its documented maximum is 4 MiB including the
+deterministic marker `\n[output truncated at 4194304 bytes]\n`; the marker
+replaces the tail when the child exceeds the cap. The failure object is
+versioned JSON and is written create-only; it is not part of a generation,
+does not create a current pointer, and is never written on success. A
+diagnostic write failure is reported through the existing fixed
+failure-recording category and cannot publish a generation.
+
+The payload is bounded to 4 KiB and contains `version: 1`, `status: "failed"`,
+a finite stage, a finite error class, the pipeline `execution` id, a bounded
+redacted `message` (root cause text with credentials scrubbed), and when proven
+at a child-process boundary a finite child command plus numeric exit code.
+Stages include input materialization, Synto migration/config/run/index export,
+source/concept reconciliation, postprocess, generation publication, receipt
+recording, and lease cleanup. Error classes include validation, child exit,
+timeout, cancellation, I/O, invalid state, publication conflict, recording
+failure, and unknown. The accepted user command is only `run`; migration and
+index export are worker-owned child seams.
+
+Credentials (`LLM_API_KEY` / `DEEPSEEK_API_KEY` / configured API key) are always
+redacted from `message`, pipeline logs, and process exit lines. Control-plane
+identity (execution id, tenant/project ids, paths, stage text) is retained for
+operators. Source receipt `error` remains the fixed tenant-facing string
+`pipeline failed`. Process exit logs preserve operational public boundaries and
+their unwrapped causes (for example
+`pipeline publish lease unavailable: object generation conflict`). Only
+cobra/CLI parse failures collapse to the fixed `worker command rejected` string
+so user-supplied tokens are not echoed. Operational failures use stable public
+boundary sentinels (so callers and tests can match `Error()` / `errors.Is`) but
+must wrap the root cause with `annotateError` rather than replacing it.
+
+The worker is the only producer-side cap: it publishes one complete bounded
+execution artifact of at most 4 MiB. The explicit PipelineLog fetch returns
+that artifact without head/tail sampling or a second API truncation marker.
+Status polling fetches execution metadata only; it does not fetch or proxy
+Cloud Logging output. Raw text is never parsed as a stage contract; the typed
+diagnostic remains the stable status/timeline/automation contract.
+
+The one deliberate exception is `errManifestCommitOutcomeUnknown`: when the
+manifest CAS/readback outcome is ambiguous, the worker writes no failed
+diagnostic object and no failure source receipt. The manifest may already have
+committed, so recording failure would falsify publication truth and encourage
+an unsafe replay; the explicit ambiguous outcome is preserved instead.
 
 ## Generated Artifacts
 
@@ -218,96 +307,12 @@ They do not write request files and do not rely on a periodic worker.
 
 Manual rebuild endpoints remain available for repair and admin workflows.
 
-## Historical Pre-LWC-170 Verification Evidence
+## Historical Verification Note
 
-This section records pre-LWC-170 verification only. It does not describe the
-current development deployment or establish a new live deployment.
-
-Project:
-
-```text
-llm-wiki-cloud
-```
-
-Region:
-
-```text
-asia-east1
-```
-
-Job:
-
-```text
-olw-pipeline
-```
-
-Image:
-
-```text
-asia-east1-docker.pkg.dev/llm-wiki-cloud/cloud-run-images/olw-pipeline:80a08fa
-```
-
-Mounted bucket:
-
-```text
-gs://llm-wiki-data -> /data
-```
-
-The tested job configuration uses:
-
-```text
-timeoutSeconds=7200
-maxRetries=0
-memory=2Gi
-cpu=1000m
-```
-
-The previous `1800s` timeout was too short for the full demo project.
-
-## Verification Results
-
-Local checks:
-
-```bash
-go test ./...
-docker build --target worker -t llm-wiki-bff-olw-worker:test .
-```
-
-Docker smoke test:
-
-- mounted a temporary host directory into `/data`
-- ran `olw init`
-- copied three Helios raw files into `raw/`
-- passed `LLM_API_KEY` or `DEEPSEEK_API_KEY` through env/Secret Manager only
-- did not mount host `~/.config/olw`
-- ran ingest, compile, and worker postprocess successfully
-
-Cloud Run test:
-
-```text
-execution: olw-pipeline-kxbm4
-status: success
-duration: 42m54.05s
-compiled: 107
-published: 107
-```
-
-Generated artifacts in GCS:
-
-```text
-gs://llm-wiki-data/users/test-user/projects/demo/cache/id_map.json
-gs://llm-wiki-data/users/test-user/projects/demo/cache/concepts.jsonl
-```
-
-Observed artifact sizes:
-
-```text
-id_map.json:      29,373 bytes
-concepts.jsonl: 1,023,792 bytes
-concepts.jsonl: 420 lines
-```
-
-## Known Issues And Follow-Ups
+Pre-LWC-170 deployment and mounted-filesystem smoke results are intentionally
+not retained here as current architecture or release evidence. Validate the
+active Storage API object-store path with the repository tests and deployment
+workflow for the revision under review.
 
 ## Synto 0.7.0 Compatibility Smoke
 
@@ -319,6 +324,7 @@ OLW_BASELINE_ROOT=/path/to/olw-0.8.5 \
   LWC195_EXACT_INDEX_RUN1_PATH="$bridge_dir/run1-INDEX.json" \
   LWC195_EXACT_INDEX_RUN2_PATH="$bridge_dir/run2-INDEX.json" \
   LWC195_RAW_SOURCE_PATH="$bridge_dir/source.md" \
+  LWC197_MIGRATED_CONFIG_PATH="$bridge_dir/migrated-synto.toml" \
   /path/to/synto-0.7.0/.venv/bin/python \
   cmd/olw_worker/testdata/synto_exact_release_smoke.py
 ```
@@ -329,9 +335,11 @@ runs `synto run --vault … --auto-approve` followed by the exact
 `synto pack export --target agents --out …` command twice. Both exports are
 non-empty and must contain `articles/Alpha.md`, the same article identity, the
 same non-empty engine entity ID, and the expected `raw/source.md`/`Alpha`
-source edge. The first and second authoritative `index/INDEX.json` bytes and
-the actual raw source bytes are written to bridge paths supplied by environment
-variables. The test process patches only exact-release client construction
+source edge. The first and second authoritative `index/INDEX.json` bytes, the
+actual raw source bytes, and the migrated `synto.toml` are written to four
+bridge paths supplied by environment variables. These paths are one bundle:
+any publication failure removes every destination, with no stale prior
+artifact retained. The test process patches only exact-release client construction
 with a local health-only/fail-if-called provider: the real CLI dependency
 loader, router, StateDB, orchestrator, and pack exporter remain exercised,
 while any generation or embedding call fails the gate. It does not claim a
@@ -348,7 +356,7 @@ per-concept state required by the compile scheduler. The Go adapter mirrors
 Synto's `frontmatter.parse(...).content.strip()` hash semantics, including
 plain markdown's terminal newline trimming. Bridge files are staged until all
 assertions pass, then atomically replaced with temporary files created beside
-each destination so bind-mounted Docker output paths remain same-filesystem.
+each destination.
 
 The pinned `src/synto/pack_export.py` contract is important at the adapter
 boundary: it writes `index/INDEX.json`, emits `articles/<vault article path>`
@@ -375,11 +383,13 @@ OLW_BASELINE_ROOT=/path/to/olw-0.8.5 \
 LWC195_EXACT_INDEX_RUN1_PATH="$bridge_dir/run1-INDEX.json" \
 LWC195_EXACT_INDEX_RUN2_PATH="$bridge_dir/run2-INDEX.json" \
 LWC195_RAW_SOURCE_PATH="$bridge_dir/source.md" \
+LWC197_MIGRATED_CONFIG_PATH="$bridge_dir/migrated-synto.toml" \
   /path/to/synto-0.7.0/.venv/bin/python \
   cmd/olw_worker/testdata/synto_exact_release_smoke.py
 LWC195_EXACT_INDEX_RUN1_PATH="$bridge_dir/run1-INDEX.json" \
 LWC195_EXACT_INDEX_RUN2_PATH="$bridge_dir/run2-INDEX.json" \
 LWC195_RAW_SOURCE_PATH="$bridge_dir/source.md" \
+LWC197_MIGRATED_CONFIG_PATH="$bridge_dir/migrated-synto.toml" \
   go test ./cmd/olw_worker -run '^TestExactSyntoPackExportBridge$' -count=1 -v
 ```
 
@@ -396,11 +406,13 @@ docker run --rm --entrypoint python \
   -e LWC195_EXACT_INDEX_RUN1_PATH=/bridge/run1-INDEX.json \
   -e LWC195_EXACT_INDEX_RUN2_PATH=/bridge/run2-INDEX.json \
   -e LWC195_RAW_SOURCE_PATH=/bridge/source.md \
+  -e LWC197_MIGRATED_CONFIG_PATH=/bridge/migrated-synto.toml \
   llm-wiki-bff-olw-worker:test \
   /testdata/synto_exact_release_smoke.py
 LWC195_EXACT_INDEX_RUN1_PATH="$bridge_dir/run1-INDEX.json" \
 LWC195_EXACT_INDEX_RUN2_PATH="$bridge_dir/run2-INDEX.json" \
 LWC195_RAW_SOURCE_PATH="$bridge_dir/source.md" \
+LWC197_MIGRATED_CONFIG_PATH="$bridge_dir/migrated-synto.toml" \
   go test ./cmd/olw_worker -run '^TestExactSyntoPackExportBridge$' -count=1 -v
 ```
 
@@ -433,18 +445,7 @@ tracked baseline hash, runs ordinary compile with a provider that fails if
 called, and requires `deferred_manual_edit`, no draft/failure, and zero calls.
 It is intentionally separate from `go test ./...` and requires no network.
 
-- Four concepts failed during the Cloud Run verification because DeepSeek output
-  was truncated at `max_tokens=2400`. This is an OLW/model output limit issue,
-  not a worker startup or deployment failure.
-- gcsfuse logs repeated SQLite journal warnings for `.olw/state.db`, including
-  out-of-order writes. The successful run shows this is not immediately fatal,
-  but it is a durability/performance risk.
-- gcsfuse also logs unsupported hard link operations during git activity. The
-  job still completed successfully.
-- Long-term, `.olw/state.db` and git operations should probably run on local
-  scratch storage, then sync only durable vault/artifact outputs back to GCS.
-- Full project pipeline runs are long. The verified demo run needed about
-  43 minutes after prior partial progress. Keep the Cloud Run Job timeout above
+- Full project pipeline runs can be long. Keep the Cloud Run Job timeout above
   the expected full-project runtime or split OLW work into smaller batches.
 
 ## Owner Review Notes

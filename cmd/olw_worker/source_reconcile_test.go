@@ -151,6 +151,163 @@ func TestReconcileWorkspaceRewritesAuthoritativeSourceReferencesOnly(t *testing.
 	}
 }
 
+func TestReconcileWorkspaceCollapsesExactSyntoSourceRegenerationPair(t *testing.T) {
+	workspace := t.TempDir()
+	prior := []sourceSnapshot{{
+		SourceID:       "s1",
+		RawPath:        "raw/source.md",
+		AnnotationBody: "saved note",
+		AnnotationSHA:  annotation.Digest("saved note"),
+	}}
+	winner := syntoSourceSummaryPage("raw/source.md")
+	transientID := wikiindex.ContentDerivedID(winner)
+	idMap := []byte(`{
+  "concept": {},
+	"source": {"s1": "s1", "` + transientID + `": "source"},
+  "source_meta": {
+    "s1": {"slug": "s1", "source_file": "raw/source.md"},
+	"` + transientID + `": {"slug": "source", "source_file": "raw/source.md"}
+  },
+  "redirects": {"s1": ["older-source"]}
+}`)
+	mustWriteFile(t, filepath.Join(workspace, "cache", "id_map.json"), idMap)
+	mustWriteFile(t, filepath.Join(workspace, "cache", "concepts.jsonl"), []byte(`{"slug":"article","sources":["`+transientID+`"],"frontmatter":{"sources":["`+transientID+`"]}}`+"\n"))
+	mustWriteFile(t, filepath.Join(workspace, "wiki", "article.md"), []byte("---\nid: article\nsources:\n  - "+transientID+"\n---\narticle\n"))
+	mustWriteFile(t, filepath.Join(workspace, "wiki", "sources", "s1.md"), []byte("---\nid: s1\nsource_file: raw/source.md\n---\nlegacy\n"))
+	mustWriteFile(t, filepath.Join(workspace, "wiki", "sources", "source.md"), winner)
+
+	if err := reconcileWorkspaceSources(workspace, prior); err != nil {
+		t.Fatal(err)
+	}
+
+	var got wikiindex.IDMap
+	mapData, err := os.ReadFile(filepath.Join(workspace, "cache", "id_map.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(mapData, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Source["s1"] != "source" || len(got.Source) != 1 || len(got.SourceMeta) != 1 {
+		t.Fatalf("source map=%s", mapData)
+	}
+	if redirects := got.Redirects["s1"]; len(redirects) != 2 || redirects[0] != "older-source" || redirects[1] != "s1" {
+		t.Fatalf("source redirects=%#v", redirects)
+	}
+	if _, err := os.Stat(filepath.Join(workspace, "wiki", "sources", "s1.md")); !os.IsNotExist(err) {
+		t.Fatalf("legacy source page remains: %v", err)
+	}
+	winnerData, err := os.ReadFile(filepath.Join(workspace, "wiki", "sources", "source.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(string(winnerData), "id: s1\n") != 1 || strings.Count(string(winnerData), "<!-- lwc-ann-v1 source_id=s1 ") != 1 || strings.Contains(string(winnerData), transientID) {
+		t.Fatalf("winner=%s", winnerData)
+	}
+	cache, _ := os.ReadFile(filepath.Join(workspace, "cache", "concepts.jsonl"))
+	if !strings.Contains(string(cache), `"s1"`) || strings.Contains(string(cache), transientID) {
+		t.Fatalf("cache=%s", cache)
+	}
+	article, _ := os.ReadFile(filepath.Join(workspace, "wiki", "article.md"))
+	if !strings.Contains(string(article), "- s1\n") || strings.Contains(string(article), transientID) {
+		t.Fatalf("article=%s", article)
+	}
+}
+
+func TestReconcileWorkspaceRejectsMismatchedSyntoTransientIDWithoutMutation(t *testing.T) {
+	workspace := t.TempDir()
+	prior := []sourceSnapshot{{SourceID: "s1", RawPath: "raw/source.md"}}
+	winner := syntoSourceSummaryPage("raw/source.md")
+	idMap := []byte(`{
+  "concept": {},
+  "source": {"s1": "s1", "arbitrary-transient": "source"},
+  "source_meta": {
+    "s1": {"slug": "s1", "source_file": "raw/source.md"},
+    "arbitrary-transient": {"slug": "source", "source_file": "raw/source.md"}
+  },
+  "redirects": {}
+}`)
+	mustWriteFile(t, filepath.Join(workspace, "cache", "id_map.json"), idMap)
+	mustWriteFile(t, filepath.Join(workspace, "cache", "concepts.jsonl"), []byte(`{"slug":"article","sources":["arbitrary-transient"]}`+"\n"))
+	mustWriteFile(t, filepath.Join(workspace, "wiki", "article.md"), []byte("---\nid: article\nsources:\n  - arbitrary-transient\n---\narticle\n"))
+	mustWriteFile(t, filepath.Join(workspace, "wiki", "sources", "s1.md"), []byte("---\nid: s1\nsource_file: raw/source.md\n---\nlegacy\n"))
+	mustWriteFile(t, filepath.Join(workspace, "wiki", "sources", "source.md"), winner)
+
+	before := snapshotRelevantVaultBytes(t, workspace, "cache/id_map.json", "cache/concepts.jsonl", "wiki/article.md", "wiki/sources/s1.md", "wiki/sources/source.md")
+	if err := reconcileWorkspaceSources(workspace, prior); err == nil {
+		t.Fatal("mismatched transient ID was accepted")
+	}
+	assertVaultBytesUnchanged(t, workspace, before)
+}
+
+func TestReconcileWorkspaceDoesNotCollapseUnprovableSyntoSourceGroups(t *testing.T) {
+	tests := []struct {
+		name  string
+		pages map[string][]byte
+	}{
+		{
+			name: "two transient candidates",
+			pages: map[string][]byte{
+				"source-a.md": syntoSourceSummaryPage("raw/source.md"),
+				"source-b.md": syntoSourceSummaryPage("raw/source.md"),
+			},
+		},
+		{
+			name: "fake marker with explicit id",
+			pages: map[string][]byte{
+				"source.md": []byte("---\nid: fake\ntitle: source\naliases: []\ntags:\n  - source\nstatus: published\nsource_file: raw/source.md\nquality: high\ncreated: 2026-07-24\n---\nfake\n"),
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			workspace := t.TempDir()
+			idMap := []byte(`{
+  "concept": {},
+  "source": {"s1": "s1", "transient-a": "source-a", "transient-b": "source-b"},
+  "source_meta": {
+    "s1": {"slug": "s1", "source_file": "raw/source.md"},
+    "transient-a": {"slug": "source-a", "source_file": "raw/source.md"},
+    "transient-b": {"slug": "source-b", "source_file": "raw/source.md"}
+  },
+  "redirects": {}
+}`)
+			if test.name == "fake marker with explicit id" {
+				idMap = []byte(`{
+  "concept": {},
+  "source": {"s1": "s1", "transient-a": "source"},
+  "source_meta": {
+    "s1": {"slug": "s1", "source_file": "raw/source.md"},
+    "transient-a": {"slug": "source", "source_file": "raw/source.md"}
+  },
+  "redirects": {}
+}`)
+			}
+			mustWriteFile(t, filepath.Join(workspace, "cache", "id_map.json"), idMap)
+			mustWriteFile(t, filepath.Join(workspace, "wiki", "sources", "s1.md"), []byte("---\nid: s1\nsource_file: raw/source.md\n---\nlegacy\n"))
+			for slug, page := range test.pages {
+				mustWriteFile(t, filepath.Join(workspace, "wiki", "sources", slug), page)
+			}
+			before := snapshotRelevantVaultBytes(t, workspace, "cache/id_map.json", "wiki/sources/s1.md")
+			for slug := range test.pages {
+				before["wiki/sources/"+slug] = append([]byte(nil), test.pages[slug]...)
+			}
+
+			if err := reconcileWorkspaceSources(workspace, []sourceSnapshot{{SourceID: "s1", RawPath: "raw/source.md"}}); err == nil {
+				t.Fatal("unprovable duplicate source group was accepted")
+			}
+			assertVaultBytesUnchanged(t, workspace, before)
+			if _, err := os.Stat(filepath.Join(workspace, "wiki", "sources", "s1.md")); err != nil {
+				t.Fatalf("legacy source page was deleted: %v", err)
+			}
+		})
+	}
+}
+
+func syntoSourceSummaryPage(rawPath string) []byte {
+	return []byte("---\ntitle: source\naliases: []\ntags:\n  - source\nstatus: published\nsource_file: " + rawPath + "\nquality: high\ncreated: 2026-07-24\n---\n# source\n")
+}
+
 func TestReconcileWorkspaceRejectsRemovedIDReuse(t *testing.T) {
 	data := []byte(`{"source":{"removed":"new"},"source_meta":{"removed":{"slug":"new","source_file":"raw/new.md"}}}`)
 	if _, _, err := reconcileSourceIDMap(data, []sourceSnapshot{{SourceID: "removed", RawPath: "raw/old.md"}}); err == nil || !strings.Contains(err.Error(), "reserved") {

@@ -11,10 +11,13 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log"
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
+	"time"
 
 	"github.com/BurntSushi/toml"
 	fm "github.com/adrg/frontmatter"
@@ -27,132 +30,147 @@ import (
 // ensureSyntoVault is the only worker-owned Synto migration seam. It runs in
 // the private workspace before execution, and verifies that migration did not
 // alter the source or generated page byte streams.
-func ensureSyntoVault(ctx context.Context, vault string, cfg workerConfig, env []string) error {
+func ensureSyntoVault(ctx context.Context, vault string, cfg workerConfig, env []string, output ...io.Writer) error {
+	stdout, stderr := syntoOutputWriters(output...)
 	if err := validateSyntoVaultLayout(vault); err != nil {
-		return err
+		return newWorkerFailure(ctx, failureStageSyntoConfigValidation, failureClassStateInvalid, "", err)
 	}
 	syntoConfig := filepath.Join(vault, "synto.toml")
 	configInfo, configErr := os.Lstat(syntoConfig)
 	if configErr == nil {
 		if !configInfo.Mode().IsRegular() {
-			return errors.New("synto.toml is not a regular file")
+			return newWorkerFailure(ctx, failureStageSyntoConfigValidation, failureClassStateInvalid, "", errors.New("synto.toml is not a regular file"))
 		}
 		syntoState, stateErr := os.Lstat(filepath.Join(vault, ".synto", "state.db"))
 		if stateErr != nil && !errors.Is(stateErr, os.ErrNotExist) {
-			return fmt.Errorf("stat .synto/state.db: %w", stateErr)
+			return newWorkerFailure(ctx, failureStageSyntoConfigValidation, failureClassIO, "", fmt.Errorf("stat .synto/state.db: %w", stateErr))
 		}
 		if errors.Is(stateErr, os.ErrNotExist) {
 			if _, err := os.Lstat(filepath.Join(vault, ".synto")); err == nil {
-				return errors.New("Synto directory exists without .synto/state.db")
+				return newWorkerFailure(ctx, failureStageSyntoConfigValidation, failureClassStateInvalid, "", errors.New("Synto directory exists without .synto/state.db"))
 			} else if !errors.Is(err, os.ErrNotExist) {
-				return fmt.Errorf("stat .synto: %w", err)
+				return newWorkerFailure(ctx, failureStageSyntoConfigValidation, failureClassIO, "", fmt.Errorf("stat .synto: %w", err))
 			}
 			_, legacyConfigErr := os.Lstat(filepath.Join(vault, "wiki.toml"))
 			_, legacyStateErr := os.Lstat(filepath.Join(vault, ".olw", "state.db"))
 			if legacyConfigErr == nil || legacyStateErr == nil {
-				return errors.New("incoherent migrated state: legacy artifacts exist without .synto/state.db")
+				return newWorkerFailure(ctx, failureStageSyntoConfigValidation, failureClassStateInvalid, "", errors.New("incoherent migrated state: legacy artifacts exist without .synto/state.db"))
 			}
 			if !errors.Is(legacyConfigErr, os.ErrNotExist) {
-				return fmt.Errorf("stat wiki.toml: %w", legacyConfigErr)
+				return newWorkerFailure(ctx, failureStageSyntoConfigValidation, failureClassIO, "", fmt.Errorf("stat wiki.toml: %w", legacyConfigErr))
 			}
 			if !errors.Is(legacyStateErr, os.ErrNotExist) {
-				return fmt.Errorf("stat .olw/state.db: %w", legacyStateErr)
+				return newWorkerFailure(ctx, failureStageSyntoConfigValidation, failureClassIO, "", fmt.Errorf("stat .olw/state.db: %w", legacyStateErr))
 			}
 			if err := validateOLWWithoutState(vault); err != nil {
-				return err
+				return newWorkerFailure(ctx, failureStageSyntoConfigValidation, failureClassStateInvalid, "", err)
 			}
 		} else if !syntoState.Mode().IsRegular() {
-			return errors.New(".synto/state.db is not a regular file")
+			return newWorkerFailure(ctx, failureStageSyntoConfigValidation, failureClassStateInvalid, "", errors.New(".synto/state.db is not a regular file"))
 		} else if err := validateSQLiteArtifact(vault, ".synto/state.db"); err != nil {
-			return fmt.Errorf("invalid .synto/state.db: %w", err)
+			return newWorkerFailure(ctx, failureStageSyntoConfigValidation, failureClassStateInvalid, "", fmt.Errorf("invalid .synto/state.db: %w", err))
 		}
 		if _, err := os.Lstat(filepath.Join(vault, ".olw", "state.db")); err == nil {
 			if err := validateSQLiteArtifact(vault, ".olw/state.db"); err != nil {
-				return fmt.Errorf("invalid .olw/state.db: %w", err)
+				return newWorkerFailure(ctx, failureStageSyntoConfigValidation, failureClassStateInvalid, "", fmt.Errorf("invalid .olw/state.db: %w", err))
 			}
 		} else if !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("stat .olw/state.db: %w", err)
+			return newWorkerFailure(ctx, failureStageSyntoConfigValidation, failureClassIO, "", fmt.Errorf("stat .olw/state.db: %w", err))
 		}
 		if _, err := os.Lstat(filepath.Join(vault, ".olw", "state.db")); errors.Is(err, os.ErrNotExist) {
 			if err := validateOLWWithoutState(vault); err != nil {
-				return err
+				return newWorkerFailure(ctx, failureStageSyntoConfigValidation, failureClassStateInvalid, "", err)
 			}
 		}
 		// Existing Synto configuration is user/migration-owned. The worker may
 		// create a safe default, but must not rewrite an existing config while
 		// preparing a fresh or migrated generation.
-		return validateSyntoPipelineSafety(syntoConfig)
+		if err := validateSyntoPipelineSafety(syntoConfig); err != nil {
+			return newWorkerFailure(ctx, failureStageSyntoConfigValidation, failureClassValidation, "", err)
+		}
+		return nil
 	} else if !errors.Is(configErr, os.ErrNotExist) {
-		return fmt.Errorf("stat synto.toml: %w", configErr)
+		return newWorkerFailure(ctx, failureStageSyntoConfigValidation, failureClassIO, "", fmt.Errorf("stat synto.toml: %w", configErr))
 	}
 
 	if _, err := os.Lstat(filepath.Join(vault, ".synto")); err == nil {
-		return errors.New("Synto state exists without synto.toml")
+		return newWorkerFailure(ctx, failureStageSyntoConfigValidation, failureClassStateInvalid, "", errors.New("Synto state exists without synto.toml"))
 	} else if !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("stat .synto: %w", err)
+		return newWorkerFailure(ctx, failureStageSyntoConfigValidation, failureClassIO, "", fmt.Errorf("stat .synto: %w", err))
 	}
 
 	legacyConfigInfo, legacyConfigErr := os.Lstat(filepath.Join(vault, "wiki.toml"))
 	if legacyConfigErr != nil && !errors.Is(legacyConfigErr, os.ErrNotExist) {
-		return fmt.Errorf("stat wiki.toml: %w", legacyConfigErr)
+		return newWorkerFailure(ctx, failureStageSyntoConfigValidation, failureClassIO, "", fmt.Errorf("stat wiki.toml: %w", legacyConfigErr))
 	}
 	legacyState, legacyStateErr := os.Lstat(filepath.Join(vault, ".olw", "state.db"))
 	if legacyStateErr != nil && !errors.Is(legacyStateErr, os.ErrNotExist) {
-		return fmt.Errorf("stat .olw/state.db: %w", legacyStateErr)
+		return newWorkerFailure(ctx, failureStageSyntoConfigValidation, failureClassIO, "", fmt.Errorf("stat .olw/state.db: %w", legacyStateErr))
 	}
 	legacyConfigPresent := legacyConfigErr == nil
 	legacyStatePresent := legacyStateErr == nil
 	if !legacyStatePresent {
 		if err := validateOLWWithoutState(vault); err != nil {
-			return err
+			return newWorkerFailure(ctx, failureStageSyntoConfigValidation, failureClassStateInvalid, "", err)
 		}
 	}
 	if legacyConfigPresent != legacyStatePresent {
-		return errors.New("incoherent legacy migration state: wiki.toml and .olw/state.db must appear together")
+		return newWorkerFailure(ctx, failureStageSyntoConfigValidation, failureClassStateInvalid, "", errors.New("incoherent legacy migration state: wiki.toml and .olw/state.db must appear together"))
 	}
 	if legacyStatePresent {
 		if !legacyState.Mode().IsRegular() || !legacyConfigInfo.Mode().IsRegular() {
-			return errors.New("legacy migration artifacts are not regular files")
+			return newWorkerFailure(ctx, failureStageSyntoMigration, failureClassStateInvalid, "", errors.New("legacy migration artifacts are not regular files"))
 		}
 		if err := validateSQLiteArtifact(vault, ".olw/state.db"); err != nil {
-			return fmt.Errorf("invalid .olw/state.db: %w", err)
+			return newWorkerFailure(ctx, failureStageSyntoMigration, failureClassStateInvalid, "", fmt.Errorf("invalid .olw/state.db: %w", err))
 		}
 		before, err := snapshotMigrationInputs(vault)
 		if err != nil {
-			return err
+			return newWorkerFailure(ctx, failureStageSyntoMigration, failureClassStateInvalid, "", err)
 		}
-		if err := execOLW(ctx, vault, []string{"migrate-olw", "--vault", vault}, env, io.Discard, io.Discard); err != nil {
-			return fmt.Errorf("Synto OLW migration failed: %w", err)
+		if err := execOLW(ctx, vault, []string{"migrate-olw", "--vault", vault}, env, stdout, stderr); err != nil {
+			return fmt.Errorf("Synto OLW migration failed: %w", newWorkerFailure(ctx, failureStageSyntoMigration, failureClassChildExit, failureChildMigrateOLW, err))
 		}
 		after, err := snapshotMigrationInputs(vault)
 		if err != nil {
-			return err
+			return newWorkerFailure(ctx, failureStageSyntoMigration, failureClassStateInvalid, "", err)
 		}
 		if !equalMigrationInputs(before, after) {
-			return errors.New("Synto migration modified raw or wiki inputs")
+			return newWorkerFailure(ctx, failureStageSyntoMigration, failureClassStateInvalid, "", errors.New("Synto migration modified raw or wiki inputs"))
 		}
 		if info, err := os.Lstat(syntoConfig); err != nil {
-			return fmt.Errorf("Synto migration did not produce synto.toml: %w", err)
+			return newWorkerFailure(ctx, failureStageSyntoMigration, failureClassStateInvalid, "", fmt.Errorf("Synto migration did not produce synto.toml: %w", err))
 		} else if !info.Mode().IsRegular() {
-			return errors.New("Synto migration produced a non-regular synto.toml")
+			return newWorkerFailure(ctx, failureStageSyntoMigration, failureClassStateInvalid, "", errors.New("Synto migration produced a non-regular synto.toml"))
 		}
 		if info, err := os.Lstat(filepath.Join(vault, ".synto")); err != nil {
-			return fmt.Errorf("Synto migration did not produce .synto state: %w", err)
+			return newWorkerFailure(ctx, failureStageSyntoMigration, failureClassStateInvalid, "", fmt.Errorf("Synto migration did not produce .synto state: %w", err))
 		} else if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-			return errors.New("Synto migration produced an unsafe .synto directory")
+			return newWorkerFailure(ctx, failureStageSyntoMigration, failureClassStateInvalid, "", errors.New("Synto migration produced an unsafe .synto directory"))
 		}
 		if info, err := os.Lstat(filepath.Join(vault, ".synto", "state.db")); err != nil {
-			return fmt.Errorf("Synto migration did not produce .synto/state.db: %w", err)
+			return newWorkerFailure(ctx, failureStageSyntoMigration, failureClassStateInvalid, "", fmt.Errorf("Synto migration did not produce .synto/state.db: %w", err))
 		} else if !info.Mode().IsRegular() {
-			return errors.New("Synto migration produced a non-regular .synto/state.db")
+			return newWorkerFailure(ctx, failureStageSyntoMigration, failureClassStateInvalid, "", errors.New("Synto migration produced a non-regular .synto/state.db"))
 		}
 		if err := validateSQLiteArtifact(vault, ".synto/state.db"); err != nil {
-			return fmt.Errorf("invalid migrated .synto/state.db: %w", err)
+			return newWorkerFailure(ctx, failureStageSyntoMigration, failureClassStateInvalid, "", fmt.Errorf("invalid migrated .synto/state.db: %w", err))
 		}
-		return validateSyntoPipelineSafety(syntoConfig)
+		if err := normalizeMigratedSyntoConfig(vault); err != nil {
+			class := failureClassValidation
+			var pathErr *os.PathError
+			if errors.As(err, &pathErr) {
+				class = failureClassIO
+			}
+			return fmt.Errorf("normalize migrated synto.toml: %w", newWorkerFailure(ctx, failureStageSyntoConfigNormalization, class, "", err))
+		}
+		if err := validateSyntoPipelineSafety(syntoConfig); err != nil {
+			return newWorkerFailure(ctx, failureStageSyntoConfigValidation, failureClassValidation, "", err)
+		}
+		return nil
 	}
 	if legacyConfigPresent {
-		return errors.New("legacy wiki.toml exists without .olw/state.db")
+		return newWorkerFailure(ctx, failureStageSyntoMigration, failureClassStateInvalid, "", errors.New("legacy wiki.toml exists without .olw/state.db"))
 	}
 
 	const config = `[providers.default]
@@ -181,12 +199,15 @@ max_concepts_per_source = 8
 ingest_parallel = false
 `
 	if strings.TrimSpace(cfg.APIKey) == "" {
-		return errors.New("missing API key: set --api-key or LLM_API_KEY to create synto.toml")
+		return newWorkerFailure(ctx, failureStageSyntoConfigValidation, failureClassValidation, "", errors.New("missing API key: set --api-key or LLM_API_KEY to create synto.toml"))
 	}
 	if err := writeFileAtomicWithin(vault, "synto.toml", []byte(config)); err != nil {
-		return fmt.Errorf("write synto.toml: %w", err)
+		return newWorkerFailure(ctx, failureStageSyntoConfigValidation, failureClassIO, "", fmt.Errorf("write synto.toml: %w", err))
 	}
-	return validateSyntoPipelineSafety(syntoConfig)
+	if err := validateSyntoPipelineSafety(syntoConfig); err != nil {
+		return newWorkerFailure(ctx, failureStageSyntoConfigValidation, failureClassValidation, "", err)
+	}
+	return nil
 }
 
 // validateSyntoVaultLayout rejects symlinked control/state paths before any
@@ -422,11 +443,249 @@ func equalMigrationInputs(a, b migrationInputSnapshot) bool {
 	return true
 }
 
+var syntoPipelineSafetyKeys = [...]string{"auto_commit", "auto_maintain", "relation_extraction"}
+
+// migrate-olw emits a 44-byte synto.toml for the exact Synto 0.7.0 fixture.
+// One MiB leaves ample room for ordinary provider/model tables and comments,
+// while keeping the migration-only normalizer far below the generic 64 MiB
+// generation bound before TOML decoding creates interface values.
+const syntoMigratedConfigMaxBytes int64 = 1 << 20
+
+var errSyntoOutputLimit = errors.New("Synto normalization output limit exceeded")
+
+type syntoLimitedWriter struct {
+	buffer bytes.Buffer
+	limit  int64
+}
+
+func newSyntoLimitedWriter(limit int64) *syntoLimitedWriter {
+	return &syntoLimitedWriter{limit: limit}
+}
+
+func (w *syntoLimitedWriter) Write(data []byte) (int, error) {
+	if w.limit < 0 || int64(w.buffer.Len()) > w.limit || int64(len(data)) > w.limit-int64(w.buffer.Len()) {
+		return 0, fmt.Errorf("%w: limit=%d", errSyntoOutputLimit, w.limit)
+	}
+	return w.buffer.Write(data)
+}
+
+func (w *syntoLimitedWriter) Len() int {
+	return w.buffer.Len()
+}
+
+func (w *syntoLimitedWriter) Bytes() []byte {
+	return w.buffer.Bytes()
+}
+
+// normalizeMigratedSyntoConfig is intentionally restricted to the config just
+// produced by migrate-olw. Existing Synto configs are user-owned and must go
+// through validation without this rewrite.
+func normalizeMigratedSyntoConfig(vault string) error {
+	data, err := readBoundedRegularFileWithinLimit(vault, "synto.toml", syntoMigratedConfigMaxBytes)
+	if err != nil {
+		return fmt.Errorf("read migrated synto.toml with normalizer input limit of %d bytes: %w", syntoMigratedConfigMaxBytes, err)
+	}
+
+	var document map[string]interface{}
+	metadata, err := toml.Decode(string(data), &document)
+	if err != nil {
+		return fmt.Errorf("parse migrated synto.toml: %w", err)
+	}
+	if err := rejectUnsupportedSyntoTemporalValues(document, metadata); err != nil {
+		return err
+	}
+	pipeline, exists := document["pipeline"]
+	if !exists {
+		pipeline = map[string]interface{}{}
+		document["pipeline"] = pipeline
+	}
+	pipelineTable, ok := pipeline.(map[string]interface{})
+	if !ok {
+		return errors.New("pipeline is not a table")
+	}
+	for _, key := range syntoPipelineSafetyKeys {
+		if value, exists := pipelineTable[key]; exists {
+			if _, ok := value.(bool); !ok {
+				return fmt.Errorf("pipeline.%s is not a boolean", key)
+			}
+		}
+		pipelineTable[key] = false
+	}
+
+	normalized := newSyntoLimitedWriter(syntoMigratedConfigMaxBytes)
+	if err := toml.NewEncoder(normalized).Encode(document); err != nil {
+		if errors.Is(err, errSyntoOutputLimit) {
+			return fmt.Errorf("encoded migrated synto.toml exceeds normalizer output limit of %d bytes: %w", syntoMigratedConfigMaxBytes, err)
+		}
+		return fmt.Errorf("encode migrated synto.toml: %w", err)
+	}
+	normalizedData := normalized.Bytes()
+	if err := validateSyntoPipelineSafetyBytes(normalizedData); err != nil {
+		return fmt.Errorf("validate normalized synto.toml: %w", err)
+	}
+	var roundTripped map[string]interface{}
+	if _, err := toml.Decode(string(normalizedData), &roundTripped); err != nil {
+		return fmt.Errorf("parse normalized synto.toml: %w", err)
+	}
+	if !equalSyntoConfigSemanticsWithoutSafety(document, roundTripped) {
+		return errors.New("normalized synto.toml changed non-safety configuration semantics")
+	}
+	if err := writeFileAtomicWithin(vault, "synto.toml", normalizedData); err != nil {
+		return fmt.Errorf("write normalized synto.toml: %w", err)
+	}
+	return nil
+}
+
+func validateExactSyntoBridgeEnv(paths ...string) error {
+	if len(paths) != 4 {
+		return fmt.Errorf("exact Synto bridge expects four output paths, got %d", len(paths))
+	}
+	anySet := false
+	for _, path := range paths {
+		if strings.TrimSpace(path) != "" {
+			anySet = true
+			break
+		}
+	}
+	if !anySet {
+		return nil
+	}
+	labels := [...]string{
+		"LWC195_EXACT_INDEX_RUN1_PATH",
+		"LWC195_EXACT_INDEX_RUN2_PATH",
+		"LWC195_RAW_SOURCE_PATH",
+		"LWC197_MIGRATED_CONFIG_PATH",
+	}
+	missing := make([]string, 0, len(labels))
+	for i, path := range paths {
+		if strings.TrimSpace(path) == "" {
+			missing = append(missing, labels[i])
+		}
+	}
+	if len(missing) != 0 {
+		return fmt.Errorf("exact Synto bridge requires all four output paths; missing %s", strings.Join(missing, ", "))
+	}
+	return nil
+}
+
+func rejectUnsupportedSyntoTemporalValues(document map[string]interface{}, metadata toml.MetaData) error {
+	for _, key := range metadata.Keys() {
+		if metadata.Type(key...) == "Datetime" {
+			return fmt.Errorf("temporal TOML value %q cannot be safely normalized with the pinned decoder/encoder", key)
+		}
+	}
+	if syntoTOMLContainsTime(document) {
+		return errors.New("temporal TOML value in an array cannot be safely normalized with the pinned decoder/encoder")
+	}
+	return nil
+}
+
+func syntoTOMLContainsTime(value interface{}) bool {
+	switch value := value.(type) {
+	case time.Time:
+		return true
+	case map[string]interface{}:
+		for _, nested := range value {
+			if syntoTOMLContainsTime(nested) {
+				return true
+			}
+		}
+	case []interface{}:
+		for _, nested := range value {
+			if syntoTOMLContainsTime(nested) {
+				return true
+			}
+		}
+	case []map[string]interface{}:
+		for _, nested := range value {
+			if syntoTOMLContainsTime(nested) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func equalSyntoConfigSemanticsWithoutSafety(a, b map[string]interface{}) bool {
+	strip := func(document map[string]interface{}) map[string]interface{} {
+		copy := make(map[string]interface{}, len(document))
+		for key, value := range document {
+			copy[key] = value
+		}
+		if pipeline, ok := copy["pipeline"].(map[string]interface{}); ok {
+			pipelineCopy := make(map[string]interface{}, len(pipeline))
+			for key, value := range pipeline {
+				pipelineCopy[key] = value
+			}
+			for _, key := range syntoPipelineSafetyKeys {
+				delete(pipelineCopy, key)
+			}
+			copy["pipeline"] = pipelineCopy
+		}
+		return copy
+	}
+	left, right := strip(a), strip(b)
+	if _, existed := a["pipeline"]; !existed {
+		if pipeline, exists := right["pipeline"].(map[string]interface{}); exists && len(pipeline) == 0 {
+			delete(right, "pipeline")
+		}
+	}
+	return equalSyntoTOMLValues(left, right)
+}
+
+func equalSyntoTOMLValues(a, b interface{}) bool {
+	switch left := a.(type) {
+	case time.Time:
+		right, ok := b.(time.Time)
+		return ok && reflect.DeepEqual(left, right)
+	case map[string]interface{}:
+		right, ok := b.(map[string]interface{})
+		if !ok || len(left) != len(right) {
+			return false
+		}
+		for key, value := range left {
+			other, ok := right[key]
+			if !ok || !equalSyntoTOMLValues(value, other) {
+				return false
+			}
+		}
+		return true
+	case []interface{}:
+		right, ok := b.([]interface{})
+		if !ok || len(left) != len(right) {
+			return false
+		}
+		for i := range left {
+			if !equalSyntoTOMLValues(left[i], right[i]) {
+				return false
+			}
+		}
+		return true
+	case []map[string]interface{}:
+		right, ok := b.([]map[string]interface{})
+		if !ok || len(left) != len(right) {
+			return false
+		}
+		for i := range left {
+			if !equalSyntoTOMLValues(left[i], right[i]) {
+				return false
+			}
+		}
+		return true
+	default:
+		return reflect.DeepEqual(a, b)
+	}
+}
+
 func validateSyntoPipelineSafety(path string) error {
-	data, err := os.ReadFile(path)
+	data, err := readBoundedRegularFileWithinLimit(filepath.Dir(path), filepath.Base(path), generation.MaxFileBytes)
 	if err != nil {
 		return fmt.Errorf("read synto.toml: %w", err)
 	}
+	return validateSyntoPipelineSafetyBytes(data)
+}
+
+func validateSyntoPipelineSafetyBytes(data []byte) error {
 	var document map[string]interface{}
 	if _, err := toml.Decode(string(data), &document); err != nil {
 		return fmt.Errorf("parse synto.toml: %w", err)
@@ -489,7 +748,45 @@ type syntoIndexTruth struct {
 	AmbiguousLineage bool
 }
 
-const maxSyntoIndexBytes = 8 << 20
+type syntoIndexDecodeReason int
+
+const (
+	syntoIndexDecodeReasonSourceConceptIdentity syntoIndexDecodeReason = iota
+	syntoIndexDecodeReasonArticleIdentity
+	syntoIndexDecodeReasonArticlePath
+)
+
+type syntoIndexDecoder interface {
+	SyntoIndexDecodeReason() syntoIndexDecodeReason
+}
+
+type syntoIndexDecodeError struct {
+	reason syntoIndexDecodeReason
+	cause  error
+}
+
+func (e *syntoIndexDecodeError) Error() string {
+	if e == nil || e.cause == nil {
+		return "invalid Synto INDEX.json"
+	}
+	return e.cause.Error()
+}
+
+func (e *syntoIndexDecodeError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
+}
+
+func (e *syntoIndexDecodeError) SyntoIndexDecodeReason() syntoIndexDecodeReason {
+	if e == nil {
+		return -1
+	}
+	return e.reason
+}
+
+const maxSyntoIndexBytes = generation.MaxFileBytes
 
 const sqliteHeader = "SQLite format 3\x00"
 
@@ -557,17 +854,181 @@ func readSyntoIndexTruth(workspace string) (syntoIndexTruth, error) {
 	return index, nil
 }
 
+// enforceActiveEntityCoverage fails closed when every active source-concept
+// entity lacks an entity-bound article. Partial gaps remain soft-warned;
+// total emptiness would publish a successful generation with zero Concepts.
+func enforceActiveEntityCoverage(plan wikiindex.SyntoIdentityPlan) error {
+	if len(plan.ActiveEntities) == 0 {
+		return nil
+	}
+	unbound := wikiindex.UnboundActiveEntities(plan)
+	if len(unbound) == len(plan.ActiveEntities) {
+		return fmt.Errorf("identity_coverage_empty: all %d active Synto entity_id values lack entity-bound articles", len(unbound))
+	}
+	return nil
+}
+
+// reportUnboundActiveEntities records source_concepts entities that have no
+// explicit article.entity_id binding. Partial coverage gaps no longer fail the
+// run; they are written to the durable pipeline log (when warn is set) and to
+// the worker process log under a stable greppable code.
+//
+// Each warning includes the Synto concept name(s) and raw source_path(s) from
+// INDEX source_concepts so operators can map entity_id -> concept without
+// opening state.db. Callers must still enforceActiveEntityCoverage for the
+// all-unbound case.
+func reportUnboundActiveEntities(plan wikiindex.SyntoIdentityPlan, index syntoIndexTruth, warn io.Writer) {
+	unbound := wikiindex.UnboundActiveEntities(plan)
+	if len(unbound) == 0 {
+		return
+	}
+	type entityCoverage struct {
+		names []string
+		paths []string
+	}
+	byEntity := make(map[string]*entityCoverage, len(unbound))
+	for _, entityID := range unbound {
+		byEntity[entityID] = &entityCoverage{}
+	}
+	for _, edge := range index.SourceConcepts {
+		detail, ok := byEntity[edge.EntityID]
+		if !ok {
+			continue
+		}
+		if edge.Name != "" {
+			detail.names = append(detail.names, edge.Name)
+		}
+		if edge.SourcePath != "" {
+			detail.paths = append(detail.paths, edge.SourcePath)
+		}
+	}
+	// Optional hint: entity-less INDEX articles whose title matches a missing
+	// concept name (common when pack export omits article.entity_id).
+	articlesByName := make(map[string][]string)
+	for _, article := range index.Articles {
+		if article.EntityID != "" || article.Name == "" {
+			continue
+		}
+		articlesByName[article.Name] = append(articlesByName[article.Name], article.Path)
+	}
+
+	msg := fmt.Sprintf(
+		`WARNING postprocess identity_coverage_gap_summary count=%d detail="active Synto entities missing entity-bound articles; continuing"`,
+		len(unbound),
+	)
+	log.Print(msg)
+	if warn != nil {
+		fmt.Fprintln(warn, msg)
+	}
+	for _, entityID := range unbound {
+		detail := byEntity[entityID]
+		names := uniqueSortedStrings(detail.names)
+		paths := uniqueSortedStrings(detail.paths)
+		var candidatePaths []string
+		for _, name := range names {
+			candidatePaths = append(candidatePaths, articlesByName[name]...)
+		}
+		candidatePaths = uniqueSortedStrings(candidatePaths)
+		conceptNames := strings.Join(names, ",")
+		if conceptNames == "" {
+			conceptNames = "<unknown>"
+		}
+		line := fmt.Sprintf(
+			`WARNING postprocess identity_coverage_gap entity_id=%q concept_names=%q source_paths=%q candidate_article_paths=%q detail="active Synto entity has no entity-bound article; continuing without concept"`,
+			entityID,
+			conceptNames,
+			strings.Join(paths, ","),
+			strings.Join(candidatePaths, ","),
+		)
+		log.Print(line)
+		if warn != nil {
+			fmt.Fprintln(warn, line)
+		}
+	}
+}
+
+func uniqueSortedStrings(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	sort.Strings(values)
+	out := values[:0]
+	var prev string
+	for i, value := range values {
+		if i == 0 || value != prev {
+			out = append(out, value)
+			prev = value
+		}
+	}
+	return out
+}
+
+// syntoIdentityPlanFromIndex converts the already validated INDEX artifact
+// into the direct Concept identity authority. It never matches by title,
+// source name, path history or content; only an explicit article.entity_id is
+// eligible. Entity-less articles remain ordinary page bytes.
+func syntoIdentityPlanFromIndex(index syntoIndexTruth) (wikiindex.SyntoIdentityPlan, error) {
+	plan := wikiindex.SyntoIdentityPlan{
+		ByPath:         make(map[string]string),
+		ActiveEntities: make(map[string]bool, len(index.ActiveEntities)),
+	}
+	for entityID := range index.ActiveEntities {
+		if !wikiindex.ValidSyntoEntityID(entityID) {
+			return wikiindex.SyntoIdentityPlan{}, fmt.Errorf("unsafe active Synto entity_id %q", entityID)
+		}
+		plan.ActiveEntities[entityID] = true
+	}
+
+	seenIDs := make(map[string]string, len(index.Articles))
+	seenSlugs := make(map[string]string, len(index.Articles))
+	seenEntities := make(map[string]string, len(index.Articles))
+	for _, edge := range index.SourceConcepts {
+		if edge.Name == "" || !wikiindex.ValidSyntoEntityID(edge.EntityID) {
+			return wikiindex.SyntoIdentityPlan{}, errors.New("invalid Synto source concept identity")
+		}
+		plan.ActiveEntities[edge.EntityID] = true
+	}
+	for _, article := range index.Articles {
+		slug, err := normalizeSyntoArticlePath(article.Path)
+		if err != nil {
+			return wikiindex.SyntoIdentityPlan{}, err
+		}
+		canonicalPath := filepath.ToSlash(filepath.Join("wiki", slug+".md"))
+		if article.ID == "" || !annotation.ValidSourceID(article.ID) {
+			return wikiindex.SyntoIdentityPlan{}, fmt.Errorf("invalid Synto article ID for %q", slug)
+		}
+		if previous, exists := seenIDs[article.ID]; exists {
+			return wikiindex.SyntoIdentityPlan{}, fmt.Errorf("duplicate Synto article ID %q for %q and %q", article.ID, previous, slug)
+		}
+		seenIDs[article.ID] = slug
+		if previous, exists := seenSlugs[strings.ToLower(slug)]; exists {
+			return wikiindex.SyntoIdentityPlan{}, fmt.Errorf("duplicate Synto article slug %q for %q and %q", slug, previous, slug)
+		}
+		seenSlugs[strings.ToLower(slug)] = slug
+		if article.EntityID == "" {
+			continue
+		}
+		if !wikiindex.ValidSyntoEntityID(article.EntityID) {
+			return wikiindex.SyntoIdentityPlan{}, fmt.Errorf("unsafe Synto article entity_id %q", article.EntityID)
+		}
+		if previous, exists := seenEntities[article.EntityID]; exists {
+			return wikiindex.SyntoIdentityPlan{}, fmt.Errorf("Synto entity_id %q maps to multiple articles %q and %q", article.EntityID, previous, slug)
+		}
+		seenEntities[article.EntityID] = canonicalPath
+		if wikiindex.IsSyntoRootPage(canonicalPath) {
+			continue
+		}
+		path := canonicalPath
+		plan.ByPath[path] = article.EntityID
+	}
+	return plan, nil
+}
+
 // ensureSyntoIndex uses the exact 0.7.0 documented offline pack-export
 // surface. The orchestrator's generate_index() only writes wiki/index.md;
 // pack export is the release-supported path that serializes the authoritative
 // schema-v1 INDEX.json without another provider call.
-func ensureSyntoIndex(ctx context.Context, vault string, env []string) error {
-	exportDir, err := os.MkdirTemp("", "lwc-synto-index-")
-	if err != nil {
-		return fmt.Errorf("create Synto INDEX export directory: %w", err)
-	}
-	defer os.RemoveAll(exportDir)
-	command := []string{"pack", "export", "--target", "agents", "--out", exportDir}
+func ensureSyntoIndex(ctx context.Context, vault string, env []string, output ...io.Writer) error {
 	if !isDefaultSyntoExecutor() {
 		// Existing reconciliation fixtures install an already validated INDEX
 		// from their fake Synto run. They do not model the external pack exporter;
@@ -579,25 +1040,340 @@ func ensureSyntoIndex(ctx context.Context, vault string, env []string) error {
 			}
 		}
 	}
-	if err := execOLW(ctx, vault, command, env, io.Discard, io.Discard); err != nil {
-		return fmt.Errorf("Synto offline INDEX export failed: %w", err)
+	data, err := exportSyntoIndex(ctx, vault, env, output...)
+	if err != nil {
+		return err
+	}
+	if err := writeFileAtomicWithin(vault, ".synto/INDEX.json", data); err != nil {
+		return newWorkerFailure(ctx, failureStageSyntoIndexExport, failureClassIO, "", fmt.Errorf("install authoritative .synto/INDEX.json: %w", err))
+	}
+	if _, err := readSyntoIndexTruth(vault); err != nil {
+		return newWorkerFailure(ctx, failureStageSyntoIndexExport, failureClassStateInvalid, "", fmt.Errorf("validate installed .synto/INDEX.json: %w", err))
+	}
+	return nil
+}
+
+func exportSyntoIndex(ctx context.Context, vault string, env []string, output ...io.Writer) ([]byte, error) {
+	exportDir, err := os.MkdirTemp("", "lwc-synto-index-")
+	if err != nil {
+		return nil, newWorkerFailure(ctx, failureStageSyntoIndexExport, failureClassIO, "", fmt.Errorf("create Synto INDEX export directory: %w", err))
+	}
+	defer os.RemoveAll(exportDir)
+	command := []string{"pack", "export", "--target", "agents", "--out", exportDir}
+	stdout, stderr := syntoOutputWriters(output...)
+	if err := execOLW(ctx, vault, command, env, stdout, stderr); err != nil {
+		return nil, fmt.Errorf("Synto offline INDEX export failed: %w", newWorkerFailure(ctx, failureStageSyntoIndexExport, failureClassChildExit, failureChildPackExport, err))
 	}
 	data, err := readBoundedRegularFileWithin(exportDir, "index/INDEX.json")
 	if err != nil {
-		// Existing unit fixtures predate the production export gate and replace
-		// the executor with a no-op. Keep those fixtures focused on reconciliation;
-		// the real executor remains fail-closed when the documented export is absent.
-		return fmt.Errorf("Synto offline INDEX export missing index/INDEX.json: %w", err)
+		return nil, newWorkerFailure(ctx, failureStageSyntoIndexExport, failureClassStateInvalid, "", fmt.Errorf("Synto offline INDEX export missing index/INDEX.json: %w", err))
+	}
+	concepts, err := readBoundedRegularFileWithinLimit(exportDir, "agent/concepts.json", maxSyntoIndexBytes)
+	if err != nil {
+		return nil, newWorkerFailure(ctx, failureStageSyntoIndexExport, failureClassStateInvalid, "", fmt.Errorf("Synto offline concepts export missing agent/concepts.json: %w", err))
+	}
+	data, err = enrichSyntoIndexWithAgentConcepts(data, concepts)
+	if err != nil {
+		return nil, newWorkerFailure(ctx, failureStageSyntoIndexExport, failureClassStateInvalid, "", fmt.Errorf("Synto offline export identity join failed: %w", err))
 	}
 	if _, err := decodeSyntoIndex(data); err != nil {
-		return fmt.Errorf("Synto offline INDEX export is invalid: %w", err)
+		return nil, newWorkerFailure(ctx, failureStageSyntoIndexExport, failureClassStateInvalid, "", fmt.Errorf("Synto offline INDEX export is invalid: %w", err))
 	}
-	if err := writeFileAtomicWithin(vault, ".synto/INDEX.json", data); err != nil {
-		return fmt.Errorf("install authoritative .synto/INDEX.json: %w", err)
+	return data, nil
+}
+
+func syntoOutputWriters(output ...io.Writer) (io.Writer, io.Writer) {
+	if len(output) >= 2 && output[0] != nil && output[1] != nil {
+		return output[0], output[1]
 	}
-	if _, err := readSyntoIndexTruth(vault); err != nil {
-		return fmt.Errorf("validate installed .synto/INDEX.json: %w", err)
+	return os.Stdout, os.Stderr
+}
+
+type syntoAgentConcept struct {
+	EntityID           string
+	CanonicalArticleID *string
+	ArticlePath        *string
+}
+
+type syntoArticleProofKey struct {
+	ID   string
+	Path string
+}
+
+// enrichSyntoIndexWithAgentConcepts joins the two artifacts produced by one
+// agents pack export. Agent concepts with a complete canonical article binding
+// are the only supported proof for filling an omitted/null INDEX
+// article.entity_id. Source names and source-path sets are not identity
+// evidence. An explicit non-empty article.entity_id remains authoritative and
+// is never overwritten by a disagreeing agent proof.
+func enrichSyntoIndexWithAgentConcepts(indexData, conceptsData []byte) ([]byte, error) {
+	index, err := decodeSyntoIndex(indexData)
+	if err != nil {
+		return nil, fmt.Errorf("decode INDEX.json: %w", err)
 	}
+	concepts, err := decodeSyntoAgentConcepts(conceptsData)
+	if err != nil {
+		return nil, fmt.Errorf("decode agent/concepts.json: %w", err)
+	}
+
+	byID := make(map[string]int, len(index.Articles))
+	byPath := make(map[string]int, len(index.Articles))
+	entityArticle := make(map[string]int, len(index.Articles))
+	for i, article := range index.Articles {
+		path, err := normalizeSyntoArticlePath(article.Path)
+		if err != nil {
+			return nil, fmt.Errorf("article %q has unsafe path: %w", article.ID, err)
+		}
+		if article.ID != "" {
+			if previous, exists := byID[article.ID]; exists && previous != i {
+				return nil, fmt.Errorf("duplicate INDEX article ID %q", article.ID)
+			}
+			byID[article.ID] = i
+		}
+		if previous, exists := byPath[path]; exists && previous != i {
+			return nil, fmt.Errorf("duplicate INDEX article path %q", article.Path)
+		}
+		byPath[path] = i
+		if article.EntityID != "" {
+			if previous, exists := entityArticle[article.EntityID]; exists && previous != i {
+				return nil, fmt.Errorf("INDEX article entity_id %q maps to multiple articles", article.EntityID)
+			}
+			entityArticle[article.EntityID] = i
+		}
+	}
+
+	proofs := make(map[syntoArticleProofKey]string, len(concepts))
+	entityOwners := make(map[string]syntoArticleProofKey, len(concepts))
+	for _, concept := range concepts {
+		if concept.CanonicalArticleID == nil && concept.ArticlePath == nil {
+			continue
+		}
+		if concept.CanonicalArticleID == nil || concept.ArticlePath == nil {
+			return nil, errors.New("agent concept has incomplete canonical article binding")
+		}
+		path, err := normalizeSyntoArticlePath(*concept.ArticlePath)
+		if err != nil {
+			return nil, fmt.Errorf("agent concept article_path: %w", err)
+		}
+		idIndex, idExists := byID[*concept.CanonicalArticleID]
+		pathIndex, pathExists := byPath[path]
+		if !idExists || !pathExists {
+			return nil, fmt.Errorf("agent concept canonical article does not match INDEX: %q/%q", *concept.CanonicalArticleID, *concept.ArticlePath)
+		}
+		if idIndex != pathIndex {
+			return nil, fmt.Errorf("agent concept canonical article ID/path disagreement: %q/%q", *concept.CanonicalArticleID, *concept.ArticlePath)
+		}
+		if concept.EntityID == "" || !wikiindex.ValidSyntoEntityID(concept.EntityID) {
+			return nil, errors.New("agent concept has invalid entity_id")
+		}
+		key := syntoArticleProofKey{ID: *concept.CanonicalArticleID, Path: path}
+		if previous, exists := proofs[key]; exists {
+			if previous == concept.EntityID {
+				return nil, fmt.Errorf("agent concept article has duplicate canonical article proof: %q", key.ID)
+			}
+			return nil, fmt.Errorf("agent concept article has multiple entity_id values: %q", key.ID)
+		}
+		if previous, exists := entityOwners[concept.EntityID]; exists && previous != key {
+			return nil, fmt.Errorf("agent entity_id %q maps to multiple articles", concept.EntityID)
+		}
+		proofs[key] = concept.EntityID
+		entityOwners[concept.EntityID] = key
+	}
+
+	// Apply agent proofs only where INDEX omitted/null entity_id. Explicit
+	// released article.entity_id values stay authoritative.
+	fills := make(map[int]string)
+	for key, entityID := range proofs {
+		idx := byID[key.ID]
+		article := index.Articles[idx]
+		if article.EntityID != "" {
+			// Explicit INDEX identity wins; disagreeing agent proof is ignored.
+			continue
+		}
+		if previous, exists := entityArticle[entityID]; exists && previous != idx {
+			return nil, fmt.Errorf("agent entity_id %q already bound to another INDEX article", entityID)
+		}
+		if previous, exists := fills[idx]; exists && previous != entityID {
+			return nil, fmt.Errorf("agent concept article has multiple entity_id values: %q", article.ID)
+		}
+		fills[idx] = entityID
+		entityArticle[entityID] = idx
+	}
+	if len(fills) == 0 {
+		return indexData, nil
+	}
+	return applyAgentEntityFillsToIndex(indexData, fills)
+}
+
+// applyAgentEntityFillsToIndex rewrites only article.entity_id values for the
+// given article indices. Other INDEX fields are preserved as raw JSON.
+func applyAgentEntityFillsToIndex(indexData []byte, fills map[int]string) ([]byte, error) {
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(indexData, &root); err != nil {
+		return nil, fmt.Errorf("decode INDEX for agent fill: %w", err)
+	}
+	rawArticles, ok := root["articles"]
+	if !ok {
+		return nil, errors.New("INDEX.json missing articles")
+	}
+	var articles []map[string]json.RawMessage
+	if err := json.Unmarshal(rawArticles, &articles); err != nil {
+		return nil, fmt.Errorf("decode INDEX articles for agent fill: %w", err)
+	}
+	for idx, entityID := range fills {
+		if idx < 0 || idx >= len(articles) {
+			return nil, fmt.Errorf("agent fill index %d out of range", idx)
+		}
+		encoded, err := json.Marshal(entityID)
+		if err != nil {
+			return nil, err
+		}
+		articles[idx]["entity_id"] = encoded
+	}
+	encodedArticles, err := json.Marshal(articles)
+	if err != nil {
+		return nil, err
+	}
+	root["articles"] = encodedArticles
+	out, err := json.Marshal(root)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := decodeSyntoIndex(out); err != nil {
+		return nil, fmt.Errorf("agent-filled INDEX is invalid: %w", err)
+	}
+	return out, nil
+}
+
+func decodeSyntoAgentConcepts(data []byte) ([]syntoAgentConcept, error) {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	token, err := dec.Token()
+	if err != nil {
+		return nil, err
+	}
+	if token != json.Delim('{') {
+		return nil, errors.New("agent concepts must be an object")
+	}
+	seen := map[string]bool{}
+	var concepts []syntoAgentConcept
+	for dec.More() {
+		keyToken, err := dec.Token()
+		if err != nil {
+			return nil, err
+		}
+		key, ok := keyToken.(string)
+		if !ok || seen[key] {
+			return nil, errors.New("duplicate or invalid agent concepts key")
+		}
+		seen[key] = true
+		switch key {
+		case "schema_version":
+			var version int
+			if err := dec.Decode(&version); err != nil || version != 1 {
+				return nil, errors.New("agent concepts schema_version must be 1")
+			}
+		case "concepts":
+			concepts, err = decodeSyntoAgentConceptList(dec)
+			if err != nil {
+				return nil, err
+			}
+		default:
+			return nil, fmt.Errorf("unsupported agent concepts field %q", key)
+		}
+	}
+	if _, err := dec.Token(); err != nil {
+		return nil, err
+	}
+	if err := generation.EnsureJSONEOF(dec); err != nil {
+		return nil, err
+	}
+	for _, key := range []string{"schema_version", "concepts"} {
+		if !seen[key] {
+			return nil, fmt.Errorf("missing agent concepts field %q", key)
+		}
+	}
+	return concepts, nil
+}
+
+func decodeSyntoAgentConceptList(dec *json.Decoder) ([]syntoAgentConcept, error) {
+	token, err := dec.Token()
+	if err != nil || token != json.Delim('[') {
+		return nil, errors.New("agent concepts must be an array")
+	}
+	concepts := make([]syntoAgentConcept, 0)
+	for dec.More() {
+		if len(concepts) >= generation.MaxFiles {
+			return nil, generation.ErrLogicalEntryLimit
+		}
+		var concept syntoAgentConcept
+		var canonicalArticleID, articlePath *string
+		var name string
+		seen, err := decodeSyntoObject(dec, map[string]bool{
+			"name": true, "entity_id": true, "aliases": true,
+			"canonical_article_id": true, "article_path": true, "related_names": true,
+		}, func(key string, dec *json.Decoder) error {
+			switch key {
+			case "name":
+				return decodeStringInto(dec, &name, 4096)
+			case "entity_id":
+				return decodeStringInto(dec, &concept.EntityID, 1024)
+			case "aliases", "related_names":
+				_, err := decodeBoundedStringArray(dec, 4096)
+				return err
+			case "canonical_article_id":
+				return decodeNullableStringInto(dec, &canonicalArticleID, 1024)
+			case "article_path":
+				return decodeNullableStringInto(dec, &articlePath, generation.MaxPathBytes)
+			}
+			return nil
+		})
+		if err != nil {
+			return nil, err
+		}
+		for _, key := range []string{"name", "entity_id", "aliases", "canonical_article_id", "article_path", "related_names"} {
+			if !seen[key] {
+				return nil, fmt.Errorf("missing agent concept field %q", key)
+			}
+		}
+		if name == "" {
+			return nil, errors.New("agent concept name is empty")
+		}
+		if concept.EntityID != "" && !wikiindex.ValidSyntoEntityID(concept.EntityID) {
+			return nil, errors.New("agent concept entity_id is unsafe")
+		}
+		if canonicalArticleID != nil && !annotation.ValidSourceID(*canonicalArticleID) {
+			return nil, errors.New("agent concept canonical_article_id is unsafe")
+		}
+		if articlePath != nil {
+			if _, err := normalizeSyntoArticlePath(*articlePath); err != nil {
+				return nil, fmt.Errorf("agent concept article_path is unsafe: %w", err)
+			}
+		}
+		concept.CanonicalArticleID = canonicalArticleID
+		concept.ArticlePath = articlePath
+		concepts = append(concepts, concept)
+	}
+	if _, err := dec.Token(); err != nil {
+		return nil, err
+	}
+	return concepts, nil
+}
+
+func decodeNullableStringInto(dec *json.Decoder, target **string, max int) error {
+	token, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	if token == nil {
+		*target = nil
+		return nil
+	}
+	value, ok := token.(string)
+	if !ok || len(value) > max {
+		return errors.New("invalid bounded nullable string")
+	}
+	*target = &value
 	return nil
 }
 
@@ -605,89 +1381,154 @@ func isDefaultSyntoExecutor() bool {
 	return reflect.ValueOf(execOLW).Pointer() == reflect.ValueOf(execOLWCommand).Pointer()
 }
 
-func readSyntoEntityIDs(workspace string, concepts map[string]string) (map[string]string, error) {
+func readSyntoEntityIDs(workspace string, concepts map[string]string, prior ...[]conceptSnapshot) (map[string]string, error) {
 	index, err := readSyntoIndexTruth(workspace)
 	if err != nil {
-		return nil, err
+		var decodeReason syntoIndexDecoder
+		if errors.As(err, &decodeReason) {
+			switch decodeReason.SyntoIndexDecodeReason() {
+			case syntoIndexDecodeReasonSourceConceptIdentity:
+				return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingSourceConceptIdentity, cause: err}
+			case syntoIndexDecodeReasonArticleIdentity:
+				return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingArticleIdentity, cause: err}
+			case syntoIndexDecodeReasonArticlePath:
+				return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingArticlePath, cause: err}
+			}
+		}
+		return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingIndexTruth, cause: err}
 	}
 	if !index.Present {
 		return nil, nil
 	}
+	return mapSyntoEntityIDsFromIndexTruth(index, concepts, prior...)
+}
+
+func mapSyntoEntityIDsFromIndexTruth(index syntoIndexTruth, concepts map[string]string, prior ...[]conceptSnapshot) (map[string]string, error) {
 	byID := make(map[string]string, len(index.Articles))
 	bySlug := make(map[string]string, len(index.Articles))
 	byEntity := make(map[string]string, len(index.Articles))
-	byName := make(map[string]string, len(index.SourceConcepts))
-	ambiguousNames := make(map[string]bool)
+	entitylessIDs := make(map[string]string, len(index.Articles))
+	entitylessSlugs := make(map[string]string, len(index.Articles))
+	seenArticleIDs := make(map[string]string, len(index.Articles))
+	seenArticleSlugs := make(map[string]string, len(index.Articles))
+	if len(prior) > 1 {
+		return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingConceptMissingMapping, cause: errors.New("multiple prior concept identity sets supplied")}
+	}
+	if len(prior) == 1 {
+		seenPriorIDs := make(map[string]bool, len(prior[0]))
+		seenPriorSlugs := make(map[string]bool, len(prior[0]))
+		seenPriorEntities := make(map[string]bool, len(prior[0]))
+		for _, concept := range prior[0] {
+			if !annotation.ValidSourceID(concept.ConceptID) || !safeConceptSlug(concept.Slug) || (concept.EntityID != "" && !wikiindex.ValidSyntoEntityID(concept.EntityID)) {
+				return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingConceptMissingMapping, cause: fmt.Errorf("invalid prior concept identity for %q", concept.ConceptID)}
+			}
+			if seenPriorIDs[concept.ConceptID] {
+				return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingDuplicateArticleID, cause: fmt.Errorf("duplicate prior article ID %q", concept.ConceptID)}
+			}
+			if seenPriorSlugs[concept.Slug] {
+				return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingDuplicateArticlePath, cause: fmt.Errorf("duplicate prior article path %q", concept.Slug)}
+			}
+			if concept.EntityID != "" && seenPriorEntities[concept.EntityID] {
+				return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingConceptEntityCollision, cause: fmt.Errorf("prior entity_id %q maps to multiple LWC IDs", concept.EntityID)}
+			}
+			seenPriorIDs[concept.ConceptID] = true
+			seenPriorSlugs[concept.Slug] = true
+			if concept.EntityID != "" {
+				seenPriorEntities[concept.EntityID] = true
+			}
+		}
+	}
 	for _, edge := range index.SourceConcepts {
-		if edge.Name == "" || !annotation.ValidSourceID(edge.EntityID) {
-			return nil, errors.New("invalid Synto INDEX.json source concept identity")
-		}
-		if old, exists := byName[edge.Name]; exists && old != edge.EntityID {
-			ambiguousNames[edge.Name] = true
-			delete(byName, edge.Name)
-			continue
-		}
-		if !ambiguousNames[edge.Name] {
-			byName[edge.Name] = edge.EntityID
+		if edge.Name == "" || !wikiindex.ValidSyntoEntityID(edge.EntityID) {
+			return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingSourceConceptIdentity, cause: errors.New("invalid Synto INDEX.json source concept identity")}
 		}
 	}
 	for _, article := range index.Articles {
-		if (article.ID != "" && !annotation.ValidSourceID(article.ID)) || (article.EntityID != "" && !annotation.ValidSourceID(article.EntityID)) {
-			return nil, errors.New("invalid Synto INDEX.json article identity")
+		if (article.ID != "" && !annotation.ValidSourceID(article.ID)) || (article.EntityID != "" && !wikiindex.ValidSyntoEntityID(article.EntityID)) {
+			return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingArticleIdentity, cause: errors.New("invalid Synto INDEX.json article identity")}
 		}
 		slug, err := normalizeSyntoArticlePath(article.Path)
 		if err != nil {
-			return nil, err
+			return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingArticlePath, cause: err}
+		}
+		if previous, exists := seenArticleIDs[article.ID]; exists {
+			return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingDuplicateArticleID, cause: fmt.Errorf("Synto INDEX.json duplicate article ID %q for %q and %q", article.ID, previous, slug)}
+		}
+		seenArticleIDs[article.ID] = slug
+		articleSlug := strings.ToLower(slug)
+		if previous, exists := seenArticleSlugs[articleSlug]; exists {
+			return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingDuplicateArticlePath, cause: fmt.Errorf("Synto INDEX.json duplicate article path %q for %q and %q", slug, previous, article.Path)}
+		}
+		seenArticleSlugs[articleSlug] = article.Path
+		if wikiindex.IsSyntoRootPage(article.Path) {
+			continue
 		}
 		entityID := article.EntityID
 		if entityID == "" {
-			if ambiguousNames[article.Name] {
-				return nil, fmt.Errorf("Synto INDEX.json article %q has ambiguous source_concepts entity_id", slug)
-			}
-			entityID = byName[article.Name]
-			if entityID == "" {
-				return nil, fmt.Errorf("Synto INDEX.json article %q has no source_concepts entity_id", slug)
-			}
-		} else if sourceEntity := byName[article.Name]; sourceEntity != "" && sourceEntity != entityID {
-			return nil, fmt.Errorf("Synto INDEX.json article/entity disagreement for %q", slug)
+			entitylessIDs[article.ID] = slug
+			entitylessSlugs[articleSlug] = article.ID
+			continue
 		}
 		if article.ID != "" {
 			if _, exists := byID[article.ID]; exists {
-				return nil, fmt.Errorf("Synto INDEX.json duplicate article ID %q", article.ID)
+				return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingDuplicateArticleID, cause: fmt.Errorf("Synto INDEX.json duplicate article ID %q", article.ID)}
 			}
 			byID[article.ID] = entityID
 		}
 		collisionKey := strings.ToLower(slug)
 		if old, exists := bySlug[collisionKey]; exists {
-			return nil, fmt.Errorf("Synto INDEX.json concept path collision between %q and %q", old, slug)
+			return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingDuplicateArticlePath, cause: fmt.Errorf("Synto INDEX.json concept path collision between %q and %q", old, slug)}
 		}
 		bySlug[collisionKey] = slug
 		if old, exists := byEntity[entityID]; exists && old != slug {
-			return nil, fmt.Errorf("Synto INDEX.json entity_id collision %q", entityID)
+			return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingDuplicateEntityID, cause: fmt.Errorf("Synto INDEX.json entity_id collision %q", entityID)}
 		}
 		byEntity[entityID] = slug
 	}
 	for entityID := range index.ActiveEntities {
 		if _, exists := byEntity[entityID]; !exists {
-			return nil, fmt.Errorf("Synto INDEX.json source edge references unknown entity_id %q", entityID)
+			return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingActiveEntityUnknown, cause: fmt.Errorf("Synto INDEX.json source edge references unknown entity_id %q", entityID)}
 		}
 	}
 	out := make(map[string]string, len(concepts))
 	used := make(map[string]string, len(concepts))
-	for currentID, slug := range concepts {
+	currentConcepts := make([]string, 0, len(concepts))
+	for currentID := range concepts {
+		currentConcepts = append(currentConcepts, currentID)
+	}
+	sort.Strings(currentConcepts)
+	for _, currentID := range currentConcepts {
+		slug := concepts[currentID]
 		idEntity, byIDPresent := byID[currentID]
 		pathSlug, byPathPresent := bySlug[strings.ToLower(slug)]
+		entitylessSlug, idIsEntityless := entitylessIDs[currentID]
+		entitylessID, slugIsEntityless := entitylessSlugs[strings.ToLower(slug)]
+		if idIsEntityless || slugIsEntityless {
+			if idIsEntityless {
+				if slugIsEntityless && entitylessID == currentID && strings.EqualFold(entitylessSlug, slug) {
+					continue
+				}
+				return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingConceptIDPathDisagreement, cause: fmt.Errorf("Synto INDEX.json ID/path disagreement for concept %q", currentID)}
+			}
+			if _, knownArticleID := seenArticleIDs[currentID]; knownArticleID {
+				return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingConceptIDPathDisagreement, cause: fmt.Errorf("Synto INDEX.json ID/path disagreement for concept %q", currentID)}
+			}
+			// A generated transient ID may not be present in INDEX.json for an
+			// entity-less article. Exclusion remains allowed when the slug identifies
+			// that ordinary article and the ID identifies no different INDEX article.
+			continue
+		}
 		pathEntity := ""
 		if byPathPresent && pathSlug == slug {
 			pathEntity = byEntityForSlug(byEntity, pathSlug)
 		} else if byPathPresent {
-			return nil, fmt.Errorf("Synto INDEX.json slug case mismatch for concept %q", currentID)
+			return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingConceptSlugCase, cause: fmt.Errorf("Synto INDEX.json slug case mismatch for concept %q", currentID)}
 		}
 		if byIDPresent && byPathPresent && idEntity != pathEntity {
-			return nil, fmt.Errorf("Synto INDEX.json ID/path disagreement for concept %q", currentID)
+			return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingConceptIDPathDisagreement, cause: fmt.Errorf("Synto INDEX.json ID/path disagreement for concept %q", currentID)}
 		}
 		if byIDPresent && !byPathPresent {
-			return nil, fmt.Errorf("Synto INDEX.json article ID %q has no matching path %q", currentID, slug)
+			return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingConceptMissingMapping, cause: fmt.Errorf("Synto INDEX.json article ID %q has no matching path %q", currentID, slug)}
 		}
 		if byIDPresent && byPathPresent {
 			// An ID hit and a slug hit must resolve to the same article. This
@@ -695,21 +1536,21 @@ func readSyntoEntityIDs(workspace string, concepts map[string]string) (map[strin
 			// an entity to a different generated page.
 			entityID := idEntity
 			if entityID != pathEntity {
-				return nil, fmt.Errorf("Synto INDEX.json ID/path disagreement for concept %q", currentID)
+				return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingConceptIDPathDisagreement, cause: fmt.Errorf("Synto INDEX.json ID/path disagreement for concept %q", currentID)}
 			}
 			out[currentID] = entityID
 			if old, exists := used[entityID]; exists && old != currentID {
-				return nil, fmt.Errorf("Synto entity_id collision %q", entityID)
+				return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingConceptEntityCollision, cause: fmt.Errorf("Synto entity_id collision %q", entityID)}
 			}
 			used[entityID] = currentID
 			continue
 		}
 		entityID := pathEntity
 		if !byPathPresent {
-			return nil, fmt.Errorf("Synto INDEX.json missing entity_id for concept %q", currentID)
+			return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingConceptMissingMapping, cause: fmt.Errorf("Synto INDEX.json missing entity_id for concept %q", currentID)}
 		}
 		if old, exists := used[entityID]; exists && old != currentID {
-			return nil, fmt.Errorf("Synto entity_id collision %q", entityID)
+			return nil, &conceptReconciliationFailure{detail: conceptDetailEntityMappingConceptEntityCollision, cause: fmt.Errorf("Synto entity_id collision %q", entityID)}
 		}
 		used[entityID] = currentID
 		out[currentID] = entityID
@@ -724,6 +1565,23 @@ func byEntityForSlug(byEntity map[string]string, slug string) string {
 		}
 	}
 	return ""
+}
+
+func countPriorOwnedSourceEdges(edges []syntoSourceConcept, prior conceptSnapshot, name string) int {
+	if prior.EntityID == "" || len(prior.SourcePaths) == 0 {
+		return 0
+	}
+	paths := make(map[string]bool, len(prior.SourcePaths))
+	for _, path := range prior.SourcePaths {
+		paths[path] = true
+	}
+	count := 0
+	for _, edge := range edges {
+		if edge.EntityID == prior.EntityID && paths[edge.SourcePath] && (name == "" || edge.Name == name) {
+			count++
+		}
+	}
+	return count
 }
 
 func decodeSyntoIndex(data []byte) (syntoIndexTruth, error) {
@@ -896,12 +1754,13 @@ func decodeSyntoArticles(dec *json.Decoder) ([]syntoIndexEntry, error) {
 		}
 		var article syntoIndexEntry
 		allowed := map[string]bool{"id": true, "entity_id": true, "name": true, "path": true, "summary": true, "tags": true, "aliases": true, "confidence": true}
+		var entityID *string
 		seen, err := decodeSyntoObject(dec, allowed, func(key string, dec *json.Decoder) error {
 			switch key {
 			case "id":
 				return decodeStringInto(dec, &article.ID, 1024)
 			case "entity_id":
-				return decodeStringInto(dec, &article.EntityID, 1024)
+				return decodeNullableStringInto(dec, &entityID, 1024)
 			case "name":
 				return decodeStringInto(dec, &article.Name, 4096)
 			case "path":
@@ -919,17 +1778,23 @@ func decodeSyntoArticles(dec *json.Decoder) ([]syntoIndexEntry, error) {
 		if err != nil {
 			return nil, err
 		}
+		if entityID != nil {
+			if strings.TrimSpace(*entityID) == "" || !wikiindex.ValidSyntoEntityID(*entityID) {
+				return nil, &syntoIndexDecodeError{reason: syntoIndexDecodeReasonArticleIdentity, cause: errors.New("invalid Synto article identity")}
+			}
+			article.EntityID = *entityID
+		}
 		for _, key := range []string{"id", "name", "path", "summary", "tags", "aliases", "confidence"} {
 			if !seen[key] {
 				return nil, fmt.Errorf("missing article field %q", key)
 			}
 		}
 		if (article.ID != "" && !annotation.ValidSourceID(article.ID)) ||
-			(article.EntityID != "" && !annotation.ValidSourceID(article.EntityID)) || article.Name == "" {
-			return nil, errors.New("invalid Synto article identity")
+			(article.EntityID != "" && !wikiindex.ValidSyntoEntityID(article.EntityID)) || article.Name == "" {
+			return nil, &syntoIndexDecodeError{reason: syntoIndexDecodeReasonArticleIdentity, cause: errors.New("invalid Synto article identity")}
 		}
 		if _, err := normalizeSyntoArticlePath(article.Path); err != nil {
-			return nil, err
+			return nil, &syntoIndexDecodeError{reason: syntoIndexDecodeReasonArticlePath, cause: err}
 		}
 		out = append(out, article)
 	}
@@ -944,6 +1809,7 @@ func decodeSyntoSourceConcepts(dec *json.Decoder) ([]syntoSourceConcept, error) 
 		return nil, errors.New("source_concepts must be an array")
 	}
 	out := make([]syntoSourceConcept, 0)
+	seenGroups := make(map[string]struct{})
 	for dec.More() {
 		if len(out) >= generation.MaxFiles {
 			return nil, generation.ErrLogicalEntryLimit
@@ -982,7 +1848,17 @@ func decodeSyntoSourceConcepts(dec *json.Decoder) ([]syntoSourceConcept, error) 
 		if !validSyntoContentHash(contentHash) {
 			return nil, errors.New("source_concepts content_hash must be a lowercase SHA-256 digest")
 		}
+		if _, exists := seenGroups[sourcePath]; exists {
+			return nil, fmt.Errorf("duplicate Synto source_concepts group %q", sourcePath)
+		}
+		seenGroups[sourcePath] = struct{}{}
+		seenItems := make(map[string]struct{}, len(edgeItems))
 		for i := range edgeItems {
+			semantic := edgeItems[i].Name + "\x00" + edgeItems[i].EntityID
+			if _, exists := seenItems[semantic]; exists {
+				return nil, fmt.Errorf("duplicate Synto source concept %q", edgeItems[i].Name)
+			}
+			seenItems[semantic] = struct{}{}
 			edgeItems[i].SourcePath = sourcePath
 			edgeItems[i].ContentHash = contentHash
 		}
@@ -1033,7 +1909,7 @@ func decodeSyntoSourceConceptItems(dec *json.Decoder) ([]syntoSourceConcept, err
 				}
 				key, ok := keyToken.(string)
 				if !ok || seen[key] || (key != "name" && key != "entity_id") {
-					return nil, errors.New("invalid source concept identity")
+					return nil, &syntoIndexDecodeError{reason: syntoIndexDecodeReasonSourceConceptIdentity, cause: errors.New("invalid source concept identity")}
 				}
 				seen[key] = true
 				if key == "name" {
@@ -1047,8 +1923,8 @@ func decodeSyntoSourceConceptItems(dec *json.Decoder) ([]syntoSourceConcept, err
 			if _, err := dec.Token(); err != nil {
 				return nil, err
 			}
-			if !seen["name"] || !seen["entity_id"] || name == "" || !annotation.ValidSourceID(entity) {
-				return nil, errors.New("invalid source concept identity")
+			if !seen["name"] || !seen["entity_id"] || name == "" || !wikiindex.ValidSyntoEntityID(entity) {
+				return nil, &syntoIndexDecodeError{reason: syntoIndexDecodeReasonSourceConceptIdentity, cause: errors.New("invalid source concept identity")}
 			}
 			out = append(out, syntoSourceConcept{Name: name, EntityID: entity})
 		} else if value, ok := token.(string); ok && value != "" {
@@ -1087,12 +1963,27 @@ func decodeSyntoSources(dec *json.Decoder) error {
 		if err != nil {
 			return err
 		}
-		if !seen["id"] || !seen["title"] || !seen["source_type"] || !annotation.ValidSourceID(id) || sourceType == "" {
+		if !seen["id"] || !seen["title"] || !seen["source_type"] || !safeSyntoSourceID(id) || sourceType == "" {
 			return errors.New("invalid Synto source entry")
 		}
 	}
 	_, err := dec.Token()
 	return err
+}
+
+func safeSyntoSourceID(value string) bool {
+	if strings.IndexFunc(value, func(r rune) bool {
+		return r < 0x20 || r == 0x7f
+	}) >= 0 {
+		return false
+	}
+	if len(value) >= 2 && value[1] == ':' {
+		first := value[0]
+		if ('A' <= first && first <= 'Z') || ('a' <= first && first <= 'z') {
+			return false
+		}
+	}
+	return value != "." && safeSyntoRelativePath(value)
 }
 
 func decodeSyntoSynthesis(dec *json.Decoder) error {

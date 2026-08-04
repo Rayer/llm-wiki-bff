@@ -1151,7 +1151,7 @@ const docTemplate = `{
                         "ProjectHeader": []
                     }
                 ],
-                "description": "Returns the stdout and stderr log captured by the pipeline worker for the current project execution.",
+                "description": "Returns bounded raw pipeline stdout/stderr for the authenticated owning project execution.",
                 "produces": [
                     "text/plain"
                 ],
@@ -1212,7 +1212,7 @@ const docTemplate = `{
                         "ProjectHeader": []
                     }
                 ],
-                "description": "Returns the latest Cloud Run pipeline execution for the current project. Pass execution_id to fetch a specific execution. When an execution is available, last_execution.log_url points to the authenticated log endpoint.",
+                "description": "Returns the latest Cloud Run pipeline execution for the current project, including a bounded typed failure diagnostic when available. Pass execution_id to fetch a specific execution. When an execution is available, last_execution.log_url points to the authenticated log endpoint.",
                 "produces": [
                     "application/json"
                 ],
@@ -2029,10 +2029,19 @@ const docTemplate = `{
         "handler.PipelineExecutionResponse": {
             "type": "object",
             "properties": {
+                "diagnostic": {
+                    "$ref": "#/definitions/handler.PipelineFailureDiagnostic"
+                },
                 "duration": {
                     "type": "string"
                 },
                 "end_time": {
+                    "type": "string"
+                },
+                "log_state": {
+                    "type": "string"
+                },
+                "log_state_reason": {
                     "type": "string"
                 },
                 "log_url": {
@@ -2046,6 +2055,32 @@ const docTemplate = `{
                 },
                 "status": {
                     "type": "string"
+                }
+            }
+        },
+        "handler.PipelineFailureDiagnostic": {
+            "type": "object",
+            "properties": {
+                "child_command": {
+                    "type": "string"
+                },
+                "detail_code": {
+                    "type": "string"
+                },
+                "error_class": {
+                    "type": "string"
+                },
+                "exit_code": {
+                    "type": "integer"
+                },
+                "stage": {
+                    "type": "string"
+                },
+                "status": {
+                    "type": "string"
+                },
+                "version": {
+                    "type": "integer"
                 }
             }
         },
@@ -2223,6 +2258,12 @@ const docTemplate = `{
                 },
                 "sources_count": {
                     "type": "integer"
+                },
+                "suggested_queries": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
                 }
             }
         },

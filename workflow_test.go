@@ -2,9 +2,353 @@ package main
 
 import (
 	"os"
+	"os/exec"
+	"regexp"
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
+
+func TestDevWorkflowManualDispatchRequiresCanonicalDevelopSHA(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
+
+	var workflow struct {
+		On struct {
+			Push struct {
+				Branches []string `yaml:"branches"`
+			} `yaml:"push"`
+			WorkflowDispatch struct {
+				Inputs map[string]struct {
+					Required bool   `yaml:"required"`
+					Type     string `yaml:"type"`
+				} `yaml:"inputs"`
+			} `yaml:"workflow_dispatch"`
+		} `yaml:"on"`
+	}
+	if err := yaml.Unmarshal([]byte(contents), &workflow); err != nil {
+		t.Fatalf("deploy workflow is not valid YAML: %v", err)
+	}
+	if got, want := strings.Join(workflow.On.Push.Branches, ","), "main"; got != want {
+		t.Fatalf("automatic push branches = %q, want %q", got, want)
+	}
+	commitInput, ok := workflow.On.WorkflowDispatch.Inputs["commit_sha"]
+	if !ok || !commitInput.Required || commitInput.Type != "string" {
+		t.Fatalf("workflow_dispatch.commit_sha must be a required string input, got %#v", commitInput)
+	}
+
+	checkout := workflowSection(t, contents, "      - name: Checkout code", "      - name: Validate deployment source")
+	for _, want := range []string{
+		"ref: ${{ github.event_name == 'workflow_dispatch' && inputs.commit_sha || github.sha }}",
+		"fetch-depth: 0",
+		"persist-credentials: false",
+	} {
+		if !strings.Contains(checkout, want) {
+			t.Errorf("checkout is missing exact-candidate contract %q", want)
+		}
+	}
+
+	source := workflowSection(t, contents, "      - name: Validate deployment source", "      - name: Setup Go")
+	for _, want := range []string{
+		`if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then`,
+		`"$REF" != "refs/heads/develop"`,
+		`"$REF_NAME" != "develop"`,
+		`^[0-9a-f]{40}$`,
+		"git fetch origin develop --force --no-tags",
+		"git rev-parse HEAD",
+		"git rev-parse origin/develop",
+		`input commit SHA does not match checked-out HEAD`,
+		`input commit SHA does not match current origin/develop`,
+		`"$EVENT_NAME" == "push"`,
+		`"$GITHUB_SHA"`,
+	} {
+		if !strings.Contains(source, want) {
+			t.Errorf("source validation is missing %q", want)
+		}
+	}
+
+	authAt := strings.Index(contents, "      - name: Authenticate to Google Cloud")
+	buildAt := strings.Index(contents, "      - name: Build and deploy to Cloud Run")
+	sourceAt := strings.Index(contents, "      - name: Validate deployment source")
+	if sourceAt < 0 || authAt < 0 || buildAt < 0 || sourceAt > authAt || sourceAt > buildAt {
+		t.Fatalf("source validation must precede authentication and build: source=%d auth=%d build=%d", sourceAt, authAt, buildAt)
+	}
+}
+
+func TestWorkerDevWorkflowBindsManualDispatchToExactCanonicalDevelopSHA(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/deploy-worker.yml")
+
+	var workflow struct {
+		On struct {
+			Push struct {
+				Branches []string `yaml:"branches"`
+			} `yaml:"push"`
+			WorkflowDispatch struct {
+				Inputs map[string]struct {
+					Required bool   `yaml:"required"`
+					Type     string `yaml:"type"`
+				} `yaml:"inputs"`
+			} `yaml:"workflow_dispatch"`
+		} `yaml:"on"`
+	}
+	if err := yaml.Unmarshal([]byte(contents), &workflow); err != nil {
+		t.Fatalf("deploy workflow is not valid YAML: %v", err)
+	}
+	if got, want := strings.Join(workflow.On.Push.Branches, ","), "main"; got != want {
+		t.Fatalf("automatic push branches = %q, want %q", got, want)
+	}
+	commitInput, ok := workflow.On.WorkflowDispatch.Inputs["commit_sha"]
+	if !ok || !commitInput.Required || commitInput.Type != "string" {
+		t.Fatalf("workflow_dispatch.commit_sha must be a required string input, got %#v", commitInput)
+	}
+
+	checkout := workflowSection(t, contents, "      - uses: actions/checkout@v4", "      - name: Set up Go")
+	for _, want := range []string{
+		"ref: ${{ github.event_name == 'workflow_dispatch' && inputs.commit_sha || github.sha }}",
+		"fetch-depth: 0",
+		"persist-credentials: false",
+	} {
+		if !strings.Contains(checkout, want) {
+			t.Errorf("checkout is missing exact-candidate contract %q", want)
+		}
+	}
+
+	source := workflowSection(t, contents, "      - name: Validate deployment source", "      - name: Set up Go")
+	for _, want := range []string{
+		`if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then`,
+		`"$REF" != "refs/heads/develop"`,
+		`"$REF_NAME" != "develop"`,
+		`^[0-9a-f]{40}$`,
+		"malformed commit_sha",
+		"git fetch origin develop --force --no-tags",
+		"git rev-parse HEAD",
+		"git rev-parse origin/develop",
+		`input commit SHA does not match checked-out HEAD`,
+		`input commit SHA does not match current origin/develop`,
+		`"$EVENT_NAME" == "push"`,
+		`"$GITHUB_SHA"`,
+	} {
+		if !strings.Contains(source, want) {
+			t.Errorf("source validation is missing %q", want)
+		}
+	}
+	runtimeAt := strings.Index(contents, "      - name: Update dev worker without GCSFuse")
+	if runtimeAt < 0 {
+		t.Fatal("worker workflow is missing the runtime update step")
+	}
+	runtime := contents[runtimeAt:]
+	for _, want := range []string{`case "${GITHUB_REF_NAME}" in`, "develop|main)"} {
+		if !strings.Contains(runtime, want) {
+			t.Errorf("worker runtime is missing push branch contract %q", want)
+		}
+	}
+
+	sourceAt := strings.Index(contents, "      - name: Validate deployment source")
+	for _, cloudStep := range []string{
+		"      - name: Authenticate to Google Cloud",
+		"      - name: Set up Cloud SDK",
+		"      - name: Configure Artifact Registry Docker auth",
+	} {
+		cloudAt := strings.Index(contents, cloudStep)
+		if sourceAt < 0 || cloudAt < 0 || sourceAt > cloudAt {
+			t.Fatalf("source validation must precede %s: source=%d cloud=%d", cloudStep, sourceAt, cloudAt)
+		}
+	}
+}
+
+func TestWorkerDevWorkflowUsesReadOnlyIAMPreflight(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/deploy-worker.yml")
+	preflight := workflowSection(t, contents, "      - name: Verify existing dev worker IAM prerequisites", "      - name: Configure Artifact Registry Docker auth")
+	for _, want := range []string{
+		"gcloud run jobs get-iam-policy olw-pipeline-dev",
+		"--project llm-wiki-cloud",
+		"--region asia-east1",
+		"--format=json",
+		"roles/run.viewer",
+		"serviceAccount:lwc-pipeline-dev@llm-wiki-cloud.iam.gserviceaccount.com",
+	} {
+		if !strings.Contains(preflight, want) {
+			t.Errorf("worker IAM preflight is missing %q", want)
+		}
+	}
+	if !hasWorkerIAMPolicyValidatorPipeline(preflight) {
+		t.Fatal("worker IAM preflight must pipe $IAM_POLICY to the policy validator and fail closed")
+	}
+	mutatedPreflight := strings.Replace(preflight,
+		`if ! printf '%s\n' "$IAM_POLICY" | python3 scripts/validate_cloud_run_job_iam_policy.py; then`,
+		"if ! true; then", 1)
+	if hasWorkerIAMPolicyValidatorPipeline(mutatedPreflight) {
+		t.Fatal("worker IAM preflight assertion accepts a no-op replacement for the validator pipeline")
+	}
+	for _, forbidden := range []string{
+		"add-iam-policy-binding",
+		"remove-iam-policy-binding",
+		"set-iam-policy",
+	} {
+		if strings.Contains(contents, forbidden) {
+			t.Errorf("worker deploy workflow must not mutate IAM with %q", forbidden)
+		}
+	}
+	for _, mutation := range []string{
+		"gcloud projects add-iam-policy-binding --member serviceAccount:attacker@example.com",
+		"gcloud run jobs remove-iam-policy-binding --member serviceAccount:attacker@example.com",
+		"gcloud projects \\\n		  set-iam-policy policy.json",
+	} {
+		if !containsForbiddenWorkerIAMMutator(mutation) {
+			t.Fatalf("worker IAM mutation assertion accepts %q", mutation)
+		}
+	}
+	authAt := strings.Index(contents, "      - name: Authenticate to Google Cloud")
+	sdkAt := strings.Index(contents, "      - name: Set up Cloud SDK")
+	preflightAt := strings.Index(contents, "      - name: Verify existing dev worker IAM prerequisites")
+	dockerAt := strings.Index(contents, "      - name: Configure Artifact Registry Docker auth")
+	updateAt := strings.Index(contents, "      - name: Update dev worker without GCSFuse")
+	if authAt < 0 || sdkAt < 0 || preflightAt < 0 || dockerAt < 0 || updateAt < 0 || !(authAt < sdkAt && sdkAt < preflightAt && preflightAt < dockerAt && dockerAt < updateAt) {
+		t.Fatalf("worker deployment order must be auth < SDK < IAM preflight < docker auth < update: auth=%d sdk=%d preflight=%d docker=%d update=%d", authAt, sdkAt, preflightAt, dockerAt, updateAt)
+	}
+}
+
+func hasWorkerIAMPolicyValidatorPipeline(preflight string) bool {
+	const pipeline = `if ! printf '%s\n' "$IAM_POLICY" | python3 scripts/validate_cloud_run_job_iam_policy.py; then`
+	return strings.Contains(preflight, pipeline) &&
+		regexp.MustCompile(`(?s)`+regexp.QuoteMeta(pipeline)+`.*?exit 1\s+fi`).MatchString(preflight)
+}
+
+func containsForbiddenWorkerIAMMutator(contents string) bool {
+	for _, name := range []string{
+		"add-iam-policy-binding",
+		"remove-iam-policy-binding",
+		"set-iam-policy",
+	} {
+		if strings.Contains(contents, name) {
+			return true
+		}
+	}
+	return false
+}
+
+func TestCloudRunJobIAMPolicyValidator(t *testing.T) {
+	testCases := []struct {
+		name    string
+		policy  string
+		wantErr bool
+	}{
+		{
+			name:    "required member only in different role",
+			policy:  `{"bindings":[{"role":"roles/run.viewer","members":["serviceAccount:other@llm-wiki-cloud.iam.gserviceaccount.com"]},{"role":"roles/run.invoker","members":["serviceAccount:lwc-pipeline-dev@llm-wiki-cloud.iam.gserviceaccount.com"]}]}`,
+			wantErr: true,
+		},
+		{
+			name:   "valid",
+			policy: `{"bindings":[{"role":"roles/run.viewer","members":["serviceAccount:lwc-pipeline-dev@llm-wiki-cloud.iam.gserviceaccount.com"]}]}`,
+		},
+		{name: "malformed JSON", policy: `{`, wantErr: true},
+		{name: "missing bindings", policy: `{}`, wantErr: true},
+		{name: "bindings wrong shape", policy: `{"bindings":{}}`, wantErr: true},
+		{name: "binding wrong shape", policy: `{"bindings":["bad"]}`, wantErr: true},
+		{name: "members wrong shape", policy: `{"bindings":[{"role":"roles/run.viewer","members":"bad"}]}`, wantErr: true},
+		{name: "missing binding", policy: `{"bindings":[{"role":"roles/run.invoker","members":["serviceAccount:lwc-pipeline-dev@llm-wiki-cloud.iam.gserviceaccount.com"]}]}`, wantErr: true},
+		{name: "wrong role", policy: `{"bindings":[{"role":"roles/run.admin","members":["serviceAccount:lwc-pipeline-dev@llm-wiki-cloud.iam.gserviceaccount.com"]}]}`, wantErr: true},
+		{name: "wrong member", policy: `{"bindings":[{"role":"roles/run.viewer","members":["serviceAccount:other@llm-wiki-cloud.iam.gserviceaccount.com"]}]}`, wantErr: true},
+		{name: "duplicate role binding", policy: `{"bindings":[{"role":"roles/run.viewer","members":[]},{"role":"roles/run.viewer","members":["serviceAccount:lwc-pipeline-dev@llm-wiki-cloud.iam.gserviceaccount.com"]}]}`, wantErr: true},
+		{name: "duplicate required member", policy: `{"bindings":[{"role":"roles/run.viewer","members":["serviceAccount:lwc-pipeline-dev@llm-wiki-cloud.iam.gserviceaccount.com","serviceAccount:lwc-pipeline-dev@llm-wiki-cloud.iam.gserviceaccount.com"]}]}`, wantErr: true},
+		{name: "required member in another binding", policy: `{"bindings":[{"role":"roles/run.viewer","members":["serviceAccount:lwc-pipeline-dev@llm-wiki-cloud.iam.gserviceaccount.com"]},{"role":"roles/run.invoker","members":["serviceAccount:lwc-pipeline-dev@llm-wiki-cloud.iam.gserviceaccount.com"]}]}`, wantErr: true},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := exec.Command("python3", "scripts/validate_cloud_run_job_iam_policy.py")
+			cmd.Stdin = strings.NewReader(tc.policy)
+			output, err := cmd.CombinedOutput()
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("validator error = %v, wantErr=%t; output=%s", err, tc.wantErr, output)
+			}
+			if strings.Contains(string(output), "lwc-pipeline-dev@llm-wiki-cloud.iam.gserviceaccount.com") {
+				t.Fatal("validator must not print policy contents")
+			}
+		})
+	}
+}
+
+func TestWorkerDevWorkflowYAMLAndRunBlocksAreExecutable(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/deploy-worker.yml")
+	var document any
+	if err := yaml.Unmarshal([]byte(contents), &document); err != nil {
+		t.Fatalf("deploy workflow is not valid YAML: %v", err)
+	}
+
+	runBlockPattern := regexp.MustCompile(`(?m)^\s+run: \|\n((?:\s{10,}.+\n?)+)`)
+	runs := runBlockPattern.FindAllStringSubmatch(contents, -1)
+	if len(runs) == 0 {
+		t.Fatal("deploy workflow has no executable run blocks")
+	}
+	for _, run := range runs {
+		body := strings.TrimSpace(run[1])
+		body = regexp.MustCompile(`(?m)^ {10}`).ReplaceAllString(body, "")
+		body = regexp.MustCompile(`\$\{\{[^}]*\}\}`).ReplaceAllString(body, "workflow-expression")
+		cmd := exec.Command("bash", "-n")
+		cmd.Stdin = strings.NewReader(body)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("deploy workflow run block has invalid shell syntax: %v\n%s", err, output)
+		}
+	}
+}
+
+func TestDevWorkflowPreflightsExistingIAMBeforeMutation(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
+	preflight := workflowSection(t, contents, "      - name: Verify existing dev IAM prerequisites", "      - name: Build and deploy to Cloud Run")
+	for _, want := range []string{
+		"gcloud run jobs get-iam-policy",
+		"roles/run.jobsExecutorWithOverrides",
+		"serviceAccount:lwc-bff-dev@llm-wiki-cloud.iam.gserviceaccount.com",
+		"gcloud run services get-iam-policy",
+		"roles/run.invoker",
+		"allUsers",
+	} {
+		if !strings.Contains(preflight, want) {
+			t.Errorf("IAM preflight is missing %q", want)
+		}
+	}
+
+	for _, forbidden := range []string{
+		"gcloud run jobs add-iam-policy-binding",
+		"--allow-unauthenticated",
+	} {
+		if strings.Contains(contents, forbidden) {
+			t.Errorf("dev workflow must not contain IAM mutation %q", forbidden)
+		}
+	}
+
+	preflightAt := strings.Index(contents, "      - name: Verify existing dev IAM prerequisites")
+	buildAt := strings.Index(contents, "gcloud builds submit")
+	deployAt := strings.Index(contents, "gcloud run deploy")
+	if preflightAt < 0 || buildAt < 0 || deployAt < 0 || preflightAt > buildAt || preflightAt > deployAt {
+		t.Fatalf("IAM preflight must precede Cloud Build and Cloud Run mutation: preflight=%d build=%d deploy=%d", preflightAt, buildAt, deployAt)
+	}
+}
+
+func TestDevWorkflowYAMLAndRunBlocksAreExecutable(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
+	var document any
+	if err := yaml.Unmarshal([]byte(contents), &document); err != nil {
+		t.Fatalf("deploy workflow is not valid YAML: %v", err)
+	}
+
+	runBlockPattern := regexp.MustCompile(`(?m)^\s+run: \|\n((?:\s{10,}.+\n?)+)`)
+	runs := runBlockPattern.FindAllStringSubmatch(contents, -1)
+	if len(runs) == 0 {
+		t.Fatal("deploy workflow has no executable run blocks")
+	}
+	for _, run := range runs {
+		body := strings.TrimSpace(run[1])
+		body = regexp.MustCompile(`(?m)^ {10}`).ReplaceAllString(body, "")
+		body = regexp.MustCompile(`\$\{\{[^}]*\}\}`).ReplaceAllString(body, "workflow-expression")
+		cmd := exec.Command("bash", "-n")
+		cmd.Stdin = strings.NewReader(body)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("deploy workflow run block has invalid shell syntax: %v\n%s", err, output)
+		}
+	}
+}
 
 func TestDevWorkflowValidatesAndPassesBuildIdentity(t *testing.T) {
 	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
@@ -32,35 +376,26 @@ func TestDevWorkflowValidatesAndPassesBuildIdentity(t *testing.T) {
 	assertWorkflowUsesCentralizedVersioncheck(t, contents)
 }
 
-func TestDeployWorkflowPushesDevelopAndMain(t *testing.T) {
+func TestCIWorkflowPushesAndPRsMainAndDevelop(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/ci.yml")
+	for _, want := range []string{
+		"  push:\n    branches: [main, develop]",
+		"  pull_request:\n    branches: [main, develop]",
+	} {
+		if !strings.Contains(contents, want) {
+			t.Errorf("CI workflow is missing trigger contract %q", want)
+		}
+	}
+}
+
+func TestBFFDevWorkflowPushesMainOnlyAndSupportsManualDispatch(t *testing.T) {
 	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
-	const pushBranchesStart = "  push:\n    branches:\n"
-	start := strings.Index(contents, pushBranchesStart)
-	if start == -1 {
-		t.Fatal("deploy workflow is missing a push branches trigger")
-	}
-	pushBranches := contents[start+len(pushBranchesStart):]
-	if end := strings.Index(pushBranches, "  workflow_dispatch:"); end != -1 {
-		pushBranches = pushBranches[:end]
-	}
-	var branches []string
-	for _, line := range strings.Split(pushBranches, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		if !strings.HasPrefix(line, "- ") {
-			t.Fatalf("deploy workflow push branch line must use YAML list syntax; got %q", line)
-		}
-		branches = append(branches, strings.TrimSpace(strings.TrimPrefix(line, "- ")))
-	}
-	want := []string{"develop/1.0", "main"}
-	if len(branches) != len(want) {
-		t.Fatalf("deploy workflow push branches = %q, want %q", branches, want)
-	}
-	for i, branch := range want {
-		if branches[i] != branch {
-			t.Fatalf("deploy workflow push branch %d = %q, want %q", i, branches[i], branch)
+	for _, want := range []string{
+		"  push:\n    branches: [main]",
+		"  workflow_dispatch:",
+	} {
+		if !strings.Contains(contents, want) {
+			t.Errorf("BFF dev workflow is missing trigger contract %q", want)
 		}
 	}
 }
@@ -105,19 +440,141 @@ func TestDeployWorkflowUsesImmutableCloudBuildResultDigest(t *testing.T) {
 func TestReleaseWorkflowRequiresMainBuildProvenance(t *testing.T) {
 	contents := readWorkflow(t, ".github/workflows/release-bff.yml")
 	for _, want := range []string{
+		"if: github.ref == 'refs/heads/main'",
+		"concurrency:",
+		"group: promote-bff-production",
+		"cancel-in-progress: false",
 		"- name: Checkout main",
-		"ref: main",
-		"git fetch origin main --force --no-tags",
-		`git merge-base --is-ancestor "$COMMIT_SHA" origin/main`,
+		"actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
+		"# v4",
+		"ref: ${{ github.sha }}",
+		"persist-credentials: false",
+		"google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093",
+		"# v3",
+		"google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f",
+		"# v2",
+		"actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
+		"# v4.6.2",
+		`git cat-file -e "$COMMIT_SHA^{commit}"`,
+		`git merge-base --is-ancestor "$COMMIT_SHA" HEAD`,
 		"commit_sha is not an ancestor of main",
 		`.head_branch == "main"`,
+		".html_url",
+		"run_event=",
+		"run_head_branch=",
+		"run_head_sha=",
+		"run_conclusion=",
+		"roles/run.jobsExecutorWithOverrides",
+		"get-iam-policy",
+		"scripts/render_bff_deployment_evidence.py prepare-rollback",
+		"scripts/render_bff_deployment_evidence.py render-evidence",
+		"scripts/render_bff_deployment_evidence.py render-partial",
+		"/api/v1/public/version",
+		"actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
 	} {
 		if !strings.Contains(contents, want) {
 			t.Errorf("release workflow is missing main provenance contract %q", want)
 		}
 	}
-	if strings.Contains(contents, "develop/1.0") {
-		t.Fatal("release workflow must not accept develop/1.0 provenance")
+	for _, forbidden := range []string{"ref: develop", `origin/develop`, `.head_branch == "develop"`} {
+		if strings.Contains(contents, forbidden) {
+			t.Fatalf("release workflow must not accept develop provenance %q", forbidden)
+		}
+	}
+	if strings.Contains(contents, "git fetch") {
+		t.Fatal("release workflow must validate promotion ancestry from the full local checkout")
+	}
+	checkoutStart := strings.Index(contents, "      - name: Checkout main")
+	checkoutEnd := strings.Index(contents, "      - name: Initialize deployment evidence paths")
+	if checkoutStart < 0 || checkoutEnd < 0 || checkoutStart >= checkoutEnd {
+		t.Fatal("release workflow checkout section is missing")
+	}
+	checkout := contents[checkoutStart:checkoutEnd]
+	for _, forbidden := range []string{"token:", "GH_TOKEN", "github.token", "http.extraheader", "git config"} {
+		if strings.Contains(checkout, forbidden) {
+			t.Fatalf("release checkout must not inject credentials or tokens: found %q", forbidden)
+		}
+	}
+}
+
+func TestReleaseWorkflowAuthenticatesOnlyAfterReadOnlyGatesAndHasOneProviderMutation(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/release-bff.yml")
+	auth := strings.Index(contents, "- name: Authenticate to Google Cloud")
+	provenance := strings.Index(contents, "- name: Locate successful main dev deployment")
+	image := strings.Index(contents, "- name: Download exact dev image digest")
+	preflight := strings.Index(contents, "- name: Verify production IAM preflight")
+	deploy := strings.Index(contents, "gcloud run deploy")
+	if auth < 0 || provenance < 0 || image < 0 || preflight < 0 || deploy < 0 {
+		t.Fatal("release workflow is missing the source, provenance, IAM, or deploy gates")
+	}
+	if auth < provenance || auth < image || auth > preflight || preflight > deploy {
+		t.Fatal("release authentication/deploy order is not fail-closed")
+	}
+	serviceIAM := strings.Index(contents, "gcloud run services get-iam-policy")
+	jobIAM := strings.Index(contents, "gcloud run jobs get-iam-policy")
+	if serviceIAM < 0 || jobIAM < 0 || serviceIAM > deploy || jobIAM > deploy {
+		t.Fatal("production release must read service and job IAM before deploy")
+	}
+	if strings.Contains(contents, "--allow-unauthenticated") {
+		t.Fatal("production BFF release must not mutate service IAM through deploy")
+	}
+	if strings.Contains(contents, "add-iam-policy-binding") || strings.Contains(contents, "set-iam-policy") || strings.Contains(contents, "remove-iam-policy-binding") {
+		t.Fatal("production BFF release must not mutate IAM")
+	}
+	if strings.Count(contents, "gcloud run deploy") != 1 {
+		t.Fatal("production BFF release must have exactly one Cloud Run deploy mutation")
+	}
+	if strings.Count(contents, "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02") != 2 {
+		t.Fatal("production BFF release must upload exactly two pinned artifacts")
+	}
+	if strings.Index(contents, "Tag promoted production image") < strings.Index(contents, "Upload normalized deployment evidence") {
+		t.Fatal("production image tag must follow evidence upload")
+	}
+}
+
+func TestReleaseWorkflowDurablyUploadsRollbackBeforeMutation(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/release-bff.yml")
+	freeze := strings.Index(contents, "- name: Freeze production rollback contract")
+	metadata := strings.Index(contents, "- name: Prepare validated deployment metadata before mutation")
+	rollbackUpload := strings.Index(contents, "- name: Upload immutable rollback contract")
+	deploy := strings.Index(contents, "gcloud run deploy")
+	evidenceUpload := strings.Index(contents, "- name: Upload normalized deployment evidence")
+	if freeze < 0 || metadata < 0 || rollbackUpload < 0 || deploy < 0 || evidenceUpload < 0 {
+		t.Fatal("release workflow is missing the freeze, metadata, rollback upload, deploy, or evidence upload stage")
+	}
+	if !(freeze < metadata && metadata < rollbackUpload && rollbackUpload < deploy && deploy < evidenceUpload) {
+		t.Fatal("release workflow must freeze, validate metadata, durably upload rollback, deploy once, then upload final evidence")
+	}
+	if strings.Count(contents, "gcloud run deploy") != 1 {
+		t.Fatal("production BFF release must have exactly one Cloud Run deploy mutation")
+	}
+	for _, want := range []string{
+		`ROLLBACK_ARTIFACT_NAME="bff-rollback-contract-${COMMIT_SHA}"`,
+		`EVIDENCE_ARTIFACT_NAME="bff-deployment-evidence-${COMMIT_SHA}"`,
+		`--artifact-name "$ROLLBACK_ARTIFACT_NAME"`,
+		`echo "rollback_artifact_name=$ROLLBACK_ARTIFACT_NAME" >> "$GITHUB_OUTPUT"`,
+		"ROLLBACK_ARTIFACT_NAME: ${{ steps.rollback.outputs.rollback_artifact_name }}",
+		`--arg rollback_artifact_name "$ROLLBACK_ARTIFACT_NAME"`,
+		"name: ${{ steps.rollback.outputs.rollback_artifact_name }}",
+		"path: ${{ env.ROLLBACK_CONTRACT }}",
+		"path: ${{ env.EVIDENCE }}",
+		"if-no-files-found: error",
+		"retention-days: 90",
+	} {
+		if !strings.Contains(contents, want) {
+			t.Errorf("release workflow is missing durable rollback contract %q", want)
+		}
+	}
+	rollbackBlock := contents[rollbackUpload:deploy]
+	if strings.Contains(rollbackBlock, "if: always()") || strings.Contains(rollbackBlock, "continue-on-error") {
+		t.Fatal("rollback contract upload must fail closed before deploy")
+	}
+	evidenceBlock := contents[evidenceUpload:]
+	if !strings.Contains(evidenceBlock, "if: always()") {
+		t.Fatal("final deployment evidence upload must run always")
+	}
+	if !strings.Contains(evidenceBlock, "name: ${{ steps.rollback.outputs.evidence_artifact_name }}") {
+		t.Fatal("final deployment evidence must use the distinct evidence artifact name")
 	}
 }
 
@@ -196,7 +653,7 @@ func TestDockerfileEmbedsBuildIdentityWithoutGitContext(t *testing.T) {
 func TestReleaseWorkflowPromotesExistingDigestWithoutRebuild(t *testing.T) {
 	contents := readWorkflow(t, ".github/workflows/release-bff.yml")
 	for _, want := range []string{
-		"gcloud run deploy ${{ env.SERVICE_NAME }} \\",
+		"gcloud run deploy \"$SERVICE_NAME\" \\",
 		"--image \"$IMMUTABLE_IMAGE\"",
 		"gcloud artifacts docker tags add",
 	} {
@@ -216,6 +673,19 @@ func readWorkflow(t *testing.T, path string) string {
 		t.Fatalf("read %s: %v", path, err)
 	}
 	return string(contents)
+}
+
+func workflowSection(t *testing.T, contents, start, end string) string {
+	t.Helper()
+	startAt := strings.Index(contents, start)
+	if startAt < 0 {
+		t.Fatalf("workflow is missing section start %q", start)
+	}
+	section := contents[startAt:]
+	if endAt := strings.Index(section, end); endAt >= 0 {
+		section = section[:endAt]
+	}
+	return section
 }
 
 func TestCloudRunWorkflowsUsePrivateRangesOnlyEgress(t *testing.T) {
@@ -269,6 +739,15 @@ func TestBFFWorkflowsGrantOnlyMatchingRuntimeServiceAccountJobExecution(t *testi
 			assertWorkflowEnvDeclaration(t, contents, "RUNTIME_SERVICE_ACCOUNT", tc.runtimeServiceAcc)
 
 			commands := iamBindingCommands(contents)
+			if tc.name == "development" || tc.name == "production" {
+				if len(commands) != 0 {
+					t.Fatalf("%s workflow has %d IAM mutation commands, want none", tc.name, len(commands))
+				}
+				if tc.name == "production" && !strings.Contains(contents, "gcloud run jobs get-iam-policy") {
+					t.Fatal("production workflow must preflight the existing job IAM binding read-only")
+				}
+				return
+			}
 			if len(commands) != 1 {
 				t.Fatalf("workflow has %d gcloud run jobs add-iam-policy-binding commands, want exactly 1", len(commands))
 			}

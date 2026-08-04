@@ -17,7 +17,21 @@ import (
 
 	"github.com/rayer/llm-wiki-bff/internal/annotation"
 	"github.com/rayer/llm-wiki-bff/internal/sourcestatus"
+	"github.com/rayer/llm-wiki-bff/internal/suggestedqueries"
 )
+
+type testSuggestedQueryProvider struct {
+	calls int
+	user  string
+	raw   string
+	err   error
+}
+
+func (p *testSuggestedQueryProvider) Chat(_ context.Context, _, user string) (string, error) {
+	p.calls++
+	p.user = user
+	return p.raw, p.err
+}
 
 func TestParseCommandBatch(t *testing.T) {
 	commands, err := parseCommandBatch(`[["clear"],["run","--auto-approve"]]`)
@@ -384,7 +398,12 @@ func TestRunPostprocessWritesSuggestedQueriesFromConcepts(t *testing.T) {
 	mustWriteFile(t, filepath.Join(vault, "wiki", "alpha.md"), []byte("---\nid: alpha-id\ntitle: Alpha\nupdated: 2026-07-01T00:00:00Z\n---\nAlpha"))
 	mustWriteFile(t, filepath.Join(vault, "wiki", "beta.md"), []byte("---\nid: beta-id\ntitle: Beta\nupdated: 2026-07-10T00:00:00Z\n---\nBeta"))
 
-	if err := runPostprocess(context.Background(), vault); err != nil {
+	provider := &testSuggestedQueryProvider{raw: `{"candidates":[
+{"question":"哪些概念值得一起比較？","intent/use_case":"comparison","corpus_anchor_concept_ids":["alpha-id","beta-id"]},
+{"question":"如何探索這個主題的不同面向？","intent/use_case":"exploration","corpus_anchor_concept_ids":["alpha-id"]},
+{"question":"哪些選擇適合進一步查找？","intent/use_case":"retrieval","corpus_anchor_concept_ids":["beta-id"]}
+]}`}
+	if err := runPostprocessWithProvider(context.Background(), vault, provider, nil); err != nil {
 		t.Fatalf("runPostprocess() error = %v", err)
 	}
 
@@ -399,34 +418,231 @@ func TestRunPostprocessWritesSuggestedQueriesFromConcepts(t *testing.T) {
 	if err := json.Unmarshal(data, &artifact); err != nil {
 		t.Fatalf("decode suggested_queries.json: %v", err)
 	}
-	if len(artifact.Queries) != 2 {
-		t.Fatalf("queries = %#v, want 2 entries", artifact.Queries)
+	if len(artifact.Queries) != 3 {
+		t.Fatalf("queries = %#v, want 3 entries", artifact.Queries)
 	}
-	if artifact.Queries[0] != "Beta" {
-		t.Fatalf("queries[0] = %q, want Beta", artifact.Queries[0])
+	if artifact.Queries[0] != "哪些概念值得一起比較？" || provider.calls != 1 {
+		t.Fatalf("queries[0] = %q, provider calls = %d", artifact.Queries[0], provider.calls)
 	}
 	if artifact.UpdatedAt == "" {
 		t.Fatal("updated_at is empty")
 	}
 }
 
+func TestSuggestedQueryGenerationDoesNotReadVaultRootIndexAsDescription(t *testing.T) {
+	vault := t.TempDir()
+	mustWriteFile(t, filepath.Join(vault, "index.md"), []byte("SYSTEM_INDEX_MUST_NOT_REACH_SUGGESTED_QUERY_PROVIDER"))
+	mustWriteFile(t, filepath.Join(vault, "wiki", "alpha.md"), []byte("---\nid: alpha-id\ntitle: Alpha\n---\nAlpha"))
+	provider := &testSuggestedQueryProvider{raw: `{"candidates":[
+{"question":"哪些概念值得一起比較？","intent/use_case":"comparison","corpus_anchor_concept_ids":["alpha-id"]},
+{"question":"如何探索這個主題的不同面向？","intent/use_case":"exploration","corpus_anchor_concept_ids":["alpha-id"]},
+{"question":"哪些選擇適合進一步查找？","intent/use_case":"retrieval","corpus_anchor_concept_ids":["alpha-id"]}
+]}`}
+	if err := runPostprocessWithProvider(context.Background(), vault, provider, nil); err != nil {
+		t.Fatalf("runPostprocessWithProvider() error = %v", err)
+	}
+	if strings.Contains(provider.user, "SYSTEM_INDEX_MUST_NOT_REACH_SUGGESTED_QUERY_PROVIDER") {
+		t.Fatalf("provider user payload contains vault root index.md content: %q", provider.user)
+	}
+}
+
+func TestSuggestedQueryGenerationFailurePreservesLastKnownGoodBytes(t *testing.T) {
+	vault := t.TempDir()
+	mustWriteFile(t, filepath.Join(vault, "wiki", "alpha.md"), []byte("---\nid: alpha-id\ntitle: Alpha\n---\nAlpha"))
+	prior := []byte(`{"version":2,"queries":["哪些概念值得一起比較？","如何探索這個主題的不同面向？","哪些選擇適合進一步查找？"],"candidates":[{"question":"哪些概念值得一起比較？","intent/use_case":"comparison","corpus_anchor_concept_ids":["alpha-id"],"generation":{"model":"fixture","prompt_version":"v1"}},{"question":"如何探索這個主題的不同面向？","intent/use_case":"exploration","corpus_anchor_concept_ids":["alpha-id"],"generation":{"model":"fixture","prompt_version":"v1"}},{"question":"哪些選擇適合進一步查找？","intent/use_case":"retrieval","corpus_anchor_concept_ids":["alpha-id"],"generation":{"model":"fixture","prompt_version":"v1"}}],"updated_at":"2026-07-28T00:00:00Z"}`)
+	mustWriteFile(t, filepath.Join(vault, "cache", "suggested_queries.json"), prior)
+	provider := &testSuggestedQueryProvider{err: errors.New("provider unavailable")}
+	if err := runPostprocessWithProvider(context.Background(), vault, provider, nil); err != nil {
+		t.Fatalf("runPostprocessWithProvider() error = %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(vault, "cache", "suggested_queries.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, prior) {
+		t.Fatalf("suggested query artifact changed on provider failure: got %q, want byte-identical prior", got)
+	}
+}
+
+func TestSuggestedQueryGenerationFailureWritesValidEmptyV2WhenAbsent(t *testing.T) {
+	vault := t.TempDir()
+	mustWriteFile(t, filepath.Join(vault, "wiki", "alpha.md"), []byte("---\nid: alpha-id\ntitle: Alpha\n---\nAlpha"))
+	provider := &testSuggestedQueryProvider{err: errors.New("provider unavailable")}
+	if err := runPostprocessWithProvider(context.Background(), vault, provider, nil); err != nil {
+		t.Fatalf("runPostprocessWithProvider() error = %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(vault, suggestedqueries.Path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifact, err := suggestedqueries.Decode(data)
+	if err != nil {
+		t.Fatalf("empty fallback is not valid v2 JSON: %v", err)
+	}
+	if artifact.Version != 2 || artifact.Queries == nil || len(artifact.Queries) != 0 || artifact.Candidates == nil || len(artifact.Candidates) != 0 {
+		t.Fatalf("empty fallback = %#v, want valid empty v2 artifact", artifact)
+	}
+}
+
+func TestSuggestedQueriesStageOnlyRewritesQueryChips(t *testing.T) {
+	vault := t.TempDir()
+	idMap := []byte(`{"concept":{"alpha-id":"alpha"},"source":{},"redirects":{}}`)
+	concepts := []byte(`{"id":"alpha-id","slug":"alpha","title":"Alpha","body":"Alpha","frontmatter":{"id":"alpha-id","title":"Alpha"}}` + "\n")
+	priorQueries := []byte(`{"version":2,"queries":["舊的 query"],"candidates":[{"question":"舊的 query","intent/use_case":"exploration","corpus_anchor_concept_ids":["alpha-id"],"generation":{"model":"fixture","prompt_version":"v1"}}],"updated_at":"2026-07-01T00:00:00Z"}`)
+	mustWriteFile(t, filepath.Join(vault, "cache", "id_map.json"), idMap)
+	mustWriteFile(t, filepath.Join(vault, "cache", "concepts.jsonl"), concepts)
+	mustWriteFile(t, filepath.Join(vault, "cache", "suggested_queries.json"), priorQueries)
+	mustWriteFile(t, filepath.Join(vault, "wiki", "alpha.md"), []byte("---\nid: alpha-id\ntitle: Alpha\n---\nAlpha"))
+
+	provider := &testSuggestedQueryProvider{raw: `{"candidates":[
+{"question":"哪些概念值得一起比較？","intent/use_case":"comparison","corpus_anchor_concept_ids":["alpha-id"]},
+{"question":"如何探索這個主題的不同面向？","intent/use_case":"exploration","corpus_anchor_concept_ids":["alpha-id"]},
+{"question":"哪些選擇適合進一步查找？","intent/use_case":"retrieval","corpus_anchor_concept_ids":["alpha-id"]}
+]}`}
+	if err := runSuggestedQueriesStage(context.Background(), vault, provider); err != nil {
+		t.Fatalf("runSuggestedQueriesStage() error = %v", err)
+	}
+	if provider.calls != 1 {
+		t.Fatalf("provider calls = %d, want 1", provider.calls)
+	}
+
+	gotMap, err := os.ReadFile(filepath.Join(vault, "cache", "id_map.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(gotMap, idMap) {
+		t.Fatalf("id_map.json changed: got %s", gotMap)
+	}
+	gotConcepts, err := os.ReadFile(filepath.Join(vault, "cache", "concepts.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(gotConcepts, concepts) {
+		t.Fatalf("concepts.jsonl changed: got %s", gotConcepts)
+	}
+	gotQueries, err := os.ReadFile(filepath.Join(vault, "cache", "suggested_queries.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(gotQueries, priorQueries) {
+		t.Fatal("suggested_queries.json was not regenerated")
+	}
+	artifact, err := suggestedqueries.Decode(gotQueries)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(artifact.Queries) != 3 || artifact.Queries[0] != "哪些概念值得一起比較？" {
+		t.Fatalf("queries = %#v", artifact.Queries)
+	}
+}
+
+func TestCacheIndexStageDoesNotTouchSuggestedQueries(t *testing.T) {
+	vault := t.TempDir()
+	priorQueries := []byte(`{"version":2,"queries":["保留的 chip"],"candidates":[{"question":"保留的 chip","intent/use_case":"exploration","corpus_anchor_concept_ids":["alpha-id"],"generation":{"model":"fixture","prompt_version":"v1"}}],"updated_at":"2026-07-01T00:00:00Z"}`)
+	mustWriteFile(t, filepath.Join(vault, "cache", "suggested_queries.json"), priorQueries)
+	mustWriteFile(t, filepath.Join(vault, "wiki", "alpha.md"), []byte("---\nid: a3f7b2c01d9d\ntitle: Alpha\n---\nAlpha"))
+	mustWriteFile(t, filepath.Join(vault, "synto.toml"), []byte("[pipeline]\nauto_commit = false\n"))
+	mustWriteFile(t, filepath.Join(vault, ".synto", "INDEX.json"), []byte(syntoIndexFixture("a3f7b2c01d9d", "01JAZ5N7Y3K8M2Q4R6T9VWXABC", "alpha", false)))
+	writeValidSQLiteState(t, filepath.Join(vault, ".synto", "state.db"))
+
+	if err := runCacheIndexStage(context.Background(), vault, nil); err != nil {
+		t.Fatalf("runCacheIndexStage() error = %v", err)
+	}
+	gotQueries, err := os.ReadFile(filepath.Join(vault, "cache", "suggested_queries.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(gotQueries, priorQueries) {
+		t.Fatalf("suggested_queries.json changed during cache/index stage: %s", gotQueries)
+	}
+	if _, err := os.Stat(filepath.Join(vault, "cache", "id_map.json")); err != nil {
+		t.Fatalf("id_map.json missing after cache/index stage: %v", err)
+	}
+}
+
+func TestSuggestedQueriesCommandPublishesChipsWithoutIndexRebuild(t *testing.T) {
+	vault := t.TempDir()
+	// Use content-stable concept id so a full index rebuild would rewrite id_map;
+	// the suggested-queries command must leave the hand-authored map untouched.
+	idMap := []byte(`{"concept":{"a3f7b2c01d9d":"alpha"},"source":{},"redirects":{},"concept_entity_id":{"a3f7b2c01d9d":"01JAZ5N7Y3K8M2Q4R6T9VWXABC"}}`)
+	concepts := []byte(`{"id":"a3f7b2c01d9d","slug":"alpha","title":"Alpha","body":"Alpha","frontmatter":{"id":"a3f7b2c01d9d","title":"Alpha"}}` + "\n")
+	mustWriteFile(t, filepath.Join(vault, "cache", "id_map.json"), idMap)
+	mustWriteFile(t, filepath.Join(vault, "cache", "concepts.jsonl"), concepts)
+	mustWriteFile(t, filepath.Join(vault, "wiki", "alpha.md"), []byte("---\nid: a3f7b2c01d9d\ntitle: Alpha\n---\nAlpha"))
+	mustWriteFile(t, filepath.Join(vault, "cache", "dormant_concepts.jsonl"), nil)
+	mustWriteFile(t, filepath.Join(vault, "cache", "raw_status.json"), []byte(`{"version":1,"files":{},"file_count":0}`))
+	mustWriteFile(t, filepath.Join(vault, "cache", "suggested_queries.json"), []byte(`{"version":2,"queries":[],"candidates":[],"updated_at":"2026-07-01T00:00:00Z"}`))
+	mustWriteFile(t, filepath.Join(vault, "synto.toml"), []byte("[pipeline]\nauto_commit = false\nauto_maintain = false\nrelation_extraction = false\n"))
+	mustWriteFile(t, filepath.Join(vault, ".synto", "INDEX.json"), []byte(syntoIndexFixture("a3f7b2c01d9d", "01JAZ5N7Y3K8M2Q4R6T9VWXABC", "alpha", false)))
+	writeValidSQLiteState(t, filepath.Join(vault, ".synto", "state.db"))
+
+	provider := &testSuggestedQueryProvider{raw: `{"candidates":[
+{"question":"哪些概念值得一起比較？","intent/use_case":"comparison","corpus_anchor_concept_ids":["a3f7b2c01d9d"]},
+{"question":"如何探索這個主題的不同面向？","intent/use_case":"exploration","corpus_anchor_concept_ids":["a3f7b2c01d9d"]},
+{"question":"哪些選擇適合進一步查找？","intent/use_case":"retrieval","corpus_anchor_concept_ids":["a3f7b2c01d9d"]}
+]}`}
+	cfg := workerConfig{
+		VaultPath:                vault,
+		ExecutionID:              "suggest-only-1",
+		SuggestedQueries:         true,
+		suggestedQueriesProvider: provider,
+	}
+	if err := runSuggestedQueriesCommand(context.Background(), cfg); err != nil {
+		t.Fatalf("runSuggestedQueriesCommand() error = %v", err)
+	}
+	if provider.calls != 1 {
+		t.Fatalf("provider calls = %d, want 1", provider.calls)
+	}
+	gotMap, err := os.ReadFile(filepath.Join(vault, "cache", "id_map.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(gotMap, idMap) {
+		t.Fatalf("command rewrote id_map.json: %s", gotMap)
+	}
+	gotQueries, err := os.ReadFile(filepath.Join(vault, "cache", "suggested_queries.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifact, err := suggestedqueries.Decode(gotQueries)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(artifact.Queries) != 3 {
+		t.Fatalf("queries = %#v, want 3", artifact.Queries)
+	}
+}
+
+func TestSuggestedQueriesCommandRejectsCloudWithLocalRouting(t *testing.T) {
+	err := runSuggestedQueriesCommand(context.Background(), workerConfig{
+		Bucket:    "some-bucket",
+		UserID:    "u",
+		ProjectID: "p",
+		VaultPath: "/tmp/vault",
+		vaultSet:  true,
+	})
+	if err == nil || !errors.Is(err, errWorkerConfigInvalid) {
+		t.Fatalf("error = %v, want errWorkerConfigInvalid", err)
+	}
+}
+
 func TestWorkerPostprocessDirectPreservesDormantConceptAndEntityMappings(t *testing.T) {
 	vault := t.TempDir()
-	mustWriteFile(t, filepath.Join(vault, "wiki", "alpha.md"), []byte("---\nid: stable-alpha\n---\nAlpha"))
-	mustWriteFile(t, filepath.Join(vault, "cache", "id_map.json"), []byte(`{"concept":{"stable-alpha":"alpha"},"dormant_concept":{"stable-beta":"beta"},"concept_entity_id":{"stable-alpha":"entity-alpha","stable-beta":"entity-beta","orphan":"entity-orphan"},"source":{},"redirects":{}}`))
+	mustWriteFile(t, filepath.Join(vault, "wiki", "alpha.md"), []byte("---\nid: a3f7b2c01d9d\n---\nAlpha"))
+	mustWriteFile(t, filepath.Join(vault, "cache", "id_map.json"), []byte(`{"concept":{"a3f7b2c01d9d":"alpha"},"dormant_concept":{"stable-beta":"beta"},"concept_entity_id":{"a3f7b2c01d9d":"01JAZ5N7Y3K8M2Q4R6T9VWXABC","stable-beta":"01JAZ5N7Y3K8M2Q4R6T9VWXABD","orphan":"01JAZ5N7Y3K8M2Q4R6T9VWXAC7"},"source":{},"redirects":{}}`))
 	mustWriteFile(t, filepath.Join(vault, "synto.toml"), []byte("[pipeline]\nauto_commit = false\nauto_maintain = false\nrelation_extraction = false\n"))
-	mustWriteFile(t, filepath.Join(vault, ".synto", "INDEX.json"), []byte(syntoIndexFixture("stable-alpha", "entity-alpha", "alpha", false)))
+	mustWriteFile(t, filepath.Join(vault, ".synto", "INDEX.json"), []byte(syntoIndexFixture("a3f7b2c01d9d", "01JAZ5N7Y3K8M2Q4R6T9VWXABC", "alpha", false)))
 	writeValidSQLiteState(t, filepath.Join(vault, ".synto", "state.db"))
 
 	if err := runPostprocessCommand(context.Background(), workerConfig{VaultPath: vault, ExecutionID: "direct-r1"}); err != nil {
 		t.Fatalf("runPostprocessCommand() error = %v", err)
 	}
 	ids := mustSnapshotIDMap(t, vault)
-	if ids.Concept["stable-alpha"] != "alpha" || ids.DormantConcept["stable-beta"] != "beta" {
-		t.Fatalf("postprocess lifecycle maps = %#v", ids)
+	if ids.Concept["01JAZ5N7Y3K8M2Q4R6T9VWXABC"] != "alpha" || len(ids.Concept) != 1 || len(ids.DormantConcept) != 0 {
+		t.Fatalf("postprocess direct entity maps = %#v", ids)
 	}
-	if ids.ConceptEntityID["stable-alpha"] != "entity-alpha" || ids.ConceptEntityID["stable-beta"] != "entity-beta" {
-		t.Fatalf("postprocess entity maps = %#v", ids.ConceptEntityID)
+	if len(ids.ConceptEntityID) != 0 {
+		t.Fatalf("postprocess retained legacy entity map = %#v", ids.ConceptEntityID)
 	}
 	if _, ok := ids.ConceptEntityID["orphan"]; ok {
 		t.Fatalf("postprocess retained orphan entity mapping: %#v", ids.ConceptEntityID)
@@ -435,22 +651,22 @@ func TestWorkerPostprocessDirectPreservesDormantConceptAndEntityMappings(t *test
 
 func TestWorkerPostprocessWorkspacePreservesDormantConceptAndEntityMappings(t *testing.T) {
 	vault := t.TempDir()
-	mustWriteFile(t, filepath.Join(vault, "wiki", "alpha.md"), []byte("---\nid: stable-alpha\n---\nAlpha"))
-	mustWriteFile(t, filepath.Join(vault, "cache", "id_map.json"), []byte(`{"concept":{"stable-alpha":"alpha"},"dormant_concept":{"stable-beta":"beta"},"concept_entity_id":{"stable-alpha":"entity-alpha","stable-beta":"entity-beta","orphan":"entity-orphan"},"source":{},"redirects":{}}`))
+	mustWriteFile(t, filepath.Join(vault, "wiki", "alpha.md"), []byte("---\nid: a3f7b2c01d9d\n---\nAlpha"))
+	mustWriteFile(t, filepath.Join(vault, "cache", "id_map.json"), []byte(`{"concept":{"a3f7b2c01d9d":"alpha"},"dormant_concept":{"stable-beta":"beta"},"concept_entity_id":{"a3f7b2c01d9d":"01JAZ5N7Y3K8M2Q4R6T9VWXABC","stable-beta":"01JAZ5N7Y3K8M2Q4R6T9VWXABD","orphan":"01JAZ5N7Y3K8M2Q4R6T9VWXAC7"},"source":{},"redirects":{}}`))
 	mustWriteFile(t, filepath.Join(vault, "cache", "dormant_concepts.jsonl"), nil)
 	mustWriteFile(t, filepath.Join(vault, "synto.toml"), []byte("[pipeline]\n"))
-	mustWriteFile(t, filepath.Join(vault, ".synto", "INDEX.json"), []byte(syntoIndexFixture("stable-alpha", "entity-alpha", "alpha", true)))
+	mustWriteFile(t, filepath.Join(vault, ".synto", "INDEX.json"), []byte(syntoIndexFixture("a3f7b2c01d9d", "01JAZ5N7Y3K8M2Q4R6T9VWXABC", "alpha", true)))
 	writeValidSQLiteState(t, filepath.Join(vault, ".synto", "state.db"))
 
 	if err := runPostprocessCommand(context.Background(), workerConfig{VaultPath: vault, Workspace: true, WorkspaceDir: t.TempDir(), ExecutionID: "workspace-r1"}); err != nil {
 		t.Fatalf("runPostprocessCommand(workspace) error = %v", err)
 	}
 	ids := mustSnapshotIDMap(t, vault)
-	if ids.Concept["stable-alpha"] != "alpha" || ids.DormantConcept["stable-beta"] != "beta" {
-		t.Fatalf("workspace postprocess lifecycle maps = %#v", ids)
+	if ids.Concept["01JAZ5N7Y3K8M2Q4R6T9VWXABC"] != "alpha" || len(ids.Concept) != 1 || len(ids.DormantConcept) != 0 {
+		t.Fatalf("workspace postprocess direct entity maps = %#v", ids)
 	}
-	if ids.ConceptEntityID["stable-alpha"] != "entity-alpha" || ids.ConceptEntityID["stable-beta"] != "entity-beta" {
-		t.Fatalf("workspace postprocess entity maps = %#v", ids.ConceptEntityID)
+	if len(ids.ConceptEntityID) != 0 {
+		t.Fatalf("workspace postprocess retained legacy entity map = %#v", ids.ConceptEntityID)
 	}
 	if _, ok := ids.ConceptEntityID["orphan"]; ok {
 		t.Fatalf("workspace postprocess retained orphan entity mapping: %#v", ids.ConceptEntityID)
@@ -615,6 +831,94 @@ func TestWorkspaceRejectsDuplicateMappedRawPath(t *testing.T) {
 	err := runWorkerBatch(context.Background(), workerConfig{VaultPath: vault, APIKey: "secret", Workspace: true, WorkspaceDir: t.TempDir(), Postprocess: true}, `[["run"]]`)
 	if err == nil || !strings.Contains(err.Error(), "duplicate source mapping") {
 		t.Fatalf("error=%v", err)
+	}
+}
+
+func TestSnapshotSourcesLegacyFallback(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		idMap     string
+		pages     map[string]string
+		raw       map[string]string
+		wantError string
+	}{
+		{
+			name:  "success uses authoritative source ID",
+			idMap: `{"concept":{},"source":{"stable-source":"source"},"redirects":{}}`,
+			pages: map[string]string{"source": "---\nid: not-the-stable-id\nsource_file: raw/source.md\n---\nsource\n"},
+			raw:   map[string]string{"raw/source.md": "raw source"},
+		},
+		{
+			name:      "missing page",
+			idMap:     `{"source":{"stable-source":"source"}}`,
+			wantError: "missing legacy source page",
+		},
+		{
+			name:      "malformed frontmatter",
+			idMap:     `{"source":{"stable-source":"source"}}`,
+			pages:     map[string]string{"source": "not frontmatter\n"},
+			wantError: "parse legacy source page",
+		},
+		{
+			name:      "missing source_file",
+			idMap:     `{"source":{"stable-source":"source"}}`,
+			pages:     map[string]string{"source": "---\nid: source\n---\nsource\n"},
+			wantError: "missing or unsafe legacy source_file",
+		},
+		{
+			name:      "unsafe source_file",
+			idMap:     `{"source":{"stable-source":"source"}}`,
+			pages:     map[string]string{"source": "---\nsource_file: raw/../escape.md\n---\nsource\n"},
+			wantError: "missing or unsafe legacy source_file",
+		},
+		{
+			name:      "duplicate raw path",
+			idMap:     `{"source":{"stable-a":"a","stable-b":"b"}}`,
+			pages:     map[string]string{"a": "---\nsource_file: raw/same.md\n---\n", "b": "---\nsource_file: raw/same.md\n---\n"},
+			wantError: "duplicate source mapping",
+		},
+		{
+			name:      "duplicate source slug",
+			idMap:     `{"source":{"stable-a":"same","stable-b":"same"}}`,
+			pages:     map[string]string{"same": "---\nsource_file: raw/same.md\n---\n"},
+			wantError: "duplicate legacy source slug",
+		},
+		{
+			name:      "source and source metadata disagree",
+			idMap:     `{"source":{"stable-source":"source"},"source_meta":{"stable-source":{"slug":"other","source_file":"raw/source.md"}}}`,
+			wantError: "source metadata slug disagrees",
+		},
+		{
+			name:      "mixed metadata duplicate raw path",
+			idMap:     `{"source":{"stable-a":"a","stable-b":"b"},"source_meta":{"stable-a":{"slug":"a","source_file":"raw/same.md"}}}`,
+			pages:     map[string]string{"b": "---\nsource_file: raw/same.md\n---\n"},
+			wantError: "duplicate source mapping",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			vault := t.TempDir()
+			for path, body := range tc.raw {
+				mustWriteFile(t, filepath.Join(vault, filepath.FromSlash(path)), []byte(body))
+			}
+			for slug, page := range tc.pages {
+				mustWriteFile(t, filepath.Join(vault, "wiki", "sources", slug+".md"), []byte(page))
+			}
+			mustWriteFile(t, filepath.Join(vault, "cache", "id_map.json"), []byte(tc.idMap))
+
+			got, err := snapshotSources(vault)
+			if tc.wantError != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantError) {
+					t.Fatalf("snapshotSources() error=%v, want substring %q", err, tc.wantError)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("snapshotSources() error=%v", err)
+			}
+			if len(got) != 1 || got[0].SourceID != "stable-source" || got[0].RawPath != "raw/source.md" || string(got[0].RawBytes) != "raw source" || got[0].Tombstone || !got[0].Dirty {
+				t.Fatalf("snapshotSources() = %#v", got)
+			}
+		})
 	}
 }
 
@@ -959,8 +1263,9 @@ func TestCappedRedactingWriterCapsAndRedacts(t *testing.T) {
 
 func TestDiagnosticSinkRedactsSplitAlternatingOutputAndArguments(t *testing.T) {
 	var output bytes.Buffer
-	sink := newDiagnosticSink([]io.Writer{&output}, []string{"api-secret", "user-secret", "project-secret", "/tmp/private", "--secret-arg"})
-	for _, part := range []string{strings.Repeat("safe", 3000), "api-", "secret user-", "secret project-", "secret /tmp/", "private --secret-", "arg"} {
+	// Only credentials belong in the redaction set; identity/path stay visible.
+	sink := newDiagnosticSink([]io.Writer{&output}, []string{"api-secret"})
+	for _, part := range []string{strings.Repeat("safe", 3000), "api-", "secret user-id-ok /tmp/private --arg-ok"} {
 		if _, err := sink.Write([]byte(part)); err != nil {
 			t.Fatal(err)
 		}
@@ -969,13 +1274,128 @@ func TestDiagnosticSinkRedactsSplitAlternatingOutputAndArguments(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := output.String()
-	for _, raw := range []string{"api-secret", "user-secret", "project-secret", "/tmp/private", "--secret-arg"} {
-		if strings.Contains(text, raw) {
-			t.Fatalf("diagnostic leaked %q: %q", raw, text)
-		}
+	if strings.Contains(text, "api-secret") {
+		t.Fatalf("diagnostic leaked api credential: %q", text)
 	}
 	if !strings.Contains(text, "[REDACTED]") {
 		t.Fatalf("diagnostic was not redacted: %q", text)
+	}
+	if !strings.Contains(text, "user-id-ok") || !strings.Contains(text, "/tmp/private") || !strings.Contains(text, "--arg-ok") {
+		t.Fatalf("diagnostic over-redacted control-plane context: %q", text)
+	}
+}
+
+func TestDiagnosticSinkRetainsFullCapUntilOverflow(t *testing.T) {
+	const capBytes = maxPipelineLog
+	marker := []byte(pipelineLogTruncationMarker)
+
+	makeInput := func(size int) []byte {
+		data := bytes.Repeat([]byte{'x'}, size)
+		copy(data, []byte("BEGIN-unique-diagnostic-sentinel"))
+		middle := size / 2
+		copy(data[middle:], []byte("MIDDLE-unique-diagnostic-sentinel"))
+		copy(data[size-len("END-unique-diagnostic-sentinel"):], []byte("END-unique-diagnostic-sentinel"))
+		return data
+	}
+
+	tests := []struct {
+		name       string
+		write      func(*testing.T, *diagnosticSink)
+		want       []byte
+		wantMarker bool
+	}{
+		{
+			name: "exact cap",
+			write: func(t *testing.T, sink *diagnosticSink) {
+				t.Helper()
+				if n, err := sink.Write(makeInput(capBytes)); err != nil || n != capBytes {
+					t.Fatalf("Write() = %d, %v; want %d, nil", n, err, capBytes)
+				}
+			},
+			want: makeInput(capBytes),
+		},
+		{
+			name: "cap plus one",
+			write: func(t *testing.T, sink *diagnosticSink) {
+				t.Helper()
+				if n, err := sink.Write(makeInput(capBytes + 1)); err != nil || n != capBytes+1 {
+					t.Fatalf("Write() = %d, %v; want %d, nil", n, err, capBytes+1)
+				}
+			},
+			want:       append(append([]byte(nil), makeInput(capBytes)[:capBytes-len(marker)]...), marker...),
+			wantMarker: true,
+		},
+		{
+			name: "late multi-write overflow",
+			write: func(t *testing.T, sink *diagnosticSink) {
+				t.Helper()
+				input := makeInput(capBytes)
+				for len(input) > 0 {
+					n := 7777
+					if n > len(input) {
+						n = len(input)
+					}
+					if written, err := sink.Write(input[:n]); err != nil || written != n {
+						t.Fatalf("Write() = %d, %v; want %d, nil", written, err, n)
+					}
+					input = input[n:]
+				}
+				if _, err := sink.Write([]byte("late-overflow")); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := sink.Write([]byte("subsequent-output-must-not-change")); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want:       append(append([]byte(nil), makeInput(capBytes)[:capBytes-len(marker)]...), marker...),
+			wantMarker: true,
+		},
+		{
+			name: "far oversized",
+			write: func(t *testing.T, sink *diagnosticSink) {
+				t.Helper()
+				if n, err := sink.Write(makeInput(capBytes + 100000)); err != nil || n != capBytes+100000 {
+					t.Fatalf("Write() = %d, %v; want %d, nil", n, err, capBytes+100000)
+				}
+			},
+			want:       append(append([]byte(nil), makeInput(capBytes + 100000)[:capBytes-len(marker)]...), marker...),
+			wantMarker: true,
+		},
+		{
+			name:  "empty",
+			write: func(t *testing.T, _ *diagnosticSink) { t.Helper() },
+			want:  []byte{},
+		},
+		{
+			name: "ordinary",
+			write: func(t *testing.T, sink *diagnosticSink) {
+				t.Helper()
+				if _, err := sink.Write([]byte("ordinary diagnostic output")); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: []byte("ordinary diagnostic output"),
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var output bytes.Buffer
+			sink := newDiagnosticSink([]io.Writer{&output}, nil)
+			test.write(t, sink)
+			if err := sink.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(output.Bytes(), test.want) {
+				t.Fatalf("output length=%d, want=%d; marker=%v, want marker=%v", output.Len(), len(test.want), bytes.Contains(output.Bytes(), marker), test.wantMarker)
+			}
+			if output.Len() != len(test.want) {
+				t.Fatalf("output length=%d, want=%d", output.Len(), len(test.want))
+			}
+			if bytes.Contains(output.Bytes(), marker) != test.wantMarker {
+				t.Fatalf("marker presence=%v, want %v", bytes.Contains(output.Bytes(), marker), test.wantMarker)
+			}
+		})
 	}
 }
 
@@ -993,6 +1413,71 @@ func TestWorkerCommandErrorsAreFixedAndSilent(t *testing.T) {
 		if output.Len() != 0 || strings.Contains(err.Error(), "secret") {
 			t.Fatalf("args=%q output=%q error=%v", args, output.String(), err)
 		}
+	}
+}
+
+func TestWorkerOperationalExitLogKeepsLeaseCause(t *testing.T) {
+	err := annotateError(errCloudLeaseUnavailable, errObjectGenerationConflict)
+	if isWorkerCLIRejection(err) {
+		t.Fatal("lease conflict must not be treated as CLI rejection")
+	}
+	got := formatWorkerExitLog(err)
+	want := "pipeline publish lease unavailable: object generation conflict"
+	if got != want {
+		t.Fatalf("exit log=%q, want %q", got, want)
+	}
+	// Public Error() stays stable for callers/tests that match exact boundary text.
+	if err.Error() != "pipeline publish lease unavailable" {
+		t.Fatalf("public error changed: %q", err.Error())
+	}
+	if !errors.Is(err, errCloudLeaseUnavailable) || !errors.Is(err, errObjectGenerationConflict) {
+		t.Fatalf("unwrap/Is broken: %v", err)
+	}
+}
+
+func TestWorkerExitLogRedactsCredentialsInCause(t *testing.T) {
+	t.Setenv("LLM_API_KEY", "sk-super-secret-value")
+	err := annotateError(errCloudPipelineExecution, errors.New("provider rejected sk-super-secret-value"))
+	got := formatWorkerExitLog(err)
+	if strings.Contains(got, "sk-super-secret-value") {
+		t.Fatalf("credential leaked in exit log: %q", got)
+	}
+	if !strings.Contains(got, "pipeline execution failed") || !strings.Contains(got, "[REDACTED]") {
+		t.Fatalf("exit log missing boundary or redaction: %q", got)
+	}
+}
+
+func TestWorkerCLIRejectionClassification(t *testing.T) {
+	for _, msg := range []string{
+		"unknown command \"payload-secret\" for \"worker\"",
+		"invalid argument \"x\" for \"run\"",
+		"worker command rejected",
+	} {
+		if !isWorkerCLIRejection(errors.New(msg)) {
+			t.Fatalf("expected CLI rejection for %q", msg)
+		}
+	}
+	for _, err := range []error{
+		errCloudLeaseUnavailable,
+		errCloudPipelineExecution,
+		errors.New("worker input is invalid"),
+		annotateError(errCloudMaterialization, errors.New("gcs timeout")),
+	} {
+		if isWorkerCLIRejection(err) {
+			t.Fatalf("operational error misclassified as CLI: %v", err)
+		}
+	}
+}
+
+func TestWorkerRuntimeLeaseErrorIsNotCollapsedToRejected(t *testing.T) {
+	// Runtime annotated lease errors must pass through executeWorkerCommand unchanged.
+	// We exercise the classifier boundary used by executeWorkerCommand.
+	err := annotateError(errCloudLeaseUnavailable, annotateError(errCloudLeaseHeld, errObjectGenerationConflict))
+	if isWorkerCLIRejection(err) {
+		t.Fatalf("runtime lease error treated as CLI rejection: %v", err)
+	}
+	if err.Error() != "pipeline publish lease unavailable" {
+		t.Fatalf("public boundary changed: %q", err.Error())
 	}
 }
 
@@ -1047,6 +1532,25 @@ func TestExplicitEmptyAndFalseFlagsSuppressInheritedEnvironment(t *testing.T) {
 	})
 	if got.Bucket != "" || got.APIKey != "" || got.UserID != "" || got.ProjectID != "" || got.ExecutionID != "" || got.WorkspaceDir != "" || got.VaultPath != "" || got.DataDir != "" || got.Workspace {
 		t.Fatalf("explicit empty/false flags were replaced by environment: %+v", got)
+	}
+}
+
+func TestAPIKeyEnvironmentPrecedenceAndExplicitEmptySuppression(t *testing.T) {
+	t.Setenv("LLM_API_KEY", "llm-key")
+	t.Setenv("DEEPSEEK_API_KEY", "deepseek-key")
+
+	if got := configFromEnvironment(workerConfig{}).APIKey; got != "llm-key" {
+		t.Fatalf("LLM_API_KEY precedence = %q, want llm-key", got)
+	}
+	t.Setenv("LLM_API_KEY", "")
+	if got := configFromEnvironment(workerConfig{}).APIKey; got != "deepseek-key" {
+		t.Fatalf("DEEPSEEK_API_KEY fallback = %q, want deepseek-key", got)
+	}
+	if got := configFromEnvironment(workerConfig{APIKey: "explicit-key", apiKeySet: true}).APIKey; got != "explicit-key" {
+		t.Fatalf("explicit API key = %q, want explicit-key", got)
+	}
+	if got := configFromEnvironment(workerConfig{apiKeySet: true}).APIKey; got != "" {
+		t.Fatalf("explicit empty API key = %q, want suppression", got)
 	}
 }
 
@@ -1292,8 +1796,9 @@ func workspaceVault(t *testing.T, raw string) string {
 	vault := t.TempDir()
 	mustWriteFile(t, filepath.Join(vault, "raw", "source.md"), []byte(raw))
 	mustWriteFile(t, filepath.Join(vault, "cache", "id_map.json"), []byte(`{"source_meta":{"s1":{"source_file":"raw/source.md"}}}`))
+	mustWriteFile(t, filepath.Join(vault, "wiki", "new.md"), []byte("---\nid: 22af645d1859\n---\nnew article\n"))
 	mustWriteFile(t, filepath.Join(vault, "synto.toml"), []byte("[pipeline]\nauto_commit = false\nauto_maintain = false\nrelation_extraction = false\n"))
-	mustWriteFile(t, filepath.Join(vault, ".synto", "INDEX.json"), []byte(syntoIndexFixture("22af645d1859", "entity", "new", false)))
+	mustWriteFile(t, filepath.Join(vault, ".synto", "INDEX.json"), []byte(syntoIndexFixture("22af645d1859", "01JAZ5N7Y3K8M2Q4R6T9VWXAC8", "new", false)))
 	writeValidSQLiteState(t, filepath.Join(vault, ".synto", "state.db"))
 	return vault
 }
@@ -1320,4 +1825,88 @@ func writeWorkspaceStatus(t *testing.T, vault string, receipt sourcestatus.Recei
 func sha256Text(text string) string {
 	sum := sha256.Sum256([]byte(text))
 	return fmt.Sprintf("%x", sum[:])
+}
+
+func TestWorkerInputInvalidPreservesCause(t *testing.T) {
+	// Oversized API key is a bounds failure; public boundary stays stable.
+	cfg := workerConfig{APIKey: strings.Repeat("k", maxWorkerKeyBytes+1), apiKeySet: true, Bucket: "b", bucketSet: true, UserID: "u", ProjectID: "p", ExecutionID: "exec-1", Postprocess: true}
+	err := runWorkerBatch(context.Background(), cfg, `[["run","--auto-approve"]]`)
+	if err == nil || err.Error() != "worker input is invalid" {
+		t.Fatalf("error=%v", err)
+	}
+	if !errors.Is(err, errWorkerInputInvalid) {
+		t.Fatalf("missing sentinel: %v", err)
+	}
+	if got := formatWorkerExitLog(err); !strings.Contains(got, "worker input is invalid") || !strings.Contains(got, ":") {
+		t.Fatalf("cause concealed in exit log: %q", got)
+	}
+}
+
+func TestPipelineLogWritersTeesConsoleUnlessSuppressed(t *testing.T) {
+	vault := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(vault, "cache"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg := workerConfig{ExecutionID: "exec-console-tee"}
+	stdout, stderr, closeLog, err := pipelineLogWriters(vault, cfg, nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeLog()
+	if _, err := stdout.Write([]byte("hello-console-tee\n")); err != nil {
+		t.Fatal(err)
+	}
+	if stderr == stdout {
+		t.Fatal("stdout/stderr writers should remain independent")
+	}
+	if err := closeLog(); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(vault, "cache", "pipeline-exec-console-tee.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "hello-console-tee") {
+		t.Fatalf("log missing write: %q", data)
+	}
+
+	// Suppress path still writes the file.
+	vault2 := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(vault2, "cache"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	stdout2, _, close2, err := pipelineLogWriters(vault2, workerConfig{ExecutionID: "exec-quiet"}, nil, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stdout2.Write([]byte("quiet-only-file\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := close2(); err != nil {
+		t.Fatal(err)
+	}
+	data, err = os.ReadFile(filepath.Join(vault2, "cache", "pipeline-exec-quiet.log"))
+	if err != nil || !strings.Contains(string(data), "quiet-only-file") {
+		t.Fatalf("suppressed path lost file log: %v %q", err, data)
+	}
+}
+
+func TestDiagnosticSecretsAreCredentialsOnly(t *testing.T) {
+	cfg := workerConfig{
+		APIKey: "api-secret", apiKeySet: true,
+		UserID: "user-id", ProjectID: "project-id", ExecutionID: "exec-id",
+		VaultPath: "/vault/path", WorkspaceDir: "/ws", DataDir: "/data", Bucket: "bucket",
+	}
+	got := diagnosticSecrets(cfg, [][]string{{"run", "--arg", "/tmp/path"}})
+	joined := strings.Join(got, "\n")
+	if !strings.Contains(joined, "api-secret") {
+		t.Fatalf("missing api key: %v", got)
+	}
+	for _, forbidden := range []string{"user-id", "project-id", "exec-id", "/vault/path", "/ws", "/data", "bucket", "--arg", "/tmp/path", "run"} {
+		for _, value := range got {
+			if value == forbidden {
+				t.Fatalf("diagnosticSecrets scrubbed control-plane value %q: %v", forbidden, got)
+			}
+		}
+	}
 }

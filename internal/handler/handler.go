@@ -2,7 +2,7 @@ package handler
 
 import (
 	"context"
-	"fmt"
+	"encoding/json"
 	"log"
 	"net/http"
 	"net/url"
@@ -14,13 +14,17 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/rayer/llm-wiki-bff/internal/firestore"
 	"github.com/rayer/llm-wiki-bff/internal/gcs"
+	"github.com/rayer/llm-wiki-bff/internal/jsonutil"
 	"github.com/rayer/llm-wiki-bff/internal/llm"
 	"github.com/rayer/llm-wiki-bff/internal/search"
 )
 
 // Handler holds all dependencies for API handlers.
 type Handler struct {
-	gcs       *gcs.Client
+	gcs             *gcs.Client
+	queryPageReader interface {
+		GetPage(context.Context, string, string) (*gcs.WikiPage, []byte, error)
+	}
 	firestore *firestore.Client
 	index     *search.Index
 	llm       *llm.Client
@@ -36,6 +40,7 @@ func New(gcs *gcs.Client, fs *firestore.Client, idx *search.Index, llmClient *ll
 
 // Query handles POST /api/query with JSON body {"q": "...", "mode": "wiki|full"}
 func (h *Handler) Query(c *gin.Context) {
+	ctx := c.Request.Context()
 	var req QueryRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "invalid JSON: " + err.Error()})
@@ -55,7 +60,7 @@ func (h *Handler) Query(c *gin.Context) {
 	searchQuery := q
 	var expandResult *llm.ExpandResult
 	if h.expander != nil {
-		if result, err := h.expander.Expand(q); err != nil {
+		if result, err := h.expander.Expand(ctx, q); err != nil {
 			log.Printf("[expander] query expansion failed for %q: %v — falling back to raw query", q, err)
 		} else if result != nil {
 			expandResult = result
@@ -74,29 +79,41 @@ func (h *Handler) Query(c *gin.Context) {
 	}
 
 	if h.llm != nil && len(results) > 0 {
+		authority, err := search.NewCitationAuthority(results)
+		if err != nil {
+			log.Printf("citation capability issuance failed: %v", err)
+			c.JSON(http.StatusOK, resp)
+			return
+		}
 		// Fetch full text for top 10 results
 		topN := 10
 		if len(results) < topN {
 			topN = len(results)
 		}
 		var contexts []string
-		for _, r := range results[:topN] {
+		pageReader := h.queryPageReader
+		if pageReader == nil {
+			pageReader = h.gcs
+		}
+		if pageReader == nil {
+			c.JSON(http.StatusOK, resp)
+			return
+		}
+		for rank, r := range results[:topN] {
 			category := r.Type + "s"
-			_, data, err := h.gcs.GetPage(context.Background(), r.Slug, category)
+			_, data, err := pageReader.GetPage(ctx, r.Slug, category)
 			if err != nil {
 				continue
 			}
-			contexts = append(contexts, fmt.Sprintf("[%s] %s\n\n%s", r.Title, r.Slug, string(data)))
+			contexts = append(contexts, authority.AddContext(rank, r, string(data)))
 		}
 
 		if len(contexts) > 0 {
 			systemPrompt := buildSystemPrompt(mode)
 			userPrompt := buildUserPrompt(q, contexts)
-			if answer, err := h.llm.Chat(systemPrompt, userPrompt); err == nil {
-				// Post-process: ensure citation names are bracketed [like this]
-				answer = ensureBrackets(answer, results)
+			if answer, err := h.llm.Chat(ctx, systemPrompt, userPrompt); err == nil {
+				answer, citations, filtered := authority.Resolve(answer)
 				resp.AISynth = answer
-				citations, filtered := search.ParseCitations(answer, results)
 				resp.Citations = citations
 				resp.Results = filtered
 			} else {
@@ -139,13 +156,17 @@ func (h *Handler) GetSource(c *gin.Context) {
 		return
 	}
 
-	fm, body := parseFrontmatter(string(data))
+	frontmatter, body, err := parseFrontmatterJSON(string(data))
+	if err != nil {
+		writeFrontmatterSerializeError(c, err)
+		return
+	}
 
-	c.JSON(http.StatusOK, SourceDetailResponse{
+	writeJSON(c, http.StatusOK, SourceDetailResponse{
 		Slug:        slug,
 		Title:       slug,
 		Type:        "source",
-		Frontmatter: fm,
+		Frontmatter: frontmatter,
 		Body:        body,
 		Raw:         string(data),
 	})
@@ -187,14 +208,18 @@ func (h *Handler) GetConcept(c *gin.Context) {
 		return
 	}
 
-	fm, body := parseFrontmatter(string(data))
+	frontmatter, body, err := parseFrontmatterJSON(string(data))
+	if err != nil {
+		writeFrontmatterSerializeError(c, err)
+		return
+	}
 
-	c.JSON(http.StatusOK, ConceptDetailResponse{
+	writeJSON(c, http.StatusOK, ConceptDetailResponse{
 		Slug:        slug,
 		Title:       slug,
 		Type:        "concept",
 		Status:      page.Status,
-		Frontmatter: fm,
+		Frontmatter: frontmatter,
 		Body:        body,
 		Raw:         string(data),
 	})
@@ -302,6 +327,8 @@ func (h *Handler) Metrics(c *gin.Context) {
 func buildSystemPrompt(mode string) string {
 	base := "CRITICAL: If the user asks about a specific location (city, district, area), ONLY include results relevant to that location. Ignore results from other locations even if they match on topic keywords." +
 		"\n\nCITATION FORMAT RULES (mandatory):" +
+		"\n- Each wiki block includes one server-issued internal reference in brackets. Use that exact reference in brackets when citing the block; the server will replace it with the canonical title." +
+		"\n- Never invent, alter, or reuse a citation reference for a different wiki block" +
 		"\n- EVERY factual claim from wiki content MUST have a bracketed citation: [Exact Source Name]" +
 		"\n- Use the EXACT full title from the wiki content inside brackets" +
 		"\n- Never use **bold** instead of brackets" +
@@ -316,6 +343,8 @@ func buildSystemPrompt(mode string) string {
 			"\n- NEVER say 'I cannot find this in the wiki' or apologize for missing information. Just answer the question." +
 			"\n- When mixing wiki and general knowledge, make it seamless — don't call out which is which in the text." +
 			"\n\nCITATION FORMAT RULES (mandatory):" +
+			"\n- Each wiki block includes one server-issued internal reference in brackets. Use that exact reference in brackets when citing the block; the server will replace it with the canonical title." +
+			"\n- Never invent, alter, or reuse a citation reference for a different wiki block" +
 			"\n- EVERY factual claim from wiki content MUST have a bracketed citation: [Exact Source Name]" +
 			"\n- Use the EXACT full title from the wiki content inside brackets" +
 			"\n- Never use **bold** instead of brackets" +
@@ -329,73 +358,13 @@ func buildSystemPrompt(mode string) string {
 func buildUserPrompt(query string, contexts []string) string {
 	var sb strings.Builder
 	sb.WriteString("User question: ")
-	sb.WriteString(query)
+	sb.WriteString(search.NeutralizeCitationReferences(query))
 	sb.WriteString("\n\nWiki content:\n")
 	for _, ctx := range contexts {
 		sb.WriteString("\n---\n")
 		sb.WriteString(ctx)
 	}
 	return sb.String()
-}
-
-// ensureBrackets post-processes LLM output to wrap known citation names
-// in brackets [like this] when the LLM outputs them as plain text.
-func ensureBrackets(text string, results []search.Result) string {
-	// Collect unique citation names, longest first to avoid partial matches
-	names := make(map[string]bool)
-	var sorted []string
-	for _, r := range results {
-		if !names[r.Title] {
-			names[r.Title] = true
-			sorted = append(sorted, r.Title)
-		}
-	}
-	// Sort by length descending so longer names are checked first
-	for i := 0; i < len(sorted); i++ {
-		for j := i + 1; j < len(sorted); j++ {
-			if len(sorted[j]) > len(sorted[i]) {
-				sorted[i], sorted[j] = sorted[j], sorted[i]
-			}
-		}
-	}
-
-	for _, name := range sorted {
-		if len(name) < 3 {
-			continue
-		}
-		bracketed := "[" + name + "]"
-		// Skip if already properly bracketed
-		if strings.Contains(text, bracketed) {
-			continue
-		}
-		// Replace plain occurrences — only when not already inside brackets
-		// Simple approach: replace occurrences that are not preceded by '[' and not followed by ']'
-		idx := 0
-		for {
-			pos := strings.Index(text[idx:], name)
-			if pos < 0 {
-				break
-			}
-			absPos := idx + pos
-			// Check it's not already inside brackets
-			before := ""
-			if absPos > 0 {
-				before = text[absPos-1 : absPos]
-			}
-			after := ""
-			if absPos+len(name) < len(text) {
-				after = text[absPos+len(name) : absPos+len(name)+1]
-			}
-			if before == "[" && after == "]" {
-				idx = absPos + len(name)
-				continue
-			}
-			// Replace this occurrence
-			text = text[:absPos] + bracketed + text[absPos+len(name):]
-			idx = absPos + len(bracketed)
-		}
-	}
-	return text
 }
 
 // parseFrontmatter extracts YAML frontmatter (between --- markers) from markdown.
@@ -411,4 +380,28 @@ func parseFrontmatter(md string) (map[string]interface{}, string) {
 		return make(map[string]interface{}), md
 	}
 	return result, string(body)
+}
+
+func parseFrontmatterJSON(md string) (map[string]interface{}, string, error) {
+	frontmatter, body := parseFrontmatter(md)
+	normalized, err := jsonutil.NormalizeMap(frontmatter)
+	if err != nil {
+		return nil, body, err
+	}
+	return normalized, body, nil
+}
+
+func writeJSON(c *gin.Context, status int, payload interface{}) {
+	data, err := json.Marshal(payload)
+	if err != nil {
+		log.Printf("response serialization failed: %v", err)
+		c.JSON(http.StatusInternalServerError, ErrorResponse{Error: "response serialization failed"})
+		return
+	}
+	c.Data(status, "application/json; charset=utf-8", data)
+}
+
+func writeFrontmatterSerializeError(c *gin.Context, err error) {
+	log.Printf("frontmatter JSON normalization failed: %v", err)
+	c.JSON(http.StatusInternalServerError, ErrorResponse{Error: "response serialization failed"})
 }

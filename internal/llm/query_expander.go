@@ -1,6 +1,7 @@
 package llm
 
 import (
+	"context"
 	"embed"
 	"encoding/json"
 	"fmt"
@@ -58,12 +59,12 @@ func loadPrompt(domain string) (string, error) {
 // Expand rewrites a user query into structured search keywords.
 // Returns the expansion result; on failure returns nil AND the error
 // so callers can log and gracefully degrade.
-func (e *QueryExpander) Expand(query string) (*ExpandResult, error) {
+func (e *QueryExpander) Expand(ctx context.Context, query string) (*ExpandResult, error) {
 	if e == nil {
 		return nil, nil
 	}
 
-	raw, err := e.client.Chat(e.systemPrompt, query)
+	raw, err := e.client.Chat(ctx, e.systemPrompt, query)
 	if err != nil {
 		log.Printf("[expander] LLM call failed for query %q: %v", query, err)
 		return nil, fmt.Errorf("expander: chat: %w", err)

@@ -1,11 +1,16 @@
 FROM golang:1.26-bookworm AS build
 WORKDIR /src
+ARG BUILD_NONCE
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -o /out/worker ./cmd/olw_worker
+RUN : "${BUILD_NONCE:?BUILD_NONCE is required}" \
+    && sh ./cmd/olw_worker/validate_build_nonce.sh "${BUILD_NONCE}" \
+    && CGO_ENABLED=0 GOOS=linux go build -ldflags "-X main.buildNonce=${BUILD_NONCE}" -o /out/worker ./cmd/olw_worker
 
 FROM python:3.12-slim AS worker
+ARG BUILD_NONCE
+LABEL io.llm-wiki.build.nonce="${BUILD_NONCE}"
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates git \
     && rm -rf /var/lib/apt/lists/* \
