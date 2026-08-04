@@ -284,8 +284,7 @@ func TestWorkerDevWorkflowYAMLAndRunBlocksAreExecutable(t *testing.T) {
 	for _, run := range runs {
 		body := strings.TrimSpace(run[1])
 		body = regexp.MustCompile(`(?m)^ {10}`).ReplaceAllString(body, "")
-		body = strings.ReplaceAll(body, "${{", "${")
-		body = strings.ReplaceAll(body, "}}", "}")
+		body = regexp.MustCompile(`\$\{\{[^}]*\}\}`).ReplaceAllString(body, "workflow-expression")
 		cmd := exec.Command("bash", "-n")
 		cmd.Stdin = strings.NewReader(body)
 		if output, err := cmd.CombinedOutput(); err != nil {
@@ -342,8 +341,7 @@ func TestDevWorkflowYAMLAndRunBlocksAreExecutable(t *testing.T) {
 	for _, run := range runs {
 		body := strings.TrimSpace(run[1])
 		body = regexp.MustCompile(`(?m)^ {10}`).ReplaceAllString(body, "")
-		body = strings.ReplaceAll(body, "${{", "${")
-		body = strings.ReplaceAll(body, "}}", "}")
+		body = regexp.MustCompile(`\$\{\{[^}]*\}\}`).ReplaceAllString(body, "workflow-expression")
 		cmd := exec.Command("bash", "-n")
 		cmd.Stdin = strings.NewReader(body)
 		if output, err := cmd.CombinedOutput(); err != nil {
@@ -442,12 +440,37 @@ func TestDeployWorkflowUsesImmutableCloudBuildResultDigest(t *testing.T) {
 func TestReleaseWorkflowRequiresMainBuildProvenance(t *testing.T) {
 	contents := readWorkflow(t, ".github/workflows/release-bff.yml")
 	for _, want := range []string{
+		"if: github.ref == 'refs/heads/main'",
+		"concurrency:",
+		"group: promote-bff-production",
+		"cancel-in-progress: false",
 		"- name: Checkout main",
-		"ref: main",
-		"git fetch origin main --force --no-tags",
-		`git merge-base --is-ancestor "$COMMIT_SHA" origin/main`,
+		"actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
+		"# v4",
+		"ref: ${{ github.sha }}",
+		"persist-credentials: false",
+		"google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093",
+		"# v3",
+		"google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f",
+		"# v2",
+		"actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
+		"# v4.6.2",
+		`git cat-file -e "$COMMIT_SHA^{commit}"`,
+		`git merge-base --is-ancestor "$COMMIT_SHA" HEAD`,
 		"commit_sha is not an ancestor of main",
 		`.head_branch == "main"`,
+		".html_url",
+		"run_event=",
+		"run_head_branch=",
+		"run_head_sha=",
+		"run_conclusion=",
+		"roles/run.jobsExecutorWithOverrides",
+		"get-iam-policy",
+		"scripts/render_bff_deployment_evidence.py prepare-rollback",
+		"scripts/render_bff_deployment_evidence.py render-evidence",
+		"scripts/render_bff_deployment_evidence.py render-partial",
+		"/api/v1/public/version",
+		"actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
 	} {
 		if !strings.Contains(contents, want) {
 			t.Errorf("release workflow is missing main provenance contract %q", want)
@@ -457,6 +480,101 @@ func TestReleaseWorkflowRequiresMainBuildProvenance(t *testing.T) {
 		if strings.Contains(contents, forbidden) {
 			t.Fatalf("release workflow must not accept develop provenance %q", forbidden)
 		}
+	}
+	if strings.Contains(contents, "git fetch") {
+		t.Fatal("release workflow must validate promotion ancestry from the full local checkout")
+	}
+	checkoutStart := strings.Index(contents, "      - name: Checkout main")
+	checkoutEnd := strings.Index(contents, "      - name: Initialize deployment evidence paths")
+	if checkoutStart < 0 || checkoutEnd < 0 || checkoutStart >= checkoutEnd {
+		t.Fatal("release workflow checkout section is missing")
+	}
+	checkout := contents[checkoutStart:checkoutEnd]
+	for _, forbidden := range []string{"token:", "GH_TOKEN", "github.token", "http.extraheader", "git config"} {
+		if strings.Contains(checkout, forbidden) {
+			t.Fatalf("release checkout must not inject credentials or tokens: found %q", forbidden)
+		}
+	}
+}
+
+func TestReleaseWorkflowAuthenticatesOnlyAfterReadOnlyGatesAndHasOneProviderMutation(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/release-bff.yml")
+	auth := strings.Index(contents, "- name: Authenticate to Google Cloud")
+	provenance := strings.Index(contents, "- name: Locate successful main dev deployment")
+	image := strings.Index(contents, "- name: Download exact dev image digest")
+	preflight := strings.Index(contents, "- name: Verify production IAM preflight")
+	deploy := strings.Index(contents, "gcloud run deploy")
+	if auth < 0 || provenance < 0 || image < 0 || preflight < 0 || deploy < 0 {
+		t.Fatal("release workflow is missing the source, provenance, IAM, or deploy gates")
+	}
+	if auth < provenance || auth < image || auth > preflight || preflight > deploy {
+		t.Fatal("release authentication/deploy order is not fail-closed")
+	}
+	serviceIAM := strings.Index(contents, "gcloud run services get-iam-policy")
+	jobIAM := strings.Index(contents, "gcloud run jobs get-iam-policy")
+	if serviceIAM < 0 || jobIAM < 0 || serviceIAM > deploy || jobIAM > deploy {
+		t.Fatal("production release must read service and job IAM before deploy")
+	}
+	if strings.Contains(contents, "--allow-unauthenticated") {
+		t.Fatal("production BFF release must not mutate service IAM through deploy")
+	}
+	if strings.Contains(contents, "add-iam-policy-binding") || strings.Contains(contents, "set-iam-policy") || strings.Contains(contents, "remove-iam-policy-binding") {
+		t.Fatal("production BFF release must not mutate IAM")
+	}
+	if strings.Count(contents, "gcloud run deploy") != 1 {
+		t.Fatal("production BFF release must have exactly one Cloud Run deploy mutation")
+	}
+	if strings.Count(contents, "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02") != 2 {
+		t.Fatal("production BFF release must upload exactly two pinned artifacts")
+	}
+	if strings.Index(contents, "Tag promoted production image") < strings.Index(contents, "Upload normalized deployment evidence") {
+		t.Fatal("production image tag must follow evidence upload")
+	}
+}
+
+func TestReleaseWorkflowDurablyUploadsRollbackBeforeMutation(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/release-bff.yml")
+	freeze := strings.Index(contents, "- name: Freeze production rollback contract")
+	metadata := strings.Index(contents, "- name: Prepare validated deployment metadata before mutation")
+	rollbackUpload := strings.Index(contents, "- name: Upload immutable rollback contract")
+	deploy := strings.Index(contents, "gcloud run deploy")
+	evidenceUpload := strings.Index(contents, "- name: Upload normalized deployment evidence")
+	if freeze < 0 || metadata < 0 || rollbackUpload < 0 || deploy < 0 || evidenceUpload < 0 {
+		t.Fatal("release workflow is missing the freeze, metadata, rollback upload, deploy, or evidence upload stage")
+	}
+	if !(freeze < metadata && metadata < rollbackUpload && rollbackUpload < deploy && deploy < evidenceUpload) {
+		t.Fatal("release workflow must freeze, validate metadata, durably upload rollback, deploy once, then upload final evidence")
+	}
+	if strings.Count(contents, "gcloud run deploy") != 1 {
+		t.Fatal("production BFF release must have exactly one Cloud Run deploy mutation")
+	}
+	for _, want := range []string{
+		`ROLLBACK_ARTIFACT_NAME="bff-rollback-contract-${COMMIT_SHA}"`,
+		`EVIDENCE_ARTIFACT_NAME="bff-deployment-evidence-${COMMIT_SHA}"`,
+		`--artifact-name "$ROLLBACK_ARTIFACT_NAME"`,
+		`echo "rollback_artifact_name=$ROLLBACK_ARTIFACT_NAME" >> "$GITHUB_OUTPUT"`,
+		"ROLLBACK_ARTIFACT_NAME: ${{ steps.rollback.outputs.rollback_artifact_name }}",
+		`--arg rollback_artifact_name "$ROLLBACK_ARTIFACT_NAME"`,
+		"name: ${{ steps.rollback.outputs.rollback_artifact_name }}",
+		"path: ${{ env.ROLLBACK_CONTRACT }}",
+		"path: ${{ env.EVIDENCE }}",
+		"if-no-files-found: error",
+		"retention-days: 90",
+	} {
+		if !strings.Contains(contents, want) {
+			t.Errorf("release workflow is missing durable rollback contract %q", want)
+		}
+	}
+	rollbackBlock := contents[rollbackUpload:deploy]
+	if strings.Contains(rollbackBlock, "if: always()") || strings.Contains(rollbackBlock, "continue-on-error") {
+		t.Fatal("rollback contract upload must fail closed before deploy")
+	}
+	evidenceBlock := contents[evidenceUpload:]
+	if !strings.Contains(evidenceBlock, "if: always()") {
+		t.Fatal("final deployment evidence upload must run always")
+	}
+	if !strings.Contains(evidenceBlock, "name: ${{ steps.rollback.outputs.evidence_artifact_name }}") {
+		t.Fatal("final deployment evidence must use the distinct evidence artifact name")
 	}
 }
 
@@ -535,7 +653,7 @@ func TestDockerfileEmbedsBuildIdentityWithoutGitContext(t *testing.T) {
 func TestReleaseWorkflowPromotesExistingDigestWithoutRebuild(t *testing.T) {
 	contents := readWorkflow(t, ".github/workflows/release-bff.yml")
 	for _, want := range []string{
-		"gcloud run deploy ${{ env.SERVICE_NAME }} \\",
+		"gcloud run deploy \"$SERVICE_NAME\" \\",
 		"--image \"$IMMUTABLE_IMAGE\"",
 		"gcloud artifacts docker tags add",
 	} {
@@ -621,9 +739,12 @@ func TestBFFWorkflowsGrantOnlyMatchingRuntimeServiceAccountJobExecution(t *testi
 			assertWorkflowEnvDeclaration(t, contents, "RUNTIME_SERVICE_ACCOUNT", tc.runtimeServiceAcc)
 
 			commands := iamBindingCommands(contents)
-			if tc.name == "development" {
+			if tc.name == "development" || tc.name == "production" {
 				if len(commands) != 0 {
-					t.Fatalf("development workflow has %d gcloud run jobs add-iam-policy-binding commands, want none", len(commands))
+					t.Fatalf("%s workflow has %d IAM mutation commands, want none", tc.name, len(commands))
+				}
+				if tc.name == "production" && !strings.Contains(contents, "gcloud run jobs get-iam-policy") {
+					t.Fatal("production workflow must preflight the existing job IAM binding read-only")
 				}
 				return
 			}
