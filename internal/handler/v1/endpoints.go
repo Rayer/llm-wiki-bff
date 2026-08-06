@@ -1879,6 +1879,10 @@ func splitProjectDocID(docID string) (userID, projectID string) {
 	return docID[:lastUnderscore], docID[lastUnderscore+1:]
 }
 
+func validAdminProjectSegments(userID, projectID string) bool {
+	return auth.ValidPathSegment(userID) && auth.ValidPathSegment(projectID)
+}
+
 func (h *Handler) verifyAdminProjectExists(ctx context.Context, docID string) error {
 	if h.projectExists != nil {
 		return h.projectExists(ctx, docID)
@@ -2157,7 +2161,7 @@ func (h *Handler) AdminProjects(c *gin.Context) {
 func (h *Handler) AdminDeleteProject(c *gin.Context) {
 	docID := c.Param("id")
 	uid, pid := splitProjectDocID(docID)
-	if pid == "" {
+	if !validAdminProjectSegments(uid, pid) {
 		c.JSON(http.StatusBadRequest, handler.ErrorResponse{Error: "invalid project doc ID"})
 		return
 	}
@@ -2182,7 +2186,7 @@ func (h *Handler) AdminDeleteProject(c *gin.Context) {
 
 	data := dsnap.Data()
 	name, _ := data["name"].(string)
-	if err := requireGCSPrefixDeleter(h.store); err != nil {
+	if err := requireGCSProjectPrefixDeleter(h.store); err != nil {
 		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "project delete unavailable"})
 		return
 	}
@@ -2190,7 +2194,7 @@ func (h *Handler) AdminDeleteProject(c *gin.Context) {
 	lockRef := fs.Collection("locks").Doc(fmt.Sprintf("%s__%s", uid, pid))
 	if err := deleteAdminProjectResources(ctx,
 		func(ctx context.Context) error {
-			return deleteGCSPrefix(ctx, h.store, store.ProjectPrefixWithSlash(uid, pid))
+			return deleteGCSProjectPrefix(ctx, h.store, uid, pid)
 		},
 		func(ctx context.Context) error {
 			return deleteAdminFirestoreDoc(ctx, lockRef)
@@ -2673,12 +2677,16 @@ func (h *Handler) AdminUpdateUser(c *gin.Context) {
 //	@Security		BearerAuth
 //	@Router			/api/v1/admin/users/{id} [delete]
 func (h *Handler) AdminDeleteUser(c *gin.Context) {
+	userID := c.Param("id")
+	if !auth.ValidPathSegment(userID) {
+		c.JSON(http.StatusBadRequest, handler.ErrorResponse{Error: "invalid user ID"})
+		return
+	}
 	if h.firestore == nil || h.firestore.Raw() == nil {
 		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "Firestore client is not configured"})
 		return
 	}
 
-	userID := c.Param("id")
 	fs := h.firestore.Raw()
 	ctx := c.Request.Context()
 
@@ -2692,7 +2700,7 @@ func (h *Handler) AdminDeleteUser(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "read user: " + err.Error()})
 		return
 	}
-	if err := requireGCSPrefixDeleter(h.store); err != nil {
+	if err := requireGCSProjectPrefixDeleter(h.store); err != nil {
 		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "user delete unavailable"})
 		return
 	}
@@ -2721,7 +2729,7 @@ func (h *Handler) AdminDeleteUser(c *gin.Context) {
 		if uid != userID {
 			continue
 		}
-		if pid == "" {
+		if !validAdminProjectSegments(uid, pid) {
 			// An owned project document without a safe project segment cannot
 			// be mapped to a bounded storage prefix, so fail closed before any
 			// cleanup starts.
@@ -2745,7 +2753,7 @@ func (h *Handler) AdminDeleteUser(c *gin.Context) {
 		lockRef := fs.Collection("locks").Doc(fmt.Sprintf("%s__%s", project.uid, project.pid))
 		return deleteAdminProjectResources(ctx,
 			func(ctx context.Context) error {
-				return deleteGCSPrefix(ctx, h.store, store.ProjectPrefixWithSlash(project.uid, project.pid))
+				return deleteGCSProjectPrefix(ctx, h.store, project.uid, project.pid)
 			},
 			func(ctx context.Context) error {
 				return deleteAdminFirestoreDoc(ctx, lockRef)
@@ -2767,8 +2775,8 @@ func (h *Handler) AdminDeleteUser(c *gin.Context) {
 	})
 }
 
-type gcsPrefixDeleter interface {
-	DeletePrefix(context.Context, string) (int, error)
+type gcsProjectPrefixDeleter interface {
+	DeleteProjectPrefix(context.Context, string, string) (int, error)
 }
 
 var errAdminDeleteCleanup = errors.New("admin cleanup failed")
@@ -2807,11 +2815,11 @@ func deleteAdminUserResources(ctx context.Context, projectIDs []string, deletePr
 	return nil
 }
 
-func requireGCSPrefixDeleter(client any) error {
+func requireGCSProjectPrefixDeleter(client any) error {
 	if client == nil {
 		return errAdminDeleteStorageUnsupported
 	}
-	if _, ok := client.(gcsPrefixDeleter); !ok {
+	if _, ok := client.(gcsProjectPrefixDeleter); !ok {
 		return errAdminDeleteStorageUnsupported
 	}
 	return nil
@@ -2828,12 +2836,15 @@ func deleteAdminFirestoreDoc(ctx context.Context, ref *firestore.DocumentRef) er
 	return err
 }
 
-func deleteGCSPrefix(ctx context.Context, client any, prefix string) error {
-	if err := requireGCSPrefixDeleter(client); err != nil {
+func deleteGCSProjectPrefix(ctx context.Context, client any, userID, projectID string) error {
+	if !validAdminProjectSegments(userID, projectID) {
+		return errAdminDeleteCleanup
+	}
+	if err := requireGCSProjectPrefixDeleter(client); err != nil {
 		return err
 	}
-	deleter := client.(gcsPrefixDeleter)
-	_, err := deleter.DeletePrefix(ctx, prefix)
+	deleter := client.(gcsProjectPrefixDeleter)
+	_, err := deleter.DeleteProjectPrefix(ctx, userID, projectID)
 	if errors.Is(err, storage.ErrObjectNotExist) || status.Code(err) == codes.NotFound {
 		return nil
 	}

@@ -30,6 +30,8 @@ type memoryBackend struct {
 	requestedLimits         []int64
 	manifestReads           int
 	listVisits              int
+	listCalls               int
+	listPrefixes            []string
 	switchManifestOnRead    string
 	commitManifestOnWrite   []byte
 	manifestAfterLeaseWrite []byte
@@ -114,6 +116,8 @@ func (m *memoryBackend) Attrs(_ context.Context, name string, generation int64) 
 
 func (m *memoryBackend) List(_ context.Context, prefix string, directOnly bool, visit func(backendObject) error) error {
 	m.mu.Lock()
+	m.listCalls++
+	m.listPrefixes = append(m.listPrefixes, prefix)
 	objects := make([]backendObject, 0)
 	for name, object := range m.objects {
 		if strings.HasPrefix(name, prefix) {

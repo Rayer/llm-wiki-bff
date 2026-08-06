@@ -679,13 +679,15 @@ func (c *Client) ListObjectMeta(ctx context.Context, relPrefix string) ([]store.
 	return out, nil
 }
 
-// DeletePrefix removes every object below prefix. Listing an empty prefix is
-// success, and an object that disappears between listing and deletion is also
-// success, so callers can safely retry after partial progress.
-func (c *Client) DeletePrefix(ctx context.Context, prefix string) (int, error) {
-	if strings.TrimSpace(prefix) == "" || !strings.HasSuffix(prefix, "/") {
-		return 0, errors.New("invalid delete prefix")
+// DeleteProjectPrefix removes every object below one user/project prefix.
+// Listing an empty prefix is success, and an object that disappears between
+// listing and deletion is also success, so callers can safely retry after
+// partial progress.
+func (c *Client) DeleteProjectPrefix(ctx context.Context, userID, projectID string) (int, error) {
+	if !safeProjectPrefixSegment(userID) || !safeProjectPrefixSegment(projectID) {
+		return 0, errors.New("invalid project prefix")
 	}
+	prefix := "users/" + userID + "/projects/" + projectID + "/"
 
 	deleted := 0
 	err := c.visitObjectsRaw(ctx, prefix, false, func(object backendObject) error {
@@ -699,6 +701,10 @@ func (c *Client) DeletePrefix(ctx context.Context, prefix string) (int, error) {
 		return nil
 	})
 	return deleted, err
+}
+
+func safeProjectPrefixSegment(value string) bool {
+	return value != "" && value != "." && value != ".." && !strings.ContainsAny(value, "/\\\x00")
 }
 
 // ListMarkdownFiles reads direct .md files under dir, relative to the

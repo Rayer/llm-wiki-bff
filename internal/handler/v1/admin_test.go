@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -403,6 +404,30 @@ func TestAdminDeleteProject_MissingProjectID(t *testing.T) {
 	assert.Equal(t, "invalid project doc ID", resp["error"])
 }
 
+func TestAdminDeleteProjectRejectsUnsafeIDsBeforeFirestore(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, docID := range []string{
+		".._project-123",
+		"user-123456_..",
+		"user/../tenant_project-123",
+		"user\\tenant_project-123",
+		"user-123456_project/../other",
+		"user-123456_project\x00suffix",
+	} {
+		t.Run(fmt.Sprintf("%q", docID), func(t *testing.T) {
+			h := &Handler{}
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodDelete, "/", nil)
+			c.Params = gin.Params{{Key: "id", Value: docID}}
+
+			h.AdminDeleteProject(c)
+
+			assert.Equal(t, http.StatusBadRequest, recorder.Code)
+		})
+	}
+}
+
 // TestAdminDeleteProject_NoFirestore tests that a nil firestore client
 // returns 500 Internal Server Error.
 func TestAdminDeleteProject_NoFirestore(t *testing.T) {
@@ -438,6 +463,23 @@ func TestAdminDeleteProject_MissingProject_Route404(t *testing.T) {
 	r.ServeHTTP(w, req)
 
 	assert.Equal(t, http.StatusNotFound, w.Code)
+}
+
+func TestAdminDeleteUserRejectsUnsafeIDBeforeFirestore(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, userID := range []string{"", ".", "..", "user/tenant", `user\tenant`, "user\x00tenant", "user/../tenant"} {
+		t.Run(fmt.Sprintf("%q", userID), func(t *testing.T) {
+			h := &Handler{}
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodDelete, "/", nil)
+			c.Params = gin.Params{{Key: "id", Value: userID}}
+
+			h.AdminDeleteUser(c)
+
+			assert.Equal(t, http.StatusBadRequest, recorder.Code)
+		})
+	}
 }
 
 func TestDeleteAdminProjectResourcesFailsClosedAtEachStage(t *testing.T) {
@@ -524,30 +566,72 @@ func TestDeleteAdminUserResourcesDoesNotDeleteUserAfterProjectFailure(t *testing
 	}
 }
 
-func TestDeleteGCSPrefixFailsClosedForUnsupportedStore(t *testing.T) {
+func TestDeleteGCSProjectPrefixFailsClosedForUnsupportedStore(t *testing.T) {
 	root := &adminStatsRootStore{adminStatsProjectStore: &adminStatsProjectStore{prefix: "root"}}
-	if err := deleteGCSPrefix(context.Background(), root, "users/u/projects/p/"); err == nil {
-		t.Fatal("deleteGCSPrefix() error = nil, want unsupported capability failure")
+	if err := deleteGCSProjectPrefix(context.Background(), root, "u", "p"); err == nil {
+		t.Fatal("deleteGCSProjectPrefix() error = nil, want unsupported capability failure")
 	}
 }
 
-func TestDeleteGCSPrefixTreatsAlreadyMissingAsSuccess(t *testing.T) {
-	root := &adminDeletePrefixRootStore{
+func TestDeleteGCSProjectPrefixTreatsAlreadyMissingAsSuccess(t *testing.T) {
+	root := &adminDeleteProjectPrefixRootStore{
 		adminStatsRootStore: &adminStatsRootStore{adminStatsProjectStore: &adminStatsProjectStore{prefix: "root"}},
 		err:                 storage.ErrObjectNotExist,
 	}
-	if err := deleteGCSPrefix(context.Background(), root, "users/u/projects/p/"); err != nil {
-		t.Fatalf("deleteGCSPrefix() error = %v, want nil for missing prefix", err)
+	if err := deleteGCSProjectPrefix(context.Background(), root, "u", "p"); err != nil {
+		t.Fatalf("deleteGCSProjectPrefix() error = %v, want nil for missing prefix", err)
 	}
 }
 
-type adminDeletePrefixRootStore struct {
+func TestDeleteGCSProjectPrefixRejectsUnsafeIDsBeforeProviderCall(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		uid  string
+		pid  string
+	}{
+		{name: "empty user", uid: "", pid: "project"},
+		{name: "dot user", uid: ".", pid: "project"},
+		{name: "dotdot user", uid: "..", pid: "project"},
+		{name: "slash user", uid: "user/tenant", pid: "project"},
+		{name: "backslash user", uid: `user\tenant`, pid: "project"},
+		{name: "nul user", uid: "user\x00tenant", pid: "project"},
+		{name: "normalization user", uid: "user/../tenant", pid: "project"},
+		{name: "empty project", uid: "user", pid: ""},
+		{name: "dot project", uid: "user", pid: "."},
+		{name: "dotdot project", uid: "user", pid: ".."},
+		{name: "slash project", uid: "user", pid: "project/child"},
+		{name: "backslash project", uid: "user", pid: `project\child`},
+		{name: "nul project", uid: "user", pid: "project\x00child"},
+		{name: "normalization project", uid: "user", pid: "project/../other"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := &adminCountingProjectPrefixRootStore{}
+			if err := deleteGCSProjectPrefix(context.Background(), root, tc.uid, tc.pid); err == nil {
+				t.Fatal("deleteGCSProjectPrefix() error = nil, want invalid ID failure")
+			}
+			if root.calls != 0 {
+				t.Fatalf("provider calls = %d, want 0", root.calls)
+			}
+		})
+	}
+}
+
+type adminDeleteProjectPrefixRootStore struct {
 	*adminStatsRootStore
 	err error
 }
 
-func (s *adminDeletePrefixRootStore) DeletePrefix(context.Context, string) (int, error) {
+func (s *adminDeleteProjectPrefixRootStore) DeleteProjectPrefix(context.Context, string, string) (int, error) {
 	return 0, s.err
+}
+
+type adminCountingProjectPrefixRootStore struct {
+	calls int
+}
+
+func (s *adminCountingProjectPrefixRootStore) DeleteProjectPrefix(context.Context, string, string) (int, error) {
+	s.calls++
+	return 0, nil
 }
 
 // =========================================================================

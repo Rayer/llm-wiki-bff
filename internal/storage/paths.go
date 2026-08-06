@@ -10,7 +10,9 @@ func ProjectPrefix(userID, projectID string) string {
 	return path.Join("users", userID, "projects", projectID)
 }
 
-// ProjectPrefixWithSlash returns ProjectPrefix with a trailing slash for prefix deletes and listings.
+// ProjectPrefixWithSlash returns ProjectPrefix with a trailing slash for
+// non-destructive project listings. Cleanup code must use a typed deletion
+// capability instead of accepting a caller-supplied raw prefix.
 func ProjectPrefixWithSlash(userID, projectID string) string {
 	return ProjectPrefix(userID, projectID) + "/"
 }
