@@ -172,39 +172,62 @@ func TestMainV1RoutingIncludesRawScrapeRouteUnderAuthAndProjectMiddleware(t *tes
 		t.Fatalf("parse main.go: %v", err)
 	}
 
-	var mainFn *ast.FuncDecl
-	for _, decl := range file.Decls {
-		fn, ok := decl.(*ast.FuncDecl)
-		if ok && fn.Name.Name == "main" {
-			mainFn = fn
-			break
-		}
+	routingBlock := projectMiddlewareRouteBlock(file, "v1")
+	if routingBlock == nil {
+		t.Fatal("production wiring in main.go does not contain v1.Use(auth.ProjectMiddleware()) followed by route scope block")
 	}
-	if mainFn == nil || mainFn.Body == nil {
-		t.Fatal("main() function not found or missing body")
-	}
-
-	seenProjectMiddleware := false
-	found := false
-	for _, stmt := range mainFn.Body.List {
-		if isV1ProjectMiddlewareUse(stmt, "v1") {
-			seenProjectMiddleware = true
-			continue
-		}
-		if seenProjectMiddleware {
-			block, ok := stmt.(*ast.BlockStmt)
-			if !ok {
-				// If anything other than the scoped route block appears directly after
-				// v1.Use(auth.ProjectMiddleware()), the route is no longer in the intended
-				// middleware scope.
-				break
-			}
-			found = blockContainsRouteRegistration(block, "v1")
-			break
-		}
-	}
-	if !found {
+	if !topLevelRawScrapeRouteRegistration(routingBlock, "v1") {
 		t.Fatal("production wiring in main.go does not register registerRawScrapeRoute under v1 JWT + ProjectMiddleware scope")
+	}
+}
+
+func TestMainV1RoutingContractMutationProofRemovingRegistration(t *testing.T) {
+	t.Parallel()
+	src := `package main
+
+	func main() {
+		var v1 *int
+		v1.Use(auth.ProjectMiddleware())
+		{
+			v1.GET("/index", nil)
+		}
+	}`
+	file, err := parser.ParseFile(token.NewFileSet(), "main.go", src, 0)
+	if err != nil {
+		t.Fatalf("parse mutated source: %v", err)
+	}
+	routingBlock := projectMiddlewareRouteBlock(file, "v1")
+	if routingBlock == nil {
+		t.Fatal("mutated source is missing v1.Use(auth.ProjectMiddleware()) route block")
+	}
+	if topLevelRawScrapeRouteRegistration(routingBlock, "v1") {
+		t.Fatal("mutation proof failed: removing registerRawScrapeRoute(v1,...) was unexpectedly accepted")
+	}
+}
+
+func TestMainV1RoutingContractMutationProofWrappedInLocalMode(t *testing.T) {
+	t.Parallel()
+	src := `package main
+
+	func main() {
+		var v1 *int
+		v1.Use(auth.ProjectMiddleware())
+		{
+			if localMode {
+				registerRawScrapeRoute(v1, nil, nil)
+			}
+		}
+	}`
+	file, err := parser.ParseFile(token.NewFileSet(), "main.go", src, 0)
+	if err != nil {
+		t.Fatalf("parse mutated source: %v", err)
+	}
+	routingBlock := projectMiddlewareRouteBlock(file, "v1")
+	if routingBlock == nil {
+		t.Fatal("mutated source is missing v1.Use(auth.ProjectMiddleware()) route block")
+	}
+	if topLevelRawScrapeRouteRegistration(routingBlock, "v1") {
+		t.Fatal("mutation proof failed: localMode-wrapped registerRawScrapeRoute(v1,...) was unexpectedly accepted")
 	}
 }
 
@@ -223,6 +246,36 @@ func readSwaggerDocument(t *testing.T) struct {
 		t.Fatalf("decode generated Swagger document: %v", err)
 	}
 	return document
+}
+
+func projectMiddlewareRouteBlock(file *ast.File, groupName string) *ast.BlockStmt {
+	var mainFn *ast.FuncDecl
+	for _, decl := range file.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if ok && fn.Name.Name == "main" && fn.Body != nil {
+			mainFn = fn
+			break
+		}
+	}
+	if mainFn == nil {
+		return nil
+	}
+
+	seenProjectMiddleware := false
+	for _, stmt := range mainFn.Body.List {
+		if isV1ProjectMiddlewareUse(stmt, groupName) {
+			seenProjectMiddleware = true
+			continue
+		}
+		if seenProjectMiddleware {
+			block, ok := stmt.(*ast.BlockStmt)
+			if !ok {
+				return nil
+			}
+			return block
+		}
+	}
+	return nil
 }
 
 func isV1ProjectMiddlewareUse(stmt ast.Stmt, groupName string) bool {
@@ -255,28 +308,30 @@ func isV1ProjectMiddlewareUse(stmt ast.Stmt, groupName string) bool {
 	return ok && pkg.Name == "auth"
 }
 
-func blockContainsRouteRegistration(block *ast.BlockStmt, groupName string) bool {
-	found := false
-	ast.Inspect(block, func(n ast.Node) bool {
-		call, ok := n.(*ast.CallExpr)
+func topLevelRawScrapeRouteRegistration(block *ast.BlockStmt, groupName string) bool {
+	for _, stmt := range block.List {
+		exprStmt, ok := stmt.(*ast.ExprStmt)
 		if !ok {
-			return true
+			continue
+		}
+		call, ok := exprStmt.X.(*ast.CallExpr)
+		if !ok {
+			continue
 		}
 		fn, ok := call.Fun.(*ast.Ident)
 		if !ok || fn.Name != "registerRawScrapeRoute" {
-			return true
+			continue
 		}
 		if len(call.Args) < 1 {
-			return true
+			continue
 		}
 		groupArg, ok := call.Args[0].(*ast.Ident)
 		if !ok || groupArg.Name != groupName {
-			return true
+			continue
 		}
-		found = true
-		return false
-	})
-	return found
+		return true
+	}
+	return false
 }
 
 func registeredAuthPOSTRoutes(t *testing.T) map[string]struct{} {
