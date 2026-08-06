@@ -26,9 +26,8 @@ type ReadyResponse struct {
 
 // QueryRequest is the request body for a query endpoint.
 type QueryRequest struct {
-	Query   string `json:"q"`
-	Mode    string `json:"mode"`
-	Project string `json:"project"`
+	Query string `json:"q"`
+	Mode  string `json:"mode"`
 }
 
 // QueryResponse is the response for a query endpoint.

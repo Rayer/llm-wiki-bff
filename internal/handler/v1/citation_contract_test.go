@@ -144,6 +144,41 @@ func TestV1QueryUsesIssuedCapabilityFromActualPromptContext(t *testing.T) {
 
 }
 
+func TestV1QueryIgnoresLegacyProjectFieldFromBody(t *testing.T) {
+	root := localfs.New(t.TempDir())
+	projectStore := root.Scope("user", "project")
+	concepts := `{"slug":"alpha-coffee","title":"Alpha Coffee","body":"coffee and espresso"}`
+	if _, err := projectStore.WriteBytes(context.Background(), []byte(concepts+"\n"), conceptcache.GCSPath); err != nil {
+		t.Fatal(err)
+	}
+
+	otherStore := root.Scope("user", "other-project")
+	if _, err := otherStore.WriteBytes(context.Background(), []byte(`{"slug":"other","title":"Other Coffee","body":"other body"}
+`), conceptcache.GCSPath); err != nil {
+		t.Fatal(err)
+	}
+
+	h := New(root, nil, search.NewIndex(), conceptcache.New(), nil, nil)
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/query", strings.NewReader(`{"q":"coffee","project":"other-project"}`))
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = request
+	c.Set("userID", "user")
+	c.Set("projectID", "project")
+	h.Query(c)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	var response handler.QueryResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Results) != 1 || response.Results[0].Slug != "alpha-coffee" {
+		t.Fatalf("project field changed query scope: %#v", response.Results)
+	}
+}
+
 func TestV1CachedContextsSkippedResultCannotBindAndIncludedResultCan(t *testing.T) {
 	reader := &handlerCacheReader{
 		prefix: "users/u/projects/p",
