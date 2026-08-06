@@ -1701,11 +1701,7 @@ func TestCloudSuggestedQueriesGenerateInsidePrivateWorkspaceBeforeManifestPublis
 	m := newMemoryObjects()
 	prefix := "users/user/projects/project/"
 	seedCloudSource(t, m, prefix, "raw-start", "", priorCloudReceipt())
-	provider := &testSuggestedQueryProvider{raw: `{"candidates":[
-{"question":"哪些概念值得一起比較？","intent/use_case":"comparison","corpus_anchor_concept_ids":["01JAZ5N7Y3K8M2Q4R6T9VWXABE"]},
-{"question":"如何探索這個主題的不同面向？","intent/use_case":"exploration","corpus_anchor_concept_ids":["01JAZ5N7Y3K8M2Q4R6T9VWXABE"]},
-{"question":"哪些選擇適合進一步查找？","intent/use_case":"retrieval","corpus_anchor_concept_ids":["01JAZ5N7Y3K8M2Q4R6T9VWXABE"]}
-]}`}
+	provider := &testSuggestedQueryProvider{raw: twentySuggestedQueriesRaw("01JAZ5N7Y3K8M2Q4R6T9VWXABE")}
 	cfg := cloudCfgFor("user", "project", "execution")
 	cfg.SuggestedQueries = true
 	cfg.suggestedQueriesProvider = provider
@@ -1759,11 +1755,7 @@ func TestCloudSuggestedQueriesStageOnlyPublishesNewChips(t *testing.T) {
 		t.Fatalf("seed publishCloudGeneration() error = %v", err)
 	}
 
-	suggestProvider := &testSuggestedQueryProvider{raw: `{"candidates":[
-{"question":"哪些概念值得一起比較？","intent/use_case":"comparison","corpus_anchor_concept_ids":["149603e6c035"]},
-{"question":"如何探索這個主題的不同面向？","intent/use_case":"exploration","corpus_anchor_concept_ids":["149603e6c035"]},
-{"question":"哪些選擇適合進一步查找？","intent/use_case":"retrieval","corpus_anchor_concept_ids":["149603e6c035"]}
-]}`}
+	suggestProvider := &testSuggestedQueryProvider{raw: twentySuggestedQueriesRaw("149603e6c035")}
 	suggestCfg := cloudCfgFor("user", "project", "suggest-exec")
 	suggestCfg.SuggestedQueries = true
 	suggestCfg.suggestedQueriesProvider = suggestProvider
@@ -1803,7 +1795,7 @@ func TestCloudSuggestedQueriesStageOnlyPublishesNewChips(t *testing.T) {
 	}
 	published, _ := cloudGenerationFile(t, m, prefix, nextManifest, suggestedqueries.Path)
 	artifact, err := suggestedqueries.Decode(published)
-	if err != nil || len(artifact.Queries) != 3 || artifact.Queries[0] != "哪些概念值得一起比較？" {
+	if err != nil || len(artifact.Queries) != 20 || artifact.Queries[0] != "哪些概念值得一起比較？" {
 		t.Fatalf("published chips invalid: err=%v artifact=%#v", err, artifact)
 	}
 }
@@ -3397,7 +3389,6 @@ func assertCloudFailure(t *testing.T, m *memoryObjects, prefix string, forbidden
 	}
 }
 
-
 func TestFailureDiagnosticUnknownErrorKeepsBoundedRedactedMessage(t *testing.T) {
 	// Put the credential near the front so truncation cannot hide redaction.
 	raw := "provider rejected api-secret-value " + strings.Repeat("x", 600)
@@ -3463,4 +3454,4 @@ func (s *receiptReadFailStore) Write(context.Context, string, []byte, map[string
 	return objectAttrs{}, s.err
 }
 func (s *receiptReadFailStore) Delete(context.Context, string, int64) error { return s.err }
-func (s *receiptReadFailStore) Close() error                               { return nil }
+func (s *receiptReadFailStore) Close() error                                { return nil }

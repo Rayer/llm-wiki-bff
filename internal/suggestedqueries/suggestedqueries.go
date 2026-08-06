@@ -13,7 +13,7 @@ import (
 
 const (
 	Path       = "cache/suggested_queries.json"
-	MaxQueries = 5
+	MaxQueries = 20
 )
 
 type Artifact struct {

@@ -31,6 +31,7 @@ import (
 	"github.com/rayer/llm-wiki-bff/internal/pipelinequota"
 	"github.com/rayer/llm-wiki-bff/internal/search"
 	store "github.com/rayer/llm-wiki-bff/internal/storage"
+	"github.com/rayer/llm-wiki-bff/internal/suggestedqueries"
 )
 
 func TestGetGCSClientUsesRequestContextIdentity(t *testing.T) {
@@ -1438,8 +1439,8 @@ func TestPipelineStatusIncludesSuggestedQueries(t *testing.T) {
 	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if len(body.SuggestedQueries) != 3 || body.SuggestedQueries[0] != "哪些概念值得一起比較？" {
-		t.Fatalf("suggested_queries = %#v, want three generated questions", body.SuggestedQueries)
+	if len(body.SuggestedQueries) != 20 || body.SuggestedQueries[0] != "哪些概念值得一起比較？" {
+		t.Fatalf("suggested_queries = %#v, want full twenty-item array", body.SuggestedQueries)
 	}
 }
 
@@ -3452,8 +3453,9 @@ func TestStatusAndPipelineStatusSuggestedQueriesUsePresentArtifact(t *testing.T)
 	writeSuggestionFixtures(t, projectRoot, validSuggestedQueriesJSON(), "")
 
 	got := readSuggestedQueriesFromStatusEndpoints(t, root)
-	if !reflect.DeepEqual(got, []string{"哪些概念值得一起比較？", "如何探索這個主題的不同面向？", "哪些選擇適合進一步查找？"}) {
-		t.Fatalf("suggested_queries = %#v, want generated questions", got)
+	want := mustSuggestedQueries(t, validSuggestedQueriesJSON())
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("suggested_queries = %#v, want published order %#v", got, want)
 	}
 }
 
@@ -3557,10 +3559,33 @@ func TestStatusAndPipelineStatusSuggestedQueriesNoDataReturnsEmptySlice(t *testi
 }
 
 func validSuggestedQueriesJSON() string {
-	return `{"version":2,"queries":["哪些概念值得一起比較？","如何探索這個主題的不同面向？","哪些選擇適合進一步查找？"],"candidates":[
-{"question":"哪些概念值得一起比較？","intent/use_case":"comparison","corpus_anchor_concept_ids":["c1"],"generation":{"model":"fixture","prompt_version":"v1"}},
-{"question":"如何探索這個主題的不同面向？","intent/use_case":"exploration","corpus_anchor_concept_ids":["c1"],"generation":{"model":"fixture","prompt_version":"v1"}},
-{"question":"哪些選擇適合進一步查找？","intent/use_case":"retrieval","corpus_anchor_concept_ids":["c1"],"generation":{"model":"fixture","prompt_version":"v1"}}],"updated_at":"2026-07-10T00:00:00Z"}`
+	candidates := make([]suggestedqueries.Candidate, 0, 20)
+	questions := []string{"哪些概念值得一起比較？", "如何探索這個主題的不同面向？", "哪些選擇適合進一步查找？"}
+	for i := 3; i < 20; i++ {
+		questions = append(questions, fmt.Sprintf("What else should I explore in concept %d?", i))
+	}
+	for _, question := range questions {
+		candidates = append(candidates, suggestedqueries.Candidate{
+			Question:               question,
+			Intent:                 "discovery",
+			CorpusAnchorConceptIDs: []string{"c1"},
+			Generation:             suggestedqueries.GenerationMetadata{Model: "fixture", PromptVersion: "v1"},
+		})
+	}
+	data, err := json.Marshal(suggestedqueries.ArtifactFromCandidates(candidates, time.Date(2026, 7, 10, 0, 0, 0, 0, time.UTC)))
+	if err != nil {
+		panic(err)
+	}
+	return string(data)
+}
+
+func mustSuggestedQueries(t *testing.T, data string) []string {
+	t.Helper()
+	artifact, err := suggestedqueries.Decode([]byte(data))
+	if err != nil {
+		t.Fatalf("decode suggestion fixture: %v", err)
+	}
+	return suggestedqueries.Queries(artifact)
 }
 
 func TestStatusRawCountUsesLiveRawListing(t *testing.T) {
