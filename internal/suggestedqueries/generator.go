@@ -17,11 +17,15 @@ import (
 )
 
 const (
-	MinQueries       = 3
+	MinQueries = 3
+	// MaxLegacyQueries is the largest readable v2 artifact from the pre-exact-20
+	// publishing contract. Newly generated artifacts use RequiredQueries exactly.
+	MaxLegacyQueries = 5
+	RequiredQueries  = 20
 	MaxConcepts      = 12
 	MaxQuestionBytes = 512
 	MaxProviderBytes = 64 * 1024
-	PromptVersion    = "lwc-205-v1"
+	PromptVersion    = "lwc-249-v1"
 	maxWrapperRunes  = 512
 )
 
@@ -95,7 +99,7 @@ func Generate(ctx context.Context, provider Provider, description string, entrie
 	if err != nil {
 		return Artifact{}, err
 	}
-	if err := validateCandidates(candidates, concepts, true, false); err != nil {
+	if err := validateGeneratedCandidates(candidates, concepts); err != nil {
 		return Artifact{}, err
 	}
 	for i := range candidates {
@@ -109,7 +113,7 @@ Return only a JSON object with a candidates array. Each candidate must contain q
 intent/use_case, and corpus_anchor_concept_ids. Do not include generation metadata.
 Use only supplied concept IDs as corpus anchors. Use-case hypotheses are allowed only as
 questions to be decided by retrieval; do not assert unsupported attributes as facts.
-Return 3 to 5 distinct questions. Never return a bare title or a trivial title wrapper.`
+Return exactly 20 distinct questions. Never return a bare title or a trivial title wrapper.`
 
 func RepresentativeConcepts(entries []conceptcache.Entry, mtimes map[string]time.Time) []ConceptEvidence {
 	type ranked struct {
@@ -358,7 +362,8 @@ func ArtifactFromCandidates(candidates []Candidate, now time.Time) Artifact {
 }
 
 func IsPublishable(artifact Artifact) bool {
-	if artifact.Version != 2 || len(artifact.Candidates) < MinQueries || len(artifact.Candidates) > MaxQueries || len(artifact.Queries) != len(artifact.Candidates) {
+	count := len(artifact.Candidates)
+	if artifact.Version != 2 || !((count >= MinQueries && count <= MaxLegacyQueries) || count == RequiredQueries) || len(artifact.Queries) != count {
 		return false
 	}
 	if err := validateCandidates(artifact.Candidates, nil, false, true); err != nil {
@@ -384,6 +389,13 @@ func truncateBytes(value string, limit int) string {
 
 func ValidateCandidates(candidates []Candidate, concepts []ConceptEvidence) error {
 	return validateCandidates(candidates, concepts, true, true)
+}
+
+func validateGeneratedCandidates(candidates []Candidate, concepts []ConceptEvidence) error {
+	if len(candidates) != RequiredQueries {
+		return fmt.Errorf("%w: candidate count %d, want exactly %d", ErrInvalidCandidates, len(candidates), RequiredQueries)
+	}
+	return validateCandidates(candidates, concepts, true, false)
 }
 
 func validateCandidates(candidates []Candidate, concepts []ConceptEvidence, checkAnchors, requireGeneration bool) error {

@@ -3,11 +3,14 @@ package suggestedqueries
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	conceptcache "github.com/rayer/llm-wiki-bff/internal/cache"
+	"github.com/rayer/llm-wiki-bff/internal/generation"
 )
 
 func TestDecodeReturnsQueries(t *testing.T) {
@@ -36,6 +39,72 @@ func TestDecodeRejectsLogicalEntryOverflow(t *testing.T) {
 	}
 }
 
+func TestDecodeRejectsOversizedArtifactBeforeNormalDecode(t *testing.T) {
+	artifact := readCardinalityArtifact(20)
+	artifact.UpdatedAt = strings.Repeat("x", 128<<10)
+	data, err := json.Marshal(artifact)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(data) <= 128<<10 {
+		t.Fatalf("fixture bytes = %d, want over 128 KiB", len(data))
+	}
+	if _, err := Decode(data); err == nil {
+		t.Fatal("Decode() accepted an artifact over the feature byte bound")
+	}
+}
+
+func TestDecodeRejectsPublishedQueryOverflowAtFeatureLimit(t *testing.T) {
+	data := []byte(`{"version":2,"queries":[` + strings.Repeat(`"q",`, MaxQueries) + `"overflow"],"candidates":[],"updated_at":""}`)
+	if _, err := Decode(data); !errors.Is(err, generation.ErrLogicalEntryLimit) {
+		t.Fatalf("Decode() error = %v, want feature logical-entry limit", err)
+	}
+}
+
+func TestDecodeRejectsOversizedPublishedQuery(t *testing.T) {
+	data := []byte(`{"version":2,"queries":["` + strings.Repeat("q", MaxQuestionBytes+1) + `"],"candidates":[],"updated_at":""}`)
+	if _, err := Decode(data); err == nil {
+		t.Fatal("Decode() accepted an oversized published query")
+	}
+}
+
+func TestIsPublishableReadCardinalityMatrix(t *testing.T) {
+	for _, tc := range []struct {
+		count int
+		want  bool
+	}{
+		{count: 0, want: false},
+		{count: 1, want: false},
+		{count: 2, want: false},
+		{count: 3, want: true},
+		{count: 4, want: true},
+		{count: 5, want: true},
+		{count: 6, want: false},
+		{count: 19, want: false},
+		{count: 20, want: true},
+		{count: 21, want: false},
+	} {
+		t.Run(strconv.Itoa(tc.count), func(t *testing.T) {
+			if got := IsPublishable(readCardinalityArtifact(tc.count)); got != tc.want {
+				t.Fatalf("IsPublishable(%d) = %t, want %t", tc.count, got, tc.want)
+			}
+		})
+	}
+}
+
+func readCardinalityArtifact(count int) Artifact {
+	candidates := make([]Candidate, count)
+	for i := range candidates {
+		candidates[i] = Candidate{
+			Question:               "Explore concept " + strconv.Itoa(i) + "?",
+			Intent:                 "discovery",
+			CorpusAnchorConceptIDs: []string{"c1"},
+			Generation:             GenerationMetadata{Model: "fixture", PromptVersion: "v1"},
+		}
+	}
+	return ArtifactFromCandidates(candidates, time.Unix(0, 0))
+}
+
 func TestQueriesReturnsEmptySliceForNil(t *testing.T) {
 	got := Queries(Artifact{})
 	if got == nil || len(got) != 0 {
@@ -62,7 +131,11 @@ func TestValidateCandidatesRejectsUnsafeStructuredOutput(t *testing.T) {
 		{name: "duplicate", make: func() []Candidate { out := append([]Candidate(nil), base...); out[1] = out[0]; return out }},
 		{name: "empty", make: func() []Candidate { out := append([]Candidate(nil), base...); out[0] = valid("   "); return out }},
 		{name: "overflow", make: func() []Candidate {
-			return append(append([]Candidate(nil), base...), valid("還有什麼值得探索的地方？"), valid("如何比較不同選擇？"), valid("哪些選項最方便？"))
+			out := append([]Candidate(nil), base...)
+			for i := 0; i < RequiredQueries+1-len(base); i++ {
+				out = append(out, valid("還有什麼值得探索的地方 "+strconv.Itoa(i)+"？"))
+			}
+			return out
 		}},
 		{name: "malformed metadata", make: func() []Candidate { out := append([]Candidate(nil), base...); out[0].Generation.Model = ""; return out }},
 		{name: "unknown anchor", make: func() []Candidate {
@@ -227,11 +300,7 @@ func TestParseProviderCandidatesAcceptsMarkdownCodeFence(t *testing.T) {
 
 func TestGenerateAcceptsMarkdownFencedProviderOutput(t *testing.T) {
 	entries := []conceptcache.Entry{{Slug: "c1", Title: "Concept 1", Body: "Evidence"}}
-	provider := &fixtureProvider{raw: "```json\n" + `{"candidates":[
-{"question":"哪些概念值得一起比較？","intent/use_case":"comparison","corpus_anchor_concept_ids":["c1"]},
-{"question":"如何探索這個主題的不同面向？","intent/use_case":"exploration","corpus_anchor_concept_ids":["c1"]},
-{"question":"哪些選擇適合進一步查找？","intent/use_case":"retrieval","corpus_anchor_concept_ids":["c1"]}
-]}` + "\n```"}
+	provider := &fixtureProvider{raw: "```json\n" + providerCandidatesJSON(20) + "\n```"}
 	artifact, err := Generate(context.Background(), provider, "", entries, nil, GenerationMetadata{Model: "fixture", PromptVersion: "v1"}, time.Now())
 	if err != nil {
 		t.Fatalf("Generate() error = %v", err)
@@ -239,8 +308,54 @@ func TestGenerateAcceptsMarkdownFencedProviderOutput(t *testing.T) {
 	if !IsPublishable(artifact) {
 		t.Fatalf("artifact not publishable: %#v", artifact)
 	}
-	if len(artifact.Queries) != 3 {
-		t.Fatalf("queries = %#v, want 3", artifact.Queries)
+	if len(artifact.Queries) != 20 {
+		t.Fatalf("queries = %#v, want 20", artifact.Queries)
+	}
+}
+
+func TestGeneratePublishesExactlyTwentyCandidates(t *testing.T) {
+	provider := &fixtureProvider{raw: providerCandidatesJSON(20)}
+	artifact, err := Generate(context.Background(), provider, "", []conceptcache.Entry{{Slug: "c1", Title: "Concept 1"}}, nil, GenerationMetadata{Model: "fixture", PromptVersion: "v1"}, time.Now())
+	if err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+	if len(artifact.Candidates) != 20 || len(artifact.Queries) != 20 {
+		t.Fatalf("artifact lengths = candidates:%d queries:%d, want 20 each", len(artifact.Candidates), len(artifact.Queries))
+	}
+	if artifact.Queries[0] != "Explore concept 0?" || artifact.Queries[19] != "Explore concept 19?" {
+		t.Fatalf("query order = first %q last %q, want provider order", artifact.Queries[0], artifact.Queries[19])
+	}
+	if !strings.Contains(provider.system, "exactly 20") {
+		t.Fatalf("provider system prompt = %q, want exact-20 instruction", provider.system)
+	}
+}
+
+func TestGenerateRejectsNonTwentyWhileLegacyThreeItemArtifactReads(t *testing.T) {
+	for _, count := range []int{19, 21} {
+		t.Run("generated-"+strconv.Itoa(count), func(t *testing.T) {
+			_, err := Generate(context.Background(), &fixtureProvider{raw: providerCandidatesJSON(count)}, "", []conceptcache.Entry{{Slug: "c1", Title: "Concept 1"}}, nil, GenerationMetadata{Model: "fixture", PromptVersion: "v1"}, time.Now())
+			if err == nil {
+				t.Fatalf("Generate() accepted %d candidates, want exact-20 rejection", count)
+			}
+		})
+	}
+
+	legacyCandidates := make([]Candidate, 3)
+	for i := range legacyCandidates {
+		legacyCandidates[i] = Candidate{
+			Question:               "Explore concept " + strconv.Itoa(i) + "?",
+			Intent:                 "discovery",
+			CorpusAnchorConceptIDs: []string{"c1"},
+			Generation:             GenerationMetadata{Model: "fixture", PromptVersion: "v1"},
+		}
+	}
+	data, err := json.Marshal(ArtifactFromCandidates(legacyCandidates, time.Now()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifact, err := Decode(data)
+	if err != nil || !IsPublishable(artifact) || len(artifact.Candidates) != 3 {
+		t.Fatalf("legacy artifact read = artifact:%#v err:%v, want publishable 3-item v2 artifact", artifact, err)
 	}
 }
 
@@ -259,7 +374,7 @@ func TestParseProviderCandidatesRejectsDuplicateAndUnknownKeys(t *testing.T) {
 }
 
 func TestParseProviderCandidatesRejectsCandidateOverflow(t *testing.T) {
-	raw := `{"candidates":[{}, {}, {}, {}, {}, {}]}`
+	raw := providerCandidatesJSON(MaxQueries + 1)
 	if _, err := parseProviderCandidates(raw); err == nil {
 		t.Fatal("parseProviderCandidates() error = nil, want candidate overflow rejection")
 	}
@@ -267,11 +382,7 @@ func TestParseProviderCandidatesRejectsCandidateOverflow(t *testing.T) {
 
 func TestGenerateAttachesTrustedMetadataAfterProviderValidation(t *testing.T) {
 	entries := []conceptcache.Entry{{Slug: "c1", Title: "Concept 1", Body: "Evidence"}}
-	provider := &fixtureProvider{raw: `{"candidates":[
-{"question":"哪些概念值得一起比較？","intent/use_case":"comparison","corpus_anchor_concept_ids":["c1"]},
-{"question":"如何探索這個主題的不同面向？","intent/use_case":"exploration","corpus_anchor_concept_ids":["c1"]},
-{"question":"哪些選擇適合進一步查找？","intent/use_case":"retrieval","corpus_anchor_concept_ids":["c1"]}
-]}`}
+	provider := &fixtureProvider{raw: providerCandidatesJSON(20)}
 	trusted := GenerationMetadata{Model: "fixture-model", PromptVersion: "fixture-prompt-v1"}
 	artifact, err := Generate(context.Background(), provider, "", entries, nil, trusted, time.Now())
 	if err != nil {
@@ -285,11 +396,7 @@ func TestGenerateAttachesTrustedMetadataAfterProviderValidation(t *testing.T) {
 }
 
 func TestGeneratePassesExplicitOptionalDescription(t *testing.T) {
-	provider := &fixtureProvider{raw: `{"candidates":[
-{"question":"哪些概念值得一起比較？","intent/use_case":"comparison","corpus_anchor_concept_ids":["c1"]},
-{"question":"如何探索這個主題的不同面向？","intent/use_case":"exploration","corpus_anchor_concept_ids":["c1"]},
-{"question":"哪些選擇適合進一步查找？","intent/use_case":"retrieval","corpus_anchor_concept_ids":["c1"]}
-]}`}
+	provider := &fixtureProvider{raw: providerCandidatesJSON(20)}
 	if _, err := Generate(context.Background(), provider, "explicit description seam", []conceptcache.Entry{{Slug: "c1", Title: "Concept 1"}}, nil, GenerationMetadata{Model: "fixture", PromptVersion: "v1"}, time.Now()); err != nil {
 		t.Fatalf("Generate() error = %v", err)
 	}
@@ -363,16 +470,38 @@ func TestGoldenLifestyleQuestionsSeparateQuestionHypothesesFromUnsupportedAssert
 }
 
 type fixtureProvider struct {
-	calls int
-	user  string
-	raw   string
-	err   error
+	calls  int
+	system string
+	user   string
+	raw    string
+	err    error
 }
 
-func (p *fixtureProvider) Chat(_ context.Context, _, user string) (string, error) {
+func (p *fixtureProvider) Chat(_ context.Context, system, user string) (string, error) {
 	p.calls++
+	p.system = system
 	p.user = user
 	return p.raw, p.err
+}
+
+func providerCandidatesJSON(count int) string {
+	return providerCandidatesJSONWithAnchor(count, "c1")
+}
+
+func providerCandidatesJSONWithAnchor(count int, anchor string) string {
+	candidates := make([]map[string]interface{}, count)
+	for i := range candidates {
+		candidates[i] = map[string]interface{}{
+			"question":                  "Explore concept " + strconv.Itoa(i) + "?",
+			"intent/use_case":           "discovery",
+			"corpus_anchor_concept_ids": []string{anchor},
+		}
+	}
+	data, err := json.Marshal(map[string]interface{}{"candidates": candidates})
+	if err != nil {
+		panic(err)
+	}
+	return string(data)
 }
 
 type blockingProvider struct {
@@ -419,11 +548,7 @@ func TestGenerateUsesBoundedRepresentativeConceptsAndOptionalDescription(t *test
 		})
 	}
 	entries = append(entries, conceptcache.Entry{Slug: "index", Title: "System Index", Frontmatter: map[string]interface{}{"id": "system"}})
-	provider := &fixtureProvider{raw: `{"candidates":[
-{"question":"哪些概念值得一起比較？","intent/use_case":"comparison","corpus_anchor_concept_ids":["id-c"]},
-{"question":"如何探索這個主題的不同面向？","intent/use_case":"exploration","corpus_anchor_concept_ids":["id-d"]},
-{"question":"哪些選擇適合進一步查找？","intent/use_case":"retrieval","corpus_anchor_concept_ids":["id-c"]}
-]}`}
+	provider := &fixtureProvider{raw: providerCandidatesJSONWithAnchor(20, "id-c")}
 	artifact, err := Generate(context.Background(), provider, "", entries, nil, GenerationMetadata{Model: "fixture", PromptVersion: "v1"}, time.Date(2026, 7, 28, 0, 0, 0, 0, time.UTC))
 	if err != nil {
 		t.Fatalf("Generate() error = %v", err)
@@ -431,8 +556,8 @@ func TestGenerateUsesBoundedRepresentativeConceptsAndOptionalDescription(t *test
 	if provider.calls != 1 {
 		t.Fatalf("provider calls = %d, want 1", provider.calls)
 	}
-	if len(artifact.Queries) != 3 || artifact.Version != 2 || len(artifact.Candidates) != 3 {
-		t.Fatalf("artifact = %#v, want three published candidates", artifact)
+	if len(artifact.Queries) != 20 || artifact.Version != 2 || len(artifact.Candidates) != 20 {
+		t.Fatalf("artifact = %#v, want twenty published candidates", artifact)
 	}
 	var input struct {
 		Description string            `json:"project_description"`
