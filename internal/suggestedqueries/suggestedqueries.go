@@ -3,6 +3,7 @@ package suggestedqueries
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -13,7 +14,16 @@ import (
 
 const (
 	Path       = "cache/suggested_queries.json"
-	MaxQueries = 5
+	MaxQueries = 20
+	// MaxArtifactBytes bounds status reads and decoding for this small published
+	// artifact. It covers a valid current artifact with candidates, anchors, and
+	// generation metadata while remaining far below the general generation-file limit.
+	MaxArtifactBytes = 128 << 10
+)
+
+var (
+	ErrArtifactTooLarge     = errors.New("suggested-query artifact exceeds byte limit")
+	ErrPublishedQueryTooBig = errors.New("suggested-query query exceeds byte limit")
 )
 
 type Artifact struct {
@@ -24,6 +34,9 @@ type Artifact struct {
 }
 
 func Decode(data []byte) (Artifact, error) {
+	if len(data) > MaxArtifactBytes {
+		return Artifact{}, ErrArtifactTooLarge
+	}
 	dec := json.NewDecoder(bytes.NewReader(data))
 	token, err := dec.Token()
 	if err != nil {
@@ -229,12 +242,15 @@ func decodePublishedQueries(dec *json.Decoder) ([]string, error) {
 	}
 	queries := make([]string, 0)
 	for dec.More() {
-		if len(queries) >= generation.MaxFiles {
+		if len(queries) >= MaxQueries {
 			return nil, generation.ErrLogicalEntryLimit
 		}
 		query, err := decodeJSONString(dec)
 		if err != nil {
 			return nil, err
+		}
+		if len([]byte(query)) > MaxQuestionBytes {
+			return nil, ErrPublishedQueryTooBig
 		}
 		queries = append(queries, query)
 	}

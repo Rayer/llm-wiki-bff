@@ -33,6 +33,72 @@ func (p *testSuggestedQueryProvider) Chat(_ context.Context, _, user string) (st
 	return p.raw, p.err
 }
 
+func twentySuggestedQueriesRaw(anchorIDs ...string) string {
+	if len(anchorIDs) == 0 {
+		anchorIDs = []string{"alpha-id"}
+	}
+	candidates := []map[string]interface{}{
+		{"question": "哪些概念值得一起比較？", "intent/use_case": "comparison", "corpus_anchor_concept_ids": anchorIDs},
+		{"question": "如何探索這個主題的不同面向？", "intent/use_case": "exploration", "corpus_anchor_concept_ids": []string{anchorIDs[0]}},
+		{"question": "哪些選擇適合進一步查找？", "intent/use_case": "retrieval", "corpus_anchor_concept_ids": []string{anchorIDs[len(anchorIDs)-1]}},
+	}
+	for i := 3; i < 20; i++ {
+		candidates = append(candidates, map[string]interface{}{
+			"question":                  fmt.Sprintf("What else should I explore in concept %d?", i),
+			"intent/use_case":           "discovery",
+			"corpus_anchor_concept_ids": []string{anchorIDs[0]},
+		})
+	}
+	data, err := json.Marshal(map[string]interface{}{"candidates": candidates})
+	if err != nil {
+		panic(err)
+	}
+	return string(data)
+}
+
+func twentySuggestedQueriesWithDuplicateRaw(anchorIDs ...string) string {
+	var payload struct {
+		Candidates []map[string]interface{} `json:"candidates"`
+	}
+	if err := json.Unmarshal([]byte(twentySuggestedQueriesRaw(anchorIDs...)), &payload); err != nil {
+		panic(err)
+	}
+	payload.Candidates[1]["question"] = payload.Candidates[0]["question"]
+	data, err := json.Marshal(payload)
+	if err != nil {
+		panic(err)
+	}
+	return string(data)
+}
+
+func suggestedQueriesByCountRaw(count int, anchorIDs ...string) string {
+	var payload struct {
+		Candidates []map[string]interface{} `json:"candidates"`
+	}
+	if err := json.Unmarshal([]byte(twentySuggestedQueriesRaw(anchorIDs...)), &payload); err != nil {
+		panic(err)
+	}
+	switch {
+	case count < 3 || count > 21:
+		panic(fmt.Sprintf("unsupported candidate count %d", count))
+	case count <= len(payload.Candidates):
+		payload.Candidates = payload.Candidates[:count]
+	default:
+		for i := len(payload.Candidates); i < count; i++ {
+			payload.Candidates = append(payload.Candidates, map[string]interface{}{
+				"question":                  fmt.Sprintf("What else should I explore in concept %d?", i),
+				"intent/use_case":           "discovery",
+				"corpus_anchor_concept_ids": []string{anchorIDs[0]},
+			})
+		}
+	}
+	data, err := json.Marshal(map[string]interface{}{"candidates": payload.Candidates})
+	if err != nil {
+		panic(err)
+	}
+	return string(data)
+}
+
 func TestParseCommandBatch(t *testing.T) {
 	commands, err := parseCommandBatch(`[["clear"],["run","--auto-approve"]]`)
 	if err != nil {
@@ -398,11 +464,7 @@ func TestRunPostprocessWritesSuggestedQueriesFromConcepts(t *testing.T) {
 	mustWriteFile(t, filepath.Join(vault, "wiki", "alpha.md"), []byte("---\nid: alpha-id\ntitle: Alpha\nupdated: 2026-07-01T00:00:00Z\n---\nAlpha"))
 	mustWriteFile(t, filepath.Join(vault, "wiki", "beta.md"), []byte("---\nid: beta-id\ntitle: Beta\nupdated: 2026-07-10T00:00:00Z\n---\nBeta"))
 
-	provider := &testSuggestedQueryProvider{raw: `{"candidates":[
-{"question":"哪些概念值得一起比較？","intent/use_case":"comparison","corpus_anchor_concept_ids":["alpha-id","beta-id"]},
-{"question":"如何探索這個主題的不同面向？","intent/use_case":"exploration","corpus_anchor_concept_ids":["alpha-id"]},
-{"question":"哪些選擇適合進一步查找？","intent/use_case":"retrieval","corpus_anchor_concept_ids":["beta-id"]}
-]}`}
+	provider := &testSuggestedQueryProvider{raw: twentySuggestedQueriesRaw("alpha-id", "beta-id")}
 	if err := runPostprocessWithProvider(context.Background(), vault, provider, nil); err != nil {
 		t.Fatalf("runPostprocess() error = %v", err)
 	}
@@ -418,8 +480,8 @@ func TestRunPostprocessWritesSuggestedQueriesFromConcepts(t *testing.T) {
 	if err := json.Unmarshal(data, &artifact); err != nil {
 		t.Fatalf("decode suggested_queries.json: %v", err)
 	}
-	if len(artifact.Queries) != 3 {
-		t.Fatalf("queries = %#v, want 3 entries", artifact.Queries)
+	if len(artifact.Queries) != 20 {
+		t.Fatalf("queries = %#v, want 20 entries", artifact.Queries)
 	}
 	if artifact.Queries[0] != "哪些概念值得一起比較？" || provider.calls != 1 {
 		t.Fatalf("queries[0] = %q, provider calls = %d", artifact.Queries[0], provider.calls)
@@ -433,16 +495,54 @@ func TestSuggestedQueryGenerationDoesNotReadVaultRootIndexAsDescription(t *testi
 	vault := t.TempDir()
 	mustWriteFile(t, filepath.Join(vault, "index.md"), []byte("SYSTEM_INDEX_MUST_NOT_REACH_SUGGESTED_QUERY_PROVIDER"))
 	mustWriteFile(t, filepath.Join(vault, "wiki", "alpha.md"), []byte("---\nid: alpha-id\ntitle: Alpha\n---\nAlpha"))
-	provider := &testSuggestedQueryProvider{raw: `{"candidates":[
-{"question":"哪些概念值得一起比較？","intent/use_case":"comparison","corpus_anchor_concept_ids":["alpha-id"]},
-{"question":"如何探索這個主題的不同面向？","intent/use_case":"exploration","corpus_anchor_concept_ids":["alpha-id"]},
-{"question":"哪些選擇適合進一步查找？","intent/use_case":"retrieval","corpus_anchor_concept_ids":["alpha-id"]}
-]}`}
+	provider := &testSuggestedQueryProvider{raw: twentySuggestedQueriesRaw("alpha-id")}
 	if err := runPostprocessWithProvider(context.Background(), vault, provider, nil); err != nil {
 		t.Fatalf("runPostprocessWithProvider() error = %v", err)
 	}
 	if strings.Contains(provider.user, "SYSTEM_INDEX_MUST_NOT_REACH_SUGGESTED_QUERY_PROVIDER") {
 		t.Fatalf("provider user payload contains vault root index.md content: %q", provider.user)
+	}
+}
+
+func TestSuggestedQueryGenerationRejectsInvalidCountPreservesByteIdenticalLegacyLKG(t *testing.T) {
+	vault := t.TempDir()
+	mustWriteFile(t, filepath.Join(vault, "wiki", "alpha.md"), []byte("---\nid: alpha-id\ntitle: Alpha\n---\nAlpha"))
+
+	seedCandidates := []suggestedqueries.Candidate{
+		{Question: "哪些概念值得一起比較？", Intent: "comparison", CorpusAnchorConceptIDs: []string{"alpha-id"}, Generation: suggestedqueries.GenerationMetadata{Model: "fixture", PromptVersion: "v1"}},
+		{Question: "如何探索這個主題的不同面向？", Intent: "exploration", CorpusAnchorConceptIDs: []string{"alpha-id"}, Generation: suggestedqueries.GenerationMetadata{Model: "fixture", PromptVersion: "v1"}},
+		{Question: "哪些選擇適合進一步查找？", Intent: "retrieval", CorpusAnchorConceptIDs: []string{"alpha-id"}, Generation: suggestedqueries.GenerationMetadata{Model: "fixture", PromptVersion: "v1"}},
+	}
+	lkgArtifact := suggestedqueries.ArtifactFromCandidates(seedCandidates, time.Date(2026, 7, 28, 0, 0, 0, 0, time.UTC))
+	lkg, err := json.MarshalIndent(lkgArtifact, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustWriteFile(t, filepath.Join(vault, "cache", suggestedqueries.Path), lkg)
+
+	for _, tc := range []struct {
+		name  string
+		count int
+	}{
+		{name: "count-19", count: 19},
+		{name: "count-21", count: 21},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			provider := &testSuggestedQueryProvider{raw: suggestedQueriesByCountRaw(tc.count, "alpha-id")}
+			if err := runPostprocessWithProvider(context.Background(), vault, provider, nil); err != nil {
+				t.Fatalf("runPostprocessWithProvider() error = %v", err)
+			}
+			got, err := os.ReadFile(filepath.Join(vault, "cache", suggestedqueries.Path))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(got, lkg) {
+				t.Fatalf("suggested query artifact changed after %d outputs: got %q, want %q", tc.count, got, lkg)
+			}
+			if provider.calls != 1 {
+				t.Fatalf("provider calls = %d, want 1", provider.calls)
+			}
+		})
 	}
 }
 
@@ -461,6 +561,24 @@ func TestSuggestedQueryGenerationFailurePreservesLastKnownGoodBytes(t *testing.T
 	}
 	if !bytes.Equal(got, prior) {
 		t.Fatalf("suggested query artifact changed on provider failure: got %q, want byte-identical prior", got)
+	}
+}
+
+func TestSuggestedQueryDuplicateOutputPreservesLastKnownGoodBytes(t *testing.T) {
+	vault := t.TempDir()
+	mustWriteFile(t, filepath.Join(vault, "wiki", "alpha.md"), []byte("---\nid: alpha-id\ntitle: Alpha\n---\nAlpha"))
+	prior := []byte(`{"version":2,"queries":["lkg one?","lkg two?","lkg three?"],"candidates":[{"question":"lkg one?","intent/use_case":"fixture","corpus_anchor_concept_ids":["alpha-id"],"generation":{"model":"fixture","prompt_version":"v1"}},{"question":"lkg two?","intent/use_case":"fixture","corpus_anchor_concept_ids":["alpha-id"],"generation":{"model":"fixture","prompt_version":"v1"}},{"question":"lkg three?","intent/use_case":"fixture","corpus_anchor_concept_ids":["alpha-id"],"generation":{"model":"fixture","prompt_version":"v1"}}],"updated_at":"2026-07-28T00:00:00Z"}`)
+	mustWriteFile(t, filepath.Join(vault, "cache", "suggested_queries.json"), prior)
+	provider := &testSuggestedQueryProvider{raw: twentySuggestedQueriesWithDuplicateRaw("alpha-id")}
+	if err := runPostprocessWithProvider(context.Background(), vault, provider, nil); err != nil {
+		t.Fatalf("runPostprocessWithProvider() error = %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(vault, "cache", "suggested_queries.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, prior) {
+		t.Fatalf("suggested query artifact changed after duplicate output: got %q, want byte-identical prior", got)
 	}
 }
 
@@ -494,11 +612,7 @@ func TestSuggestedQueriesStageOnlyRewritesQueryChips(t *testing.T) {
 	mustWriteFile(t, filepath.Join(vault, "cache", "suggested_queries.json"), priorQueries)
 	mustWriteFile(t, filepath.Join(vault, "wiki", "alpha.md"), []byte("---\nid: alpha-id\ntitle: Alpha\n---\nAlpha"))
 
-	provider := &testSuggestedQueryProvider{raw: `{"candidates":[
-{"question":"哪些概念值得一起比較？","intent/use_case":"comparison","corpus_anchor_concept_ids":["alpha-id"]},
-{"question":"如何探索這個主題的不同面向？","intent/use_case":"exploration","corpus_anchor_concept_ids":["alpha-id"]},
-{"question":"哪些選擇適合進一步查找？","intent/use_case":"retrieval","corpus_anchor_concept_ids":["alpha-id"]}
-]}`}
+	provider := &testSuggestedQueryProvider{raw: twentySuggestedQueriesRaw("alpha-id")}
 	if err := runSuggestedQueriesStage(context.Background(), vault, provider); err != nil {
 		t.Fatalf("runSuggestedQueriesStage() error = %v", err)
 	}
@@ -531,7 +645,7 @@ func TestSuggestedQueriesStageOnlyRewritesQueryChips(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(artifact.Queries) != 3 || artifact.Queries[0] != "哪些概念值得一起比較？" {
+	if len(artifact.Queries) != 20 || artifact.Queries[0] != "哪些概念值得一起比較？" {
 		t.Fatalf("queries = %#v", artifact.Queries)
 	}
 }
@@ -576,11 +690,7 @@ func TestSuggestedQueriesCommandPublishesChipsWithoutIndexRebuild(t *testing.T) 
 	mustWriteFile(t, filepath.Join(vault, ".synto", "INDEX.json"), []byte(syntoIndexFixture("a3f7b2c01d9d", "01JAZ5N7Y3K8M2Q4R6T9VWXABC", "alpha", false)))
 	writeValidSQLiteState(t, filepath.Join(vault, ".synto", "state.db"))
 
-	provider := &testSuggestedQueryProvider{raw: `{"candidates":[
-{"question":"哪些概念值得一起比較？","intent/use_case":"comparison","corpus_anchor_concept_ids":["a3f7b2c01d9d"]},
-{"question":"如何探索這個主題的不同面向？","intent/use_case":"exploration","corpus_anchor_concept_ids":["a3f7b2c01d9d"]},
-{"question":"哪些選擇適合進一步查找？","intent/use_case":"retrieval","corpus_anchor_concept_ids":["a3f7b2c01d9d"]}
-]}`}
+	provider := &testSuggestedQueryProvider{raw: twentySuggestedQueriesRaw("a3f7b2c01d9d")}
 	cfg := workerConfig{
 		VaultPath:                vault,
 		ExecutionID:              "suggest-only-1",
@@ -608,8 +718,8 @@ func TestSuggestedQueriesCommandPublishesChipsWithoutIndexRebuild(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(artifact.Queries) != 3 {
-		t.Fatalf("queries = %#v, want 3", artifact.Queries)
+	if len(artifact.Queries) != 20 {
+		t.Fatalf("queries = %#v, want 20", artifact.Queries)
 	}
 }
 
