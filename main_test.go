@@ -131,6 +131,28 @@ func TestSwaggerDocumentsPublicVersionRoute(t *testing.T) {
 	}
 }
 
+func TestSwaggerQueryRequestDoesNotExposeProjectField(t *testing.T) {
+	data, err := os.ReadFile("docs/swagger.json")
+	if err != nil {
+		t.Fatalf("read generated Swagger document: %v", err)
+	}
+	var artifact struct {
+		Definitions map[string]struct {
+			Properties map[string]json.RawMessage `json:"properties"`
+		} `json:"definitions"`
+	}
+	if err := json.Unmarshal(data, &artifact); err != nil {
+		t.Fatalf("decode generated Swagger document: %v", err)
+	}
+	definition, ok := artifact.Definitions["handler.QueryRequest"]
+	if !ok {
+		t.Fatal("swagger definitions do not include handler.QueryRequest")
+	}
+	if _, ok := definition.Properties["project"]; ok {
+		t.Fatal(`swagger schema still advertises "project" for handler.QueryRequest`)
+	}
+}
+
 func TestPublicVersionRouteDoesNotRequireAuthOrProject(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	router := gin.New()

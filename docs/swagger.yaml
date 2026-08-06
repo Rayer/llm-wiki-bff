@@ -273,8 +273,6 @@ definitions:
     properties:
       mode:
         type: string
-      project:
-        type: string
       q:
         type: string
     type: object

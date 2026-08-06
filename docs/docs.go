@@ -2104,9 +2104,6 @@ const docTemplate = `{
                 "mode": {
                     "type": "string"
                 },
-                "project": {
-                    "type": "string"
-                },
                 "q": {
                     "type": "string"
                 }
