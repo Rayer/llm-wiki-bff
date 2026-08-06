@@ -440,6 +440,116 @@ func TestAdminDeleteProject_MissingProject_Route404(t *testing.T) {
 	assert.Equal(t, http.StatusNotFound, w.Code)
 }
 
+func TestDeleteAdminProjectResourcesFailsClosedAtEachStage(t *testing.T) {
+	stageErr := errors.New("injected cleanup failure")
+	for _, tc := range []struct {
+		name       string
+		failStage  int
+		wantCalled int
+	}{
+		{name: "gcs", failStage: 0, wantCalled: 1},
+		{name: "lock", failStage: 1, wantCalled: 2},
+		{name: "project", failStage: 2, wantCalled: 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			cleanup := func(context.Context) error {
+				stage := calls
+				calls++
+				if stage == tc.failStage {
+					return stageErr
+				}
+				return nil
+			}
+
+			if err := deleteAdminProjectResources(context.Background(), cleanup, cleanup, cleanup); err == nil {
+				t.Fatal("deleteAdminProjectResources() error = nil, want failure")
+			}
+			if calls != tc.wantCalled {
+				t.Fatalf("cleanup calls = %d, want %d", calls, tc.wantCalled)
+			}
+		})
+	}
+}
+
+func TestDeleteAdminProjectResourcesRetriesAfterPartialProgress(t *testing.T) {
+	projectDeleteCalls := 0
+	cleanup := func(context.Context) error { return nil }
+	deleteProject := func(context.Context) error {
+		projectDeleteCalls++
+		if projectDeleteCalls == 1 {
+			return errors.New("injected project delete failure")
+		}
+		return nil
+	}
+
+	if err := deleteAdminProjectResources(context.Background(), cleanup, cleanup, deleteProject); err == nil {
+		t.Fatal("first cleanup error = nil, want failure")
+	}
+	// GCS and lock cleanup are intentionally safe to repeat after the first
+	// attempt made progress. A retry must be able to finish the project.
+	if err := deleteAdminProjectResources(context.Background(), cleanup, cleanup, deleteProject); err != nil {
+		t.Fatalf("retry cleanup error = %v, want nil", err)
+	}
+}
+
+func TestDeleteAdminUserResourcesDoesNotDeleteUserAfterProjectFailure(t *testing.T) {
+	userDeleteCalls := 0
+	projectCalls := 0
+	projectErr := errors.New("injected project cleanup failure")
+	cleanupProject := func(context.Context, string) error {
+		projectCalls++
+		if projectCalls == 2 {
+			return projectErr
+		}
+		return nil
+	}
+	deleteUser := func(context.Context) error {
+		userDeleteCalls++
+		return nil
+	}
+
+	if err := deleteAdminUserResources(context.Background(), []string{"project-1", "project-2"}, cleanupProject, deleteUser); err == nil {
+		t.Fatal("user cleanup error = nil, want failure")
+	}
+	if userDeleteCalls != 0 {
+		t.Fatalf("user delete calls = %d, want 0", userDeleteCalls)
+	}
+
+	if err := deleteAdminUserResources(context.Background(), []string{"project-2"}, func(context.Context, string) error { return nil }, deleteUser); err != nil {
+		t.Fatalf("user cleanup retry error = %v, want nil", err)
+	}
+	if userDeleteCalls != 1 {
+		t.Fatalf("user delete calls after retry = %d, want 1", userDeleteCalls)
+	}
+}
+
+func TestDeleteGCSPrefixFailsClosedForUnsupportedStore(t *testing.T) {
+	root := &adminStatsRootStore{adminStatsProjectStore: &adminStatsProjectStore{prefix: "root"}}
+	if err := deleteGCSPrefix(context.Background(), root, "users/u/projects/p/"); err == nil {
+		t.Fatal("deleteGCSPrefix() error = nil, want unsupported capability failure")
+	}
+}
+
+func TestDeleteGCSPrefixTreatsAlreadyMissingAsSuccess(t *testing.T) {
+	root := &adminDeletePrefixRootStore{
+		adminStatsRootStore: &adminStatsRootStore{adminStatsProjectStore: &adminStatsProjectStore{prefix: "root"}},
+		err:                 storage.ErrObjectNotExist,
+	}
+	if err := deleteGCSPrefix(context.Background(), root, "users/u/projects/p/"); err != nil {
+		t.Fatalf("deleteGCSPrefix() error = %v, want nil for missing prefix", err)
+	}
+}
+
+type adminDeletePrefixRootStore struct {
+	*adminStatsRootStore
+	err error
+}
+
+func (s *adminDeletePrefixRootStore) DeletePrefix(context.Context, string) (int, error) {
+	return 0, s.err
+}
+
 // =========================================================================
 // AdminRebuildIndex tests
 // =========================================================================

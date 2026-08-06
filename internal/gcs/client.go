@@ -679,6 +679,28 @@ func (c *Client) ListObjectMeta(ctx context.Context, relPrefix string) ([]store.
 	return out, nil
 }
 
+// DeletePrefix removes every object below prefix. Listing an empty prefix is
+// success, and an object that disappears between listing and deletion is also
+// success, so callers can safely retry after partial progress.
+func (c *Client) DeletePrefix(ctx context.Context, prefix string) (int, error) {
+	if strings.TrimSpace(prefix) == "" || !strings.HasSuffix(prefix, "/") {
+		return 0, errors.New("invalid delete prefix")
+	}
+
+	deleted := 0
+	err := c.visitObjectsRaw(ctx, prefix, false, func(object backendObject) error {
+		if err := c.deleteObject(ctx, object.Name, object.Generation); err != nil {
+			if objectNotFound(err) {
+				return nil
+			}
+			return err
+		}
+		deleted++
+		return nil
+	})
+	return deleted, err
+}
+
 // ListMarkdownFiles reads direct .md files under dir, relative to the
 // user/project prefix. Nested files are ignored.
 func (c *Client) ListMarkdownFiles(ctx context.Context, dir string) ([]MarkdownFile, error) {

@@ -82,6 +82,24 @@ func TestObjectNotFoundPreservesStorageSentinel(t *testing.T) {
 	}
 }
 
+func TestDeletePrefixDeletesObjectsAndIsIdempotent(t *testing.T) {
+	client, backend := newMemoryClient()
+	backend.put("users/user/projects/project/wiki/a.md", []byte("a"), 1, nil)
+	backend.put("users/user/projects/project/cache/id_map.json", []byte("{}"), 2, nil)
+	backend.put("users/user/projects/other/wiki/keep.md", []byte("keep"), 3, nil)
+
+	deleted, err := client.DeletePrefix(context.Background(), "users/user/projects/project/")
+	if err != nil || deleted != 2 {
+		t.Fatalf("DeletePrefix() = %d, %v; want 2, nil", deleted, err)
+	}
+	if deleted, err := client.DeletePrefix(context.Background(), "users/user/projects/project/"); err != nil || deleted != 0 {
+		t.Fatalf("idempotent DeletePrefix() = %d, %v; want 0, nil", deleted, err)
+	}
+	if _, err := backend.Read(context.Background(), "users/user/projects/other/wiki/keep.md", 0, 100); err != nil {
+		t.Fatalf("DeletePrefix() removed unrelated object: %v", err)
+	}
+}
+
 func TestReadFileAcceptsWorkerFailureDiagnosticFromMemoryGCS(t *testing.T) {
 	client, backend := newMemoryClient()
 	path := "cache/pipeline-run.failure.json"

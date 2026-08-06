@@ -41,11 +41,12 @@ const (
 )
 
 var (
-	errIndexNotFound             = errors.New("index not found")
-	errFirestoreNotConfigured    = errors.New("Firestore client is not configured")
-	errInvalidAdminProjectRecord = errors.New("invalid admin project record")
-	errPipelineExecutionNotFound = errors.New("pipeline execution not found")
-	errWikiStorageNotConfigured  = errors.New("wiki storage is not configured")
+	errIndexNotFound                 = errors.New("index not found")
+	errFirestoreNotConfigured        = errors.New("Firestore client is not configured")
+	errInvalidAdminProjectRecord     = errors.New("invalid admin project record")
+	errPipelineExecutionNotFound     = errors.New("pipeline execution not found")
+	errWikiStorageNotConfigured      = errors.New("wiki storage is not configured")
+	errAdminDeleteStorageUnsupported = errors.New("admin delete storage capability is unavailable")
 )
 
 const (
@@ -2181,23 +2182,23 @@ func (h *Handler) AdminDeleteProject(c *gin.Context) {
 
 	data := dsnap.Data()
 	name, _ := data["name"].(string)
-
-	// Delete GCS data
-	if h.store != nil {
-		prefix := store.ProjectPrefixWithSlash(uid, pid)
-		if err := deleteGCSPrefix(ctx, h.store, prefix); err != nil {
-			log.Print("admin generated cleanup warning")
-		}
+	if err := requireGCSPrefixDeleter(h.store); err != nil {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "project delete unavailable"})
+		return
 	}
 
-	// Delete lock doc
 	lockRef := fs.Collection("locks").Doc(fmt.Sprintf("%s__%s", uid, pid))
-	if _, err := lockRef.Delete(ctx); err != nil && status.Code(err) != codes.NotFound {
-		log.Print("admin lock cleanup warning")
-	}
-
-	// Delete project doc
-	if _, err := docRef.Delete(ctx); err != nil {
+	if err := deleteAdminProjectResources(ctx,
+		func(ctx context.Context) error {
+			return deleteGCSPrefix(ctx, h.store, store.ProjectPrefixWithSlash(uid, pid))
+		},
+		func(ctx context.Context) error {
+			return deleteAdminFirestoreDoc(ctx, lockRef)
+		},
+		func(ctx context.Context) error {
+			return deleteAdminFirestoreDoc(ctx, docRef)
+		},
+	); err != nil {
 		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "project delete unavailable"})
 		return
 	}
@@ -2691,10 +2692,20 @@ func (h *Handler) AdminDeleteUser(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "read user: " + err.Error()})
 		return
 	}
+	if err := requireGCSPrefixDeleter(h.store); err != nil {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "user delete unavailable"})
+		return
+	}
 
 	// Find and delete all projects belonging to this user
 	iter := fs.Collection("projects").Documents(ctx)
 	defer iter.Stop()
+	projectIDs := make([]string, 0)
+	projectDocs := make(map[string]struct {
+		uid string
+		pid string
+		ref *firestore.DocumentRef
+	})
 
 	for {
 		doc, err := iter.Next()
@@ -2710,29 +2721,42 @@ func (h *Handler) AdminDeleteUser(c *gin.Context) {
 		if uid != userID {
 			continue
 		}
-
-		// Delete GCS data
-		if h.store != nil && pid != "" {
-			prefix := store.ProjectPrefixWithSlash(userID, pid)
-			if err := deleteGCSPrefix(ctx, h.store, prefix); err != nil {
-				log.Print("admin generated cleanup warning")
-			}
+		if pid == "" {
+			// An owned project document without a safe project segment cannot
+			// be mapped to a bounded storage prefix, so fail closed before any
+			// cleanup starts.
+			c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "user delete unavailable"})
+			return
 		}
 
-		// Delete lock doc
-		lockRef := fs.Collection("locks").Doc(fmt.Sprintf("%s__%s", userID, pid))
-		if _, err := lockRef.Delete(ctx); err != nil && status.Code(err) != codes.NotFound {
-			log.Print("admin lock cleanup warning")
-		}
-
-		// Delete project doc
-		if _, err := doc.Ref.Delete(ctx); err != nil {
-			log.Print("admin project delete warning")
-		}
+		projectIDs = append(projectIDs, doc.Ref.ID)
+		projectDocs[doc.Ref.ID] = struct {
+			uid string
+			pid string
+			ref *firestore.DocumentRef
+		}{uid: uid, pid: pid, ref: doc.Ref}
 	}
 
-	// Delete user doc
-	if _, err := fs.Collection("users").Doc(userID).Delete(ctx); err != nil {
+	if err := deleteAdminUserResources(ctx, projectIDs, func(ctx context.Context, projectID string) error {
+		project, ok := projectDocs[projectID]
+		if !ok {
+			return errAdminDeleteCleanup
+		}
+		lockRef := fs.Collection("locks").Doc(fmt.Sprintf("%s__%s", project.uid, project.pid))
+		return deleteAdminProjectResources(ctx,
+			func(ctx context.Context) error {
+				return deleteGCSPrefix(ctx, h.store, store.ProjectPrefixWithSlash(project.uid, project.pid))
+			},
+			func(ctx context.Context) error {
+				return deleteAdminFirestoreDoc(ctx, lockRef)
+			},
+			func(ctx context.Context) error {
+				return deleteAdminFirestoreDoc(ctx, project.ref)
+			},
+		)
+	}, func(ctx context.Context) error {
+		return deleteAdminFirestoreDoc(ctx, fs.Collection("users").Doc(userID))
+	}); err != nil {
 		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "user delete unavailable"})
 		return
 	}
@@ -2747,11 +2771,71 @@ type gcsPrefixDeleter interface {
 	DeletePrefix(context.Context, string) (int, error)
 }
 
-func deleteGCSPrefix(ctx context.Context, client any, prefix string) error {
-	deleter, ok := client.(gcsPrefixDeleter)
-	if !ok {
+var errAdminDeleteCleanup = errors.New("admin cleanup failed")
+
+// deleteAdminProjectResources is deliberately ordered. A project document is
+// removed only after its external GCS prefix and Firestore lock cleanup have
+// succeeded. This is not atomic across providers: a later failure can leave
+// partial progress, and a retry repeats the idempotent cleanup steps.
+func deleteAdminProjectResources(ctx context.Context, deleteGCS, deleteLock, deleteProject func(context.Context) error) error {
+	for _, cleanup := range []func(context.Context) error{deleteGCS, deleteLock, deleteProject} {
+		if cleanup == nil {
+			return errAdminDeleteCleanup
+		}
+		if err := cleanup(ctx); err != nil {
+			return errors.Join(errAdminDeleteCleanup, err)
+		}
+	}
+	return nil
+}
+
+// deleteAdminUserResources deletes owned projects before the user document.
+// It intentionally makes no atomicity claim; already-completed projects are
+// safe to encounter again when a retry resumes after partial progress.
+func deleteAdminUserResources(ctx context.Context, projectIDs []string, deleteProject func(context.Context, string) error, deleteUser func(context.Context) error) error {
+	if deleteProject == nil || deleteUser == nil {
+		return errAdminDeleteCleanup
+	}
+	for _, projectID := range projectIDs {
+		if err := deleteProject(ctx, projectID); err != nil {
+			return errors.Join(errAdminDeleteCleanup, err)
+		}
+	}
+	if err := deleteUser(ctx); err != nil {
+		return errors.Join(errAdminDeleteCleanup, err)
+	}
+	return nil
+}
+
+func requireGCSPrefixDeleter(client any) error {
+	if client == nil {
+		return errAdminDeleteStorageUnsupported
+	}
+	if _, ok := client.(gcsPrefixDeleter); !ok {
+		return errAdminDeleteStorageUnsupported
+	}
+	return nil
+}
+
+func deleteAdminFirestoreDoc(ctx context.Context, ref *firestore.DocumentRef) error {
+	if ref == nil {
+		return errAdminDeleteCleanup
+	}
+	_, err := ref.Delete(ctx)
+	if status.Code(err) == codes.NotFound {
 		return nil
 	}
+	return err
+}
+
+func deleteGCSPrefix(ctx context.Context, client any, prefix string) error {
+	if err := requireGCSPrefixDeleter(client); err != nil {
+		return err
+	}
+	deleter := client.(gcsPrefixDeleter)
 	_, err := deleter.DeletePrefix(ctx, prefix)
+	if errors.Is(err, storage.ErrObjectNotExist) || status.Code(err) == codes.NotFound {
+		return nil
+	}
 	return err
 }
