@@ -157,7 +157,21 @@ func main() {
 		})
 	}
 
-	// Gin router
+	var settingsStore *syssettings.Store
+	if !localMode && fsClient != nil && fsClient.Raw() != nil {
+		settingsStore = syssettings.NewStore(fsClient.Raw(), cfg.RegistrationEnabled)
+	} else {
+		settingsStore = syssettings.NewStore(nil, cfg.RegistrationEnabled)
+	}
+
+	r := newProductionRouter(cfg, localMode, gcsClient, fsClient, hV1, settingsStore)
+
+	log.Printf("BFF listening on :%s", cfg.Port)
+	log.Printf("Swagger UI: http://localhost:%s/swagger/index.html", cfg.Port)
+	log.Fatal(r.Run(":" + cfg.Port))
+}
+
+func newProductionRouter(cfg config.Config, localMode bool, gcsClient *gcs.Client, fsClient *firestore.Client, hV1 *handlerv1.Handler, settingsStore syssettings.RegistrationGate) *gin.Engine {
 	r := gin.Default()
 	r.Use(middleware.SecurityHeaders(!cfg.DevJWT))
 
@@ -172,13 +186,6 @@ func main() {
 		AllowHeaders:     []string{"Content-Type", "Authorization", "X-User-ID", "X-User-Role", "X-Project-ID", "Idempotency-Key"},
 		AllowCredentials: true,
 	}))
-
-	var settingsStore *syssettings.Store
-	if !localMode && fsClient != nil && fsClient.Raw() != nil {
-		settingsStore = syssettings.NewStore(fsClient.Raw(), cfg.RegistrationEnabled)
-	} else {
-		settingsStore = syssettings.NewStore(nil, cfg.RegistrationEnabled)
-	}
 
 	registerPublicRoutes(r, settingsStore)
 
@@ -260,9 +267,7 @@ func main() {
 		}
 	})
 
-	log.Printf("BFF listening on :%s", cfg.Port)
-	log.Printf("Swagger UI: http://localhost:%s/swagger/index.html", cfg.Port)
-	log.Fatal(r.Run(":" + cfg.Port))
+	return r
 }
 
 func registerPublicRoutes(r *gin.Engine, settingsStore syssettings.RegistrationGate) {

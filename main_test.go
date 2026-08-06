@@ -143,91 +143,54 @@ func TestPublicVersionRouteDoesNotRequireAuthOrProject(t *testing.T) {
 	}
 }
 
-func TestV1RawScrapeRouteIsRegisteredAndBypasses404(t *testing.T) {
+func TestProductionRouterRegistersRawScrapeRouteUnderAuthAndProjectMiddleware(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-	router := gin.New()
-	v1 := router.Group("/api/v1")
-	v1.Use(auth.JWTAuth(config.Config{DevJWT: true}), auth.ProjectMiddleware())
-	registerRawScrapeRoute(v1, &gcs.Client{}, nil)
+	router := newProductionRouter(
+		config.Config{DevJWT: true, JWTSecret: "test-secret", AllowedOrigins: []string{"http://example.test"}},
+		false,
+		&gcs.Client{},
+		nil,
+		handlerv1.New(nil, nil, nil, nil, nil, nil),
+		&syssettings.FakeStore{Enabled: true},
+	)
 
-	recorder := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/raw/scrape", strings.NewReader(`{}`))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-User-ID", "tenant-user")
-	req.Header.Set("X-Project-ID", "demo")
-	router.ServeHTTP(recorder, req)
+	registered := 0
+	for _, route := range router.Routes() {
+		if route.Method == http.MethodPost && route.Path == "/api/v1/raw/scrape" {
+			registered++
+		}
+	}
+	if registered != 1 {
+		t.Fatalf("POST /api/v1/raw/scrape registered %d times, want exactly once", registered)
+	}
 
+	request := func(userID, projectID string) *httptest.ResponseRecorder {
+		recorder := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/raw/scrape", strings.NewReader(`{}`))
+		req.Header.Set("Content-Type", "application/json")
+		if userID != "" {
+			req.Header.Set("X-User-ID", userID)
+		}
+		if projectID != "" {
+			req.Header.Set("X-Project-ID", projectID)
+		}
+		router.ServeHTTP(recorder, req)
+		return recorder
+	}
+
+	if recorder := request("", "demo"); recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("missing DevJWT user status = %d, want %d", recorder.Code, http.StatusUnauthorized)
+	}
+	if recorder := request("tenant-user", ""); recorder.Code != http.StatusBadRequest {
+		t.Fatalf("missing project status = %d, want %d", recorder.Code, http.StatusBadRequest)
+	}
+
+	recorder := request("tenant-user", "demo")
 	if recorder.Code == http.StatusNotFound {
-		t.Fatalf("unexpected 404 for /api/v1/raw/scrape")
+		t.Fatal("unexpected 404 for production POST /api/v1/raw/scrape")
 	}
 	if recorder.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want %d from scrape handler", recorder.Code, http.StatusBadRequest)
-	}
-}
-
-func TestMainV1RoutingIncludesRawScrapeRouteUnderAuthAndProjectMiddleware(t *testing.T) {
-	t.Parallel()
-	file, err := parser.ParseFile(token.NewFileSet(), "main.go", nil, 0)
-	if err != nil {
-		t.Fatalf("parse main.go: %v", err)
-	}
-
-	routingBlock := projectMiddlewareRouteBlock(file, "v1")
-	if routingBlock == nil {
-		t.Fatal("production wiring in main.go does not contain v1.Use(auth.ProjectMiddleware()) followed by route scope block")
-	}
-	if !topLevelRawScrapeRouteRegistration(routingBlock, "v1") {
-		t.Fatal("production wiring in main.go does not register registerRawScrapeRoute under v1 JWT + ProjectMiddleware scope")
-	}
-}
-
-func TestMainV1RoutingContractMutationProofRemovingRegistration(t *testing.T) {
-	t.Parallel()
-	src := `package main
-
-	func main() {
-		var v1 *int
-		v1.Use(auth.ProjectMiddleware())
-		{
-			v1.GET("/index", nil)
-		}
-	}`
-	file, err := parser.ParseFile(token.NewFileSet(), "main.go", src, 0)
-	if err != nil {
-		t.Fatalf("parse mutated source: %v", err)
-	}
-	routingBlock := projectMiddlewareRouteBlock(file, "v1")
-	if routingBlock == nil {
-		t.Fatal("mutated source is missing v1.Use(auth.ProjectMiddleware()) route block")
-	}
-	if topLevelRawScrapeRouteRegistration(routingBlock, "v1") {
-		t.Fatal("mutation proof failed: removing registerRawScrapeRoute(v1,...) was unexpectedly accepted")
-	}
-}
-
-func TestMainV1RoutingContractMutationProofWrappedInLocalMode(t *testing.T) {
-	t.Parallel()
-	src := `package main
-
-	func main() {
-		var v1 *int
-		v1.Use(auth.ProjectMiddleware())
-		{
-			if localMode {
-				registerRawScrapeRoute(v1, nil, nil)
-			}
-		}
-	}`
-	file, err := parser.ParseFile(token.NewFileSet(), "main.go", src, 0)
-	if err != nil {
-		t.Fatalf("parse mutated source: %v", err)
-	}
-	routingBlock := projectMiddlewareRouteBlock(file, "v1")
-	if routingBlock == nil {
-		t.Fatal("mutated source is missing v1.Use(auth.ProjectMiddleware()) route block")
-	}
-	if topLevelRawScrapeRouteRegistration(routingBlock, "v1") {
-		t.Fatal("mutation proof failed: localMode-wrapped registerRawScrapeRoute(v1,...) was unexpectedly accepted")
+		t.Fatalf("production raw scrape status = %d, want %d from scrape handler", recorder.Code, http.StatusBadRequest)
 	}
 }
 
@@ -246,92 +209,6 @@ func readSwaggerDocument(t *testing.T) struct {
 		t.Fatalf("decode generated Swagger document: %v", err)
 	}
 	return document
-}
-
-func projectMiddlewareRouteBlock(file *ast.File, groupName string) *ast.BlockStmt {
-	var mainFn *ast.FuncDecl
-	for _, decl := range file.Decls {
-		fn, ok := decl.(*ast.FuncDecl)
-		if ok && fn.Name.Name == "main" && fn.Body != nil {
-			mainFn = fn
-			break
-		}
-	}
-	if mainFn == nil {
-		return nil
-	}
-
-	seenProjectMiddleware := false
-	for _, stmt := range mainFn.Body.List {
-		if isV1ProjectMiddlewareUse(stmt, groupName) {
-			seenProjectMiddleware = true
-			continue
-		}
-		if seenProjectMiddleware {
-			block, ok := stmt.(*ast.BlockStmt)
-			if !ok {
-				return nil
-			}
-			return block
-		}
-	}
-	return nil
-}
-
-func isV1ProjectMiddlewareUse(stmt ast.Stmt, groupName string) bool {
-	exprStmt, ok := stmt.(*ast.ExprStmt)
-	if !ok {
-		return false
-	}
-	call, ok := exprStmt.X.(*ast.CallExpr)
-	if !ok || len(call.Args) != 1 {
-		return false
-	}
-	selector, ok := call.Fun.(*ast.SelectorExpr)
-	if !ok || selector.Sel.Name != "Use" {
-		return false
-	}
-	group, ok := selector.X.(*ast.Ident)
-	if !ok || group.Name != groupName {
-		return false
-	}
-
-	mwCall, ok := call.Args[0].(*ast.CallExpr)
-	if !ok {
-		return false
-	}
-	mwSel, ok := mwCall.Fun.(*ast.SelectorExpr)
-	if !ok || mwSel.Sel.Name != "ProjectMiddleware" {
-		return false
-	}
-	pkg, ok := mwSel.X.(*ast.Ident)
-	return ok && pkg.Name == "auth"
-}
-
-func topLevelRawScrapeRouteRegistration(block *ast.BlockStmt, groupName string) bool {
-	for _, stmt := range block.List {
-		exprStmt, ok := stmt.(*ast.ExprStmt)
-		if !ok {
-			continue
-		}
-		call, ok := exprStmt.X.(*ast.CallExpr)
-		if !ok {
-			continue
-		}
-		fn, ok := call.Fun.(*ast.Ident)
-		if !ok || fn.Name != "registerRawScrapeRoute" {
-			continue
-		}
-		if len(call.Args) < 1 {
-			continue
-		}
-		groupArg, ok := call.Args[0].(*ast.Ident)
-		if !ok || groupArg.Name != groupName {
-			continue
-		}
-		return true
-	}
-	return false
 }
 
 func registeredAuthPOSTRoutes(t *testing.T) map[string]struct{} {
