@@ -22,6 +22,7 @@ import (
 	"github.com/rayer/llm-wiki-bff/internal/config"
 	"github.com/rayer/llm-wiki-bff/internal/firestore"
 	"github.com/rayer/llm-wiki-bff/internal/gcs"
+	handlerraw "github.com/rayer/llm-wiki-bff/internal/handler"
 	handlerv1 "github.com/rayer/llm-wiki-bff/internal/handler/v1"
 	"github.com/rayer/llm-wiki-bff/internal/llm"
 	"github.com/rayer/llm-wiki-bff/internal/localfs"
@@ -76,12 +77,14 @@ func main() {
 	}
 	localMode := localDataDir != ""
 
+	var gcsClient *gcs.Client
 	var wikiStore store.RootStore
 	if localMode {
 		wikiStore = localfs.New(localDataDir)
 		log.Printf("Local wiki storage ready: %s", localDataDir)
 	} else {
-		gcsClient, err := gcs.NewClient(cfg.Bucket)
+		var err error
+		gcsClient, err = gcs.NewClient(cfg.Bucket)
 		if err != nil {
 			log.Fatalf("Failed to create GCS client: %v", err)
 		}
@@ -239,6 +242,7 @@ func main() {
 		v1.POST("/pipeline/run", hV1.PipelineRun)
 		v1.GET("/pipeline/status", hV1.PipelineStatus)
 		v1.GET("/pipeline/log", hV1.PipelineLog)
+		registerRawScrapeRoute(v1, gcsClient, fsClient)
 		v1.GET("/raw", hV1.RawList)
 		v1.GET("/raw/:filename", hV1.RawPreview)
 		v1.POST("/raw/upload", hV1.RawUpload)
@@ -291,4 +295,27 @@ func registerAdminRoutes(r *gin.Engine, cfg config.Config, hV1 *handlerv1.Handle
 		admin.PATCH("/users/:id", hV1.AdminUpdateUser)
 		admin.DELETE("/users/:id", hV1.AdminDeleteUser)
 	}
+}
+
+func registerRawScrapeRoute(v1 *gin.RouterGroup, gcsClient *gcs.Client, fsClient *firestore.Client) {
+	v1.POST("/raw/scrape", func(c *gin.Context) {
+		if gcsClient == nil {
+			c.JSON(http.StatusServiceUnavailable, handlerraw.ErrorResponse{Error: "storage client is not configured"})
+			return
+		}
+
+		userID := strings.TrimSpace(c.GetString("userID"))
+		projectID := strings.TrimSpace(c.GetString("projectID"))
+		if userID == "" {
+			c.JSON(http.StatusUnauthorized, handlerraw.ErrorResponse{Error: "user not authenticated"})
+			return
+		}
+		if projectID == "" {
+			c.JSON(http.StatusBadRequest, handlerraw.ErrorResponse{Error: "project ID is required"})
+			return
+		}
+
+		rawScrapeHandler := handlerraw.New(gcsClient.WithScope(userID, projectID), fsClient, nil, nil, nil)
+		rawScrapeHandler.ScrapeRaw(c)
+	})
 }

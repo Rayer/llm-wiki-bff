@@ -9,12 +9,14 @@ import (
 	"net/http/httptest"
 	"os"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/rayer/llm-wiki-bff/internal/auth"
 	"github.com/rayer/llm-wiki-bff/internal/config"
+	"github.com/rayer/llm-wiki-bff/internal/gcs"
 	handlerv1 "github.com/rayer/llm-wiki-bff/internal/handler/v1"
 	"github.com/rayer/llm-wiki-bff/internal/middleware"
 	"github.com/rayer/llm-wiki-bff/internal/syssettings"
@@ -138,6 +140,28 @@ func TestPublicVersionRouteDoesNotRequireAuthOrProject(t *testing.T) {
 	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/v1/public/version", nil))
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("public version status = %d, want %d without authentication or project header", recorder.Code, http.StatusOK)
+	}
+}
+
+func TestV1RawScrapeRouteIsRegisteredAndBypasses404(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	v1 := router.Group("/api/v1")
+	v1.Use(auth.JWTAuth(config.Config{DevJWT: true}), auth.ProjectMiddleware())
+	registerRawScrapeRoute(v1, &gcs.Client{}, nil)
+
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/raw/scrape", strings.NewReader(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-User-ID", "tenant-user")
+	req.Header.Set("X-Project-ID", "demo")
+	router.ServeHTTP(recorder, req)
+
+	if recorder.Code == http.StatusNotFound {
+		t.Fatalf("unexpected 404 for /api/v1/raw/scrape")
+	}
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d from scrape handler", recorder.Code, http.StatusBadRequest)
 	}
 }
 
