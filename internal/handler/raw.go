@@ -133,13 +133,13 @@ func (h *Handler) UploadRaw(c *gin.Context) {
 
 // ═══════════════ RAW SCRAPE ═══════════════
 
-// ScrapeRequest is the body for POST /api/raw/scrape.
+// ScrapeRequest is the body for POST /api/v1/raw/scrape.
 type ScrapeRequest struct {
 	URL      string `json:"url" binding:"required"`
 	Filename string `json:"filename"` // optional; derived from URL title if empty
 }
 
-// ScrapeResponse is the response for POST /api/raw/scrape.
+// ScrapeResponse is the response for POST /api/v1/raw/scrape.
 type ScrapeResponse struct {
 	Message  string `json:"message"`
 	Filename string `json:"filename"`
@@ -149,7 +149,7 @@ type ScrapeResponse struct {
 	Bytes    int64  `json:"bytes"`
 }
 
-// ScrapeRaw handles POST /api/raw/scrape — scrape a URL and save as raw markdown.
+// ScrapeRaw handles POST /api/v1/raw/scrape — scrape a URL and save as raw markdown.
 func (h *Handler) ScrapeRaw(c *gin.Context) {
 	var req ScrapeRequest
 	if err := c.ShouldBindJSON(&req); err != nil {

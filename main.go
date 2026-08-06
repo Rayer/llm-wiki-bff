@@ -22,6 +22,7 @@ import (
 	"github.com/rayer/llm-wiki-bff/internal/config"
 	"github.com/rayer/llm-wiki-bff/internal/firestore"
 	"github.com/rayer/llm-wiki-bff/internal/gcs"
+	handlerraw "github.com/rayer/llm-wiki-bff/internal/handler"
 	handlerv1 "github.com/rayer/llm-wiki-bff/internal/handler/v1"
 	"github.com/rayer/llm-wiki-bff/internal/llm"
 	"github.com/rayer/llm-wiki-bff/internal/localfs"
@@ -76,12 +77,14 @@ func main() {
 	}
 	localMode := localDataDir != ""
 
+	var gcsClient *gcs.Client
 	var wikiStore store.RootStore
 	if localMode {
 		wikiStore = localfs.New(localDataDir)
 		log.Printf("Local wiki storage ready: %s", localDataDir)
 	} else {
-		gcsClient, err := gcs.NewClient(cfg.Bucket)
+		var err error
+		gcsClient, err = gcs.NewClient(cfg.Bucket)
 		if err != nil {
 			log.Fatalf("Failed to create GCS client: %v", err)
 		}
@@ -154,7 +157,39 @@ func main() {
 		})
 	}
 
-	// Gin router
+	var settingsStore *syssettings.Store
+	if !localMode && fsClient != nil && fsClient.Raw() != nil {
+		settingsStore = syssettings.NewStore(fsClient.Raw(), cfg.RegistrationEnabled)
+	} else {
+		settingsStore = syssettings.NewStore(nil, cfg.RegistrationEnabled)
+	}
+
+	r := newProductionRouter(cfg, localMode, gcsClient, fsClient, hV1, settingsStore, defaultRawScrapeHandlerFactory)
+
+	log.Printf("BFF listening on :%s", cfg.Port)
+	log.Printf("Swagger UI: http://localhost:%s/swagger/index.html", cfg.Port)
+	log.Fatal(r.Run(":" + cfg.Port))
+}
+
+type rawScrapeHandler interface {
+	ScrapeRaw(*gin.Context)
+}
+
+type rawScrapeHandlerFactory func(scopedClient *gcs.Client, fsClient *firestore.Client) rawScrapeHandler
+
+func defaultRawScrapeHandlerFactory(scopedClient *gcs.Client, fsClient *firestore.Client) rawScrapeHandler {
+	return handlerraw.New(scopedClient, fsClient, nil, nil, nil)
+}
+
+func newProductionRouter(
+	cfg config.Config,
+	localMode bool,
+	gcsClient *gcs.Client,
+	fsClient *firestore.Client,
+	hV1 *handlerv1.Handler,
+	settingsStore syssettings.RegistrationGate,
+	rawScrapeFactory rawScrapeHandlerFactory,
+) *gin.Engine {
 	r := gin.Default()
 	r.Use(middleware.SecurityHeaders(!cfg.DevJWT))
 
@@ -169,13 +204,6 @@ func main() {
 		AllowHeaders:     []string{"Content-Type", "Authorization", "X-User-ID", "X-User-Role", "X-Project-ID", "Idempotency-Key"},
 		AllowCredentials: true,
 	}))
-
-	var settingsStore *syssettings.Store
-	if !localMode && fsClient != nil && fsClient.Raw() != nil {
-		settingsStore = syssettings.NewStore(fsClient.Raw(), cfg.RegistrationEnabled)
-	} else {
-		settingsStore = syssettings.NewStore(nil, cfg.RegistrationEnabled)
-	}
 
 	registerPublicRoutes(r, settingsStore)
 
@@ -239,6 +267,7 @@ func main() {
 		v1.POST("/pipeline/run", hV1.PipelineRun)
 		v1.GET("/pipeline/status", hV1.PipelineStatus)
 		v1.GET("/pipeline/log", hV1.PipelineLog)
+		registerRawScrapeRoute(v1, gcsClient, fsClient, rawScrapeFactory)
 		v1.GET("/raw", hV1.RawList)
 		v1.GET("/raw/:filename", hV1.RawPreview)
 		v1.POST("/raw/upload", hV1.RawUpload)
@@ -256,9 +285,7 @@ func main() {
 		}
 	})
 
-	log.Printf("BFF listening on :%s", cfg.Port)
-	log.Printf("Swagger UI: http://localhost:%s/swagger/index.html", cfg.Port)
-	log.Fatal(r.Run(":" + cfg.Port))
+	return r
 }
 
 func registerPublicRoutes(r *gin.Engine, settingsStore syssettings.RegistrationGate) {
@@ -291,4 +318,30 @@ func registerAdminRoutes(r *gin.Engine, cfg config.Config, hV1 *handlerv1.Handle
 		admin.PATCH("/users/:id", hV1.AdminUpdateUser)
 		admin.DELETE("/users/:id", hV1.AdminDeleteUser)
 	}
+}
+
+func registerRawScrapeRoute(v1 *gin.RouterGroup, gcsClient *gcs.Client, fsClient *firestore.Client, rawScrapeFactory rawScrapeHandlerFactory) {
+	if rawScrapeFactory == nil {
+		rawScrapeFactory = defaultRawScrapeHandlerFactory
+	}
+	v1.POST("/raw/scrape", func(c *gin.Context) {
+		if gcsClient == nil {
+			c.JSON(http.StatusServiceUnavailable, handlerraw.ErrorResponse{Error: "storage client is not configured"})
+			return
+		}
+
+		userID := strings.TrimSpace(c.GetString("userID"))
+		projectID := strings.TrimSpace(c.GetString("projectID"))
+		if userID == "" {
+			c.JSON(http.StatusUnauthorized, handlerraw.ErrorResponse{Error: "user not authenticated"})
+			return
+		}
+		if projectID == "" {
+			c.JSON(http.StatusBadRequest, handlerraw.ErrorResponse{Error: "project ID is required"})
+			return
+		}
+
+		rawScrapeHandler := rawScrapeFactory(gcsClient.WithScope(userID, projectID), fsClient)
+		rawScrapeHandler.ScrapeRaw(c)
+	})
 }
