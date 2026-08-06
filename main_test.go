@@ -165,6 +165,49 @@ func TestV1RawScrapeRouteIsRegisteredAndBypasses404(t *testing.T) {
 	}
 }
 
+func TestMainV1RoutingIncludesRawScrapeRouteUnderAuthAndProjectMiddleware(t *testing.T) {
+	t.Parallel()
+	file, err := parser.ParseFile(token.NewFileSet(), "main.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse main.go: %v", err)
+	}
+
+	var mainFn *ast.FuncDecl
+	for _, decl := range file.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if ok && fn.Name.Name == "main" {
+			mainFn = fn
+			break
+		}
+	}
+	if mainFn == nil || mainFn.Body == nil {
+		t.Fatal("main() function not found or missing body")
+	}
+
+	seenProjectMiddleware := false
+	found := false
+	for _, stmt := range mainFn.Body.List {
+		if isV1ProjectMiddlewareUse(stmt, "v1") {
+			seenProjectMiddleware = true
+			continue
+		}
+		if seenProjectMiddleware {
+			block, ok := stmt.(*ast.BlockStmt)
+			if !ok {
+				// If anything other than the scoped route block appears directly after
+				// v1.Use(auth.ProjectMiddleware()), the route is no longer in the intended
+				// middleware scope.
+				break
+			}
+			found = blockContainsRouteRegistration(block, "v1")
+			break
+		}
+	}
+	if !found {
+		t.Fatal("production wiring in main.go does not register registerRawScrapeRoute under v1 JWT + ProjectMiddleware scope")
+	}
+}
+
 func readSwaggerDocument(t *testing.T) struct {
 	Paths map[string]map[string]json.RawMessage `json:"paths"`
 } {
@@ -180,6 +223,60 @@ func readSwaggerDocument(t *testing.T) struct {
 		t.Fatalf("decode generated Swagger document: %v", err)
 	}
 	return document
+}
+
+func isV1ProjectMiddlewareUse(stmt ast.Stmt, groupName string) bool {
+	exprStmt, ok := stmt.(*ast.ExprStmt)
+	if !ok {
+		return false
+	}
+	call, ok := exprStmt.X.(*ast.CallExpr)
+	if !ok || len(call.Args) != 1 {
+		return false
+	}
+	selector, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok || selector.Sel.Name != "Use" {
+		return false
+	}
+	group, ok := selector.X.(*ast.Ident)
+	if !ok || group.Name != groupName {
+		return false
+	}
+
+	mwCall, ok := call.Args[0].(*ast.CallExpr)
+	if !ok {
+		return false
+	}
+	mwSel, ok := mwCall.Fun.(*ast.SelectorExpr)
+	if !ok || mwSel.Sel.Name != "ProjectMiddleware" {
+		return false
+	}
+	pkg, ok := mwSel.X.(*ast.Ident)
+	return ok && pkg.Name == "auth"
+}
+
+func blockContainsRouteRegistration(block *ast.BlockStmt, groupName string) bool {
+	found := false
+	ast.Inspect(block, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		fn, ok := call.Fun.(*ast.Ident)
+		if !ok || fn.Name != "registerRawScrapeRoute" {
+			return true
+		}
+		if len(call.Args) < 1 {
+			return true
+		}
+		groupArg, ok := call.Args[0].(*ast.Ident)
+		if !ok || groupArg.Name != groupName {
+			return true
+		}
+		found = true
+		return false
+	})
+	return found
 }
 
 func registeredAuthPOSTRoutes(t *testing.T) map[string]struct{} {
