@@ -25,7 +25,7 @@ const (
 	MaxConcepts      = 12
 	MaxQuestionBytes = 512
 	MaxProviderBytes = 64 * 1024
-	PromptVersion    = "lwc-249-v1"
+	PromptVersion    = "lwc-252-v1"
 	maxWrapperRunes  = 512
 )
 
@@ -110,7 +110,7 @@ func Generate(ctx context.Context, provider Provider, description string, entrie
 
 const generationSystemPrompt = `Generate natural-language discovery questions for the supplied corpus.
 Return only a JSON object with a candidates array. Each candidate must contain question,
-intent/use_case, and corpus_anchor_concept_ids. Do not include generation metadata.
+intent, and corpus_anchor_concept_ids. Do not include generation metadata.
 Use only supplied concept IDs as corpus anchors. Use-case hypotheses are allowed only as
 questions to be decided by retrieval; do not assert unsupported attributes as facts.
 Return exactly 20 distinct questions. Never return a bare title or a trivial title wrapper.`
@@ -287,6 +287,7 @@ func decodeProviderCandidate(dec *json.Decoder) (providerCandidate, error) {
 	}
 	var candidate providerCandidate
 	seen := make(map[string]struct{}, 3)
+	seenSemantic := make(map[string]struct{}, 1)
 	for dec.More() {
 		key, err := dec.Token()
 		if err != nil {
@@ -300,10 +301,25 @@ func decodeProviderCandidate(dec *json.Decoder) (providerCandidate, error) {
 			return providerCandidate{}, fmt.Errorf("duplicate provider candidate key %q", name)
 		}
 		seen[name] = struct{}{}
+		semanticKey := ""
+		switch name {
+		case "intent":
+			semanticKey = "intent"
+		case "intent/use_case":
+			semanticKey = "intent"
+		}
+		if semanticKey != "" {
+			if _, duplicate := seenSemantic[semanticKey]; duplicate {
+				return providerCandidate{}, fmt.Errorf("duplicate provider candidate semantic key %q", semanticKey)
+			}
+			seenSemantic[semanticKey] = struct{}{}
+		}
 		switch name {
 		case "question":
 			candidate.Question, err = decodeJSONString(dec)
 		case "intent/use_case":
+			candidate.Intent, err = decodeJSONString(dec)
+		case "intent":
 			candidate.Intent, err = decodeJSONString(dec)
 		case "corpus_anchor_concept_ids":
 			candidate.CorpusAnchorConceptIDs, err = decodeAnchorIDs(dec)
