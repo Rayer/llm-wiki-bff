@@ -330,6 +330,44 @@ func TestGeneratePublishesExactlyTwentyCandidates(t *testing.T) {
 	}
 }
 
+func TestPromptVersionTracksProviderIntentContract(t *testing.T) {
+	if PromptVersion != "lwc-252-v1" {
+		t.Fatalf("PromptVersion = %q, want lwc-252-v1 for the provider intent contract", PromptVersion)
+	}
+}
+
+func TestGeneratePublishesTwentyCandidatesFromProviderIntentKey(t *testing.T) {
+	provider := &fixtureProvider{raw: providerCandidatesJSONWithIntent(20)}
+	artifact, err := Generate(context.Background(), provider, "", []conceptcache.Entry{{Slug: "c1", Title: "Concept 1"}}, nil, GenerationMetadata{Model: "fixture", PromptVersion: "v1"}, time.Now())
+	if err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+	if !IsPublishable(artifact) {
+		t.Fatalf("artifact not publishable: %#v", artifact)
+	}
+	if artifact.Candidates[0].Intent != "discovery" {
+		t.Fatalf("first intent = %q, want discovery", artifact.Candidates[0].Intent)
+	}
+	raw, err := json.Marshal(artifact)
+	if err != nil {
+		t.Fatalf("marshal artifact = %v", err)
+	}
+	if !strings.Contains(string(raw), "\"intent/use_case\"") {
+		t.Fatalf("artifact = %q, want canonical intent key", string(raw))
+	}
+}
+
+func TestDecodeProviderCandidatesRejectsIntentAndLegacyIntentDuplicate(t *testing.T) {
+	raw := `{"candidates":[{"question":"哪些概念值得一起比較？","intent":"comparison","intent/use_case":"comparison","corpus_anchor_concept_ids":["c1"]}]}`
+	_, err := parseProviderCandidates(raw)
+	if err == nil {
+		t.Fatal("parseProviderCandidates() error = nil, want duplicate semantic intent rejection")
+	}
+	if !strings.Contains(err.Error(), "duplicate provider candidate semantic key") {
+		t.Fatalf("parseProviderCandidates() error = %v, want duplicate semantic intent rejection", err)
+	}
+}
+
 func TestGenerateRejectsNonTwentyWhileLegacyThreeItemArtifactReads(t *testing.T) {
 	for _, count := range []int{19, 21} {
 		t.Run("generated-"+strconv.Itoa(count), func(t *testing.T) {
@@ -486,6 +524,22 @@ func (p *fixtureProvider) Chat(_ context.Context, system, user string) (string, 
 
 func providerCandidatesJSON(count int) string {
 	return providerCandidatesJSONWithAnchor(count, "c1")
+}
+
+func providerCandidatesJSONWithIntent(count int) string {
+	candidates := make([]map[string]interface{}, count)
+	for i := range candidates {
+		candidates[i] = map[string]interface{}{
+			"question":                  "Explore concept " + strconv.Itoa(i) + "?",
+			"intent":                    "discovery",
+			"corpus_anchor_concept_ids": []string{"c1"},
+		}
+	}
+	data, err := json.Marshal(map[string]interface{}{"candidates": candidates})
+	if err != nil {
+		panic(err)
+	}
+	return string(data)
 }
 
 func providerCandidatesJSONWithAnchor(count int, anchor string) string {
