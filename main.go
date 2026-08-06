@@ -321,13 +321,13 @@ func registerAdminRoutes(r *gin.Engine, cfg config.Config, hV1 *handlerv1.Handle
 }
 
 func registerRawScrapeRoute(v1 *gin.RouterGroup, gcsClient *gcs.Client, fsClient *firestore.Client, rawScrapeFactory rawScrapeHandlerFactory) {
+	if rawScrapeFactory == nil {
+		rawScrapeFactory = defaultRawScrapeHandlerFactory
+	}
 	v1.POST("/raw/scrape", func(c *gin.Context) {
 		if gcsClient == nil {
 			c.JSON(http.StatusServiceUnavailable, handlerraw.ErrorResponse{Error: "storage client is not configured"})
 			return
-		}
-		if rawScrapeFactory == nil {
-			rawScrapeFactory = defaultRawScrapeHandlerFactory
 		}
 
 		userID := strings.TrimSpace(c.GetString("userID"))
