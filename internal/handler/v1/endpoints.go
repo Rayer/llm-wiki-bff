@@ -1956,6 +1956,12 @@ func adminProjectRecordFromFirestoreDoc(docID string, data map[string]interface{
 	if !auth.ValidPathSegment(userID) || !auth.ValidPathSegment(docProjectID) || !strings.Contains(docID, "_") {
 		return adminProjectRecord{}, false
 	}
+	if storedUserID, exists := data["user_id"]; exists {
+		storedUserID, ok := storedUserID.(string)
+		if !ok || strings.TrimSpace(storedUserID) != userID {
+			return adminProjectRecord{}, false
+		}
+	}
 	storedProjectID, ok := data["project_id"].(string)
 	if !ok || strings.TrimSpace(storedProjectID) == "" {
 		return adminProjectRecord{}, false
@@ -1973,6 +1979,21 @@ func adminProjectRecordFromFirestoreDoc(docID string, data map[string]interface{
 		userID:    userID,
 		projectID: project.ID,
 	}, true
+}
+
+// adminProjectRecordForDeletion applies the stronger invariant required by
+// destructive cleanup: legacy records without a stored owner are not safe to
+// map to a GCS prefix, even though list/read compatibility may retain them.
+func adminProjectRecordForDeletion(docID string, data map[string]interface{}) (adminProjectRecord, bool) {
+	record, ok := adminProjectRecordFromFirestoreDoc(docID, data)
+	if !ok {
+		return adminProjectRecord{}, false
+	}
+	storedUserID, ok := data["user_id"].(string)
+	if !ok || strings.TrimSpace(storedUserID) != record.userID {
+		return adminProjectRecord{}, false
+	}
+	return record, true
 }
 
 func adminProjectRecordKey(userID, projectID string) string {
@@ -2143,6 +2164,90 @@ func (h *Handler) AdminProjects(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"projects": projects})
 }
 
+// adminDeleteDocument is the small Firestore seam used by the destructive
+// admin handlers. Keeping the seam at the document-operation boundary lets
+// tests exercise the real handler validation and cleanup order without a live
+// Firestore dependency.
+type adminDeleteDocument struct {
+	id   string
+	data map[string]interface{}
+}
+
+type adminDeleteBackend interface {
+	getUser(context.Context, string) (adminDeleteDocument, error)
+	getProject(context.Context, string) (adminDeleteDocument, error)
+	listProjects(context.Context) ([]adminDeleteDocument, error)
+	deleteLock(context.Context, string, string) error
+	deleteProject(context.Context, string) error
+	deleteUser(context.Context, string) error
+}
+
+type firestoreAdminDeleteBackend struct {
+	fs *firestore.Client
+}
+
+func (b firestoreAdminDeleteBackend) getUser(ctx context.Context, userID string) (adminDeleteDocument, error) {
+	snap, err := b.fs.Collection("users").Doc(userID).Get(ctx)
+	if err != nil {
+		return adminDeleteDocument{}, err
+	}
+	return adminDeleteDocument{id: snap.Ref.ID, data: snap.Data()}, nil
+}
+
+func (b firestoreAdminDeleteBackend) getProject(ctx context.Context, docID string) (adminDeleteDocument, error) {
+	snap, err := b.fs.Collection("projects").Doc(docID).Get(ctx)
+	if err != nil {
+		return adminDeleteDocument{}, err
+	}
+	return adminDeleteDocument{id: snap.Ref.ID, data: snap.Data()}, nil
+}
+
+func (b firestoreAdminDeleteBackend) listProjects(ctx context.Context) ([]adminDeleteDocument, error) {
+	iter := b.fs.Collection("projects").Documents(ctx)
+	defer iter.Stop()
+
+	documents := make([]adminDeleteDocument, 0)
+	for {
+		doc, err := iter.Next()
+		if err != nil {
+			if status.Code(err) == codes.NotFound || errors.Is(err, iterator.Done) {
+				return documents, nil
+			}
+			return nil, err
+		}
+		documents = append(documents, adminDeleteDocument{id: doc.Ref.ID, data: doc.Data()})
+	}
+}
+
+func (b firestoreAdminDeleteBackend) deleteLock(ctx context.Context, userID, projectID string) error {
+	return deleteAdminFirestoreDoc(ctx, b.fs.Collection("locks").Doc(fmt.Sprintf("%s__%s", userID, projectID)))
+}
+
+func (b firestoreAdminDeleteBackend) deleteProject(ctx context.Context, docID string) error {
+	return deleteAdminFirestoreDoc(ctx, b.fs.Collection("projects").Doc(docID))
+}
+
+func (b firestoreAdminDeleteBackend) deleteUser(ctx context.Context, userID string) error {
+	return deleteAdminFirestoreDoc(ctx, b.fs.Collection("users").Doc(userID))
+}
+
+func (h *Handler) adminDeleteBackendOrError() (adminDeleteBackend, error) {
+	if h.adminDeleteBackend != nil {
+		return h.adminDeleteBackend, nil
+	}
+	if h.firestore == nil || h.firestore.Raw() == nil {
+		return nil, errFirestoreNotConfigured
+	}
+	return firestoreAdminDeleteBackend{fs: h.firestore.Raw()}, nil
+}
+
+func logAdminDelete(operation, stage, userID, projectID string) {
+	// This logger intentionally accepts only already validated identifiers and
+	// never receives provider errors, object names, credentials, or document
+	// payloads. Logging is diagnostic only and cannot affect cleanup.
+	log.Printf("admin_delete operation=%s stage=%s user_id=%s project_id=%s", operation, stage, userID, projectID)
+}
+
 // AdminDeleteProject handles DELETE /admin/projects/{id}.
 //
 //	@Summary		Delete a project (admin)
@@ -2160,21 +2265,21 @@ func (h *Handler) AdminProjects(c *gin.Context) {
 //	@Router			/api/v1/admin/projects/{id} [delete]
 func (h *Handler) AdminDeleteProject(c *gin.Context) {
 	docID := c.Param("id")
-	uid, pid := splitProjectDocID(docID)
-	if !validAdminProjectSegments(uid, pid) {
+	keyUserID, keyProjectID := splitProjectDocID(docID)
+	if !validAdminProjectSegments(keyUserID, keyProjectID) {
 		c.JSON(http.StatusBadRequest, handler.ErrorResponse{Error: "invalid project doc ID"})
 		return
 	}
-	if h.firestore == nil || h.firestore.Raw() == nil {
+	backend, err := h.adminDeleteBackendOrError()
+	if err != nil {
 		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "Firestore client is not configured"})
 		return
 	}
 
-	fs := h.firestore.Raw()
 	ctx := c.Request.Context()
+	logAdminDelete("project", "get", keyUserID, keyProjectID)
 
-	docRef := fs.Collection("projects").Doc(docID)
-	dsnap, err := docRef.Get(ctx)
+	doc, err := backend.getProject(ctx, docID)
 	if err != nil {
 		if status.Code(err) == codes.NotFound {
 			c.JSON(http.StatusNotFound, handler.ErrorResponse{Error: "project not found"})
@@ -2184,34 +2289,47 @@ func (h *Handler) AdminDeleteProject(c *gin.Context) {
 		return
 	}
 
-	data := dsnap.Data()
-	name, _ := data["name"].(string)
+	// The route key is untrusted input. Resolve the fetched snapshot and use
+	// only the record whose stored owner and project identity exactly match the
+	// safe key before checking capability or constructing any cleanup scope.
+	record, ok := adminProjectRecordForDeletion(doc.id, doc.data)
+	if doc.id != docID || !ok || record.id != docID || record.userID != keyUserID || record.projectID != keyProjectID {
+		logAdminDelete("project", "validation_failed", keyUserID, keyProjectID)
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "project delete unavailable"})
+		return
+	}
+	logAdminDelete("project", "validated", record.userID, record.projectID)
+
 	if err := requireGCSProjectPrefixDeleter(h.store); err != nil {
+		logAdminDelete("project", "capability_unavailable", record.userID, record.projectID)
 		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "project delete unavailable"})
 		return
 	}
 
-	lockRef := fs.Collection("locks").Doc(fmt.Sprintf("%s__%s", uid, pid))
 	if err := deleteAdminProjectResources(ctx,
 		func(ctx context.Context) error {
-			return deleteGCSProjectPrefix(ctx, h.store, uid, pid)
+			logAdminDelete("project", "gcs", record.userID, record.projectID)
+			return deleteGCSProjectPrefix(ctx, h.store, record.userID, record.projectID)
 		},
 		func(ctx context.Context) error {
-			return deleteAdminFirestoreDoc(ctx, lockRef)
+			logAdminDelete("project", "lock", record.userID, record.projectID)
+			return backend.deleteLock(ctx, record.userID, record.projectID)
 		},
 		func(ctx context.Context) error {
-			return deleteAdminFirestoreDoc(ctx, docRef)
+			logAdminDelete("project", "project", record.userID, record.projectID)
+			return backend.deleteProject(ctx, record.id)
 		},
 	); err != nil {
+		logAdminDelete("project", "cleanup_failed", record.userID, record.projectID)
 		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "project delete unavailable"})
 		return
 	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"status":  "deleted",
-		"id":      docID,
-		"user_id": uid,
-		"name":    name,
+		"id":      record.id,
+		"user_id": record.userID,
+		"name":    record.name,
 	})
 }
 
@@ -2682,89 +2800,97 @@ func (h *Handler) AdminDeleteUser(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, handler.ErrorResponse{Error: "invalid user ID"})
 		return
 	}
-	if h.firestore == nil || h.firestore.Raw() == nil {
+	backend, err := h.adminDeleteBackendOrError()
+	if err != nil {
 		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "Firestore client is not configured"})
 		return
 	}
 
-	fs := h.firestore.Raw()
 	ctx := c.Request.Context()
+	logAdminDelete("user", "get", userID, "")
 
 	// Verify user exists
-	_, err := fs.Collection("users").Doc(userID).Get(ctx)
+	userDocument, err := backend.getUser(ctx, userID)
 	if err != nil {
 		if status.Code(err) == codes.NotFound {
-			c.JSON(http.StatusNotFound, handler.ErrorResponse{Error: "user not found: " + userID})
+			c.JSON(http.StatusNotFound, handler.ErrorResponse{Error: "user not found"})
 			return
 		}
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "read user: " + err.Error()})
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "user unavailable"})
+		return
+	}
+	if userDocument.id != userID {
+		logAdminDelete("user", "validation_failed", userID, "")
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "user delete unavailable"})
 		return
 	}
 	if err := requireGCSProjectPrefixDeleter(h.store); err != nil {
+		logAdminDelete("user", "capability_unavailable", userID, "")
 		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "user delete unavailable"})
 		return
 	}
 
-	// Find and delete all projects belonging to this user
-	iter := fs.Collection("projects").Documents(ctx)
-	defer iter.Stop()
-	projectIDs := make([]string, 0)
-	projectDocs := make(map[string]struct {
-		uid string
-		pid string
-		ref *firestore.DocumentRef
-	})
-
-	for {
-		doc, err := iter.Next()
-		if err != nil {
-			if status.Code(err) == codes.NotFound || errors.Is(err, iterator.Done) {
-				break
-			}
-			c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "project list unavailable"})
-			return
-		}
-
-		uid, pid := splitProjectDocID(doc.Ref.ID)
-		if uid != userID {
+	// Enumerate and validate every project snapshot that could belong to this
+	// user before the first GCS, lock, project, or user delete. Both the key and
+	// stored identities are checked, so neither an owned-looking key nor a
+	// stored-owned record can widen the cleanup scope.
+	documents, err := backend.listProjects(ctx)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "project list unavailable"})
+		return
+	}
+	projects := make([]adminProjectRecord, 0, len(documents))
+	for _, doc := range documents {
+		keyUserID, keyProjectID := splitProjectDocID(doc.id)
+		storedUserID, _ := doc.data["user_id"].(string)
+		storedUserID = strings.TrimSpace(storedUserID)
+		keyOwned := keyUserID == userID
+		storedOwned := storedUserID == userID
+		if !keyOwned && !storedOwned {
 			continue
 		}
-		if !validAdminProjectSegments(uid, pid) {
-			// An owned project document without a safe project segment cannot
-			// be mapped to a bounded storage prefix, so fail closed before any
-			// cleanup starts.
+
+		record, ok := adminProjectRecordForDeletion(doc.id, doc.data)
+		if !ok || record.userID != userID || record.id != doc.id || record.userID != keyUserID || record.projectID != keyProjectID {
+			logAdminDelete("user", "validation_failed", userID, "")
 			c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "user delete unavailable"})
 			return
 		}
+		projects = append(projects, record)
+		logAdminDelete("user", "validated", record.userID, record.projectID)
+	}
 
-		projectIDs = append(projectIDs, doc.Ref.ID)
-		projectDocs[doc.Ref.ID] = struct {
-			uid string
-			pid string
-			ref *firestore.DocumentRef
-		}{uid: uid, pid: pid, ref: doc.Ref}
+	projectIDs := make([]string, 0, len(projects))
+	projectRecords := make(map[string]adminProjectRecord, len(projects))
+	for _, project := range projects {
+		projectIDs = append(projectIDs, project.id)
+		projectRecords[project.id] = project
 	}
 
 	if err := deleteAdminUserResources(ctx, projectIDs, func(ctx context.Context, projectID string) error {
-		project, ok := projectDocs[projectID]
+		project, ok := projectRecords[projectID]
 		if !ok {
 			return errAdminDeleteCleanup
 		}
-		lockRef := fs.Collection("locks").Doc(fmt.Sprintf("%s__%s", project.uid, project.pid))
 		return deleteAdminProjectResources(ctx,
 			func(ctx context.Context) error {
-				return deleteGCSProjectPrefix(ctx, h.store, project.uid, project.pid)
+				logAdminDelete("user", "gcs", project.userID, project.projectID)
+				return deleteGCSProjectPrefix(ctx, h.store, project.userID, project.projectID)
 			},
 			func(ctx context.Context) error {
-				return deleteAdminFirestoreDoc(ctx, lockRef)
+				logAdminDelete("user", "lock", project.userID, project.projectID)
+				return backend.deleteLock(ctx, project.userID, project.projectID)
 			},
 			func(ctx context.Context) error {
-				return deleteAdminFirestoreDoc(ctx, project.ref)
+				logAdminDelete("user", "project", project.userID, project.projectID)
+				return backend.deleteProject(ctx, project.id)
 			},
 		)
 	}, func(ctx context.Context) error {
-		return deleteAdminFirestoreDoc(ctx, fs.Collection("users").Doc(userID))
+		logAdminDelete("user", "user", userID, "")
+		return backend.deleteUser(ctx, userID)
 	}); err != nil {
+		logAdminDelete("user", "cleanup_failed", userID, "")
 		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "user delete unavailable"})
 		return
 	}

@@ -172,6 +172,7 @@ var errIdempotencyConflict = errors.New("idempotency conflict")
 func createInitProjectDocs(ctx context.Context, fs *firestore.Client, projects *firestore.CollectionRef, userID, projectID, name, idempotencyKey string, resp initProjectResponse) error {
 	now := time.Now()
 	projectData := initProjectData(projectID, name, idempotencyKey, now)
+	projectData["user_id"] = userID
 
 	projectRef := projects.Doc(projectDocID(userID, projectID))
 	if idempotencyKey == "" {
@@ -192,6 +193,7 @@ func createInitProjectDocs(ctx context.Context, fs *firestore.Client, projects *
 		}
 		return tx.Create(keyRef, map[string]interface{}{
 			"project_id":      resp.ProjectID,
+			"user_id":         userID,
 			"status":          resp.Status,
 			"status_url":      resp.StatusURL,
 			"name":            resp.Name,

@@ -31,6 +31,7 @@ type Handler struct {
 	cloudRunJobURL               string
 	projectExists                func(context.Context, string) error
 	adminProjectRecordLoader     func(context.Context, string) (adminProjectRecord, error)
+	adminDeleteBackend           adminDeleteBackend
 	rebuildIndex                 func(context.Context, string, string) (wikiindex.IDMap, error)
 	adminProjectRecordsLoader    func(context.Context) ([]adminProjectRecord, error)
 	adminProjectStatisticsLoader func(context.Context, store.RootStore, []adminProjectRecord) (map[string]adminProjectStatistics, error)
