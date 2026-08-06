@@ -1827,7 +1827,15 @@ func (h *Handler) loadSuggestedQueries(ctx context.Context, c *gin.Context) ([]s
 		}
 		return nil, err
 	}
-	data, err := wikiStore.ReadFile(ctx, suggestedqueries.Path)
+	reader, ok := wikiStore.(interface {
+		ReadFileLimited(context.Context, string, int64) ([]byte, error)
+	})
+	if !ok {
+		return nil, errors.New("suggested-query bounded reader unavailable")
+	}
+	// Read one sentinel byte so Decode can distinguish an artifact at the feature
+	// bound from one that exceeds it without falling back to an unbounded read.
+	data, err := reader.ReadFileLimited(ctx, suggestedqueries.Path, suggestedqueries.MaxArtifactBytes+1)
 	if err != nil {
 		if errors.Is(err, storage.ErrObjectNotExist) {
 			return []string{}, nil

@@ -17,7 +17,10 @@ import (
 )
 
 const (
-	MinQueries       = 3
+	MinQueries = 3
+	// MaxLegacyQueries is the largest readable v2 artifact from the pre-exact-20
+	// publishing contract. Newly generated artifacts use RequiredQueries exactly.
+	MaxLegacyQueries = 5
 	RequiredQueries  = 20
 	MaxConcepts      = 12
 	MaxQuestionBytes = 512
@@ -359,7 +362,8 @@ func ArtifactFromCandidates(candidates []Candidate, now time.Time) Artifact {
 }
 
 func IsPublishable(artifact Artifact) bool {
-	if artifact.Version != 2 || len(artifact.Candidates) < MinQueries || len(artifact.Candidates) > MaxQueries || len(artifact.Queries) != len(artifact.Candidates) {
+	count := len(artifact.Candidates)
+	if artifact.Version != 2 || !((count >= MinQueries && count <= MaxLegacyQueries) || count == RequiredQueries) || len(artifact.Queries) != count {
 		return false
 	}
 	if err := validateCandidates(artifact.Candidates, nil, false, true); err != nil {

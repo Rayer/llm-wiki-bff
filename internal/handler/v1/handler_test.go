@@ -2708,7 +2708,12 @@ func (s *pipelineLogMetadataSpyStore) StatFile(context.Context, string) (int64, 
 	return s.root.statSize, s.root.statErr
 }
 
-func (s *pipelineLogMetadataSpyStore) ReadFileLimited(context.Context, string, int64) ([]byte, error) {
+func (s *pipelineLogMetadataSpyStore) ReadFileLimited(ctx context.Context, path string, limit int64) ([]byte, error) {
+	if path == suggestedqueries.Path {
+		return s.Store.(interface {
+			ReadFileLimited(context.Context, string, int64) ([]byte, error)
+		}).ReadFileLimited(ctx, path, limit)
+	}
 	s.root.readCalls++
 	return nil, errors.New("body read must not occur during status")
 }
@@ -2734,7 +2739,7 @@ func (s *pipelineStatusMetadataStore) StatFile(context.Context, string) (int64, 
 	return s.root.statSize, nil
 }
 
-func (s *pipelineStatusMetadataStore) ReadFileLimited(_ context.Context, path string, _ int64) ([]byte, error) {
+func (s *pipelineStatusMetadataStore) ReadFileLimited(ctx context.Context, path string, limit int64) ([]byte, error) {
 	if strings.HasSuffix(path, ".log") {
 		s.root.rawReads++
 		return nil, errors.New("raw log body read must not occur during status")
@@ -2743,7 +2748,9 @@ func (s *pipelineStatusMetadataStore) ReadFileLimited(_ context.Context, path st
 		s.root.diagnosticReads++
 		return append([]byte(nil), s.root.diagnostic...), nil
 	}
-	return nil, errors.New("unexpected bounded status read")
+	return s.Store.(interface {
+		ReadFileLimited(context.Context, string, int64) ([]byte, error)
+	}).ReadFileLimited(ctx, path, limit)
 }
 
 type pipelineFailureDiagnosticSpyRoot struct {
@@ -3368,6 +3375,16 @@ type readOnlySuggestedStore struct {
 	writes *int
 }
 
+func (s *readOnlySuggestedStore) ReadFileLimited(ctx context.Context, path string, limit int64) ([]byte, error) {
+	reader, ok := s.Store.(interface {
+		ReadFileLimited(context.Context, string, int64) ([]byte, error)
+	})
+	if !ok {
+		return nil, errors.New("bounded reader unavailable")
+	}
+	return reader.ReadFileLimited(ctx, path, limit)
+}
+
 func (s *readOnlySuggestedStore) WriteBytes(context.Context, []byte, string) (string, error) {
 	*s.writes++
 	return "", errors.New("unexpected status write")
@@ -3456,6 +3473,106 @@ func TestStatusAndPipelineStatusSuggestedQueriesUsePresentArtifact(t *testing.T)
 	want := mustSuggestedQueries(t, validSuggestedQueriesJSON())
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("suggested_queries = %#v, want published order %#v", got, want)
+	}
+}
+
+func TestStatusAndPipelineStatusSuggestedQueriesRejectNineteenItemArtifact(t *testing.T) {
+	root := t.TempDir()
+	projectRoot := filepath.Join(root, "users", "request-user", "projects", "demo-project")
+	writeSuggestionFixtures(t, projectRoot, suggestedQueriesJSONWithCount(19), "")
+
+	got := readSuggestedQueriesFromStatusEndpoints(t, root)
+	if !reflect.DeepEqual(got, []string{}) {
+		t.Fatalf("suggested_queries = %#v, want [] for a non-legacy, non-current artifact", got)
+	}
+}
+
+func TestStatusAndPipelineStatusSuggestedQueriesUseBoundedReader(t *testing.T) {
+	root := &suggestedQueriesReadSpyRoot{Client: localfs.New(t.TempDir()), data: []byte(validSuggestedQueriesJSON())}
+	h := newStatusHandlerForTest(root, `{"executions":[]}`)
+
+	for _, endpoint := range []string{"/api/v1/status", "/api/v1/pipeline/status"} {
+		t.Run(endpoint, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodGet, endpoint, nil)
+			c.Set("userID", "request-user")
+			c.Set("projectID", "demo-project")
+			if endpoint == "/api/v1/pipeline/status" {
+				h.PipelineStatus(c)
+			} else {
+				h.Status(c)
+			}
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("status = %d body = %s, want 200", recorder.Code, recorder.Body.String())
+			}
+		})
+	}
+	if root.genericReads != 0 {
+		t.Fatalf("unbounded reads = %d, want 0", root.genericReads)
+	}
+	if root.limitedReads != 2 {
+		t.Fatalf("bounded reads = %d, want one per endpoint", root.limitedReads)
+	}
+	for _, limit := range root.limits {
+		if limit != 128<<10+1 {
+			t.Fatalf("bounded read limit = %d, want 131073", limit)
+		}
+	}
+}
+
+func TestStatusAndPipelineStatusSuggestedQueriesFailClosedWithoutBoundedReader(t *testing.T) {
+	for _, endpoint := range []string{"/api/v1/status", "/api/v1/pipeline/status"} {
+		t.Run(endpoint, func(t *testing.T) {
+			root := &suggestedQueriesUnboundedRoot{Client: localfs.New(t.TempDir()), data: []byte(validSuggestedQueriesJSON())}
+			h := newStatusHandlerForTest(root, `{"executions":[]}`)
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodGet, endpoint, nil)
+			c.Set("userID", "request-user")
+			c.Set("projectID", "demo-project")
+			if endpoint == "/api/v1/pipeline/status" {
+				h.PipelineStatus(c)
+			} else {
+				h.Status(c)
+			}
+			want := `{"error":"generated data unavailable"}`
+			if endpoint == "/api/v1/pipeline/status" {
+				want = `{"error":"pipeline status unavailable"}`
+			}
+			if recorder.Code != http.StatusInternalServerError || recorder.Body.String() != want {
+				t.Fatalf("status=%d body=%s, want fixed bounded-reader error", recorder.Code, recorder.Body.String())
+			}
+			if root.genericReads != 0 {
+				t.Fatalf("unbounded reads = %d, want 0", root.genericReads)
+			}
+		})
+	}
+}
+
+func TestStatusAndPipelineStatusSuggestedQueriesFailClosedOnBoundedReaderError(t *testing.T) {
+	for _, endpoint := range []string{"/api/v1/status", "/api/v1/pipeline/status"} {
+		t.Run(endpoint, func(t *testing.T) {
+			root := &suggestedQueriesReadSpyRoot{Client: localfs.New(t.TempDir()), limitedErr: errors.New("bounded read failed")}
+			h := newStatusHandlerForTest(root, `{"executions":[]}`)
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodGet, endpoint, nil)
+			c.Set("userID", "request-user")
+			c.Set("projectID", "demo-project")
+			if endpoint == "/api/v1/pipeline/status" {
+				h.PipelineStatus(c)
+			} else {
+				h.Status(c)
+			}
+			want := `{"error":"generated data unavailable"}`
+			if endpoint == "/api/v1/pipeline/status" {
+				want = `{"error":"pipeline status unavailable"}`
+			}
+			if recorder.Code != http.StatusInternalServerError || recorder.Body.String() != want {
+				t.Fatalf("status=%d body=%s, want fixed bounded-reader error", recorder.Code, recorder.Body.String())
+			}
+		})
 	}
 }
 
@@ -3559,9 +3676,13 @@ func TestStatusAndPipelineStatusSuggestedQueriesNoDataReturnsEmptySlice(t *testi
 }
 
 func validSuggestedQueriesJSON() string {
-	candidates := make([]suggestedqueries.Candidate, 0, 20)
+	return suggestedQueriesJSONWithCount(20)
+}
+
+func suggestedQueriesJSONWithCount(count int) string {
+	candidates := make([]suggestedqueries.Candidate, 0, count)
 	questions := []string{"哪些概念值得一起比較？", "如何探索這個主題的不同面向？", "哪些選擇適合進一步查找？"}
-	for i := 3; i < 20; i++ {
+	for i := 3; i < count; i++ {
 		questions = append(questions, fmt.Sprintf("What else should I explore in concept %d?", i))
 	}
 	for _, question := range questions {
@@ -3577,6 +3698,69 @@ func validSuggestedQueriesJSON() string {
 		panic(err)
 	}
 	return string(data)
+}
+
+type suggestedQueriesReadSpyRoot struct {
+	*localfs.Client
+	data         []byte
+	limitedErr   error
+	genericReads int
+	limitedReads int
+	limits       []int64
+}
+
+func (r *suggestedQueriesReadSpyRoot) Scope(userID, projectID string) store.Store {
+	return &suggestedQueriesReadSpyStore{Store: r.Client.Scope(userID, projectID), root: r}
+}
+
+type suggestedQueriesReadSpyStore struct {
+	store.Store
+	root *suggestedQueriesReadSpyRoot
+}
+
+func (s *suggestedQueriesReadSpyStore) ReadFile(ctx context.Context, path string) ([]byte, error) {
+	if path != suggestedqueries.Path {
+		return s.Store.ReadFile(ctx, path)
+	}
+	s.root.genericReads++
+	return append([]byte(nil), s.root.data...), nil
+}
+
+func (s *suggestedQueriesReadSpyStore) ReadFileLimited(ctx context.Context, path string, limit int64) ([]byte, error) {
+	if path != suggestedqueries.Path {
+		return s.Store.(interface {
+			ReadFileLimited(context.Context, string, int64) ([]byte, error)
+		}).ReadFileLimited(ctx, path, limit)
+	}
+	s.root.limitedReads++
+	s.root.limits = append(s.root.limits, limit)
+	if s.root.limitedErr != nil {
+		return nil, s.root.limitedErr
+	}
+	return append([]byte(nil), s.root.data...), nil
+}
+
+type suggestedQueriesUnboundedRoot struct {
+	*localfs.Client
+	data         []byte
+	genericReads int
+}
+
+func (r *suggestedQueriesUnboundedRoot) Scope(userID, projectID string) store.Store {
+	return &suggestedQueriesUnboundedStore{Store: r.Client.Scope(userID, projectID), root: r}
+}
+
+type suggestedQueriesUnboundedStore struct {
+	store.Store
+	root *suggestedQueriesUnboundedRoot
+}
+
+func (s *suggestedQueriesUnboundedStore) ReadFile(ctx context.Context, path string) ([]byte, error) {
+	if path != suggestedqueries.Path {
+		return s.Store.ReadFile(ctx, path)
+	}
+	s.root.genericReads++
+	return append([]byte(nil), s.root.data...), nil
 }
 
 func mustSuggestedQueries(t *testing.T, data string) []string {

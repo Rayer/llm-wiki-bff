@@ -3,12 +3,14 @@ package suggestedqueries
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	conceptcache "github.com/rayer/llm-wiki-bff/internal/cache"
+	"github.com/rayer/llm-wiki-bff/internal/generation"
 )
 
 func TestDecodeReturnsQueries(t *testing.T) {
@@ -35,6 +37,72 @@ func TestDecodeRejectsLogicalEntryOverflow(t *testing.T) {
 	if _, err := Decode([]byte(data)); err == nil || err.Error() != "generated cache logical entry limit exceeded" {
 		t.Fatalf("Decode() error = %v, want fixed logical-entry error", err)
 	}
+}
+
+func TestDecodeRejectsOversizedArtifactBeforeNormalDecode(t *testing.T) {
+	artifact := readCardinalityArtifact(20)
+	artifact.UpdatedAt = strings.Repeat("x", 128<<10)
+	data, err := json.Marshal(artifact)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(data) <= 128<<10 {
+		t.Fatalf("fixture bytes = %d, want over 128 KiB", len(data))
+	}
+	if _, err := Decode(data); err == nil {
+		t.Fatal("Decode() accepted an artifact over the feature byte bound")
+	}
+}
+
+func TestDecodeRejectsPublishedQueryOverflowAtFeatureLimit(t *testing.T) {
+	data := []byte(`{"version":2,"queries":[` + strings.Repeat(`"q",`, MaxQueries) + `"overflow"],"candidates":[],"updated_at":""}`)
+	if _, err := Decode(data); !errors.Is(err, generation.ErrLogicalEntryLimit) {
+		t.Fatalf("Decode() error = %v, want feature logical-entry limit", err)
+	}
+}
+
+func TestDecodeRejectsOversizedPublishedQuery(t *testing.T) {
+	data := []byte(`{"version":2,"queries":["` + strings.Repeat("q", MaxQuestionBytes+1) + `"],"candidates":[],"updated_at":""}`)
+	if _, err := Decode(data); err == nil {
+		t.Fatal("Decode() accepted an oversized published query")
+	}
+}
+
+func TestIsPublishableReadCardinalityMatrix(t *testing.T) {
+	for _, tc := range []struct {
+		count int
+		want  bool
+	}{
+		{count: 0, want: false},
+		{count: 1, want: false},
+		{count: 2, want: false},
+		{count: 3, want: true},
+		{count: 4, want: true},
+		{count: 5, want: true},
+		{count: 6, want: false},
+		{count: 19, want: false},
+		{count: 20, want: true},
+		{count: 21, want: false},
+	} {
+		t.Run(strconv.Itoa(tc.count), func(t *testing.T) {
+			if got := IsPublishable(readCardinalityArtifact(tc.count)); got != tc.want {
+				t.Fatalf("IsPublishable(%d) = %t, want %t", tc.count, got, tc.want)
+			}
+		})
+	}
+}
+
+func readCardinalityArtifact(count int) Artifact {
+	candidates := make([]Candidate, count)
+	for i := range candidates {
+		candidates[i] = Candidate{
+			Question:               "Explore concept " + strconv.Itoa(i) + "?",
+			Intent:                 "discovery",
+			CorpusAnchorConceptIDs: []string{"c1"},
+			Generation:             GenerationMetadata{Model: "fixture", PromptVersion: "v1"},
+		}
+	}
+	return ArtifactFromCandidates(candidates, time.Unix(0, 0))
 }
 
 func TestQueriesReturnsEmptySliceForNil(t *testing.T) {
