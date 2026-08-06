@@ -164,14 +164,32 @@ func main() {
 		settingsStore = syssettings.NewStore(nil, cfg.RegistrationEnabled)
 	}
 
-	r := newProductionRouter(cfg, localMode, gcsClient, fsClient, hV1, settingsStore)
+	r := newProductionRouter(cfg, localMode, gcsClient, fsClient, hV1, settingsStore, defaultRawScrapeHandlerFactory)
 
 	log.Printf("BFF listening on :%s", cfg.Port)
 	log.Printf("Swagger UI: http://localhost:%s/swagger/index.html", cfg.Port)
 	log.Fatal(r.Run(":" + cfg.Port))
 }
 
-func newProductionRouter(cfg config.Config, localMode bool, gcsClient *gcs.Client, fsClient *firestore.Client, hV1 *handlerv1.Handler, settingsStore syssettings.RegistrationGate) *gin.Engine {
+type rawScrapeHandler interface {
+	ScrapeRaw(*gin.Context)
+}
+
+type rawScrapeHandlerFactory func(scopedClient *gcs.Client, fsClient *firestore.Client) rawScrapeHandler
+
+func defaultRawScrapeHandlerFactory(scopedClient *gcs.Client, fsClient *firestore.Client) rawScrapeHandler {
+	return handlerraw.New(scopedClient, fsClient, nil, nil, nil)
+}
+
+func newProductionRouter(
+	cfg config.Config,
+	localMode bool,
+	gcsClient *gcs.Client,
+	fsClient *firestore.Client,
+	hV1 *handlerv1.Handler,
+	settingsStore syssettings.RegistrationGate,
+	rawScrapeFactory rawScrapeHandlerFactory,
+) *gin.Engine {
 	r := gin.Default()
 	r.Use(middleware.SecurityHeaders(!cfg.DevJWT))
 
@@ -249,7 +267,7 @@ func newProductionRouter(cfg config.Config, localMode bool, gcsClient *gcs.Clien
 		v1.POST("/pipeline/run", hV1.PipelineRun)
 		v1.GET("/pipeline/status", hV1.PipelineStatus)
 		v1.GET("/pipeline/log", hV1.PipelineLog)
-		registerRawScrapeRoute(v1, gcsClient, fsClient)
+		registerRawScrapeRoute(v1, gcsClient, fsClient, rawScrapeFactory)
 		v1.GET("/raw", hV1.RawList)
 		v1.GET("/raw/:filename", hV1.RawPreview)
 		v1.POST("/raw/upload", hV1.RawUpload)
@@ -302,11 +320,14 @@ func registerAdminRoutes(r *gin.Engine, cfg config.Config, hV1 *handlerv1.Handle
 	}
 }
 
-func registerRawScrapeRoute(v1 *gin.RouterGroup, gcsClient *gcs.Client, fsClient *firestore.Client) {
+func registerRawScrapeRoute(v1 *gin.RouterGroup, gcsClient *gcs.Client, fsClient *firestore.Client, rawScrapeFactory rawScrapeHandlerFactory) {
 	v1.POST("/raw/scrape", func(c *gin.Context) {
 		if gcsClient == nil {
 			c.JSON(http.StatusServiceUnavailable, handlerraw.ErrorResponse{Error: "storage client is not configured"})
 			return
+		}
+		if rawScrapeFactory == nil {
+			rawScrapeFactory = defaultRawScrapeHandlerFactory
 		}
 
 		userID := strings.TrimSpace(c.GetString("userID"))
@@ -320,7 +341,7 @@ func registerRawScrapeRoute(v1 *gin.RouterGroup, gcsClient *gcs.Client, fsClient
 			return
 		}
 
-		rawScrapeHandler := handlerraw.New(gcsClient.WithScope(userID, projectID), fsClient, nil, nil, nil)
+		rawScrapeHandler := rawScrapeFactory(gcsClient.WithScope(userID, projectID), fsClient)
 		rawScrapeHandler.ScrapeRaw(c)
 	})
 }

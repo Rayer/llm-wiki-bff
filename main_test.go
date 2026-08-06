@@ -16,7 +16,9 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/rayer/llm-wiki-bff/internal/auth"
 	"github.com/rayer/llm-wiki-bff/internal/config"
+	"github.com/rayer/llm-wiki-bff/internal/firestore"
 	"github.com/rayer/llm-wiki-bff/internal/gcs"
+	handlerraw "github.com/rayer/llm-wiki-bff/internal/handler"
 	handlerv1 "github.com/rayer/llm-wiki-bff/internal/handler/v1"
 	"github.com/rayer/llm-wiki-bff/internal/middleware"
 	"github.com/rayer/llm-wiki-bff/internal/syssettings"
@@ -145,6 +147,12 @@ func TestPublicVersionRouteDoesNotRequireAuthOrProject(t *testing.T) {
 
 func TestProductionRouterRegistersRawScrapeRouteUnderAuthAndProjectMiddleware(t *testing.T) {
 	gin.SetMode(gin.TestMode)
+	var capturedScopedClient *gcs.Client
+	recordingFactory := func(scopedClient *gcs.Client, fsClient *firestore.Client) rawScrapeHandler {
+		capturedScopedClient = scopedClient
+		return rawScrapeTestHandler{}
+	}
+
 	router := newProductionRouter(
 		config.Config{DevJWT: true, JWTSecret: "test-secret", AllowedOrigins: []string{"http://example.test"}},
 		false,
@@ -152,6 +160,7 @@ func TestProductionRouterRegistersRawScrapeRouteUnderAuthAndProjectMiddleware(t 
 		nil,
 		handlerv1.New(nil, nil, nil, nil, nil, nil),
 		&syssettings.FakeStore{Enabled: true},
+		recordingFactory,
 	)
 
 	registered := 0
@@ -181,17 +190,50 @@ func TestProductionRouterRegistersRawScrapeRouteUnderAuthAndProjectMiddleware(t 
 	if recorder := request("", "demo"); recorder.Code != http.StatusUnauthorized {
 		t.Fatalf("missing DevJWT user status = %d, want %d", recorder.Code, http.StatusUnauthorized)
 	}
-	if recorder := request("tenant-user", ""); recorder.Code != http.StatusBadRequest {
+
+	recorder := request("tenant-user", "")
+	if recorder.Code != http.StatusBadRequest {
 		t.Fatalf("missing project status = %d, want %d", recorder.Code, http.StatusBadRequest)
 	}
+	var missingProjectBody map[string]string
+	if err := json.Unmarshal(recorder.Body.Bytes(), &missingProjectBody); err != nil {
+		t.Fatalf("decode missing-project response: %v", err)
+	}
+	if got := missingProjectBody["error"]; got != "invalid X-Project-ID header" {
+		t.Fatalf("missing project error = %q, want %q", got, "invalid X-Project-ID header")
+	}
 
-	recorder := request("tenant-user", "demo")
+	if capturedScopedClient != nil {
+		t.Fatal("project-scoped raw scrape handler factory should not have been invoked without middleware passing projectID")
+	}
+
+	recorder = request("tenant-user", "demo")
 	if recorder.Code == http.StatusNotFound {
 		t.Fatal("unexpected 404 for production POST /api/v1/raw/scrape")
 	}
 	if recorder.Code != http.StatusBadRequest {
 		t.Fatalf("production raw scrape status = %d, want %d from scrape handler", recorder.Code, http.StatusBadRequest)
 	}
+	if capturedScopedClient == nil {
+		t.Fatal("raw scrape factory was not invoked for authenticated user+project request")
+	}
+	if got := capturedScopedClient.Prefix(); got != "users/tenant-user/projects/demo" {
+		t.Fatalf("scoped gcs client prefix = %q, want %q", got, "users/tenant-user/projects/demo")
+	}
+
+	var rawBody map[string]string
+	if err := json.Unmarshal(recorder.Body.Bytes(), &rawBody); err != nil {
+		t.Fatalf("decode raw scrape response: %v", err)
+	}
+	if got := rawBody["error"]; got != "fake raw scrape handler" {
+		t.Fatalf("raw scrape error = %q, want %q", got, "fake raw scrape handler")
+	}
+}
+
+type rawScrapeTestHandler struct{}
+
+func (rawScrapeTestHandler) ScrapeRaw(c *gin.Context) {
+	c.JSON(http.StatusBadRequest, handlerraw.ErrorResponse{Error: "fake raw scrape handler"})
 }
 
 func readSwaggerDocument(t *testing.T) struct {
