@@ -149,7 +149,21 @@ type ScrapeResponse struct {
 	Bytes    int64  `json:"bytes"`
 }
 
-// ScrapeRaw handles POST /api/v1/raw/scrape — scrape a URL and save as raw markdown.
+// ScrapeRaw handles POST /api/v1/raw/scrape.
+//
+//	@Summary	Scrape URL content into raw markdown
+//	@Description	Scrape a URL into markdown and save it under the scoped raw store.
+//	@Tags		raw
+//	@Accept		json
+//	@Produce	json
+//	@Param		request	body		handler.ScrapeRequest	true	"URL and optional filename"
+//	@Success	200		{object}	handler.ScrapeResponse
+//	@Failure	400		{object}	handler.ErrorResponse
+//	@Failure	401		{object}	handler.ErrorResponse
+//	@Failure	500		{object}	handler.ErrorResponse
+//	@Failure	503		{object}	handler.ErrorResponse
+//	@Security	BearerAuth || ProjectHeader
+//	@Router		/api/v1/raw/scrape [post]
 func (h *Handler) ScrapeRaw(c *gin.Context) {
 	var req ScrapeRequest
 	if err := c.ShouldBindJSON(&req); err != nil {

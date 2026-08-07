@@ -308,6 +308,31 @@ definitions:
       ready:
         type: boolean
     type: object
+  handler.ScrapeRequest:
+    properties:
+      filename:
+        description: optional; derived from URL title if empty
+        type: string
+      url:
+        type: string
+    required:
+    - url
+    type: object
+  handler.ScrapeResponse:
+    properties:
+      bytes:
+        type: integer
+      digest:
+        type: string
+      filename:
+        type: string
+      message:
+        type: string
+      path:
+        type: string
+      title:
+        type: string
+    type: object
   handler.SourceDetailResponse:
     properties:
       ann_updated_at:
@@ -637,8 +662,7 @@ paths:
     post:
       consumes:
       - application/json
-      description: Invokes the Cloud Run worker job for the specified project, then
-        rebuilds the search index.
+      description: Invokes the Cloud Run worker job for the specified project, then rebuilds the search index.
       parameters:
       - description: Project doc ID ({userID}_{projectID})
         in: path
@@ -1403,6 +1427,47 @@ paths:
       summary: Search wiki content
       tags:
       - search
+  /api/v1/raw/scrape:
+    post:
+      consumes:
+      - application/json
+      description: Scrape a URL into markdown and save it under the scoped raw store.
+      parameters:
+      - description: URL and optional filename
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/handler.ScrapeRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/handler.ScrapeResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+        "503":
+          description: Service Unavailable
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+      security:
+      - BearerAuth: []
+        ProjectHeader: []
+      summary: Scrape URL content into raw markdown
+      tags:
+      - raw
   /api/v1/ready:
     get:
       description: Returns 200 when the concept cache is warm for the request scope.
