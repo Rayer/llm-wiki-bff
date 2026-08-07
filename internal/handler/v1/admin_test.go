@@ -184,14 +184,22 @@ func TestAdminProjectRecordFromFirestoreDocRejectsMismatchedStoredProjectID(t *t
 }
 
 type adminDeleteTestBackend struct {
-	user            adminDeleteDocument
-	projects        []adminDeleteDocument
-	events          *[]string
-	listProjectsErr error
-	failProjectID   string
-	projectErr      error
-	failMarkerID    string
-	markerErr       error
+	user                adminDeleteDocument
+	projects            []adminDeleteDocument
+	userProjects        []adminDeleteDocument
+	expectedUserID      string
+	listUserProjectsID  string
+	deleteUserProjectID string
+	deleteUserID        string
+	events              *[]string
+	listProjectsErr     error
+	listUserProjectsErr error
+	failProjectID       string
+	projectErr          error
+	failMarkerID        string
+	markerErr           error
+	failUserProjectID   string
+	userProjectErr      error
 }
 
 func (b *adminDeleteTestBackend) getUser(context.Context, string) (adminDeleteDocument, error) {
@@ -209,6 +217,14 @@ func (b *adminDeleteTestBackend) getProject(_ context.Context, id string) (admin
 
 func (b *adminDeleteTestBackend) listProjects(context.Context) ([]adminDeleteDocument, error) {
 	return append([]adminDeleteDocument(nil), b.projects...), b.listProjectsErr
+}
+
+func (b *adminDeleteTestBackend) listUserProjects(_ context.Context, userID string) ([]adminDeleteDocument, error) {
+	b.listUserProjectsID = userID
+	if b.expectedUserID != "" && userID != b.expectedUserID {
+		return nil, fmt.Errorf("list user projects called for %q, want %q", userID, b.expectedUserID)
+	}
+	return append([]adminDeleteDocument(nil), b.userProjects...), b.listUserProjectsErr
 }
 
 func (b *adminDeleteTestBackend) deleteLock(_ context.Context, userID, projectID string) error {
@@ -256,7 +272,33 @@ func (b *adminDeleteTestBackend) deleteProjectMetadata(_ context.Context, id str
 	return nil
 }
 
-func (b *adminDeleteTestBackend) deleteUser(context.Context, string) error {
+func (b *adminDeleteTestBackend) deleteUserProjectMetadata(_ context.Context, userID, id string) error {
+	b.deleteUserProjectID = userID
+	if b.expectedUserID != "" && userID != b.expectedUserID {
+		return fmt.Errorf("delete user project called for %q, want %q", userID, b.expectedUserID)
+	}
+	*b.events = append(*b.events, "user-project:"+id)
+	if id == b.failUserProjectID {
+		b.failUserProjectID = ""
+		if b.userProjectErr != nil {
+			return b.userProjectErr
+		}
+		return errors.New("injected user project metadata failure")
+	}
+	for i, candidate := range b.userProjects {
+		if candidate.id == id {
+			b.userProjects = append(b.userProjects[:i], b.userProjects[i+1:]...)
+			break
+		}
+	}
+	return nil
+}
+
+func (b *adminDeleteTestBackend) deleteUser(_ context.Context, userID string) error {
+	b.deleteUserID = userID
+	if b.expectedUserID != "" && userID != b.expectedUserID {
+		return fmt.Errorf("delete user called for %q, want %q", userID, b.expectedUserID)
+	}
 	*b.events = append(*b.events, "user")
 	return nil
 }
@@ -479,6 +521,143 @@ func TestAdminDeleteUserFailsClosedWhenProjectListingFailsAfterPartialResults(t 
 	_, projectRemains := backend.projectByID(project.id)
 	assert.True(t, projectRemains, "project retry anchor must remain")
 	assert.Equal(t, "user-a", backend.user.id, "user retry anchor must remain")
+}
+
+func TestAdminDeleteUserDeletesUserScopedProjectMetadataBeforeUser(t *testing.T) {
+	events := []string{}
+	backend := &adminDeleteTestBackend{
+		user:           adminDeleteDocument{id: "user-a"},
+		userProjects:   []adminDeleteDocument{{id: "zeta"}, {id: "default"}, {id: "项目-α"}},
+		expectedUserID: "user-a",
+		events:         &events,
+	}
+	h := newAdminDeleteRecordingHandler(backend, &events)
+
+	recorder := invokeHandlerWithParams(h.AdminDeleteUser, http.MethodDelete, "/admin/users/user-a", gin.Params{{Key: "id", Value: "user-a"}})
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	assert.Equal(t, []string{"user-project:default", "user-project:zeta", "user-project:项目-α", "user"}, events)
+	assert.Empty(t, backend.userProjects)
+	assert.Equal(t, "user-a", backend.listUserProjectsID)
+	assert.Equal(t, "user-a", backend.deleteUserProjectID)
+}
+
+func TestAdminDeleteUserOrdersAllCleanupPhasesDeterministically(t *testing.T) {
+	events := []string{}
+	backend := &adminDeleteTestBackend{
+		user: adminDeleteDocument{id: "user-a"},
+		projects: []adminDeleteDocument{
+			adminDeleteMarkerDocWithKey("user-a_idem-z", "project-z", "idem-z", true),
+			adminDeleteProjectDoc("user-a_project-z", "user-a", "project-z"),
+			adminDeleteMarkerDocWithKey("user-a_idem-a", "project-a", "idem-a", true),
+			adminDeleteProjectDoc("user-a_project-a", "user-a", "project-a"),
+		},
+		userProjects:   []adminDeleteDocument{{id: "zeta"}, {id: "default"}, {id: "项目-α"}},
+		expectedUserID: "user-a",
+		events:         &events,
+	}
+	h := newAdminDeleteRecordingHandler(backend, &events)
+
+	recorder := invokeHandlerWithParams(h.AdminDeleteUser, http.MethodDelete, "/admin/users/user-a", gin.Params{{Key: "id", Value: "user-a"}})
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	assert.Equal(t, []string{
+		"gcs:user-a/project-a", "lock:user-a/project-a", "project:user-a_project-a",
+		"gcs:user-a/project-z", "lock:user-a/project-z", "project:user-a_project-z",
+		"marker:user-a_idem-a", "marker:user-a_idem-z",
+		"user-project:default", "user-project:zeta", "user-project:项目-α", "user",
+	}, events)
+	assert.Equal(t, "user-a", backend.deleteUserProjectID)
+	assert.Equal(t, "user-a", backend.deleteUserID)
+}
+
+func TestAdminDeleteUserRejectsUnsafeListedUserProjectIDBeforeCleanup(t *testing.T) {
+	for _, projectID := range []string{"", ".", "..", "bad/id", `bad\id`, "bad\x00id", "bad\nid", "bad\u0085id", "bad\u202eid", "bad\u2028id", "bad\u2029id"} {
+		t.Run(fmt.Sprintf("%q", projectID), func(t *testing.T) {
+			events := []string{}
+			backend := &adminDeleteTestBackend{
+				user:         adminDeleteDocument{id: "user-a"},
+				userProjects: []adminDeleteDocument{{id: "valid"}, {id: projectID}},
+				events:       &events,
+			}
+			h := newAdminDeleteRecordingHandler(backend, &events)
+
+			recorder := invokeHandlerWithParams(h.AdminDeleteUser, http.MethodDelete, "/admin/users/user-a", gin.Params{{Key: "id", Value: "user-a"}})
+
+			assert.Equal(t, http.StatusInternalServerError, recorder.Code)
+			assert.Empty(t, events, "unsafe listed child ID must fail before cleanup mutations")
+			assert.Len(t, backend.userProjects, 2)
+		})
+	}
+}
+
+func TestAdminDeleteUserRetryReenumeratesRemainingUserProjects(t *testing.T) {
+	events := []string{}
+	backend := &adminDeleteTestBackend{
+		user:              adminDeleteDocument{id: "user-a"},
+		userProjects:      []adminDeleteDocument{{id: "alpha"}, {id: "beta"}},
+		expectedUserID:    "user-a",
+		failUserProjectID: "beta",
+		userProjectErr:    errors.New("injected user project metadata failure"),
+		events:            &events,
+	}
+	h := newAdminDeleteRecordingHandler(backend, &events)
+
+	first := invokeHandlerWithParams(h.AdminDeleteUser, http.MethodDelete, "/admin/users/user-a", gin.Params{{Key: "id", Value: "user-a"}})
+	if first.Code != http.StatusInternalServerError {
+		t.Fatalf("first status=%d body=%s", first.Code, first.Body.String())
+	}
+	assert.Equal(t, []adminDeleteDocument{{id: "beta"}}, backend.userProjects)
+	assert.Equal(t, "user-a", backend.user.id)
+
+	second := invokeHandlerWithParams(h.AdminDeleteUser, http.MethodDelete, "/admin/users/user-a", gin.Params{{Key: "id", Value: "user-a"}})
+	if second.Code != http.StatusOK {
+		t.Fatalf("second status=%d body=%s", second.Code, second.Body.String())
+	}
+	assert.Empty(t, backend.userProjects)
+	assert.Equal(t, "user-a", backend.listUserProjectsID)
+	assert.Equal(t, "user-a", backend.deleteUserProjectID)
+	assert.Equal(t, "user-a", backend.deleteUserID)
+	assert.Equal(t, []string{"user-project:alpha", "user-project:beta", "user-project:beta", "user"}, events)
+}
+
+func TestAdminDeleteUserFailsClosedWhenUserProjectListingFails(t *testing.T) {
+	events := []string{}
+	backend := &adminDeleteTestBackend{
+		user:                adminDeleteDocument{id: "user-a"},
+		userProjects:        []adminDeleteDocument{{id: "default"}},
+		listUserProjectsErr: errors.New("listing interrupted"),
+		events:              &events,
+	}
+	h := newAdminDeleteRecordingHandler(backend, &events)
+
+	recorder := invokeHandlerWithParams(h.AdminDeleteUser, http.MethodDelete, "/admin/users/user-a", gin.Params{{Key: "id", Value: "user-a"}})
+
+	assert.Equal(t, http.StatusInternalServerError, recorder.Code)
+	assert.Empty(t, events, "a failed user-project listing must not start cleanup")
+	assert.Len(t, backend.userProjects, 1)
+}
+
+func TestAdminDeleteUserDoesNotDeleteUserAfterUserProjectMetadataFailure(t *testing.T) {
+	events := []string{}
+	backend := &adminDeleteTestBackend{
+		user:              adminDeleteDocument{id: "user-a"},
+		userProjects:      []adminDeleteDocument{{id: "default"}},
+		failUserProjectID: "default",
+		userProjectErr:    errors.New("metadata delete failed"),
+		events:            &events,
+	}
+	h := newAdminDeleteRecordingHandler(backend, &events)
+
+	recorder := invokeHandlerWithParams(h.AdminDeleteUser, http.MethodDelete, "/admin/users/user-a", gin.Params{{Key: "id", Value: "user-a"}})
+
+	assert.Equal(t, http.StatusInternalServerError, recorder.Code)
+	assert.Equal(t, []string{"user-project:default"}, events)
+	assert.Len(t, backend.userProjects, 1)
 }
 
 func TestAdminDeleteProjectListResultOnlyTreatsIteratorDoneAsExhaustion(t *testing.T) {

@@ -10,9 +10,11 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"cloud.google.com/go/firestore"
 	"cloud.google.com/go/storage"
@@ -2282,9 +2284,11 @@ type adminDeleteBackend interface {
 	getUser(context.Context, string) (adminDeleteDocument, error)
 	getProject(context.Context, string) (adminDeleteDocument, error)
 	listProjects(context.Context) ([]adminDeleteDocument, error)
+	listUserProjects(context.Context, string) ([]adminDeleteDocument, error)
 	deleteLock(context.Context, string, string) error
 	deleteProject(context.Context, string) error
 	deleteProjectMetadata(context.Context, string) error
+	deleteUserProjectMetadata(context.Context, string, string) error
 	deleteUser(context.Context, string) error
 }
 
@@ -2322,11 +2326,37 @@ func (b firestoreAdminDeleteBackend) listProjects(ctx context.Context) ([]adminD
 	}
 }
 
+func (b firestoreAdminDeleteBackend) listUserProjects(ctx context.Context, userID string) ([]adminDeleteDocument, error) {
+	iter := b.fs.Collection("users").Doc(userID).Collection("projects").Documents(ctx)
+	defer iter.Stop()
+
+	documents := make([]adminDeleteDocument, 0)
+	for {
+		doc, err := iter.Next()
+		if err != nil {
+			return adminDeleteProjectListResult(documents, err)
+		}
+		documents = append(documents, adminDeleteDocument{id: doc.Ref.ID, data: doc.Data()})
+	}
+}
+
 func adminDeleteProjectListResult(documents []adminDeleteDocument, err error) ([]adminDeleteDocument, error) {
 	if errors.Is(err, iterator.Done) {
 		return documents, nil
 	}
 	return nil, err
+}
+
+func validAdminDeleteUserProjectID(projectID string) bool {
+	if !auth.ValidPathSegment(projectID) {
+		return false
+	}
+	for _, r := range projectID {
+		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) || r == '\u2028' || r == '\u2029' {
+			return false
+		}
+	}
+	return true
 }
 
 func (b firestoreAdminDeleteBackend) deleteLock(ctx context.Context, userID, projectID string) error {
@@ -2339,6 +2369,10 @@ func (b firestoreAdminDeleteBackend) deleteProject(ctx context.Context, docID st
 
 func (b firestoreAdminDeleteBackend) deleteProjectMetadata(ctx context.Context, docID string) error {
 	return deleteAdminFirestoreDoc(ctx, b.fs.Collection("projects").Doc(docID))
+}
+
+func (b firestoreAdminDeleteBackend) deleteUserProjectMetadata(ctx context.Context, userID, projectID string) error {
+	return deleteAdminFirestoreDoc(ctx, b.fs.Collection("users").Doc(userID).Collection("projects").Doc(projectID))
 }
 
 func (b firestoreAdminDeleteBackend) deleteUser(ctx context.Context, userID string) error {
@@ -2997,8 +3031,26 @@ func (h *Handler) AdminDeleteUser(c *gin.Context) {
 		markerIDs = append(markerIDs, marker.id)
 		markerRecords[marker.id] = marker
 	}
+	sort.Strings(projectIDs)
+	sort.Strings(markerIDs)
 
-	if err := deleteAdminUserResourcesWithMarkers(ctx, projectIDs, markerIDs, func(ctx context.Context, projectID string) error {
+	userProjectDocuments, err := backend.listUserProjects(ctx, userID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "user delete unavailable"})
+		return
+	}
+	userProjectIDs := make([]string, 0, len(userProjectDocuments))
+	for _, doc := range userProjectDocuments {
+		if !validAdminDeleteUserProjectID(doc.id) {
+			logAdminDelete("user", "validation_failed", userID, "")
+			c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "user delete unavailable"})
+			return
+		}
+		userProjectIDs = append(userProjectIDs, doc.id)
+	}
+	sort.Strings(userProjectIDs)
+
+	if err := deleteAdminUserResourcesWithUserProjects(ctx, projectIDs, markerIDs, userProjectIDs, func(ctx context.Context, projectID string) error {
 		project, ok := projectRecords[projectID]
 		if !ok {
 			return errAdminDeleteCleanup
@@ -3024,6 +3076,9 @@ func (h *Handler) AdminDeleteUser(c *gin.Context) {
 		}
 		logAdminDelete("user", "marker", marker.userID, marker.projectID)
 		return backend.deleteProjectMetadata(ctx, marker.id)
+	}, func(ctx context.Context, projectID string) error {
+		logAdminDelete("user", "user_project", userID, projectID)
+		return backend.deleteUserProjectMetadata(ctx, userID, projectID)
 	}, func(ctx context.Context) error {
 		logAdminDelete("user", "user", userID, "")
 		return backend.deleteUser(ctx, userID)
@@ -3061,11 +3116,12 @@ func deleteAdminProjectResources(ctx context.Context, deleteGCS, deleteLock, del
 	return nil
 }
 
-// deleteAdminUserResourcesWithMarkers deletes real projects, then owned
-// idempotency marker metadata, then the user document. A retry re-enumerates
-// whichever documents remain as anchors for convergent cleanup.
-func deleteAdminUserResourcesWithMarkers(ctx context.Context, projectIDs, markerIDs []string, deleteProject func(context.Context, string) error, deleteMarker func(context.Context, string) error, deleteUser func(context.Context) error) error {
-	if deleteProject == nil || deleteMarker == nil || deleteUser == nil {
+// deleteAdminUserResourcesWithUserProjects deletes real projects, then owned
+// idempotency marker metadata, then user-scoped project metadata, then the
+// user document. A retry re-enumerates whichever documents remain as anchors
+// for convergent cleanup.
+func deleteAdminUserResourcesWithUserProjects(ctx context.Context, projectIDs, markerIDs, userProjectIDs []string, deleteProject func(context.Context, string) error, deleteMarker func(context.Context, string) error, deleteUserProject func(context.Context, string) error, deleteUser func(context.Context) error) error {
+	if deleteProject == nil || deleteMarker == nil || deleteUserProject == nil || deleteUser == nil {
 		return errAdminDeleteCleanup
 	}
 	for _, projectID := range projectIDs {
@@ -3078,10 +3134,19 @@ func deleteAdminUserResourcesWithMarkers(ctx context.Context, projectIDs, marker
 			return errors.Join(errAdminDeleteCleanup, err)
 		}
 	}
+	for _, userProjectID := range userProjectIDs {
+		if err := deleteUserProject(ctx, userProjectID); err != nil {
+			return errors.Join(errAdminDeleteCleanup, err)
+		}
+	}
 	if err := deleteUser(ctx); err != nil {
 		return errors.Join(errAdminDeleteCleanup, err)
 	}
 	return nil
+}
+
+func deleteAdminUserResourcesWithMarkers(ctx context.Context, projectIDs, markerIDs []string, deleteProject func(context.Context, string) error, deleteMarker func(context.Context, string) error, deleteUser func(context.Context) error) error {
+	return deleteAdminUserResourcesWithUserProjects(ctx, projectIDs, markerIDs, nil, deleteProject, deleteMarker, func(context.Context, string) error { return nil }, deleteUser)
 }
 
 func deleteAdminUserResources(ctx context.Context, projectIDs []string, deleteProject func(context.Context, string) error, deleteUser func(context.Context) error) error {
