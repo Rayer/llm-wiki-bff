@@ -221,7 +221,7 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "description": "Invokes the Cloud Run worker job for the specified project, then rebuilds the search index.",
+                "description": "Invokes the Cloud Run worker job for the specified project. Optional body {\"clean_rebuild\":true} cold-starts Synto from raw without prior wiki/state.",
                 "consumes": [
                     "application/json"
                 ],
@@ -231,7 +231,7 @@ const docTemplate = `{
                 "tags": [
                     "admin"
                 ],
-                "summary": "Trigger pipeline + rebuild for a project (admin)",
+                "summary": "Trigger pipeline for a project (admin)",
                 "parameters": [
                     {
                         "type": "string",
@@ -239,6 +239,14 @@ const docTemplate = `{
                         "name": "id",
                         "in": "path",
                         "required": true
+                    },
+                    {
+                        "description": "Optional flags",
+                        "name": "body",
+                        "in": "body",
+                        "schema": {
+                            "type": "object"
+                        }
                     }
                 ],
                 "responses": {
@@ -1396,6 +1404,72 @@ const docTemplate = `{
                 }
             }
         },
+        "/api/v1/raw/scrape": {
+            "post": {
+                "security": [
+                    {
+                        "DevUserAuth": []
+                    },
+                    {
+                        "ProjectHeader": []
+                    }
+                ],
+                "description": "Scrape a URL into markdown and save it under the scoped raw store.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "raw"
+                ],
+                "summary": "Scrape URL content into raw markdown",
+                "parameters": [
+                    {
+                        "description": "URL and optional filename",
+                        "name": "request",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handler.ScrapeRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/handler.ScrapeResponse"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/handler.ErrorResponse"
+                        }
+                    },
+                    "401": {
+                        "description": "Unauthorized",
+                        "schema": {
+                            "$ref": "#/definitions/handler.ErrorResponse"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error",
+                        "schema": {
+                            "$ref": "#/definitions/handler.ErrorResponse"
+                        }
+                    },
+                    "503": {
+                        "description": "Service Unavailable",
+                        "schema": {
+                            "$ref": "#/definitions/handler.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
         "/api/v1/ready": {
             "get": {
                 "security": [
@@ -2155,6 +2229,44 @@ const docTemplate = `{
                 },
                 "ready": {
                     "type": "boolean"
+                }
+            }
+        },
+        "handler.ScrapeRequest": {
+            "type": "object",
+            "required": [
+                "url"
+            ],
+            "properties": {
+                "filename": {
+                    "description": "optional; derived from URL title if empty",
+                    "type": "string"
+                },
+                "url": {
+                    "type": "string"
+                }
+            }
+        },
+        "handler.ScrapeResponse": {
+            "type": "object",
+            "properties": {
+                "bytes": {
+                    "type": "integer"
+                },
+                "digest": {
+                    "type": "string"
+                },
+                "filename": {
+                    "type": "string"
+                },
+                "message": {
+                    "type": "string"
+                },
+                "path": {
+                    "type": "string"
+                },
+                "title": {
+                    "type": "string"
                 }
             }
         },
