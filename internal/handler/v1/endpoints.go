@@ -2316,13 +2316,17 @@ func (b firestoreAdminDeleteBackend) listProjects(ctx context.Context) ([]adminD
 	for {
 		doc, err := iter.Next()
 		if err != nil {
-			if status.Code(err) == codes.NotFound || errors.Is(err, iterator.Done) {
-				return documents, nil
-			}
-			return nil, err
+			return adminDeleteProjectListResult(documents, err)
 		}
 		documents = append(documents, adminDeleteDocument{id: doc.Ref.ID, data: doc.Data()})
 	}
+}
+
+func adminDeleteProjectListResult(documents []adminDeleteDocument, err error) ([]adminDeleteDocument, error) {
+	if errors.Is(err, iterator.Done) {
+		return documents, nil
+	}
+	return nil, err
 }
 
 func (b firestoreAdminDeleteBackend) deleteLock(ctx context.Context, userID, projectID string) error {
@@ -2946,7 +2950,7 @@ func (h *Handler) AdminDeleteUser(c *gin.Context) {
 	// cleanup behavior.
 	documents, err := backend.listProjects(ctx)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "project list unavailable"})
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "user delete unavailable"})
 		return
 	}
 	projects := make([]adminProjectRecord, 0, len(documents))

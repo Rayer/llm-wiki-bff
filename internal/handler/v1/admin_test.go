@@ -14,6 +14,7 @@ import (
 	"github.com/gin-gonic/gin"
 	store "github.com/rayer/llm-wiki-bff/internal/storage"
 	"github.com/stretchr/testify/assert"
+	"google.golang.org/api/iterator"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -183,13 +184,14 @@ func TestAdminProjectRecordFromFirestoreDocRejectsMismatchedStoredProjectID(t *t
 }
 
 type adminDeleteTestBackend struct {
-	user          adminDeleteDocument
-	projects      []adminDeleteDocument
-	events        *[]string
-	failProjectID string
-	projectErr    error
-	failMarkerID  string
-	markerErr     error
+	user            adminDeleteDocument
+	projects        []adminDeleteDocument
+	events          *[]string
+	listProjectsErr error
+	failProjectID   string
+	projectErr      error
+	failMarkerID    string
+	markerErr       error
 }
 
 func (b *adminDeleteTestBackend) getUser(context.Context, string) (adminDeleteDocument, error) {
@@ -206,7 +208,7 @@ func (b *adminDeleteTestBackend) getProject(_ context.Context, id string) (admin
 }
 
 func (b *adminDeleteTestBackend) listProjects(context.Context) ([]adminDeleteDocument, error) {
-	return append([]adminDeleteDocument(nil), b.projects...), nil
+	return append([]adminDeleteDocument(nil), b.projects...), b.listProjectsErr
 }
 
 func (b *adminDeleteTestBackend) deleteLock(_ context.Context, userID, projectID string) error {
@@ -456,6 +458,39 @@ func TestAdminDeleteUserValidatesAllOwnedSnapshotsBeforeAnyDelete(t *testing.T) 
 			}
 		})
 	}
+}
+
+func TestAdminDeleteUserFailsClosedWhenProjectListingFailsAfterPartialResults(t *testing.T) {
+	events := []string{}
+	project := adminDeleteProjectDoc("user-a_project-a", "user-a", "project-a")
+	backend := &adminDeleteTestBackend{
+		user:            adminDeleteDocument{id: "user-a"},
+		projects:        []adminDeleteDocument{project},
+		events:          &events,
+		listProjectsErr: status.Error(codes.NotFound, "listing interrupted"),
+	}
+	h := newAdminDeleteRecordingHandler(backend, &events)
+
+	recorder := invokeHandlerWithParams(h.AdminDeleteUser, http.MethodDelete, "/admin/users/user-a", gin.Params{{Key: "id", Value: "user-a"}})
+
+	assert.Equal(t, http.StatusInternalServerError, recorder.Code)
+	assert.Contains(t, recorder.Body.String(), `"error":"user delete unavailable"`)
+	assert.Empty(t, events, "a failed project listing must not start cleanup")
+	_, projectRemains := backend.projectByID(project.id)
+	assert.True(t, projectRemains, "project retry anchor must remain")
+	assert.Equal(t, "user-a", backend.user.id, "user retry anchor must remain")
+}
+
+func TestAdminDeleteProjectListResultOnlyTreatsIteratorDoneAsExhaustion(t *testing.T) {
+	partial := []adminDeleteDocument{{id: "user-a_project-a"}}
+
+	got, err := adminDeleteProjectListResult(partial, iterator.Done)
+	assert.NoError(t, err)
+	assert.Equal(t, partial, got)
+
+	got, err = adminDeleteProjectListResult(partial, status.Error(codes.NotFound, "listing interrupted"))
+	assert.Error(t, err)
+	assert.Nil(t, got)
 }
 
 func TestAdminDeleteUserSkipsForeignLegacyRealProjectWithShortOwnerPrefix(t *testing.T) {
