@@ -458,6 +458,87 @@ func TestAdminDeleteUserValidatesAllOwnedSnapshotsBeforeAnyDelete(t *testing.T) 
 	}
 }
 
+func TestAdminDeleteUserSkipsForeignLegacyRealProjectWithShortOwnerPrefix(t *testing.T) {
+	events := []string{}
+	backend := &adminDeleteTestBackend{
+		user: adminDeleteDocument{id: "user"},
+		projects: []adminDeleteDocument{
+			adminDeleteLegacyProjectDoc("user_target", "target"),
+			adminDeleteLegacyProjectDoc("user_x_project", "project"),
+		},
+		events: &events,
+	}
+	h := newAdminDeleteRecordingHandler(backend, &events)
+	recorder := invokeHandlerWithParams(h.AdminDeleteUser, http.MethodDelete, "/admin/users/user", gin.Params{{Key: "id", Value: "user"}})
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	assert.Equal(t, []string{
+		"gcs:user/target", "lock:user/target", "project:user_target", "user",
+	}, events)
+}
+
+func TestAdminDeleteUserSkipsForeignLegacyMarkerWithShortOwnerPrefix(t *testing.T) {
+	events := []string{}
+	backend := &adminDeleteTestBackend{
+		user:     adminDeleteDocument{id: "user"},
+		projects: []adminDeleteDocument{adminDeleteMarkerDocWithKey("user_x_idem_key", "project", "idem_key", false)},
+		events:   &events,
+	}
+	h := newAdminDeleteRecordingHandler(backend, &events)
+	recorder := invokeHandlerWithParams(h.AdminDeleteUser, http.MethodDelete, "/admin/users/user", gin.Params{{Key: "id", Value: "user"}})
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	assert.Equal(t, []string{"user"}, events)
+	assert.Len(t, backend.projects, 1)
+}
+
+func TestAdminDeleteUserReversePrefixOwnerDeletesItsLegacyDocuments(t *testing.T) {
+	events := []string{}
+	backend := &adminDeleteTestBackend{
+		user: adminDeleteDocument{id: "user_x"},
+		projects: []adminDeleteDocument{
+			adminDeleteLegacyProjectDoc("user_x_project", "project"),
+			adminDeleteMarkerDocWithKey("user_x_idem_key", "project", "idem_key", false),
+		},
+		events: &events,
+	}
+	h := newAdminDeleteRecordingHandler(backend, &events)
+	recorder := invokeHandlerWithParams(h.AdminDeleteUser, http.MethodDelete, "/admin/users/user_x", gin.Params{{Key: "id", Value: "user_x"}})
+
+	if recorder.Code != http.StatusOK || len(backend.projects) != 0 {
+		t.Fatalf("status=%d remaining=%v body=%s", recorder.Code, backend.projects, recorder.Body.String())
+	}
+	assert.Equal(t, []string{
+		"gcs:user_x/project", "lock:user_x/project", "project:user_x_project",
+		"marker:user_x_idem_key", "user",
+	}, events)
+}
+
+func TestAdminDeleteUserRejectsAmbiguousLegacyRealAndMarkerIdentity(t *testing.T) {
+	events := []string{}
+	backend := &adminDeleteTestBackend{
+		user: adminDeleteDocument{id: "user"},
+		projects: []adminDeleteDocument{{
+			id: "user_x_project",
+			data: map[string]interface{}{
+				"project_id":      "project",
+				"idempotency_key": "x_project",
+			},
+		}},
+		events: &events,
+	}
+	h := newAdminDeleteRecordingHandler(backend, &events)
+	recorder := invokeHandlerWithParams(h.AdminDeleteUser, http.MethodDelete, "/admin/users/user", gin.Params{{Key: "id", Value: "user"}})
+
+	if recorder.Code != http.StatusInternalServerError || len(events) != 0 {
+		t.Fatalf("status=%d events=%v body=%s; want ambiguous identity rejected before mutation", recorder.Code, events, recorder.Body.String())
+	}
+}
+
 func TestAdminDeleteUserDeletesMarkerMetadataAfterRealProjects(t *testing.T) {
 	events := []string{}
 	backend := &adminDeleteTestBackend{

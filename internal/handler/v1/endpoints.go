@@ -207,6 +207,20 @@ func (h *Handler) listFirestoreProjects(ctx context.Context, userID string) ([]h
 }
 
 func projectResponseFromFirestoreDoc(docID string, data map[string]interface{}) (handler.ProjectResponse, string, bool) {
+	if kind, record, ok := classifyAdminProjectDoc(docID, data); ok {
+		if kind == adminIdempotencyMarkerDoc {
+			return handler.ProjectResponse{}, "", false
+		}
+		return handler.ProjectResponse{
+			ID:        record.projectID,
+			Name:      record.name,
+			CreatedAt: firestoreCreatedAt(data["created_at"]),
+		}, record.userID, true
+	}
+
+	// Keep the historical user-list fallback for older real records whose
+	// document suffix was a display label rather than the stored project ID.
+	// Destructive/admin consumers use only the canonical classifier above.
 	userID, docProjectID := splitProjectDocID(docID)
 	if userID == "" {
 		return handler.ProjectResponse{}, "", false
@@ -242,13 +256,8 @@ func projectResponseFromFirestoreDoc(docID string, data map[string]interface{}) 
 // the init-project idempotency cache entry rather than the real project.
 // Cache docs are stored at {userID}_{idempotencyKey} and still carry project_id.
 func isIdempotencyCacheDoc(docID string, data map[string]interface{}) bool {
-	key, _ := data["idempotency_key"].(string)
-	key = strings.TrimSpace(key)
-	if key == "" {
-		return false
-	}
-	_, docSuffix := splitProjectDocID(docID)
-	return strings.TrimSpace(docSuffix) == key
+	kind, _, ok := classifyAdminProjectDoc(docID, data)
+	return ok && kind == adminIdempotencyMarkerDoc
 }
 
 func firestoreCreatedAt(value interface{}) string {
@@ -1966,29 +1975,32 @@ func adminProjectRecordFromFirestoreDoc(docID string, data map[string]interface{
 	return record, true
 }
 
-// classifyAdminProjectDocForOwner validates a project document against an
-// authoritative owner. The owner prefix is exact and the suffix is kept
-// intact, so both project IDs and idempotency keys may contain underscores.
-func classifyAdminProjectDocForOwner(docID string, data map[string]interface{}, expectedUserID string) (adminProjectDeletionKind, adminProjectRecord, bool) {
-	if !auth.ValidPathSegment(expectedUserID) {
-		return 0, adminProjectRecord{}, false
-	}
-	prefix := expectedUserID + "_"
-	if !strings.HasPrefix(docID, prefix) {
-		return 0, adminProjectRecord{}, false
-	}
-	keySuffix := strings.TrimPrefix(docID, prefix)
-	if !auth.ValidPathSegment(keySuffix) {
-		return 0, adminProjectRecord{}, false
-	}
+type adminProjectIdentityCandidate struct {
+	kind      adminProjectDeletionKind
+	userID    string
+	projectID string
+}
 
-	if storedUserID, exists := data["user_id"]; exists {
-		value, ok := storedUserID.(string)
-		if !ok || value != expectedUserID {
-			return 0, adminProjectRecord{}, false
-		}
+// adminProjectIdentityFromSuffix derives an owner only from a complete,
+// authoritative stored suffix. It never treats a requested owner as a parse
+// prefix, which prevents short-owner/long-owner collisions.
+func adminProjectIdentityFromSuffix(docID, suffix string, kind adminProjectDeletionKind, projectID string) (adminProjectIdentityCandidate, bool) {
+	if !auth.ValidPathSegment(suffix) || !strings.HasSuffix(docID, "_"+suffix) {
+		return adminProjectIdentityCandidate{}, false
 	}
+	owner := strings.TrimSuffix(docID, "_"+suffix)
+	if !auth.ValidPathSegment(owner) || owner+"_"+suffix != docID {
+		return adminProjectIdentityCandidate{}, false
+	}
+	return adminProjectIdentityCandidate{kind: kind, userID: owner, projectID: projectID}, true
+}
 
+// classifyAdminProjectDoc validates the document key and stored identity
+// before any consumer derives a storage scope. Stored user_id is authoritative
+// when present. Without it, real and marker candidates independently derive an
+// owner from their complete stored suffix; multiple valid interpretations are
+// ambiguous and fail closed.
+func classifyAdminProjectDoc(docID string, data map[string]interface{}) (adminProjectDeletionKind, adminProjectRecord, bool) {
 	storedProjectID, ok := data["project_id"].(string)
 	if !ok || !auth.ValidPathSegment(storedProjectID) {
 		return 0, adminProjectRecord{}, false
@@ -2001,70 +2013,81 @@ func classifyAdminProjectDocForOwner(docID string, data map[string]interface{}, 
 		if !ok || !auth.ValidPathSegment(idempotencyKey) {
 			return 0, adminProjectRecord{}, false
 		}
-	}
-
-	name, _ := data["name"].(string)
-	name = strings.TrimSpace(name)
-	if name == "" {
-		name = storedProjectID
-	}
-	record := adminProjectRecord{id: docID, name: name, userID: expectedUserID, projectID: storedProjectID}
-
-	// An idempotency key equal to the document suffix identifies a marker
-	// candidate. Its target must be a separate, safe project ID; otherwise the
-	// snapshot is ambiguous/corrupt and deletion fails closed.
-	if idempotencyKey != "" && idempotencyKey == keySuffix {
-		if storedProjectID == keySuffix {
+		// A document whose marker key equals its target is corrupt rather than
+		// a real project with a usable idempotency marker.
+		if idempotencyKey == storedProjectID {
 			return 0, adminProjectRecord{}, false
 		}
-		return adminIdempotencyMarkerDoc, record, true
 	}
 
-	if storedProjectID != keySuffix {
-		return 0, adminProjectRecord{}, false
-	}
-	return adminRealProjectDoc, record, true
-}
-
-// classifyAdminProjectDoc validates the document key and its stored identity
-// before destructive cleanup derives any storage scope from it. Stored owner
-// metadata is authoritative when present. Documents from the legacy schema
-// without user_id are accepted only as real projects through the old safe split
-// fallback; legacy markers remain user-delete-only for their requested owner.
-func classifyAdminProjectDoc(docID string, data map[string]interface{}) (adminProjectDeletionKind, adminProjectRecord, bool) {
+	candidates := make([]adminProjectIdentityCandidate, 0, 2)
 	if storedUserID, exists := data["user_id"]; exists {
 		owner, ok := storedUserID.(string)
-		if !ok {
+		if !ok || !auth.ValidPathSegment(owner) {
 			return 0, adminProjectRecord{}, false
 		}
-		return classifyAdminProjectDocForOwner(docID, data, owner)
+		if candidate, ok := adminProjectIdentityFromSuffix(docID, storedProjectID, adminRealProjectDoc, storedProjectID); ok && candidate.userID == owner {
+			candidates = append(candidates, candidate)
+		}
+		if idempotencyKey != "" {
+			if candidate, ok := adminProjectIdentityFromSuffix(docID, idempotencyKey, adminIdempotencyMarkerDoc, storedProjectID); ok && candidate.userID == owner {
+				candidates = append(candidates, candidate)
+			}
+		}
+	} else {
+		if candidate, ok := adminProjectIdentityFromSuffix(docID, storedProjectID, adminRealProjectDoc, storedProjectID); ok {
+			candidates = append(candidates, candidate)
+		}
+		if idempotencyKey != "" {
+			if candidate, ok := adminProjectIdentityFromSuffix(docID, idempotencyKey, adminIdempotencyMarkerDoc, storedProjectID); ok {
+				candidates = append(candidates, candidate)
+			}
+		}
 	}
 
-	keyUserID, keyProjectID := splitProjectDocID(docID)
-	if !validAdminProjectSegments(keyUserID, keyProjectID) || !strings.Contains(docID, "_") {
+	if len(candidates) != 1 {
 		return 0, adminProjectRecord{}, false
 	}
-	storedProjectID, ok := data["project_id"].(string)
-	if !ok || !auth.ValidPathSegment(storedProjectID) || storedProjectID != keyProjectID {
-		return 0, adminProjectRecord{}, false
-	}
-	if idempotencyKey, exists := data["idempotency_key"]; exists {
-		key, ok := idempotencyKey.(string)
-		if !ok || !auth.ValidPathSegment(key) || key == keyProjectID {
-			return 0, adminProjectRecord{}, false
-		}
-	}
+	candidate := candidates[0]
 	name, _ := data["name"].(string)
 	name = strings.TrimSpace(name)
 	if name == "" {
 		name = storedProjectID
 	}
-	return adminRealProjectDoc, adminProjectRecord{
+	return candidate.kind, adminProjectRecord{
 		id:        docID,
 		name:      name,
-		userID:    keyUserID,
+		userID:    candidate.userID,
 		projectID: storedProjectID,
 	}, true
+}
+
+// classifyAdminProjectDocForOwner is retained as a narrow compatibility seam
+// for callers that already have an expected owner. Classification still comes
+// entirely from the canonical document classifier.
+func classifyAdminProjectDocForOwner(docID string, data map[string]interface{}, expectedUserID string) (adminProjectDeletionKind, adminProjectRecord, bool) {
+	kind, record, ok := classifyAdminProjectDoc(docID, data)
+	if !ok || record.userID != expectedUserID {
+		return 0, adminProjectRecord{}, false
+	}
+	return kind, record, true
+}
+
+func adminProjectDocPotentiallyOwnedBy(docID string, data map[string]interface{}, expectedUserID string) bool {
+	if !auth.ValidPathSegment(expectedUserID) {
+		return false
+	}
+	if storedUserID, exists := data["user_id"]; exists {
+		if owner, ok := storedUserID.(string); ok && owner == expectedUserID {
+			return true
+		}
+	}
+	for _, field := range []string{"project_id", "idempotency_key"} {
+		if value, ok := data[field].(string); ok && docID == expectedUserID+"_"+value {
+			return true
+		}
+	}
+	return strings.HasPrefix(docID, expectedUserID+"_")
 }
 
 // adminProjectRecordForDeletion returns only validated real project records.
@@ -2929,19 +2952,20 @@ func (h *Handler) AdminDeleteUser(c *gin.Context) {
 	projects := make([]adminProjectRecord, 0, len(documents))
 	markers := make([]adminProjectRecord, 0, len(documents))
 	for _, doc := range documents {
-		keyOwned := strings.HasPrefix(doc.id, userID+"_")
-		storedUserID, hasStoredUserID := doc.data["user_id"]
-		storedOwner, storedOwnerIsString := storedUserID.(string)
-		storedOwned := hasStoredUserID && storedOwnerIsString && storedOwner == userID
-		if !keyOwned && !storedOwned {
-			continue
-		}
-
-		kind, record, ok := classifyAdminProjectDocForOwner(doc.id, doc.data, userID)
-		if !ok || record.userID != userID || record.id != doc.id {
+		kind, record, ok := classifyAdminProjectDoc(doc.id, doc.data)
+		if !ok {
+			if !adminProjectDocPotentiallyOwnedBy(doc.id, doc.data, userID) {
+				continue
+			}
 			logAdminDelete("user", "validation_failed", userID, "")
 			c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "user delete unavailable"})
 			return
+		}
+		// Classification establishes the canonical owner before the requested
+		// owner is compared. A valid foreign document must not be selected by a
+		// shorter requested-owner prefix.
+		if record.userID != userID || record.id != doc.id {
+			continue
 		}
 		switch kind {
 		case adminRealProjectDoc:
