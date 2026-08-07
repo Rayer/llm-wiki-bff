@@ -92,15 +92,9 @@ func TestSwaggerRawScrapeRouteContractConsistency(t *testing.T) {
 	if jsonOp.Security == nil || yamlOp.Security == nil || docOp.Security == nil {
 		t.Fatal("expected security declarations in all artifacts")
 	}
-	if !securityMatches(jsonOp.Security, "DevUserAuth") || !securityMatches(jsonOp.Security, "ProjectHeader") {
-		t.Fatalf("json security mismatch: %v", jsonOp.Security)
-	}
-	if !securityMatches(yamlOp.Security, "DevUserAuth") || !securityMatches(yamlOp.Security, "ProjectHeader") {
-		t.Fatalf("yaml security mismatch: %v", yamlOp.Security)
-	}
-	if !securityMatches(docOp.Security, "DevUserAuth") || !securityMatches(docOp.Security, "ProjectHeader") {
-		t.Fatalf("docs security mismatch: %v", docOp.Security)
-	}
+	assertExactRawSecurity(t, jsonOp.Security, "json")
+	assertExactRawSecurity(t, yamlOp.Security, "yaml")
+	assertExactRawSecurity(t, docOp.Security, "docs")
 
 	if len(jsonOp.Responses) != len(yamlOp.Responses) || len(jsonOp.Responses) != len(docOp.Responses) {
 		t.Fatalf("response count drift: json=%d yaml=%d docs=%d", len(jsonOp.Responses), len(yamlOp.Responses), len(docOp.Responses))
@@ -178,12 +172,7 @@ func assertRawScrapeRouteContract(t *testing.T, artifact swaggerArtifact) {
 
 	requiresJSON(op.Consumes, "application/json", t)
 	requiresJSON(op.Produces, "application/json", t)
-	if !securityMatches(op.Security, "DevUserAuth") {
-		t.Fatalf("security missing DevUserAuth: %v", op.Security)
-	}
-	if !securityMatches(op.Security, "ProjectHeader") {
-		t.Fatalf("security missing ProjectHeader: %v", op.Security)
-	}
+	assertExactRawSecurity(t, op.Security, "route contract")
 }
 
 func assertQueryRequestFields(t *testing.T, artifact swaggerArtifact) {
@@ -301,13 +290,29 @@ func requiresJSON(values []string, want string, t *testing.T) {
 	t.Fatalf("expected %q, got %q", want, values)
 }
 
-func securityMatches(security []map[string][]string, key string) bool {
-	for _, policy := range security {
-		if _, ok := policy[key]; ok {
-			return true
+func assertExactRawSecurity(t *testing.T, security []map[string][]string, artifactName string) {
+	t.Helper()
+	if len(security) != 1 {
+		t.Fatalf("%s raw security = %v, want exactly one security requirement object", artifactName, security)
+	}
+	requirement := security[0]
+	if _, ok := requirement["BearerAuth"]; !ok {
+		t.Fatalf("%s raw security = %v, missing BearerAuth", artifactName, security)
+	}
+	if _, ok := requirement["ProjectHeader"]; !ok {
+		t.Fatalf("%s raw security = %v, missing ProjectHeader", artifactName, security)
+	}
+	if len(requirement) != 2 {
+		t.Fatalf("%s raw security = %v, expected exactly BearerAuth and ProjectHeader", artifactName, security)
+	}
+	if _, ok := requirement["DevUserAuth"]; ok {
+		t.Fatalf("%s raw security = %v, should not include DevUserAuth", artifactName, security)
+	}
+	for key := range requirement {
+		if key != "BearerAuth" && key != "ProjectHeader" {
+			t.Fatalf("%s raw security = %v, unexpected key %q", artifactName, security, key)
 		}
 	}
-	return false
 }
 
 func readSwaggerJSON(t *testing.T, path string) swaggerArtifact {

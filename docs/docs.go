@@ -1400,9 +1400,7 @@ const docTemplate = `{
             "post": {
                 "security": [
                     {
-                        "DevUserAuth": []
-                    },
-                    {
+                        "BearerAuth": [],
                         "ProjectHeader": []
                     }
                 ],

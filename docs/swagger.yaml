@@ -662,8 +662,7 @@ paths:
     post:
       consumes:
       - application/json
-      description: Invokes the Cloud Run worker job for the specified project, then
-        rebuilds the search index.
+      description: Invokes the Cloud Run worker job for the specified project, then rebuilds the search index.
       parameters:
       - description: Project doc ID ({userID}_{projectID})
         in: path
@@ -1464,8 +1463,8 @@ paths:
           schema:
             $ref: '#/definitions/handler.ErrorResponse'
       security:
-      - DevUserAuth: []
-      - ProjectHeader: []
+      - BearerAuth: []
+        ProjectHeader: []
       summary: Scrape URL content into raw markdown
       tags:
       - raw

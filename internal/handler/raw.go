@@ -162,8 +162,7 @@ type ScrapeResponse struct {
 //	@Failure	401		{object}	handler.ErrorResponse
 //	@Failure	500		{object}	handler.ErrorResponse
 //	@Failure	503		{object}	handler.ErrorResponse
-//	@Security	DevUserAuth
-//	@Security	ProjectHeader
+//	@Security	BearerAuth || ProjectHeader
 //	@Router		/api/v1/raw/scrape [post]
 func (h *Handler) ScrapeRaw(c *gin.Context) {
 	var req ScrapeRequest
