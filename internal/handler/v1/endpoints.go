@@ -1959,48 +1959,32 @@ type adminProjectStatistics struct {
 }
 
 func adminProjectRecordFromFirestoreDoc(docID string, data map[string]interface{}) (adminProjectRecord, bool) {
-	userID, docProjectID := splitProjectDocID(docID)
-	if !auth.ValidPathSegment(userID) || !auth.ValidPathSegment(docProjectID) || !strings.Contains(docID, "_") {
+	kind, record, ok := classifyAdminProjectDoc(docID, data)
+	if !ok || kind != adminRealProjectDoc {
 		return adminProjectRecord{}, false
 	}
-	if storedUserID, exists := data["user_id"]; exists {
-		storedUserID, ok := storedUserID.(string)
-		if !ok || strings.TrimSpace(storedUserID) != userID {
-			return adminProjectRecord{}, false
-		}
-	}
-	storedProjectID, ok := data["project_id"].(string)
-	if !ok || strings.TrimSpace(storedProjectID) == "" {
-		return adminProjectRecord{}, false
-	}
-	project, userID, ok := projectResponseFromFirestoreDoc(docID, data)
-	if !ok {
-		return adminProjectRecord{}, false
-	}
-	if !auth.ValidPathSegment(userID) || !auth.ValidPathSegment(project.ID) || project.ID != docProjectID {
-		return adminProjectRecord{}, false
-	}
-	return adminProjectRecord{
-		id:        docID,
-		name:      project.Name,
-		userID:    userID,
-		projectID: project.ID,
-	}, true
+	return record, true
 }
 
-// classifyAdminProjectDoc validates the document key and its stored identity
-// before destructive cleanup derives any storage scope from it. A marker is
-// metadata owned by the user; its projectID is retained only as the marker's
-// validated target and must never be used as the marker's cleanup scope.
-func classifyAdminProjectDoc(docID string, data map[string]interface{}) (adminProjectDeletionKind, adminProjectRecord, bool) {
-	keyUserID, keyProjectID := splitProjectDocID(docID)
-	if !validAdminProjectSegments(keyUserID, keyProjectID) || !strings.Contains(docID, "_") {
+// classifyAdminProjectDocForOwner validates a project document against an
+// authoritative owner. The owner prefix is exact and the suffix is kept
+// intact, so both project IDs and idempotency keys may contain underscores.
+func classifyAdminProjectDocForOwner(docID string, data map[string]interface{}, expectedUserID string) (adminProjectDeletionKind, adminProjectRecord, bool) {
+	if !auth.ValidPathSegment(expectedUserID) {
+		return 0, adminProjectRecord{}, false
+	}
+	prefix := expectedUserID + "_"
+	if !strings.HasPrefix(docID, prefix) {
+		return 0, adminProjectRecord{}, false
+	}
+	keySuffix := strings.TrimPrefix(docID, prefix)
+	if !auth.ValidPathSegment(keySuffix) {
 		return 0, adminProjectRecord{}, false
 	}
 
 	if storedUserID, exists := data["user_id"]; exists {
 		value, ok := storedUserID.(string)
-		if !ok || value != keyUserID {
+		if !ok || value != expectedUserID {
 			return 0, adminProjectRecord{}, false
 		}
 	}
@@ -2024,22 +2008,63 @@ func classifyAdminProjectDoc(docID string, data map[string]interface{}) (adminPr
 	if name == "" {
 		name = storedProjectID
 	}
-	record := adminProjectRecord{id: docID, name: name, userID: keyUserID, projectID: storedProjectID}
+	record := adminProjectRecord{id: docID, name: name, userID: expectedUserID, projectID: storedProjectID}
 
 	// An idempotency key equal to the document suffix identifies a marker
 	// candidate. Its target must be a separate, safe project ID; otherwise the
 	// snapshot is ambiguous/corrupt and deletion fails closed.
-	if idempotencyKey != "" && idempotencyKey == keyProjectID {
-		if storedProjectID == keyProjectID {
+	if idempotencyKey != "" && idempotencyKey == keySuffix {
+		if storedProjectID == keySuffix {
 			return 0, adminProjectRecord{}, false
 		}
 		return adminIdempotencyMarkerDoc, record, true
 	}
 
-	if storedProjectID != keyProjectID {
+	if storedProjectID != keySuffix {
 		return 0, adminProjectRecord{}, false
 	}
 	return adminRealProjectDoc, record, true
+}
+
+// classifyAdminProjectDoc validates the document key and its stored identity
+// before destructive cleanup derives any storage scope from it. Stored owner
+// metadata is authoritative when present. Documents from the legacy schema
+// without user_id are accepted only as real projects through the old safe split
+// fallback; legacy markers remain user-delete-only for their requested owner.
+func classifyAdminProjectDoc(docID string, data map[string]interface{}) (adminProjectDeletionKind, adminProjectRecord, bool) {
+	if storedUserID, exists := data["user_id"]; exists {
+		owner, ok := storedUserID.(string)
+		if !ok {
+			return 0, adminProjectRecord{}, false
+		}
+		return classifyAdminProjectDocForOwner(docID, data, owner)
+	}
+
+	keyUserID, keyProjectID := splitProjectDocID(docID)
+	if !validAdminProjectSegments(keyUserID, keyProjectID) || !strings.Contains(docID, "_") {
+		return 0, adminProjectRecord{}, false
+	}
+	storedProjectID, ok := data["project_id"].(string)
+	if !ok || !auth.ValidPathSegment(storedProjectID) || storedProjectID != keyProjectID {
+		return 0, adminProjectRecord{}, false
+	}
+	if idempotencyKey, exists := data["idempotency_key"]; exists {
+		key, ok := idempotencyKey.(string)
+		if !ok || !auth.ValidPathSegment(key) || key == keyProjectID {
+			return 0, adminProjectRecord{}, false
+		}
+	}
+	name, _ := data["name"].(string)
+	name = strings.TrimSpace(name)
+	if name == "" {
+		name = storedProjectID
+	}
+	return adminRealProjectDoc, adminProjectRecord{
+		id:        docID,
+		name:      name,
+		userID:    keyUserID,
+		projectID: storedProjectID,
+	}, true
 }
 
 // adminProjectRecordForDeletion returns only validated real project records.
@@ -2355,7 +2380,7 @@ func (h *Handler) AdminDeleteProject(c *gin.Context) {
 	// only the record whose stored owner and project identity exactly match the
 	// safe key before checking capability or constructing any cleanup scope.
 	kind, record, ok := classifyAdminProjectDoc(doc.id, doc.data)
-	if doc.id != docID || !ok || kind != adminRealProjectDoc || record.id != docID || record.userID != keyUserID || record.projectID != keyProjectID {
+	if doc.id != docID || !ok || kind != adminRealProjectDoc || record.id != docID {
 		logAdminDelete("project", "validation_failed", keyUserID, keyProjectID)
 		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "project delete unavailable"})
 		return
@@ -2904,27 +2929,22 @@ func (h *Handler) AdminDeleteUser(c *gin.Context) {
 	projects := make([]adminProjectRecord, 0, len(documents))
 	markers := make([]adminProjectRecord, 0, len(documents))
 	for _, doc := range documents {
-		keyUserID, keyProjectID := splitProjectDocID(doc.id)
-		storedUserID, _ := doc.data["user_id"].(string)
-		keyOwned := keyUserID == userID
-		storedOwned := storedUserID == userID
+		keyOwned := strings.HasPrefix(doc.id, userID+"_")
+		storedUserID, hasStoredUserID := doc.data["user_id"]
+		storedOwner, storedOwnerIsString := storedUserID.(string)
+		storedOwned := hasStoredUserID && storedOwnerIsString && storedOwner == userID
 		if !keyOwned && !storedOwned {
 			continue
 		}
 
-		kind, record, ok := classifyAdminProjectDoc(doc.id, doc.data)
-		if !ok || record.userID != userID || record.id != doc.id || record.userID != keyUserID {
+		kind, record, ok := classifyAdminProjectDocForOwner(doc.id, doc.data, userID)
+		if !ok || record.userID != userID || record.id != doc.id {
 			logAdminDelete("user", "validation_failed", userID, "")
 			c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "user delete unavailable"})
 			return
 		}
 		switch kind {
 		case adminRealProjectDoc:
-			if record.projectID != keyProjectID {
-				logAdminDelete("user", "validation_failed", userID, "")
-				c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "user delete unavailable"})
-				return
-			}
 			projects = append(projects, record)
 			logAdminDelete("user", "validated", record.userID, record.projectID)
 		case adminIdempotencyMarkerDoc:
