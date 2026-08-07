@@ -36,6 +36,16 @@ type rawScrapeOperation struct {
 	} `json:"responses" yaml:"responses"`
 }
 
+type adminPipelineOperation struct {
+	Summary     string `json:"summary" yaml:"summary"`
+	Description string `json:"description" yaml:"description"`
+	Parameters  []struct {
+		In       string `json:"in" yaml:"in"`
+		Name     string `json:"name" yaml:"name"`
+		Required bool   `json:"required" yaml:"required"`
+	} `json:"parameters" yaml:"parameters"`
+}
+
 func TestSwaggerRawScrapeRouteContract(t *testing.T) {
 	t.Run("json", func(t *testing.T) {
 		d := readSwaggerJSON(t, "docs/swagger.json")
@@ -50,6 +60,23 @@ func TestSwaggerRawScrapeRouteContract(t *testing.T) {
 	t.Run("docs", func(t *testing.T) {
 		d := readSwaggerFromDocsTemplate(t)
 		assertRawScrapeRouteContract(t, d)
+	})
+}
+
+func TestSwaggerAdminPipelineContract_NoUnrelatedDrift(t *testing.T) {
+	t.Run("json", func(t *testing.T) {
+		d := readSwaggerJSON(t, "docs/swagger.json")
+		assertAdminPipelineOperation(t, d, "json")
+	})
+
+	t.Run("yaml", func(t *testing.T) {
+		d := readSwaggerYAML(t, "docs/swagger.yaml")
+		assertAdminPipelineOperation(t, d, "yaml")
+	})
+
+	t.Run("docs", func(t *testing.T) {
+		d := readSwaggerFromDocsTemplate(t)
+		assertAdminPipelineOperation(t, d, "docs")
 	})
 }
 
@@ -203,6 +230,45 @@ func rawScrapeOperationForPath(t *testing.T, artifact swaggerArtifact, artifactN
 		t.Fatalf("artifact %s missing required body ref for /api/v1/raw/scrape", artifactName)
 	}
 	return op
+}
+
+func assertAdminPipelineOperation(t *testing.T, artifact swaggerArtifact, artifactName string) {
+	t.Helper()
+	const (
+		wantSummary     = "Trigger pipeline + rebuild for a project (admin)"
+		wantDescription = "Invokes the Cloud Run worker job for the specified project, then rebuilds the search index."
+	)
+
+	admin, ok := artifact.Paths["/api/v1/admin/projects/{id}/pipeline"]
+	if !ok {
+		t.Fatalf("artifact %s missing /api/v1/admin/projects/{id}/pipeline path", artifactName)
+	}
+	post, ok := admin["post"]
+	if !ok {
+		t.Fatalf("artifact %s missing POST /api/v1/admin/projects/{id}/pipeline", artifactName)
+	}
+
+	postBytes, err := json.Marshal(post)
+	if err != nil {
+		t.Fatalf("artifact %s marshal admin pipeline operation: %v", artifactName, err)
+	}
+	var op adminPipelineOperation
+	if err := json.Unmarshal(postBytes, &op); err != nil {
+		t.Fatalf("artifact %s decode admin pipeline operation: %v", artifactName, err)
+	}
+
+	if op.Summary != wantSummary {
+		t.Fatalf("artifact %s admin pipeline summary = %q, want %q", artifactName, op.Summary, wantSummary)
+	}
+	if op.Description != wantDescription {
+		t.Fatalf("artifact %s admin pipeline description = %q, want %q", artifactName, op.Description, wantDescription)
+	}
+	if len(op.Parameters) != 1 {
+		t.Fatalf("artifact %s admin pipeline parameters = %d, want 1 path-only", artifactName, len(op.Parameters))
+	}
+	if op.Parameters[0].In != "path" || op.Parameters[0].Name != "id" || !op.Parameters[0].Required {
+		t.Fatalf("artifact %s admin pipeline path parameter = {in=%q name=%q required=%v}, want {in=path name=id required=true}", artifactName, op.Parameters[0].In, op.Parameters[0].Name, op.Parameters[0].Required)
+	}
 }
 
 func rawScrapeBodyRef(op rawScrapeOperation) (string, bool) {
