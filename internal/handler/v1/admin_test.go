@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -13,6 +14,9 @@ import (
 	"github.com/gin-gonic/gin"
 	store "github.com/rayer/llm-wiki-bff/internal/storage"
 	"github.com/stretchr/testify/assert"
+	"google.golang.org/api/iterator"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 type adminStatsProjectStore struct {
@@ -157,6 +161,7 @@ func TestAdminProjectCountsByUserUsesActualOwnership(t *testing.T) {
 
 func TestAdminProjectRecordFromFirestoreDocRequiresMatchingStoredProjectID(t *testing.T) {
 	project, ok := adminProjectRecordFromFirestoreDoc("user-a_authoritative-project", map[string]interface{}{
+		"user_id":    "user-a",
 		"project_id": "authoritative-project",
 		"name":       "Authoritative Project",
 	})
@@ -170,10 +175,650 @@ func TestAdminProjectRecordFromFirestoreDocRequiresMatchingStoredProjectID(t *te
 
 func TestAdminProjectRecordFromFirestoreDocRejectsMismatchedStoredProjectID(t *testing.T) {
 	if _, ok := adminProjectRecordFromFirestoreDoc("user-a_doc-suffix", map[string]interface{}{
+		"user_id":    "user-a",
 		"project_id": "authoritative-project",
 		"name":       "Mismatched Project",
 	}); ok {
 		t.Fatal("mismatched project document must not authorize rebuild")
+	}
+}
+
+type adminDeleteTestBackend struct {
+	user            adminDeleteDocument
+	projects        []adminDeleteDocument
+	events          *[]string
+	listProjectsErr error
+	failProjectID   string
+	projectErr      error
+	failMarkerID    string
+	markerErr       error
+}
+
+func (b *adminDeleteTestBackend) getUser(context.Context, string) (adminDeleteDocument, error) {
+	return b.user, nil
+}
+
+func (b *adminDeleteTestBackend) getProject(_ context.Context, id string) (adminDeleteDocument, error) {
+	for _, project := range b.projects {
+		if project.id == id {
+			return project, nil
+		}
+	}
+	return adminDeleteDocument{}, status.Error(codes.NotFound, "missing")
+}
+
+func (b *adminDeleteTestBackend) listProjects(context.Context) ([]adminDeleteDocument, error) {
+	return append([]adminDeleteDocument(nil), b.projects...), b.listProjectsErr
+}
+
+func (b *adminDeleteTestBackend) deleteLock(_ context.Context, userID, projectID string) error {
+	*b.events = append(*b.events, "lock:"+userID+"/"+projectID)
+	return nil
+}
+
+func (b *adminDeleteTestBackend) deleteProject(_ context.Context, id string) error {
+	project, ok := b.projectByID(id)
+	if !ok {
+		return errors.New("missing project")
+	}
+	*b.events = append(*b.events, "project:"+project.id)
+	if project.projectID() == b.failProjectID {
+		b.failProjectID = ""
+		if b.projectErr != nil {
+			return b.projectErr
+		}
+		return errors.New("injected project failure")
+	}
+	for i, candidate := range b.projects {
+		if candidate.id == id {
+			b.projects = append(b.projects[:i], b.projects[i+1:]...)
+			break
+		}
+	}
+	return nil
+}
+
+func (b *adminDeleteTestBackend) deleteProjectMetadata(_ context.Context, id string) error {
+	*b.events = append(*b.events, "marker:"+id)
+	if id == b.failMarkerID {
+		b.failMarkerID = ""
+		if b.markerErr != nil {
+			return b.markerErr
+		}
+		return errors.New("injected marker failure")
+	}
+	for i, candidate := range b.projects {
+		if candidate.id == id {
+			b.projects = append(b.projects[:i], b.projects[i+1:]...)
+			break
+		}
+	}
+	return nil
+}
+
+func (b *adminDeleteTestBackend) deleteUser(context.Context, string) error {
+	*b.events = append(*b.events, "user")
+	return nil
+}
+
+func (b *adminDeleteTestBackend) projectByID(id string) (adminDeleteDocument, bool) {
+	for _, project := range b.projects {
+		if project.id == id {
+			return project, true
+		}
+	}
+	return adminDeleteDocument{}, false
+}
+
+func (d adminDeleteDocument) projectID() string {
+	projectID, _ := d.data["project_id"].(string)
+	return projectID
+}
+
+type adminDeleteRecordingRootStore struct {
+	*adminStatsRootStore
+	events *[]string
+}
+
+func (s *adminDeleteRecordingRootStore) DeleteProjectPrefix(_ context.Context, userID, projectID string) (int, error) {
+	*s.events = append(*s.events, "gcs:"+userID+"/"+projectID)
+	return 0, nil
+}
+
+func adminDeleteProjectDoc(id, userID, projectID string) adminDeleteDocument {
+	return adminDeleteDocument{id: id, data: map[string]interface{}{
+		"user_id":    userID,
+		"project_id": projectID,
+		"name":       "Authoritative name",
+	}}
+}
+
+func adminDeleteLegacyProjectDoc(id, projectID string) adminDeleteDocument {
+	return adminDeleteDocument{id: id, data: map[string]interface{}{
+		"project_id": projectID,
+		"name":       "Legacy name",
+	}}
+}
+
+func adminDeleteMarkerDoc(id, targetProjectID string, includeUserID bool) adminDeleteDocument {
+	return adminDeleteMarkerDocWithKey(id, targetProjectID, "idem-key", includeUserID)
+}
+
+func adminDeleteMarkerDocWithKey(id, targetProjectID, idempotencyKey string, includeUserID bool) adminDeleteDocument {
+	data := map[string]interface{}{
+		"project_id":      targetProjectID,
+		"idempotency_key": idempotencyKey,
+		"name":            "Cached init project",
+	}
+	if includeUserID {
+		data["user_id"] = "user-a"
+	}
+	return adminDeleteDocument{id: id, data: data}
+}
+
+func newAdminDeleteRecordingHandler(backend *adminDeleteTestBackend, events *[]string) *Handler {
+	root := &adminDeleteRecordingRootStore{
+		adminStatsRootStore: &adminStatsRootStore{adminStatsProjectStore: &adminStatsProjectStore{prefix: "root"}},
+		events:              events,
+	}
+	return &Handler{store: root, adminDeleteBackend: backend}
+}
+
+func TestAdminDeleteProjectBindsAllCleanupToAuthoritativeRecord(t *testing.T) {
+	events := make([]string, 0, 3)
+	backend := &adminDeleteTestBackend{
+		projects: []adminDeleteDocument{adminDeleteProjectDoc("user-a_project-a", "user-a", "project-a")},
+		events:   &events,
+	}
+	root := &adminDeleteRecordingRootStore{
+		adminStatsRootStore: &adminStatsRootStore{adminStatsProjectStore: &adminStatsProjectStore{prefix: "root"}},
+		events:              &events,
+	}
+	h := &Handler{store: root, adminDeleteBackend: backend}
+	recorder := invokeHandlerWithParams(h.AdminDeleteProject, http.MethodDelete, "/admin/projects/user-a_project-a", gin.Params{{Key: "id", Value: "user-a_project-a"}})
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	assert.Equal(t, []string{"gcs:user-a/project-a", "lock:user-a/project-a", "project:user-a_project-a"}, events)
+	assert.Contains(t, recorder.Body.String(), `"name":"Authoritative name"`)
+}
+
+func TestAdminDeleteProjectAcceptsLegacyRealProjectWithoutUserID(t *testing.T) {
+	events := []string{}
+	backend := &adminDeleteTestBackend{
+		projects: []adminDeleteDocument{adminDeleteLegacyProjectDoc("user-a_project-a", "project-a")},
+		events:   &events,
+	}
+	h := newAdminDeleteRecordingHandler(backend, &events)
+	recorder := invokeHandlerWithParams(h.AdminDeleteProject, http.MethodDelete, "/admin/projects/user-a_project-a", gin.Params{{Key: "id", Value: "user-a_project-a"}})
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	assert.Equal(t, []string{"gcs:user-a/project-a", "lock:user-a/project-a", "project:user-a_project-a"}, events)
+}
+
+func TestAdminDeleteProjectRejectsIdempotencyMarker(t *testing.T) {
+	events := []string{}
+	backend := &adminDeleteTestBackend{
+		projects: []adminDeleteDocument{adminDeleteMarkerDoc("user-a_idem-key", "project-a", true)},
+		events:   &events,
+	}
+	h := newAdminDeleteRecordingHandler(backend, &events)
+	recorder := invokeHandlerWithParams(h.AdminDeleteProject, http.MethodDelete, "/admin/projects/user-a_idem-key", gin.Params{{Key: "id", Value: "user-a_idem-key"}})
+
+	if recorder.Code != http.StatusInternalServerError || len(events) != 0 {
+		t.Fatalf("status=%d events=%v body=%s; want marker rejection before deletes", recorder.Code, events, recorder.Body.String())
+	}
+}
+
+func TestAdminDeleteProjectRejectsUnderscoreIdempotencyMarker(t *testing.T) {
+	events := []string{}
+	backend := &adminDeleteTestBackend{
+		projects: []adminDeleteDocument{
+			adminDeleteMarkerDocWithKey("user-a_idem_key", "project-a", "idem_key", true),
+		},
+		events: &events,
+	}
+	h := newAdminDeleteRecordingHandler(backend, &events)
+	recorder := invokeHandlerWithParams(h.AdminDeleteProject, http.MethodDelete, "/admin/projects/user-a_idem_key", gin.Params{{Key: "id", Value: "user-a_idem_key"}})
+
+	if recorder.Code != http.StatusInternalServerError || len(events) != 0 {
+		t.Fatalf("status=%d events=%v body=%s; want marker rejection before deletes", recorder.Code, events, recorder.Body.String())
+	}
+}
+
+func TestAdminDeleteProjectAcceptsRealProjectIDWithUnderscores(t *testing.T) {
+	events := []string{}
+	backend := &adminDeleteTestBackend{
+		projects: []adminDeleteDocument{
+			adminDeleteProjectDoc("user-a_project_with_underscores", "user-a", "project_with_underscores"),
+		},
+		events: &events,
+	}
+	h := newAdminDeleteRecordingHandler(backend, &events)
+	recorder := invokeHandlerWithParams(h.AdminDeleteProject, http.MethodDelete, "/admin/projects/user-a_project_with_underscores", gin.Params{{Key: "id", Value: "user-a_project_with_underscores"}})
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	assert.Equal(t, []string{
+		"gcs:user-a/project_with_underscores", "lock:user-a/project_with_underscores", "project:user-a_project_with_underscores",
+	}, events)
+}
+
+func TestAdminDeleteProjectRejectsMismatchedStoredIdentityBeforeCleanup(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		doc  adminDeleteDocument
+	}{
+		{name: "stored project mismatch", doc: adminDeleteProjectDoc("user-a_key-project", "user-a", "authoritative-project")},
+		{name: "stored user mismatch", doc: adminDeleteProjectDoc("user-a_project-a", "user-b", "project-a")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			events := []string{}
+			backend := &adminDeleteTestBackend{projects: []adminDeleteDocument{tc.doc}, events: &events}
+			root := &adminDeleteRecordingRootStore{
+				adminStatsRootStore: &adminStatsRootStore{adminStatsProjectStore: &adminStatsProjectStore{prefix: "root"}},
+				events:              &events,
+			}
+			h := &Handler{store: root, adminDeleteBackend: backend}
+			recorder := invokeHandlerWithParams(h.AdminDeleteProject, http.MethodDelete, "/admin/projects/"+tc.doc.id, gin.Params{{Key: "id", Value: tc.doc.id}})
+			if recorder.Code != http.StatusInternalServerError || len(events) != 0 {
+				t.Fatalf("status=%d events=%v body=%s; want validation failure before deletes", recorder.Code, events, recorder.Body.String())
+			}
+		})
+	}
+}
+
+func TestAdminDeleteUserValidatesAllOwnedSnapshotsBeforeAnyDelete(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		projects []adminDeleteDocument
+	}{
+		{name: "owned key with foreign stored owner", projects: []adminDeleteDocument{adminDeleteProjectDoc("user-a_project-a", "user-b", "project-a")}},
+		{name: "stored owner under foreign key", projects: []adminDeleteDocument{adminDeleteProjectDoc("user-b_project-a", "user-a", "project-a")}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			events := []string{}
+			backend := &adminDeleteTestBackend{
+				user:     adminDeleteDocument{id: "user-a"},
+				projects: tc.projects,
+				events:   &events,
+			}
+			root := &adminDeleteRecordingRootStore{
+				adminStatsRootStore: &adminStatsRootStore{adminStatsProjectStore: &adminStatsProjectStore{prefix: "root"}},
+				events:              &events,
+			}
+			h := &Handler{store: root, adminDeleteBackend: backend}
+			recorder := invokeHandlerWithParams(h.AdminDeleteUser, http.MethodDelete, "/admin/users/user-a", gin.Params{{Key: "id", Value: "user-a"}})
+			if recorder.Code != http.StatusInternalServerError || len(events) != 0 {
+				t.Fatalf("status=%d events=%v body=%s; want validation failure before deletes", recorder.Code, events, recorder.Body.String())
+			}
+		})
+	}
+}
+
+func TestAdminDeleteUserFailsClosedWhenProjectListingFailsAfterPartialResults(t *testing.T) {
+	events := []string{}
+	project := adminDeleteProjectDoc("user-a_project-a", "user-a", "project-a")
+	backend := &adminDeleteTestBackend{
+		user:            adminDeleteDocument{id: "user-a"},
+		projects:        []adminDeleteDocument{project},
+		events:          &events,
+		listProjectsErr: status.Error(codes.NotFound, "listing interrupted"),
+	}
+	h := newAdminDeleteRecordingHandler(backend, &events)
+
+	recorder := invokeHandlerWithParams(h.AdminDeleteUser, http.MethodDelete, "/admin/users/user-a", gin.Params{{Key: "id", Value: "user-a"}})
+
+	assert.Equal(t, http.StatusInternalServerError, recorder.Code)
+	assert.Contains(t, recorder.Body.String(), `"error":"user delete unavailable"`)
+	assert.Empty(t, events, "a failed project listing must not start cleanup")
+	_, projectRemains := backend.projectByID(project.id)
+	assert.True(t, projectRemains, "project retry anchor must remain")
+	assert.Equal(t, "user-a", backend.user.id, "user retry anchor must remain")
+}
+
+func TestAdminDeleteProjectListResultOnlyTreatsIteratorDoneAsExhaustion(t *testing.T) {
+	partial := []adminDeleteDocument{{id: "user-a_project-a"}}
+
+	got, err := adminDeleteProjectListResult(partial, iterator.Done)
+	assert.NoError(t, err)
+	assert.Equal(t, partial, got)
+
+	got, err = adminDeleteProjectListResult(partial, status.Error(codes.NotFound, "listing interrupted"))
+	assert.Error(t, err)
+	assert.Nil(t, got)
+}
+
+func TestAdminDeleteUserSkipsForeignLegacyRealProjectWithShortOwnerPrefix(t *testing.T) {
+	events := []string{}
+	backend := &adminDeleteTestBackend{
+		user: adminDeleteDocument{id: "user"},
+		projects: []adminDeleteDocument{
+			adminDeleteLegacyProjectDoc("user_target", "target"),
+			adminDeleteLegacyProjectDoc("user_x_project", "project"),
+		},
+		events: &events,
+	}
+	h := newAdminDeleteRecordingHandler(backend, &events)
+	recorder := invokeHandlerWithParams(h.AdminDeleteUser, http.MethodDelete, "/admin/users/user", gin.Params{{Key: "id", Value: "user"}})
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	assert.Equal(t, []string{
+		"gcs:user/target", "lock:user/target", "project:user_target", "user",
+	}, events)
+}
+
+func TestAdminDeleteUserSkipsForeignLegacyMarkerWithShortOwnerPrefix(t *testing.T) {
+	events := []string{}
+	backend := &adminDeleteTestBackend{
+		user:     adminDeleteDocument{id: "user"},
+		projects: []adminDeleteDocument{adminDeleteMarkerDocWithKey("user_x_idem_key", "project", "idem_key", false)},
+		events:   &events,
+	}
+	h := newAdminDeleteRecordingHandler(backend, &events)
+	recorder := invokeHandlerWithParams(h.AdminDeleteUser, http.MethodDelete, "/admin/users/user", gin.Params{{Key: "id", Value: "user"}})
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	assert.Equal(t, []string{"user"}, events)
+	assert.Len(t, backend.projects, 1)
+}
+
+func TestAdminDeleteUserReversePrefixOwnerDeletesItsLegacyDocuments(t *testing.T) {
+	events := []string{}
+	backend := &adminDeleteTestBackend{
+		user: adminDeleteDocument{id: "user_x"},
+		projects: []adminDeleteDocument{
+			adminDeleteLegacyProjectDoc("user_x_project", "project"),
+			adminDeleteMarkerDocWithKey("user_x_idem_key", "project", "idem_key", false),
+		},
+		events: &events,
+	}
+	h := newAdminDeleteRecordingHandler(backend, &events)
+	recorder := invokeHandlerWithParams(h.AdminDeleteUser, http.MethodDelete, "/admin/users/user_x", gin.Params{{Key: "id", Value: "user_x"}})
+
+	if recorder.Code != http.StatusOK || len(backend.projects) != 0 {
+		t.Fatalf("status=%d remaining=%v body=%s", recorder.Code, backend.projects, recorder.Body.String())
+	}
+	assert.Equal(t, []string{
+		"gcs:user_x/project", "lock:user_x/project", "project:user_x_project",
+		"marker:user_x_idem_key", "user",
+	}, events)
+}
+
+func TestAdminDeleteUserRejectsAmbiguousLegacyRealAndMarkerIdentity(t *testing.T) {
+	events := []string{}
+	backend := &adminDeleteTestBackend{
+		user: adminDeleteDocument{id: "user"},
+		projects: []adminDeleteDocument{{
+			id: "user_x_project",
+			data: map[string]interface{}{
+				"project_id":      "project",
+				"idempotency_key": "x_project",
+			},
+		}},
+		events: &events,
+	}
+	h := newAdminDeleteRecordingHandler(backend, &events)
+	recorder := invokeHandlerWithParams(h.AdminDeleteUser, http.MethodDelete, "/admin/users/user", gin.Params{{Key: "id", Value: "user"}})
+
+	if recorder.Code != http.StatusInternalServerError || len(events) != 0 {
+		t.Fatalf("status=%d events=%v body=%s; want ambiguous identity rejected before mutation", recorder.Code, events, recorder.Body.String())
+	}
+}
+
+func TestAdminDeleteUserDeletesMarkerMetadataAfterRealProjects(t *testing.T) {
+	events := []string{}
+	backend := &adminDeleteTestBackend{
+		user: adminDeleteDocument{id: "user-a"},
+		projects: []adminDeleteDocument{
+			adminDeleteProjectDoc("user-a_project-a", "user-a", "project-a"),
+			adminDeleteMarkerDoc("user-a_idem-key", "project-a", true),
+		},
+		events: &events,
+	}
+	h := newAdminDeleteRecordingHandler(backend, &events)
+	recorder := invokeHandlerWithParams(h.AdminDeleteUser, http.MethodDelete, "/admin/users/user-a", gin.Params{{Key: "id", Value: "user-a"}})
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	assert.Equal(t, []string{
+		"gcs:user-a/project-a", "lock:user-a/project-a", "project:user-a_project-a",
+		"marker:user-a_idem-key", "user",
+	}, events)
+}
+
+func TestAdminDeleteUserAcceptsMarkerWithUnderscoreIdempotencyKey(t *testing.T) {
+	events := []string{}
+	backend := &adminDeleteTestBackend{
+		user: adminDeleteDocument{id: "user-a"},
+		projects: []adminDeleteDocument{
+			adminDeleteProjectDoc("user-a_project-a", "user-a", "project-a"),
+			{id: "user-a_idem_key", data: map[string]interface{}{
+				"user_id":         "user-a",
+				"project_id":      "project-a",
+				"idempotency_key": "idem_key",
+				"name":            "Cached init project",
+			}},
+		},
+		events: &events,
+	}
+	h := newAdminDeleteRecordingHandler(backend, &events)
+	recorder := invokeHandlerWithParams(h.AdminDeleteUser, http.MethodDelete, "/admin/users/user-a", gin.Params{{Key: "id", Value: "user-a"}})
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	assert.Equal(t, []string{
+		"gcs:user-a/project-a", "lock:user-a/project-a", "project:user-a_project-a",
+		"marker:user-a_idem_key", "user",
+	}, events)
+}
+
+func TestAdminDeleteUserMarkerOnlyWithUnderscoreIdempotencyKeyConverges(t *testing.T) {
+	events := []string{}
+	backend := &adminDeleteTestBackend{
+		user:     adminDeleteDocument{id: "user-a"},
+		projects: []adminDeleteDocument{adminDeleteMarkerDocWithKey("user-a_idem_key", "project-a", "idem_key", true)},
+		events:   &events,
+	}
+	h := newAdminDeleteRecordingHandler(backend, &events)
+	recorder := invokeHandlerWithParams(h.AdminDeleteUser, http.MethodDelete, "/admin/users/user-a", gin.Params{{Key: "id", Value: "user-a"}})
+
+	if recorder.Code != http.StatusOK || len(backend.projects) != 0 {
+		t.Fatalf("status=%d remaining=%v body=%s", recorder.Code, backend.projects, recorder.Body.String())
+	}
+	assert.Equal(t, []string{"marker:user-a_idem_key", "user"}, events)
+}
+
+func TestAdminDeleteUserUnderscoreMarkerRetryPreservesAnchorAndConverges(t *testing.T) {
+	events := []string{}
+	backend := &adminDeleteTestBackend{
+		user: adminDeleteDocument{id: "user-a"},
+		projects: []adminDeleteDocument{
+			adminDeleteProjectDoc("user-a_project-a", "user-a", "project-a"),
+			adminDeleteMarkerDocWithKey("user-a_idem_key", "project_a", "idem_key", true),
+		},
+		events:       &events,
+		failMarkerID: "user-a_idem_key",
+		markerErr:    errors.New("injected marker failure"),
+	}
+	h := newAdminDeleteRecordingHandler(backend, &events)
+
+	first := invokeHandlerWithParams(h.AdminDeleteUser, http.MethodDelete, "/admin/users/user-a", gin.Params{{Key: "id", Value: "user-a"}})
+	if first.Code != http.StatusInternalServerError || len(backend.projects) != 1 || backend.projects[0].id != "user-a_idem_key" {
+		t.Fatalf("first status=%d remaining=%v body=%s", first.Code, backend.projects, first.Body.String())
+	}
+	second := invokeHandlerWithParams(h.AdminDeleteUser, http.MethodDelete, "/admin/users/user-a", gin.Params{{Key: "id", Value: "user-a"}})
+	if second.Code != http.StatusOK || len(backend.projects) != 0 {
+		t.Fatalf("retry status=%d remaining=%v body=%s", second.Code, backend.projects, second.Body.String())
+	}
+	assert.Equal(t, []string{
+		"gcs:user-a/project-a", "lock:user-a/project-a", "project:user-a_project-a",
+		"marker:user-a_idem_key", "marker:user-a_idem_key", "user",
+	}, events)
+}
+
+func TestAdminDeleteUserAcceptsRealProjectIDWithUnderscores(t *testing.T) {
+	events := []string{}
+	backend := &adminDeleteTestBackend{
+		user: adminDeleteDocument{id: "user-a"},
+		projects: []adminDeleteDocument{
+			adminDeleteProjectDoc("user-a_project_with_underscores", "user-a", "project_with_underscores"),
+		},
+		events: &events,
+	}
+	h := newAdminDeleteRecordingHandler(backend, &events)
+	recorder := invokeHandlerWithParams(h.AdminDeleteUser, http.MethodDelete, "/admin/users/user-a", gin.Params{{Key: "id", Value: "user-a"}})
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	assert.Equal(t, []string{
+		"gcs:user-a/project_with_underscores", "lock:user-a/project_with_underscores", "project:user-a_project_with_underscores", "user",
+	}, events)
+}
+
+func TestAdminDeleteUserAcceptsLegacyMarkerWithoutUserID(t *testing.T) {
+	events := []string{}
+	backend := &adminDeleteTestBackend{
+		user: adminDeleteDocument{id: "user-a"},
+		projects: []adminDeleteDocument{
+			adminDeleteLegacyProjectDoc("user-a_project-a", "project-a"),
+			adminDeleteMarkerDoc("user-a_idem-key", "project-a", false),
+		},
+		events: &events,
+	}
+	h := newAdminDeleteRecordingHandler(backend, &events)
+	recorder := invokeHandlerWithParams(h.AdminDeleteUser, http.MethodDelete, "/admin/users/user-a", gin.Params{{Key: "id", Value: "user-a"}})
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	assert.Equal(t, []string{
+		"gcs:user-a/project-a", "lock:user-a/project-a", "project:user-a_project-a",
+		"marker:user-a_idem-key", "user",
+	}, events)
+}
+
+func TestAdminDeleteUserAcceptsLegacyMarkerWithUnderscoreIdempotencyKey(t *testing.T) {
+	events := []string{}
+	backend := &adminDeleteTestBackend{
+		user:     adminDeleteDocument{id: "user-a"},
+		projects: []adminDeleteDocument{adminDeleteMarkerDocWithKey("user-a_idem_key", "project-a", "idem_key", false)},
+		events:   &events,
+	}
+	h := newAdminDeleteRecordingHandler(backend, &events)
+	recorder := invokeHandlerWithParams(h.AdminDeleteUser, http.MethodDelete, "/admin/users/user-a", gin.Params{{Key: "id", Value: "user-a"}})
+
+	if recorder.Code != http.StatusOK || len(backend.projects) != 0 {
+		t.Fatalf("status=%d remaining=%v body=%s", recorder.Code, backend.projects, recorder.Body.String())
+	}
+	assert.Equal(t, []string{"marker:user-a_idem_key", "user"}, events)
+}
+
+func TestAdminDeleteUserRejectsCorruptMarkerBeforeAnyDelete(t *testing.T) {
+	events := []string{}
+	backend := &adminDeleteTestBackend{
+		user: adminDeleteDocument{id: "user-a"},
+		projects: []adminDeleteDocument{{
+			id: "user-a_idem-key",
+			data: map[string]interface{}{
+				"user_id":         "user-a",
+				"project_id":      "idem-key",
+				"idempotency_key": "idem-key",
+			},
+		}},
+		events: &events,
+	}
+	h := newAdminDeleteRecordingHandler(backend, &events)
+	recorder := invokeHandlerWithParams(h.AdminDeleteUser, http.MethodDelete, "/admin/users/user-a", gin.Params{{Key: "id", Value: "user-a"}})
+
+	if recorder.Code != http.StatusInternalServerError || len(events) != 0 {
+		t.Fatalf("status=%d events=%v body=%s; want fail closed before deletes", recorder.Code, events, recorder.Body.String())
+	}
+}
+
+func TestAdminDeleteUserMarkerFailurePreservesRetryAnchor(t *testing.T) {
+	events := []string{}
+	backend := &adminDeleteTestBackend{
+		user: adminDeleteDocument{id: "user-a"},
+		projects: []adminDeleteDocument{
+			adminDeleteProjectDoc("user-a_project-a", "user-a", "project-a"),
+			adminDeleteMarkerDoc("user-a_idem-key", "project-a", true),
+		},
+		events:       &events,
+		failMarkerID: "user-a_idem-key",
+		markerErr:    errors.New("injected marker failure"),
+	}
+	h := newAdminDeleteRecordingHandler(backend, &events)
+
+	first := invokeHandlerWithParams(h.AdminDeleteUser, http.MethodDelete, "/admin/users/user-a", gin.Params{{Key: "id", Value: "user-a"}})
+	if first.Code != http.StatusInternalServerError || len(backend.projects) != 1 || backend.projects[0].id != "user-a_idem-key" {
+		t.Fatalf("first status=%d remaining=%v body=%s", first.Code, backend.projects, first.Body.String())
+	}
+	second := invokeHandlerWithParams(h.AdminDeleteUser, http.MethodDelete, "/admin/users/user-a", gin.Params{{Key: "id", Value: "user-a"}})
+	if second.Code != http.StatusOK || len(backend.projects) != 0 {
+		t.Fatalf("retry status=%d remaining=%v body=%s", second.Code, backend.projects, second.Body.String())
+	}
+	assert.Equal(t, []string{
+		"gcs:user-a/project-a", "lock:user-a/project-a", "project:user-a_project-a",
+		"marker:user-a_idem-key", "marker:user-a_idem-key", "user",
+	}, events)
+}
+
+func TestAdminDeleteUserRetryReenumeratesRemainingProjects(t *testing.T) {
+	events := []string{}
+	backend := &adminDeleteTestBackend{
+		user: adminDeleteDocument{id: "user-a"},
+		projects: []adminDeleteDocument{
+			adminDeleteProjectDoc("user-a_project-a", "user-a", "project-a"),
+			adminDeleteProjectDoc("user-a_project-b", "user-a", "project-b"),
+		},
+		events:        &events,
+		failProjectID: "project-b",
+		projectErr:    errors.New("injected project failure"),
+	}
+	root := &adminDeleteRecordingRootStore{
+		adminStatsRootStore: &adminStatsRootStore{adminStatsProjectStore: &adminStatsProjectStore{prefix: "root"}},
+		events:              &events,
+	}
+	h := &Handler{store: root, adminDeleteBackend: backend}
+
+	first := invokeHandlerWithParams(h.AdminDeleteUser, http.MethodDelete, "/admin/users/user-a", gin.Params{{Key: "id", Value: "user-a"}})
+	if first.Code != http.StatusInternalServerError || len(backend.projects) != 1 || backend.projects[0].id != "user-a_project-b" {
+		t.Fatalf("first status=%d remaining=%v body=%s", first.Code, backend.projects, first.Body.String())
+	}
+	second := invokeHandlerWithParams(h.AdminDeleteUser, http.MethodDelete, "/admin/users/user-a", gin.Params{{Key: "id", Value: "user-a"}})
+	if second.Code != http.StatusOK || len(backend.projects) != 0 {
+		t.Fatalf("retry status=%d remaining=%v body=%s", second.Code, backend.projects, second.Body.String())
+	}
+	assert.Equal(t, []string{
+		"gcs:user-a/project-a", "lock:user-a/project-a", "project:user-a_project-a",
+		"gcs:user-a/project-b", "lock:user-a/project-b", "project:user-a_project-b",
+		"gcs:user-a/project-b", "lock:user-a/project-b", "project:user-a_project-b", "user",
+	}, events)
+}
+
+func TestAdminDeleteHandlersReachUnsupportedCapabilityAfterValidation(t *testing.T) {
+	backend := &adminDeleteTestBackend{
+		user:     adminDeleteDocument{id: "user-a"},
+		projects: []adminDeleteDocument{adminDeleteProjectDoc("user-a_project-a", "user-a", "project-a")},
+		events:   &[]string{},
+	}
+	h := &Handler{store: &adminStatsRootStore{adminStatsProjectStore: &adminStatsProjectStore{prefix: "root"}}, adminDeleteBackend: backend}
+	project := invokeHandlerWithParams(h.AdminDeleteProject, http.MethodDelete, "/admin/projects/user-a_project-a", gin.Params{{Key: "id", Value: "user-a_project-a"}})
+	user := invokeHandlerWithParams(h.AdminDeleteUser, http.MethodDelete, "/admin/users/user-a", gin.Params{{Key: "id", Value: "user-a"}})
+	if project.Code != http.StatusInternalServerError || user.Code != http.StatusInternalServerError {
+		t.Fatalf("unsupported capability statuses: project=%d user=%d", project.Code, user.Code)
 	}
 }
 
@@ -403,6 +1048,30 @@ func TestAdminDeleteProject_MissingProjectID(t *testing.T) {
 	assert.Equal(t, "invalid project doc ID", resp["error"])
 }
 
+func TestAdminDeleteProjectRejectsUnsafeIDsBeforeFirestore(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, docID := range []string{
+		".._project-123",
+		"user-123456_..",
+		"user/../tenant_project-123",
+		"user\\tenant_project-123",
+		"user-123456_project/../other",
+		"user-123456_project\x00suffix",
+	} {
+		t.Run(fmt.Sprintf("%q", docID), func(t *testing.T) {
+			h := &Handler{}
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodDelete, "/", nil)
+			c.Params = gin.Params{{Key: "id", Value: docID}}
+
+			h.AdminDeleteProject(c)
+
+			assert.Equal(t, http.StatusBadRequest, recorder.Code)
+		})
+	}
+}
+
 // TestAdminDeleteProject_NoFirestore tests that a nil firestore client
 // returns 500 Internal Server Error.
 func TestAdminDeleteProject_NoFirestore(t *testing.T) {
@@ -438,6 +1107,175 @@ func TestAdminDeleteProject_MissingProject_Route404(t *testing.T) {
 	r.ServeHTTP(w, req)
 
 	assert.Equal(t, http.StatusNotFound, w.Code)
+}
+
+func TestAdminDeleteUserRejectsUnsafeIDBeforeFirestore(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, userID := range []string{"", ".", "..", "user/tenant", `user\tenant`, "user\x00tenant", "user/../tenant"} {
+		t.Run(fmt.Sprintf("%q", userID), func(t *testing.T) {
+			h := &Handler{}
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodDelete, "/", nil)
+			c.Params = gin.Params{{Key: "id", Value: userID}}
+
+			h.AdminDeleteUser(c)
+
+			assert.Equal(t, http.StatusBadRequest, recorder.Code)
+		})
+	}
+}
+
+func TestDeleteAdminProjectResourcesFailsClosedAtEachStage(t *testing.T) {
+	stageErr := errors.New("injected cleanup failure")
+	for _, tc := range []struct {
+		name       string
+		failStage  int
+		wantCalled int
+	}{
+		{name: "gcs", failStage: 0, wantCalled: 1},
+		{name: "lock", failStage: 1, wantCalled: 2},
+		{name: "project", failStage: 2, wantCalled: 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			cleanup := func(context.Context) error {
+				stage := calls
+				calls++
+				if stage == tc.failStage {
+					return stageErr
+				}
+				return nil
+			}
+
+			if err := deleteAdminProjectResources(context.Background(), cleanup, cleanup, cleanup); err == nil {
+				t.Fatal("deleteAdminProjectResources() error = nil, want failure")
+			}
+			if calls != tc.wantCalled {
+				t.Fatalf("cleanup calls = %d, want %d", calls, tc.wantCalled)
+			}
+		})
+	}
+}
+
+func TestDeleteAdminProjectResourcesRetriesAfterPartialProgress(t *testing.T) {
+	projectDeleteCalls := 0
+	cleanup := func(context.Context) error { return nil }
+	deleteProject := func(context.Context) error {
+		projectDeleteCalls++
+		if projectDeleteCalls == 1 {
+			return errors.New("injected project delete failure")
+		}
+		return nil
+	}
+
+	if err := deleteAdminProjectResources(context.Background(), cleanup, cleanup, deleteProject); err == nil {
+		t.Fatal("first cleanup error = nil, want failure")
+	}
+	// GCS and lock cleanup are intentionally safe to repeat after the first
+	// attempt made progress. A retry must be able to finish the project.
+	if err := deleteAdminProjectResources(context.Background(), cleanup, cleanup, deleteProject); err != nil {
+		t.Fatalf("retry cleanup error = %v, want nil", err)
+	}
+}
+
+func TestDeleteAdminUserResourcesDoesNotDeleteUserAfterProjectFailure(t *testing.T) {
+	userDeleteCalls := 0
+	projectCalls := 0
+	projectErr := errors.New("injected project cleanup failure")
+	cleanupProject := func(context.Context, string) error {
+		projectCalls++
+		if projectCalls == 2 {
+			return projectErr
+		}
+		return nil
+	}
+	deleteUser := func(context.Context) error {
+		userDeleteCalls++
+		return nil
+	}
+
+	if err := deleteAdminUserResources(context.Background(), []string{"project-1", "project-2"}, cleanupProject, deleteUser); err == nil {
+		t.Fatal("user cleanup error = nil, want failure")
+	}
+	if userDeleteCalls != 0 {
+		t.Fatalf("user delete calls = %d, want 0", userDeleteCalls)
+	}
+
+	if err := deleteAdminUserResources(context.Background(), []string{"project-2"}, func(context.Context, string) error { return nil }, deleteUser); err != nil {
+		t.Fatalf("user cleanup retry error = %v, want nil", err)
+	}
+	if userDeleteCalls != 1 {
+		t.Fatalf("user delete calls after retry = %d, want 1", userDeleteCalls)
+	}
+}
+
+func TestDeleteGCSProjectPrefixFailsClosedForUnsupportedStore(t *testing.T) {
+	root := &adminStatsRootStore{adminStatsProjectStore: &adminStatsProjectStore{prefix: "root"}}
+	if err := deleteGCSProjectPrefix(context.Background(), root, "u", "p"); err == nil {
+		t.Fatal("deleteGCSProjectPrefix() error = nil, want unsupported capability failure")
+	}
+}
+
+func TestDeleteGCSProjectPrefixTreatsAlreadyMissingAsSuccess(t *testing.T) {
+	root := &adminDeleteProjectPrefixRootStore{
+		adminStatsRootStore: &adminStatsRootStore{adminStatsProjectStore: &adminStatsProjectStore{prefix: "root"}},
+		err:                 storage.ErrObjectNotExist,
+	}
+	if err := deleteGCSProjectPrefix(context.Background(), root, "u", "p"); err != nil {
+		t.Fatalf("deleteGCSProjectPrefix() error = %v, want nil for missing prefix", err)
+	}
+}
+
+func TestDeleteGCSProjectPrefixRejectsUnsafeIDsBeforeProviderCall(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		uid  string
+		pid  string
+	}{
+		{name: "empty user", uid: "", pid: "project"},
+		{name: "dot user", uid: ".", pid: "project"},
+		{name: "dotdot user", uid: "..", pid: "project"},
+		{name: "slash user", uid: "user/tenant", pid: "project"},
+		{name: "backslash user", uid: `user\tenant`, pid: "project"},
+		{name: "nul user", uid: "user\x00tenant", pid: "project"},
+		{name: "normalization user", uid: "user/../tenant", pid: "project"},
+		{name: "empty project", uid: "user", pid: ""},
+		{name: "dot project", uid: "user", pid: "."},
+		{name: "dotdot project", uid: "user", pid: ".."},
+		{name: "slash project", uid: "user", pid: "project/child"},
+		{name: "backslash project", uid: "user", pid: `project\child`},
+		{name: "nul project", uid: "user", pid: "project\x00child"},
+		{name: "normalization project", uid: "user", pid: "project/../other"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := &adminCountingProjectPrefixRootStore{}
+			if err := deleteGCSProjectPrefix(context.Background(), root, tc.uid, tc.pid); err == nil {
+				t.Fatal("deleteGCSProjectPrefix() error = nil, want invalid ID failure")
+			}
+			if root.calls != 0 {
+				t.Fatalf("provider calls = %d, want 0", root.calls)
+			}
+		})
+	}
+}
+
+type adminDeleteProjectPrefixRootStore struct {
+	*adminStatsRootStore
+	err error
+}
+
+func (s *adminDeleteProjectPrefixRootStore) DeleteProjectPrefix(context.Context, string, string) (int, error) {
+	return 0, s.err
+}
+
+type adminCountingProjectPrefixRootStore struct {
+	calls int
+}
+
+func (s *adminCountingProjectPrefixRootStore) DeleteProjectPrefix(context.Context, string, string) (int, error) {
+	s.calls++
+	return 0, nil
 }
 
 // =========================================================================

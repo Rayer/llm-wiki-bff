@@ -82,6 +82,59 @@ func TestObjectNotFoundPreservesStorageSentinel(t *testing.T) {
 	}
 }
 
+func TestDeleteProjectPrefixDeletesObjectsAndIsIdempotent(t *testing.T) {
+	client, backend := newMemoryClient()
+	backend.put("users/user/projects/project/wiki/a.md", []byte("a"), 1, nil)
+	backend.put("users/user/projects/project/cache/id_map.json", []byte("{}"), 2, nil)
+	backend.put("users/user/projects/other/wiki/keep.md", []byte("keep"), 3, nil)
+	backend.put("users/user/projects/project-evil/wiki/keep.md", []byte("keep"), 4, nil)
+
+	deleted, err := client.DeleteProjectPrefix(context.Background(), "user", "project")
+	if err != nil || deleted != 2 {
+		t.Fatalf("DeleteProjectPrefix() = %d, %v; want 2, nil", deleted, err)
+	}
+	if deleted, err := client.DeleteProjectPrefix(context.Background(), "user", "project"); err != nil || deleted != 0 {
+		t.Fatalf("idempotent DeleteProjectPrefix() = %d, %v; want 0, nil", deleted, err)
+	}
+	if _, err := backend.Read(context.Background(), "users/user/projects/other/wiki/keep.md", 0, 100); err != nil {
+		t.Fatalf("DeleteProjectPrefix() removed unrelated object: %v", err)
+	}
+	if _, err := backend.Read(context.Background(), "users/user/projects/project-evil/wiki/keep.md", 0, 100); err != nil {
+		t.Fatalf("DeleteProjectPrefix() removed adjacent foreign project: %v", err)
+	}
+	if len(backend.listPrefixes) != 2 || backend.listPrefixes[0] != "users/user/projects/project/" {
+		t.Fatalf("list prefixes = %v, want exact project prefix", backend.listPrefixes)
+	}
+}
+
+func TestDeleteProjectPrefixRejectsUnsafeSegmentsBeforeProviderCalls(t *testing.T) {
+	unsafe := []string{"", ".", "..", "a/b", `a\b`, "a\x00b", "a/../b", "./a", "a/."}
+	for _, value := range unsafe {
+		for _, field := range []string{"userID", "projectID"} {
+			t.Run(field+"/"+fmt.Sprintf("%q", value), func(t *testing.T) {
+				client, backend := newMemoryClient()
+				backend.put("users/user/projects/project/keep.md", []byte("keep"), 1, nil)
+				userID, projectID := "user", "project"
+				if field == "userID" {
+					userID = value
+				} else {
+					projectID = value
+				}
+
+				if _, err := client.DeleteProjectPrefix(context.Background(), userID, projectID); err == nil {
+					t.Fatal("DeleteProjectPrefix() error = nil, want invalid segment failure")
+				}
+				backend.mu.Lock()
+				listCalls := backend.listCalls
+				backend.mu.Unlock()
+				if listCalls != 0 {
+					t.Fatalf("provider list calls = %d, want 0", listCalls)
+				}
+			})
+		}
+	}
+}
+
 func TestReadFileAcceptsWorkerFailureDiagnosticFromMemoryGCS(t *testing.T) {
 	client, backend := newMemoryClient()
 	path := "cache/pipeline-run.failure.json"

@@ -41,11 +41,12 @@ const (
 )
 
 var (
-	errIndexNotFound             = errors.New("index not found")
-	errFirestoreNotConfigured    = errors.New("Firestore client is not configured")
-	errInvalidAdminProjectRecord = errors.New("invalid admin project record")
-	errPipelineExecutionNotFound = errors.New("pipeline execution not found")
-	errWikiStorageNotConfigured  = errors.New("wiki storage is not configured")
+	errIndexNotFound                 = errors.New("index not found")
+	errFirestoreNotConfigured        = errors.New("Firestore client is not configured")
+	errInvalidAdminProjectRecord     = errors.New("invalid admin project record")
+	errPipelineExecutionNotFound     = errors.New("pipeline execution not found")
+	errWikiStorageNotConfigured      = errors.New("wiki storage is not configured")
+	errAdminDeleteStorageUnsupported = errors.New("admin delete storage capability is unavailable")
 )
 
 const (
@@ -206,6 +207,20 @@ func (h *Handler) listFirestoreProjects(ctx context.Context, userID string) ([]h
 }
 
 func projectResponseFromFirestoreDoc(docID string, data map[string]interface{}) (handler.ProjectResponse, string, bool) {
+	if kind, record, ok := classifyAdminProjectDoc(docID, data); ok {
+		if kind == adminIdempotencyMarkerDoc {
+			return handler.ProjectResponse{}, "", false
+		}
+		return handler.ProjectResponse{
+			ID:        record.projectID,
+			Name:      record.name,
+			CreatedAt: firestoreCreatedAt(data["created_at"]),
+		}, record.userID, true
+	}
+
+	// Keep the historical user-list fallback for older real records whose
+	// document suffix was a display label rather than the stored project ID.
+	// Destructive/admin consumers use only the canonical classifier above.
 	userID, docProjectID := splitProjectDocID(docID)
 	if userID == "" {
 		return handler.ProjectResponse{}, "", false
@@ -241,13 +256,8 @@ func projectResponseFromFirestoreDoc(docID string, data map[string]interface{}) 
 // the init-project idempotency cache entry rather than the real project.
 // Cache docs are stored at {userID}_{idempotencyKey} and still carry project_id.
 func isIdempotencyCacheDoc(docID string, data map[string]interface{}) bool {
-	key, _ := data["idempotency_key"].(string)
-	key = strings.TrimSpace(key)
-	if key == "" {
-		return false
-	}
-	_, docSuffix := splitProjectDocID(docID)
-	return strings.TrimSpace(docSuffix) == key
+	kind, _, ok := classifyAdminProjectDoc(docID, data)
+	return ok && kind == adminIdempotencyMarkerDoc
 }
 
 func firestoreCreatedAt(value interface{}) string {
@@ -1878,6 +1888,10 @@ func splitProjectDocID(docID string) (userID, projectID string) {
 	return docID[:lastUnderscore], docID[lastUnderscore+1:]
 }
 
+func validAdminProjectSegments(userID, projectID string) bool {
+	return auth.ValidPathSegment(userID) && auth.ValidPathSegment(projectID)
+}
+
 func (h *Handler) verifyAdminProjectExists(ctx context.Context, docID string) error {
 	if h.projectExists != nil {
 		return h.projectExists(ctx, docID)
@@ -1941,33 +1955,150 @@ type adminProjectRecord struct {
 	projectID string
 }
 
+type adminProjectDeletionKind uint8
+
+const (
+	adminRealProjectDoc adminProjectDeletionKind = iota + 1
+	adminIdempotencyMarkerDoc
+)
+
 type adminProjectStatistics struct {
 	conceptCount int
 	sourceCount  int
 }
 
 func adminProjectRecordFromFirestoreDoc(docID string, data map[string]interface{}) (adminProjectRecord, bool) {
-	userID, docProjectID := splitProjectDocID(docID)
-	if !auth.ValidPathSegment(userID) || !auth.ValidPathSegment(docProjectID) || !strings.Contains(docID, "_") {
+	kind, record, ok := classifyAdminProjectDoc(docID, data)
+	if !ok || kind != adminRealProjectDoc {
 		return adminProjectRecord{}, false
 	}
+	return record, true
+}
+
+type adminProjectIdentityCandidate struct {
+	kind      adminProjectDeletionKind
+	userID    string
+	projectID string
+}
+
+// adminProjectIdentityFromSuffix derives an owner only from a complete,
+// authoritative stored suffix. It never treats a requested owner as a parse
+// prefix, which prevents short-owner/long-owner collisions.
+func adminProjectIdentityFromSuffix(docID, suffix string, kind adminProjectDeletionKind, projectID string) (adminProjectIdentityCandidate, bool) {
+	if !auth.ValidPathSegment(suffix) || !strings.HasSuffix(docID, "_"+suffix) {
+		return adminProjectIdentityCandidate{}, false
+	}
+	owner := strings.TrimSuffix(docID, "_"+suffix)
+	if !auth.ValidPathSegment(owner) || owner+"_"+suffix != docID {
+		return adminProjectIdentityCandidate{}, false
+	}
+	return adminProjectIdentityCandidate{kind: kind, userID: owner, projectID: projectID}, true
+}
+
+// classifyAdminProjectDoc validates the document key and stored identity
+// before any consumer derives a storage scope. Stored user_id is authoritative
+// when present. Without it, real and marker candidates independently derive an
+// owner from their complete stored suffix; multiple valid interpretations are
+// ambiguous and fail closed.
+func classifyAdminProjectDoc(docID string, data map[string]interface{}) (adminProjectDeletionKind, adminProjectRecord, bool) {
 	storedProjectID, ok := data["project_id"].(string)
-	if !ok || strings.TrimSpace(storedProjectID) == "" {
-		return adminProjectRecord{}, false
+	if !ok || !auth.ValidPathSegment(storedProjectID) {
+		return 0, adminProjectRecord{}, false
 	}
-	project, userID, ok := projectResponseFromFirestoreDoc(docID, data)
-	if !ok {
-		return adminProjectRecord{}, false
+
+	var idempotencyKey string
+	if value, exists := data["idempotency_key"]; exists {
+		var ok bool
+		idempotencyKey, ok = value.(string)
+		if !ok || !auth.ValidPathSegment(idempotencyKey) {
+			return 0, adminProjectRecord{}, false
+		}
+		// A document whose marker key equals its target is corrupt rather than
+		// a real project with a usable idempotency marker.
+		if idempotencyKey == storedProjectID {
+			return 0, adminProjectRecord{}, false
+		}
 	}
-	if !auth.ValidPathSegment(userID) || !auth.ValidPathSegment(project.ID) || project.ID != docProjectID {
-		return adminProjectRecord{}, false
+
+	candidates := make([]adminProjectIdentityCandidate, 0, 2)
+	if storedUserID, exists := data["user_id"]; exists {
+		owner, ok := storedUserID.(string)
+		if !ok || !auth.ValidPathSegment(owner) {
+			return 0, adminProjectRecord{}, false
+		}
+		if candidate, ok := adminProjectIdentityFromSuffix(docID, storedProjectID, adminRealProjectDoc, storedProjectID); ok && candidate.userID == owner {
+			candidates = append(candidates, candidate)
+		}
+		if idempotencyKey != "" {
+			if candidate, ok := adminProjectIdentityFromSuffix(docID, idempotencyKey, adminIdempotencyMarkerDoc, storedProjectID); ok && candidate.userID == owner {
+				candidates = append(candidates, candidate)
+			}
+		}
+	} else {
+		if candidate, ok := adminProjectIdentityFromSuffix(docID, storedProjectID, adminRealProjectDoc, storedProjectID); ok {
+			candidates = append(candidates, candidate)
+		}
+		if idempotencyKey != "" {
+			if candidate, ok := adminProjectIdentityFromSuffix(docID, idempotencyKey, adminIdempotencyMarkerDoc, storedProjectID); ok {
+				candidates = append(candidates, candidate)
+			}
+		}
 	}
-	return adminProjectRecord{
+
+	if len(candidates) != 1 {
+		return 0, adminProjectRecord{}, false
+	}
+	candidate := candidates[0]
+	name, _ := data["name"].(string)
+	name = strings.TrimSpace(name)
+	if name == "" {
+		name = storedProjectID
+	}
+	return candidate.kind, adminProjectRecord{
 		id:        docID,
-		name:      project.Name,
-		userID:    userID,
-		projectID: project.ID,
+		name:      name,
+		userID:    candidate.userID,
+		projectID: storedProjectID,
 	}, true
+}
+
+// classifyAdminProjectDocForOwner is retained as a narrow compatibility seam
+// for callers that already have an expected owner. Classification still comes
+// entirely from the canonical document classifier.
+func classifyAdminProjectDocForOwner(docID string, data map[string]interface{}, expectedUserID string) (adminProjectDeletionKind, adminProjectRecord, bool) {
+	kind, record, ok := classifyAdminProjectDoc(docID, data)
+	if !ok || record.userID != expectedUserID {
+		return 0, adminProjectRecord{}, false
+	}
+	return kind, record, true
+}
+
+func adminProjectDocPotentiallyOwnedBy(docID string, data map[string]interface{}, expectedUserID string) bool {
+	if !auth.ValidPathSegment(expectedUserID) {
+		return false
+	}
+	if storedUserID, exists := data["user_id"]; exists {
+		if owner, ok := storedUserID.(string); ok && owner == expectedUserID {
+			return true
+		}
+	}
+	for _, field := range []string{"project_id", "idempotency_key"} {
+		if value, ok := data[field].(string); ok && docID == expectedUserID+"_"+value {
+			return true
+		}
+	}
+	return strings.HasPrefix(docID, expectedUserID+"_")
+}
+
+// adminProjectRecordForDeletion returns only validated real project records.
+// Legacy real records without a stored user_id remain supported: the
+// validated key owner plus matching authoritative project_id is the scope.
+func adminProjectRecordForDeletion(docID string, data map[string]interface{}) (adminProjectRecord, bool) {
+	kind, record, ok := classifyAdminProjectDoc(docID, data)
+	if !ok || kind != adminRealProjectDoc {
+		return adminProjectRecord{}, false
+	}
+	return record, true
 }
 
 func adminProjectRecordKey(userID, projectID string) string {
@@ -2138,6 +2269,99 @@ func (h *Handler) AdminProjects(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"projects": projects})
 }
 
+// adminDeleteDocument is the small Firestore seam used by the destructive
+// admin handlers. Keeping the seam at the document-operation boundary lets
+// tests exercise the real handler validation and cleanup order without a live
+// Firestore dependency.
+type adminDeleteDocument struct {
+	id   string
+	data map[string]interface{}
+}
+
+type adminDeleteBackend interface {
+	getUser(context.Context, string) (adminDeleteDocument, error)
+	getProject(context.Context, string) (adminDeleteDocument, error)
+	listProjects(context.Context) ([]adminDeleteDocument, error)
+	deleteLock(context.Context, string, string) error
+	deleteProject(context.Context, string) error
+	deleteProjectMetadata(context.Context, string) error
+	deleteUser(context.Context, string) error
+}
+
+type firestoreAdminDeleteBackend struct {
+	fs *firestore.Client
+}
+
+func (b firestoreAdminDeleteBackend) getUser(ctx context.Context, userID string) (adminDeleteDocument, error) {
+	snap, err := b.fs.Collection("users").Doc(userID).Get(ctx)
+	if err != nil {
+		return adminDeleteDocument{}, err
+	}
+	return adminDeleteDocument{id: snap.Ref.ID, data: snap.Data()}, nil
+}
+
+func (b firestoreAdminDeleteBackend) getProject(ctx context.Context, docID string) (adminDeleteDocument, error) {
+	snap, err := b.fs.Collection("projects").Doc(docID).Get(ctx)
+	if err != nil {
+		return adminDeleteDocument{}, err
+	}
+	return adminDeleteDocument{id: snap.Ref.ID, data: snap.Data()}, nil
+}
+
+func (b firestoreAdminDeleteBackend) listProjects(ctx context.Context) ([]adminDeleteDocument, error) {
+	iter := b.fs.Collection("projects").Documents(ctx)
+	defer iter.Stop()
+
+	documents := make([]adminDeleteDocument, 0)
+	for {
+		doc, err := iter.Next()
+		if err != nil {
+			return adminDeleteProjectListResult(documents, err)
+		}
+		documents = append(documents, adminDeleteDocument{id: doc.Ref.ID, data: doc.Data()})
+	}
+}
+
+func adminDeleteProjectListResult(documents []adminDeleteDocument, err error) ([]adminDeleteDocument, error) {
+	if errors.Is(err, iterator.Done) {
+		return documents, nil
+	}
+	return nil, err
+}
+
+func (b firestoreAdminDeleteBackend) deleteLock(ctx context.Context, userID, projectID string) error {
+	return deleteAdminFirestoreDoc(ctx, b.fs.Collection("locks").Doc(fmt.Sprintf("%s__%s", userID, projectID)))
+}
+
+func (b firestoreAdminDeleteBackend) deleteProject(ctx context.Context, docID string) error {
+	return deleteAdminFirestoreDoc(ctx, b.fs.Collection("projects").Doc(docID))
+}
+
+func (b firestoreAdminDeleteBackend) deleteProjectMetadata(ctx context.Context, docID string) error {
+	return deleteAdminFirestoreDoc(ctx, b.fs.Collection("projects").Doc(docID))
+}
+
+func (b firestoreAdminDeleteBackend) deleteUser(ctx context.Context, userID string) error {
+	return deleteAdminFirestoreDoc(ctx, b.fs.Collection("users").Doc(userID))
+}
+
+func (h *Handler) adminDeleteBackendOrError() (adminDeleteBackend, error) {
+	if h.adminDeleteBackend != nil {
+		return h.adminDeleteBackend, nil
+	}
+	if h.firestore == nil || h.firestore.Raw() == nil {
+		return nil, errFirestoreNotConfigured
+	}
+	return firestoreAdminDeleteBackend{fs: h.firestore.Raw()}, nil
+}
+
+func logAdminDelete(operation, stage, userID, projectID string) {
+	// This logger intentionally accepts only already validated identifiers and
+	// never receives provider errors, object names, credentials, or document
+	// payloads. Logging is diagnostic only and cannot affect cleanup.
+	log.Printf("admin_delete operation=%s stage=%s user_id=%s project_id=%s", operation, stage, userID, projectID)
+}
+
 // AdminDeleteProject handles DELETE /admin/projects/{id}.
 //
 //	@Summary		Delete a project (admin)
@@ -2155,21 +2379,21 @@ func (h *Handler) AdminProjects(c *gin.Context) {
 //	@Router			/api/v1/admin/projects/{id} [delete]
 func (h *Handler) AdminDeleteProject(c *gin.Context) {
 	docID := c.Param("id")
-	uid, pid := splitProjectDocID(docID)
-	if pid == "" {
+	keyUserID, keyProjectID := splitProjectDocID(docID)
+	if !validAdminProjectSegments(keyUserID, keyProjectID) {
 		c.JSON(http.StatusBadRequest, handler.ErrorResponse{Error: "invalid project doc ID"})
 		return
 	}
-	if h.firestore == nil || h.firestore.Raw() == nil {
+	backend, err := h.adminDeleteBackendOrError()
+	if err != nil {
 		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "Firestore client is not configured"})
 		return
 	}
 
-	fs := h.firestore.Raw()
 	ctx := c.Request.Context()
+	logAdminDelete("project", "get", keyUserID, keyProjectID)
 
-	docRef := fs.Collection("projects").Doc(docID)
-	dsnap, err := docRef.Get(ctx)
+	doc, err := backend.getProject(ctx, docID)
 	if err != nil {
 		if status.Code(err) == codes.NotFound {
 			c.JSON(http.StatusNotFound, handler.ErrorResponse{Error: "project not found"})
@@ -2179,34 +2403,47 @@ func (h *Handler) AdminDeleteProject(c *gin.Context) {
 		return
 	}
 
-	data := dsnap.Data()
-	name, _ := data["name"].(string)
+	// The route key is untrusted input. Resolve the fetched snapshot and use
+	// only the record whose stored owner and project identity exactly match the
+	// safe key before checking capability or constructing any cleanup scope.
+	kind, record, ok := classifyAdminProjectDoc(doc.id, doc.data)
+	if doc.id != docID || !ok || kind != adminRealProjectDoc || record.id != docID {
+		logAdminDelete("project", "validation_failed", keyUserID, keyProjectID)
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "project delete unavailable"})
+		return
+	}
+	logAdminDelete("project", "validated", record.userID, record.projectID)
 
-	// Delete GCS data
-	if h.store != nil {
-		prefix := store.ProjectPrefixWithSlash(uid, pid)
-		if err := deleteGCSPrefix(ctx, h.store, prefix); err != nil {
-			log.Print("admin generated cleanup warning")
-		}
+	if err := requireGCSProjectPrefixDeleter(h.store); err != nil {
+		logAdminDelete("project", "capability_unavailable", record.userID, record.projectID)
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "project delete unavailable"})
+		return
 	}
 
-	// Delete lock doc
-	lockRef := fs.Collection("locks").Doc(fmt.Sprintf("%s__%s", uid, pid))
-	if _, err := lockRef.Delete(ctx); err != nil && status.Code(err) != codes.NotFound {
-		log.Print("admin lock cleanup warning")
-	}
-
-	// Delete project doc
-	if _, err := docRef.Delete(ctx); err != nil {
+	if err := deleteAdminProjectResources(ctx,
+		func(ctx context.Context) error {
+			logAdminDelete("project", "gcs", record.userID, record.projectID)
+			return deleteGCSProjectPrefix(ctx, h.store, record.userID, record.projectID)
+		},
+		func(ctx context.Context) error {
+			logAdminDelete("project", "lock", record.userID, record.projectID)
+			return backend.deleteLock(ctx, record.userID, record.projectID)
+		},
+		func(ctx context.Context) error {
+			logAdminDelete("project", "project", record.userID, record.projectID)
+			return backend.deleteProject(ctx, record.id)
+		},
+	); err != nil {
+		logAdminDelete("project", "cleanup_failed", record.userID, record.projectID)
 		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "project delete unavailable"})
 		return
 	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"status":  "deleted",
-		"id":      docID,
-		"user_id": uid,
-		"name":    name,
+		"id":      record.id,
+		"user_id": record.userID,
+		"name":    record.name,
 	})
 }
 
@@ -2672,67 +2909,126 @@ func (h *Handler) AdminUpdateUser(c *gin.Context) {
 //	@Security		BearerAuth
 //	@Router			/api/v1/admin/users/{id} [delete]
 func (h *Handler) AdminDeleteUser(c *gin.Context) {
-	if h.firestore == nil || h.firestore.Raw() == nil {
+	userID := c.Param("id")
+	if !auth.ValidPathSegment(userID) {
+		c.JSON(http.StatusBadRequest, handler.ErrorResponse{Error: "invalid user ID"})
+		return
+	}
+	backend, err := h.adminDeleteBackendOrError()
+	if err != nil {
 		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "Firestore client is not configured"})
 		return
 	}
 
-	userID := c.Param("id")
-	fs := h.firestore.Raw()
 	ctx := c.Request.Context()
+	logAdminDelete("user", "get", userID, "")
 
 	// Verify user exists
-	_, err := fs.Collection("users").Doc(userID).Get(ctx)
+	userDocument, err := backend.getUser(ctx, userID)
 	if err != nil {
 		if status.Code(err) == codes.NotFound {
-			c.JSON(http.StatusNotFound, handler.ErrorResponse{Error: "user not found: " + userID})
+			c.JSON(http.StatusNotFound, handler.ErrorResponse{Error: "user not found"})
 			return
 		}
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "read user: " + err.Error()})
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "user unavailable"})
+		return
+	}
+	if userDocument.id != userID {
+		logAdminDelete("user", "validation_failed", userID, "")
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "user delete unavailable"})
+		return
+	}
+	if err := requireGCSProjectPrefixDeleter(h.store); err != nil {
+		logAdminDelete("user", "capability_unavailable", userID, "")
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "user delete unavailable"})
 		return
 	}
 
-	// Find and delete all projects belonging to this user
-	iter := fs.Collection("projects").Documents(ctx)
-	defer iter.Stop()
-
-	for {
-		doc, err := iter.Next()
-		if err != nil {
-			if status.Code(err) == codes.NotFound || errors.Is(err, iterator.Done) {
-				break
+	// Enumerate and validate every snapshot that could belong to this user
+	// before the first GCS, lock, project, marker, or user delete. Real project
+	// records and idempotency markers share this collection but have different
+	// cleanup behavior.
+	documents, err := backend.listProjects(ctx)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "user delete unavailable"})
+		return
+	}
+	projects := make([]adminProjectRecord, 0, len(documents))
+	markers := make([]adminProjectRecord, 0, len(documents))
+	for _, doc := range documents {
+		kind, record, ok := classifyAdminProjectDoc(doc.id, doc.data)
+		if !ok {
+			if !adminProjectDocPotentiallyOwnedBy(doc.id, doc.data, userID) {
+				continue
 			}
-			c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "project list unavailable"})
+			logAdminDelete("user", "validation_failed", userID, "")
+			c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "user delete unavailable"})
 			return
 		}
-
-		uid, pid := splitProjectDocID(doc.Ref.ID)
-		if uid != userID {
+		// Classification establishes the canonical owner before the requested
+		// owner is compared. A valid foreign document must not be selected by a
+		// shorter requested-owner prefix.
+		if record.userID != userID || record.id != doc.id {
 			continue
 		}
-
-		// Delete GCS data
-		if h.store != nil && pid != "" {
-			prefix := store.ProjectPrefixWithSlash(userID, pid)
-			if err := deleteGCSPrefix(ctx, h.store, prefix); err != nil {
-				log.Print("admin generated cleanup warning")
-			}
-		}
-
-		// Delete lock doc
-		lockRef := fs.Collection("locks").Doc(fmt.Sprintf("%s__%s", userID, pid))
-		if _, err := lockRef.Delete(ctx); err != nil && status.Code(err) != codes.NotFound {
-			log.Print("admin lock cleanup warning")
-		}
-
-		// Delete project doc
-		if _, err := doc.Ref.Delete(ctx); err != nil {
-			log.Print("admin project delete warning")
+		switch kind {
+		case adminRealProjectDoc:
+			projects = append(projects, record)
+			logAdminDelete("user", "validated", record.userID, record.projectID)
+		case adminIdempotencyMarkerDoc:
+			markers = append(markers, record)
+			logAdminDelete("user", "marker_validated", record.userID, record.projectID)
+		default:
+			logAdminDelete("user", "validation_failed", userID, "")
+			c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "user delete unavailable"})
+			return
 		}
 	}
 
-	// Delete user doc
-	if _, err := fs.Collection("users").Doc(userID).Delete(ctx); err != nil {
+	projectIDs := make([]string, 0, len(projects))
+	projectRecords := make(map[string]adminProjectRecord, len(projects))
+	for _, project := range projects {
+		projectIDs = append(projectIDs, project.id)
+		projectRecords[project.id] = project
+	}
+	markerIDs := make([]string, 0, len(markers))
+	markerRecords := make(map[string]adminProjectRecord, len(markers))
+	for _, marker := range markers {
+		markerIDs = append(markerIDs, marker.id)
+		markerRecords[marker.id] = marker
+	}
+
+	if err := deleteAdminUserResourcesWithMarkers(ctx, projectIDs, markerIDs, func(ctx context.Context, projectID string) error {
+		project, ok := projectRecords[projectID]
+		if !ok {
+			return errAdminDeleteCleanup
+		}
+		return deleteAdminProjectResources(ctx,
+			func(ctx context.Context) error {
+				logAdminDelete("user", "gcs", project.userID, project.projectID)
+				return deleteGCSProjectPrefix(ctx, h.store, project.userID, project.projectID)
+			},
+			func(ctx context.Context) error {
+				logAdminDelete("user", "lock", project.userID, project.projectID)
+				return backend.deleteLock(ctx, project.userID, project.projectID)
+			},
+			func(ctx context.Context) error {
+				logAdminDelete("user", "project", project.userID, project.projectID)
+				return backend.deleteProject(ctx, project.id)
+			},
+		)
+	}, func(ctx context.Context, markerID string) error {
+		marker, ok := markerRecords[markerID]
+		if !ok {
+			return errAdminDeleteCleanup
+		}
+		logAdminDelete("user", "marker", marker.userID, marker.projectID)
+		return backend.deleteProjectMetadata(ctx, marker.id)
+	}, func(ctx context.Context) error {
+		logAdminDelete("user", "user", userID, "")
+		return backend.deleteUser(ctx, userID)
+	}); err != nil {
+		logAdminDelete("user", "cleanup_failed", userID, "")
 		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "user delete unavailable"})
 		return
 	}
@@ -2743,15 +3039,87 @@ func (h *Handler) AdminDeleteUser(c *gin.Context) {
 	})
 }
 
-type gcsPrefixDeleter interface {
-	DeletePrefix(context.Context, string) (int, error)
+type gcsProjectPrefixDeleter interface {
+	DeleteProjectPrefix(context.Context, string, string) (int, error)
 }
 
-func deleteGCSPrefix(ctx context.Context, client any, prefix string) error {
-	deleter, ok := client.(gcsPrefixDeleter)
-	if !ok {
+var errAdminDeleteCleanup = errors.New("admin cleanup failed")
+
+// deleteAdminProjectResources is deliberately ordered. A project document is
+// removed only after its external GCS prefix and Firestore lock cleanup have
+// succeeded. This is not atomic across providers: a later failure can leave
+// partial progress, and a retry repeats the idempotent cleanup steps.
+func deleteAdminProjectResources(ctx context.Context, deleteGCS, deleteLock, deleteProject func(context.Context) error) error {
+	for _, cleanup := range []func(context.Context) error{deleteGCS, deleteLock, deleteProject} {
+		if cleanup == nil {
+			return errAdminDeleteCleanup
+		}
+		if err := cleanup(ctx); err != nil {
+			return errors.Join(errAdminDeleteCleanup, err)
+		}
+	}
+	return nil
+}
+
+// deleteAdminUserResourcesWithMarkers deletes real projects, then owned
+// idempotency marker metadata, then the user document. A retry re-enumerates
+// whichever documents remain as anchors for convergent cleanup.
+func deleteAdminUserResourcesWithMarkers(ctx context.Context, projectIDs, markerIDs []string, deleteProject func(context.Context, string) error, deleteMarker func(context.Context, string) error, deleteUser func(context.Context) error) error {
+	if deleteProject == nil || deleteMarker == nil || deleteUser == nil {
+		return errAdminDeleteCleanup
+	}
+	for _, projectID := range projectIDs {
+		if err := deleteProject(ctx, projectID); err != nil {
+			return errors.Join(errAdminDeleteCleanup, err)
+		}
+	}
+	for _, markerID := range markerIDs {
+		if err := deleteMarker(ctx, markerID); err != nil {
+			return errors.Join(errAdminDeleteCleanup, err)
+		}
+	}
+	if err := deleteUser(ctx); err != nil {
+		return errors.Join(errAdminDeleteCleanup, err)
+	}
+	return nil
+}
+
+func deleteAdminUserResources(ctx context.Context, projectIDs []string, deleteProject func(context.Context, string) error, deleteUser func(context.Context) error) error {
+	return deleteAdminUserResourcesWithMarkers(ctx, projectIDs, nil, deleteProject, func(context.Context, string) error { return nil }, deleteUser)
+}
+
+func requireGCSProjectPrefixDeleter(client any) error {
+	if client == nil {
+		return errAdminDeleteStorageUnsupported
+	}
+	if _, ok := client.(gcsProjectPrefixDeleter); !ok {
+		return errAdminDeleteStorageUnsupported
+	}
+	return nil
+}
+
+func deleteAdminFirestoreDoc(ctx context.Context, ref *firestore.DocumentRef) error {
+	if ref == nil {
+		return errAdminDeleteCleanup
+	}
+	_, err := ref.Delete(ctx)
+	if status.Code(err) == codes.NotFound {
 		return nil
 	}
-	_, err := deleter.DeletePrefix(ctx, prefix)
+	return err
+}
+
+func deleteGCSProjectPrefix(ctx context.Context, client any, userID, projectID string) error {
+	if !validAdminProjectSegments(userID, projectID) {
+		return errAdminDeleteCleanup
+	}
+	if err := requireGCSProjectPrefixDeleter(client); err != nil {
+		return err
+	}
+	deleter := client.(gcsProjectPrefixDeleter)
+	_, err := deleter.DeleteProjectPrefix(ctx, userID, projectID)
+	if errors.Is(err, storage.ErrObjectNotExist) || status.Code(err) == codes.NotFound {
+		return nil
+	}
 	return err
 }
