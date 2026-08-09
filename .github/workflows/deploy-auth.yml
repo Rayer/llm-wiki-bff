@@ -122,7 +122,8 @@ jobs:
             exit 1
           fi
 
-          if ! gcloud firestore databases describe "$FIRESTORE_DATABASE_ID" \
+          if ! gcloud firestore databases describe \
+            --database "$FIRESTORE_DATABASE_ID" \
             --project "${{ env.PROJECT_ID }}" \
             --format=json \
             --quiet >/dev/null; then
@@ -592,7 +593,7 @@ jobs:
           STRICT_OUTCOME: ${{ steps.strict_verify.outcome }}
         run: |
           set +e
-          RECONCILIATION="auth-deployment-reconciliation-${{ steps.identity.outputs.git_sha }}.json"
+          RECONCILIATION="auth-deployment-reconciliation-${{ steps.source.outputs.candidate_sha }}.json"
           HEADERS=$(mktemp)
           VERSION_BODY=$(mktemp)
           trap 'rm -f "$HEADERS" "$VERSION_BODY"' EXIT
@@ -656,8 +657,8 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: auth-deployment-reconciliation-${{ steps.identity.outputs.git_sha }}
-          path: auth-deployment-reconciliation-${{ steps.identity.outputs.git_sha }}.json
+          name: auth-deployment-reconciliation-${{ steps.source.outputs.candidate_sha }}
+          path: auth-deployment-reconciliation-${{ steps.source.outputs.candidate_sha }}.json
           if-no-files-found: error
           retention-days: 90
 

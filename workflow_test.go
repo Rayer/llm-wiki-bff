@@ -583,6 +583,44 @@ func TestAuthDevWorkflowUsesCanonicalSourceAndExistingPrerequisites(t *testing.T
 	}
 }
 
+func TestAuthPreflightUsesNamedFirestoreDatabaseAndSourceReconciliationIdentity(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/deploy-auth.yml")
+	preflight := workflowSection(t, contents, "      - name: Verify existing dev Auth prerequisites", "      - name: Resolve build identity")
+	if !strings.Contains(preflight, "gcloud firestore databases describe \\") || !strings.Contains(preflight, "            --database \"$FIRESTORE_DATABASE_ID\"") {
+		t.Error("Auth Firestore preflight must use the named --database flag")
+	}
+	if strings.Contains(preflight, "gcloud firestore databases describe \"$FIRESTORE_DATABASE_ID\"") {
+		t.Error("Auth Firestore preflight must not pass the database ID positionally")
+	}
+
+	reconcile := workflowSection(t, contents, "      - name: Reconcile Auth deployment outcome", "      - name: Persist build image digest")
+	for _, want := range []string{
+		"RECONCILIATION=\"auth-deployment-reconciliation-${{ steps.source.outputs.candidate_sha }}.json\"",
+		"name: auth-deployment-reconciliation-${{ steps.source.outputs.candidate_sha }}",
+		"path: auth-deployment-reconciliation-${{ steps.source.outputs.candidate_sha }}.json",
+	} {
+		if !strings.Contains(reconcile, want) {
+			t.Errorf("Auth reconciliation is missing source identity binding %q", want)
+		}
+	}
+	if strings.Contains(reconcile, "auth-deployment-reconciliation-${{ steps.identity.outputs.git_sha }}") {
+		t.Error("Auth reconciliation naming and path must not depend on the later identity step")
+	}
+
+	strictAndDigest := workflowSection(t, contents, "      - name: Capture and verify Auth deployment evidence", "      - name: Show deployment info")
+	for _, want := range []string{
+		"COMMIT_SHA: ${{ steps.identity.outputs.git_sha }}",
+		"name: auth-deployment-evidence-${{ steps.identity.outputs.git_sha }}",
+		"path: auth-deployment-evidence-${{ steps.identity.outputs.git_sha }}.json",
+		"COMMIT_SHA=\"${{ steps.identity.outputs.git_sha }}\"",
+		"DEV_IMAGE_TAG=\"${{ env.AR_REPO }}/llm-wiki-auth:dev-${{ steps.identity.outputs.git_sha }}\"",
+	} {
+		if !strings.Contains(strictAndDigest, want) {
+			t.Errorf("Auth strict evidence/image digest identity binding changed: missing %q", want)
+		}
+	}
+}
+
 func TestBFFDevWorkflowLimitsStageACompatibilityToOneInstance(t *testing.T) {
 	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
 	deploy := workflowSection(t, contents, "      - name: Build and deploy to Cloud Run", "      - name: Persist build image digest")
