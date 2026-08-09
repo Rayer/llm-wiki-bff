@@ -406,6 +406,20 @@ func TestBFFDevWorkflowPushesMainOnlyAndSupportsManualDispatch(t *testing.T) {
 
 func TestAuthDevWorkflowUsesCanonicalSourceAndExistingPrerequisites(t *testing.T) {
 	contents := readWorkflow(t, ".github/workflows/deploy-auth.yml")
+	if !strings.Contains(contents, "branches: [develop]") {
+		t.Fatal("Auth dev workflow must trigger automatically from canonical develop")
+	}
+	if strings.Contains(contents, "branches: [main]") {
+		t.Fatal("Auth dev workflow must not trigger automatically from main")
+	}
+	if strings.Count(contents, "ALLOWED_ORIGINS: https://llm-wiki-frontend-dev.vercel.app") != 2 {
+		t.Fatal("Auth dev workflow must set deployed ALLOWED_ORIGINS to the frontend dev origin in both build and deploy steps")
+	}
+	for _, forbidden := range []string{"http://localhost:3000", "http://127.0.0.1:3000"} {
+		if strings.Contains(contents, forbidden) {
+			t.Fatalf("Auth deployed workflow must not configure local CORS origin %q", forbidden)
+		}
+	}
 	for _, want := range []string{
 		"SERVICE_NAME: llm-wiki-auth-dev",
 		"AR_REPO: asia-east1-docker.pkg.dev/llm-wiki-cloud/cloud-run-images",

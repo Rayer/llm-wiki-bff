@@ -95,7 +95,7 @@ func newProductionRouter(cfg config.Config, localMode bool, fsClient *firestorec
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "registration is disabled in local mode; use demo@llm-wiki.dev / demo123456"})
 		})
 		authRoutes.POST("/refresh", auth.LocalDevRefreshHandler(cfg.JWTSecret))
-		authRoutes.POST("/logout", auth.LogoutHandler())
+		authRoutes.POST("/logout", auth.LogoutHandlerWithCookiePolicy(auth.LocalRefreshCookiePolicy()))
 	} else if fsClient == nil || fsClient.Raw() == nil {
 		unavailable := func(c *gin.Context) {
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "auth routes require Firestore"})
@@ -103,12 +103,12 @@ func newProductionRouter(cfg config.Config, localMode bool, fsClient *firestorec
 		authRoutes.POST("/login", unavailable)
 		authRoutes.POST("/register", unavailable)
 		authRoutes.POST("/refresh", unavailable)
-		authRoutes.POST("/logout", auth.LogoutHandler())
+		authRoutes.POST("/logout", auth.LogoutHandlerWithCookiePolicy(auth.HostRefreshCookiePolicy()))
 	} else {
-		authRoutes.POST("/login", middleware.NewRateLimiter(10, time.Minute), auth.LoginHandler(fsClient.Raw(), cfg.JWTSecret))
+		authRoutes.POST("/login", middleware.NewRateLimiter(10, time.Minute), auth.LoginHandlerWithCookiePolicy(fsClient.Raw(), cfg.JWTSecret, auth.HostRefreshCookiePolicy()))
 		authRoutes.POST("/register", middleware.NewRateLimiter(5, time.Minute), auth.RegisterHandler(fsClient.Raw(), cfg.JWTSecret, settingsStore))
-		authRoutes.POST("/refresh", auth.RefreshHandler(fsClient.Raw(), cfg.JWTSecret))
-		authRoutes.POST("/logout", auth.LogoutHandler())
+		authRoutes.POST("/refresh", auth.RefreshHandlerWithCookiePolicy(fsClient.Raw(), cfg.JWTSecret, auth.HostRefreshCookiePolicy()))
+		authRoutes.POST("/logout", auth.LogoutHandlerWithCookiePolicy(auth.HostRefreshCookiePolicy()))
 	}
 
 	r.GET("/healthz", func(c *gin.Context) {

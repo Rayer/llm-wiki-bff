@@ -154,7 +154,7 @@ func findRefreshCookie(t *testing.T, rec *httptest.ResponseRecorder) *http.Cooki
 			return cookie
 		}
 	}
-	t.Fatalf("refresh cookie missing; Set-Cookie = %v", rec.Header().Values("Set-Cookie"))
+	t.Fatal("refresh cookie missing")
 	return nil
 }
 

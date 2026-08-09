@@ -75,6 +75,30 @@ func TestProductionRouterWiresLocalAuthHandlers(t *testing.T) {
 	}
 }
 
+func TestProductionRouterUsesHostOnlyRefreshCookiePolicy(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	router := newProductionRouter(config.Config{
+		JWTSecret:      "test-secret",
+		AllowedHosts:   []string{"auth.example.test"},
+		AllowedOrigins: []string{"https://frontend.example"},
+	}, false, nil, &syssettings.FakeStore{Enabled: true})
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "http://auth.example.test/api/v1/auth/logout", nil)
+	router.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("deployed logout status = %d, want %d", recorder.Code, http.StatusOK)
+	}
+	cookies := recorder.Result().Cookies()
+	if len(cookies) != 1 {
+		t.Fatalf("deployed logout returned %d cookies, want one", len(cookies))
+	}
+	cookie := cookies[0]
+	if cookie.Name != "__Host-lwc_refresh" || cookie.Domain != "" || cookie.Path != "/" || !cookie.Secure || !cookie.HttpOnly || cookie.SameSite != http.SameSiteLaxMode || cookie.MaxAge != -1 {
+		t.Fatalf("deployed logout cookie attributes: name=%q domain=%q path=%q secure=%v httpOnly=%v sameSite=%v maxAge=%d", cookie.Name, cookie.Domain, cookie.Path, cookie.Secure, cookie.HttpOnly, cookie.SameSite, cookie.MaxAge)
+	}
+}
+
 func TestAuthHostAllowlistRejectsBeforeRouteHandling(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	router := newProductionRouter(config.Config{
