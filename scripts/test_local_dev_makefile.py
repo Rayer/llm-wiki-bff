@@ -27,6 +27,7 @@ class LocalDevMakefileTests(unittest.TestCase):
             self.assertEqual(
                 (frontend / ".env.local").read_text(),
                 "NEXT_PUBLIC_API_URL=http://localhost:8080\n"
+                "NEXT_PUBLIC_AUTH_URL=http://localhost:8081\n"
                 "NEXT_PUBLIC_DEV_USER_ID=local-user\n"
                 "NEXT_PUBLIC_DEV_PROJECT_ID=demo\n",
             )
@@ -63,22 +64,22 @@ class LocalDevMakefileTests(unittest.TestCase):
 
     def test_dev_runs_native_bff_and_frontend_targets(self):
         output = self.make_dry_run("dev")
-        self.assertIn("make -j2 bff-local frontend-local", output)
+        self.assertIn("make -j3 bff-local auth-local frontend-local", output)
         self.assertNotIn("docker compose", output)
 
-    def test_support_bff_runs_only_frontend(self):
+    def test_support_bff_runs_auth_and_frontend(self):
         output = self.make_dry_run("support-bff")
-        self.assertIn("make frontend-local", output)
+        self.assertIn("make -j2 auth-local frontend-local", output)
         self.assertNotIn("make bff-local", output)
 
-    def test_support_frontend_runs_only_bff(self):
+    def test_support_frontend_runs_bff_and_auth(self):
         output = self.make_dry_run("support-frontend")
-        self.assertIn("make bff-local", output)
+        self.assertIn("make -j2 bff-local auth-local", output)
         self.assertNotIn("make frontend-local", output)
 
-    def test_support_pipeline_runs_bff_and_frontend(self):
+    def test_support_pipeline_runs_bff_auth_and_frontend(self):
         output = self.make_dry_run("support-pipeline")
-        self.assertIn("make -j2 bff-local frontend-local", output)
+        self.assertIn("make -j3 bff-local auth-local frontend-local", output)
 
     def test_port_overrides_reach_component_commands(self):
         bff = self.make_dry_run("bff-local", "BFF_PORT=18080")
@@ -103,7 +104,7 @@ class LocalDevMakefileTests(unittest.TestCase):
         raise AssertionError(f"listener on port {port} did not start")
 
     def test_kill_local_terminates_listeners_on_both_ports(self):
-        ports = [self.free_port(), self.free_port()]
+        ports = [self.free_port(), self.free_port(), self.free_port()]
         code = (
             "import socket,sys,time; "
             "s=socket.socket(); "
@@ -123,7 +124,8 @@ class LocalDevMakefileTests(unittest.TestCase):
                     "make",
                     "kill-local",
                     f"BFF_PORT={ports[0]}",
-                    f"FRONTEND_PORT={ports[1]}",
+                    f"AUTH_PORT={ports[1]}",
+                    f"FRONTEND_PORT={ports[2]}",
                 ],
                 cwd=ROOT,
                 check=True,
@@ -173,7 +175,7 @@ server.serve_forever()
         try:
             self.wait_for_listener(port)
             result = subprocess.run(
-                ["make", "local-token", f"BFF_PORT={port}"],
+                ["make", "local-token", f"AUTH_PORT={port}"],
                 cwd=ROOT,
                 check=True,
                 capture_output=True,

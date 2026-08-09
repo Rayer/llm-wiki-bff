@@ -130,6 +130,7 @@ func TestLoadEnvironmentSelectionDefaults(t *testing.T) {
 	t.Setenv("FIRESTORE_DATABASE_ID", "")
 	t.Setenv("PIPELINE_JOB_URL", "")
 	t.Setenv("ALLOWED_ORIGINS", "")
+	t.Setenv("ALLOWED_HOSTS", "")
 
 	cfg, err := Load(writeConfig(t, "dev_jwt = true\n"))
 	if err != nil {
@@ -148,6 +149,27 @@ func TestLoadEnvironmentSelectionDefaults(t *testing.T) {
 	}
 	if !reflect.DeepEqual(cfg.AllowedOrigins, wantOrigins) {
 		t.Fatalf("AllowedOrigins = %#v, want %#v", cfg.AllowedOrigins, wantOrigins)
+	}
+}
+
+func TestLoadAllowedHostsFromEnv(t *testing.T) {
+	t.Setenv("ALLOWED_HOSTS", " auth-dev.rayer.idv.tw, auth-dev.rayer.idv.tw ")
+
+	cfg, err := Load(writeConfig(t, "dev_jwt = false\n"))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	want := []string{"auth-dev.rayer.idv.tw"}
+	if !reflect.DeepEqual(cfg.AllowedHosts, want) {
+		t.Fatalf("AllowedHosts = %#v, want %#v", cfg.AllowedHosts, want)
+	}
+}
+
+func TestLoadRejectsWildcardAllowedHost(t *testing.T) {
+	t.Setenv("ALLOWED_HOSTS", "*")
+
+	if _, err := Load(writeConfig(t, "dev_jwt = false\n")); err == nil {
+		t.Fatal("Load() accepted wildcard ALLOWED_HOSTS")
 	}
 }
 

@@ -37,6 +37,7 @@ type Config struct {
 	LocalDataDir        string
 	PipelineJobURL      string
 	AllowedOrigins      []string
+	AllowedHosts        []string
 	Users               []UserConfig
 
 	// Pipeline quota (LWC-138). Env: PIPELINE_DAILY_LIMIT, PIPELINE_COOLDOWN_SECONDS,
@@ -74,6 +75,7 @@ func Load(path string) (Config, error) {
 	v.BindEnv("firestore_database_id", "FIRESTORE_DATABASE_ID")
 	v.BindEnv("pipeline_job_url", "PIPELINE_JOB_URL")
 	v.BindEnv("allowed_origins", "ALLOWED_ORIGINS")
+	v.BindEnv("allowed_hosts", "ALLOWED_HOSTS")
 	v.BindEnv("pipeline_daily_limit", "PIPELINE_DAILY_LIMIT")
 	v.BindEnv("pipeline_cooldown_seconds", "PIPELINE_COOLDOWN_SECONDS")
 	v.BindEnv("pipeline_min_new_raw", "PIPELINE_MIN_NEW_RAW")
@@ -106,6 +108,10 @@ func Load(path string) (Config, error) {
 	if err := validatePipelineJobURL(pipelineJobURL); err != nil {
 		return Config{}, fmt.Errorf("invalid pipeline_job_url: %w", err)
 	}
+	allowedHosts, err := parseAllowedHosts(v.GetString("allowed_hosts"))
+	if err != nil {
+		return Config{}, fmt.Errorf("invalid allowed_hosts: %w", err)
+	}
 
 	var registrationEnabled *bool
 	if raw := strings.TrimSpace(v.GetString("registration_enabled")); raw != "" {
@@ -127,6 +133,7 @@ func Load(path string) (Config, error) {
 		LocalDataDir:            v.GetString("local_data_dir"),
 		PipelineJobURL:          pipelineJobURL,
 		AllowedOrigins:          parseAllowedOrigins(v.GetString("allowed_origins")),
+		AllowedHosts:            allowedHosts,
 		PipelineDailyLimit:      dailyLimit,
 		PipelineCooldownSeconds: cooldownSeconds,
 		PipelineMinNewRaw:       minNewRaw,
@@ -195,6 +202,15 @@ func (c Config) AllowedOriginsFor(localMode bool) []string {
 	return uniqueAllowedOrigins(origins)
 }
 
+// AllowedHostsFor returns configured hosts and adds loopback hosts in local mode.
+func (c Config) AllowedHostsFor(localMode bool) []string {
+	hosts := append([]string(nil), c.AllowedHosts...)
+	if localMode {
+		hosts = append(hosts, "localhost", "127.0.0.1")
+	}
+	return uniqueAllowedHosts(hosts)
+}
+
 func parseBoolEnv(raw string) (bool, bool) {
 	raw = strings.TrimSpace(strings.ToLower(raw))
 	switch raw {
@@ -243,6 +259,16 @@ func parseAllowedOrigins(raw string) []string {
 	return uniqueAllowedOrigins(origins)
 }
 
+func parseAllowedHosts(raw string) ([]string, error) {
+	parts := splitCommaList(raw)
+	for _, host := range parts {
+		if strings.Contains(host, "*") {
+			return nil, fmt.Errorf("wildcards are not allowed")
+		}
+	}
+	return uniqueAllowedHosts(parts), nil
+}
+
 func uniqueAllowedOrigins(origins []string) []string {
 	seen := make(map[string]struct{}, len(origins))
 	unique := make([]string, 0, len(origins))
@@ -256,6 +282,23 @@ func uniqueAllowedOrigins(origins []string) []string {
 		}
 		seen[origin] = struct{}{}
 		unique = append(unique, origin)
+	}
+	return unique
+}
+
+func uniqueAllowedHosts(hosts []string) []string {
+	seen := make(map[string]struct{}, len(hosts))
+	unique := make([]string, 0, len(hosts))
+	for _, host := range hosts {
+		host = strings.ToLower(strings.TrimSpace(host))
+		if host == "" {
+			continue
+		}
+		if _, ok := seen[host]; ok {
+			continue
+		}
+		seen[host] = struct{}{}
+		unique = append(unique, host)
 	}
 	return unique
 }

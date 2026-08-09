@@ -49,7 +49,6 @@ type RegistrationGate interface {
 //	@Failure		503		{object}	ErrorResponse
 //	@Failure		429		{object}	RateLimitErrorResponse
 //	@Header			429		{integer}	Retry-After	"Seconds until the rate limit window resets"
-//	@Router			/api/v1/auth/register [post]
 func RegisterHandler(fs *firestore.Client, jwtSecret string, gate RegistrationGate) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if gate != nil {

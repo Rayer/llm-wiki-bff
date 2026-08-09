@@ -1,4 +1,4 @@
-//go:generate go run github.com/swaggo/swag/cmd/swag@v1.16.4 init -g main.go -o docs/
+//go:generate sh -c "cd ../.. && go run github.com/swaggo/swag/cmd/swag@v1.16.4 init -g cmd/bff/main.go -o docs --parseDependency"
 
 package main
 
@@ -47,7 +47,7 @@ import (
 //	@securityDefinitions.apikey	BearerAuth
 //	@in							header
 //	@name						Authorization
-//	@description				JWT Bearer token from /api/v1/auth/login. Format: \"Bearer <token>\".
+//	@description				JWT Bearer token issued by the standalone Auth service. Format: \"Bearer <token>\".
 //
 //	@securityDefinitions.apikey	DevUserAuth
 //	@in							header
@@ -100,8 +100,6 @@ func main() {
 		fsClient, err = firestore.NewClientWithDatabase(cfg.GCPProject, cfg.FirestoreDatabaseID, "", "")
 		if err != nil {
 			log.Printf("WARNING: Firestore client not available: %v", err)
-		} else {
-			auth.CreateTestUser(context.Background(), fsClient.Raw())
 		}
 	}
 
@@ -207,30 +205,29 @@ func newProductionRouter(
 
 	registerPublicRoutes(r, settingsStore)
 
-	// Public auth routes (no auth middleware)
+	// Temporary Stage A compatibility lane for the frontend Auth cutover.
 	authRoutes := r.Group("/api/v1/auth")
-	{
-		if localMode {
-			authRoutes.POST("/login", middleware.NewRateLimiter(10, time.Minute), auth.LocalDevLoginHandler(cfg.JWTSecret))
-			authRoutes.POST("/register", func(c *gin.Context) {
-				c.JSON(http.StatusServiceUnavailable, gin.H{"error": "registration is disabled in local mode; use demo@llm-wiki.dev / demo123456"})
-			})
-			authRoutes.POST("/refresh", auth.LocalDevRefreshHandler(cfg.JWTSecret))
-			authRoutes.POST("/logout", auth.LogoutHandler())
-		} else if fsClient == nil || fsClient.Raw() == nil {
-			unavailable := func(c *gin.Context) {
-				c.JSON(http.StatusServiceUnavailable, gin.H{"error": "auth routes require Firestore"})
-			}
-			authRoutes.POST("/login", unavailable)
-			authRoutes.POST("/register", unavailable)
-			authRoutes.POST("/refresh", unavailable)
-			authRoutes.POST("/logout", auth.LogoutHandler())
-		} else {
-			authRoutes.POST("/login", middleware.NewRateLimiter(10, time.Minute), auth.LoginHandler(fsClient.Raw(), cfg.JWTSecret))
-			authRoutes.POST("/register", middleware.NewRateLimiter(5, time.Minute), auth.RegisterHandler(fsClient.Raw(), cfg.JWTSecret, settingsStore))
-			authRoutes.POST("/refresh", auth.RefreshHandler(fsClient.Raw(), cfg.JWTSecret))
-			authRoutes.POST("/logout", auth.LogoutHandler())
+	authRoutes.Use(auth.CompatibilityBodyLimit())
+	if localMode {
+		authRoutes.POST("/login", middleware.NewRateLimiter(10, time.Minute), auth.LocalDevLoginHandler(cfg.JWTSecret))
+		authRoutes.POST("/register", func(c *gin.Context) {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "registration is disabled in local mode; use demo@llm-wiki.dev / demo123456"})
+		})
+		authRoutes.POST("/refresh", auth.LocalDevRefreshHandler(cfg.JWTSecret))
+		authRoutes.POST("/logout", auth.LogoutHandlerWithCookiePolicy(auth.LocalRefreshCookiePolicy()))
+	} else if fsClient == nil || fsClient.Raw() == nil {
+		unavailable := func(c *gin.Context) {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "auth routes require Firestore"})
 		}
+		authRoutes.POST("/login", unavailable)
+		authRoutes.POST("/register", unavailable)
+		authRoutes.POST("/refresh", unavailable)
+		authRoutes.POST("/logout", auth.LogoutHandler())
+	} else {
+		authRoutes.POST("/login", middleware.NewRateLimiter(10, time.Minute), auth.LoginHandler(fsClient.Raw(), cfg.JWTSecret))
+		authRoutes.POST("/register", middleware.NewRateLimiter(5, time.Minute), auth.RegisterHandler(fsClient.Raw(), cfg.JWTSecret, settingsStore))
+		authRoutes.POST("/refresh", auth.RefreshHandler(fsClient.Raw(), cfg.JWTSecret))
+		authRoutes.POST("/logout", auth.LogoutHandler())
 	}
 
 	// ── Swagger UI ──

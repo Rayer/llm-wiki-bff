@@ -16,6 +16,7 @@ The BFF configuration variables are:
 | `FIRESTORE_DATABASE_ID` | Named Firestore database; empty selects the default database |
 | `PIPELINE_JOB_URL` | HTTPS `run.googleapis.com` Cloud Run Jobs API `:run` URL with the exact project/location/job path |
 | `ALLOWED_ORIGINS` | Comma-separated CORS origins; whitespace is trimmed, duplicates removed, and `*` is ignored because credentials are enabled |
+| `ALLOWED_HOSTS` | Auth-only comma-separated exact Host allowlist; wildcards are rejected, and local mode adds `localhost` and `127.0.0.1` |
 
 The dev worker is API-only: deploy it with the environment's `BUCKET` and no
 GCSFuse volumes or `/data` mount. Before promotion, verify the job image digest,

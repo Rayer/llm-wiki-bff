@@ -39,7 +39,7 @@ func LocalDevLoginHandler(jwtSecret string) gin.HandlerFunc {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate token"})
 			return
 		}
-		setLocalRefreshTokenCookie(c, refreshToken, int(refreshTokenTTL.Seconds()))
+		setRefreshTokenCookieWithPolicy(c, refreshToken, int(refreshTokenTTL.Seconds()), LocalRefreshCookiePolicy())
 		c.JSON(http.StatusOK, LoginResponse{
 			AccessToken: accessToken,
 			User:        User{ID: localDevUserID, Email: localDevEmail, Role: localDevRole},
@@ -50,7 +50,7 @@ func LocalDevLoginHandler(jwtSecret string) gin.HandlerFunc {
 // LocalDevRefreshHandler rotates local refresh tokens without Firestore.
 func LocalDevRefreshHandler(jwtSecret string) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		cookie, err := c.Request.Cookie(refreshTokenCookieName)
+		cookie, err := c.Request.Cookie(LocalRefreshCookiePolicy().Name)
 		if err != nil || cookie.Value == "" {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid refresh token"})
 			return
@@ -72,21 +72,10 @@ func LocalDevRefreshHandler(jwtSecret string) gin.HandlerFunc {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate token"})
 			return
 		}
-		setLocalRefreshTokenCookie(c, refreshToken, int(refreshTokenTTL.Seconds()))
+		setRefreshTokenCookieWithPolicy(c, refreshToken, int(refreshTokenTTL.Seconds()), LocalRefreshCookiePolicy())
 		c.JSON(http.StatusOK, RefreshResponse{
 			AccessToken: accessToken,
 			User:        User{ID: localDevUserID, Email: localDevEmail, Role: localDevRole},
 		})
 	}
-}
-
-func setLocalRefreshTokenCookie(c *gin.Context, value string, maxAge int) {
-	http.SetCookie(c.Writer, &http.Cookie{
-		Name:     refreshTokenCookieName,
-		Value:    value,
-		Path:     refreshTokenCookiePath,
-		MaxAge:   maxAge,
-		HttpOnly: true,
-		SameSite: http.SameSiteLaxMode,
-	})
 }

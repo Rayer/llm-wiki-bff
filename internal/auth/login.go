@@ -1,7 +1,6 @@
 package auth
 
 import (
-	"context"
 	"net/http"
 
 	"cloud.google.com/go/firestore"
@@ -42,21 +41,25 @@ type RateLimitErrorResponse struct {
 // LoginHandler returns a Gin handler that validates credentials against Firestore and issues a JWT.
 //
 //	@Summary		Log in
-//	@Description	Authenticates email and password, returns a 15-minute access token, and sets a seven-day refresh_token cookie. In local mode, the cookie omits Domain and Secure.
+//	@Description	Authenticates email and password, returns a 15-minute access token, and sets a seven-day runtime-specific refresh cookie.
 //	@Tags			auth
 //	@Accept			json
 //	@Produce		json
 //	@Param			request	body		LoginRequest	true	"Credentials"
 //	@Success		200		{object}	LoginResponse
-//	@Header			200		{string}	Set-Cookie	"Firestore mode: refresh_token; Path=/; Domain=rayer.idv.tw; Max-Age=604800; HttpOnly; Secure; SameSite=Lax"
+//	@Header			200		{string}	Set-Cookie	"BFF compatibility: refresh_token; Path=/; Domain=rayer.idv.tw; Max-Age=604800; HttpOnly; Secure; SameSite=Lax"
 //	@Failure		400		{object}	ErrorResponse
 //	@Failure		401		{object}	ErrorResponse
 //	@Failure		500		{object}	ErrorResponse
 //	@Failure		503		{object}	ErrorResponse
 //	@Failure		429		{object}	RateLimitErrorResponse
 //	@Header			429		{integer}	Retry-After	"Seconds until the rate limit window resets"
-//	@Router			/api/v1/auth/login [post]
 func LoginHandler(fsClient *firestore.Client, jwtSecret string) gin.HandlerFunc {
+	return LoginHandlerWithCookiePolicy(fsClient, jwtSecret, LegacyRefreshCookiePolicy())
+}
+
+// LoginHandlerWithCookiePolicy returns a login handler using the supplied immutable cookie policy.
+func LoginHandlerWithCookiePolicy(fsClient *firestore.Client, jwtSecret string, cookiePolicy RefreshCookiePolicy) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var req LoginRequest
 		if err := c.ShouldBindJSON(&req); err != nil {
@@ -83,21 +86,10 @@ func LoginHandler(fsClient *firestore.Client, jwtSecret string) gin.HandlerFunc 
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate token"})
 			return
 		}
-		setRefreshTokenCookie(c, refreshToken, int(refreshTokenTTL.Seconds()))
+		setRefreshTokenCookieWithPolicy(c, refreshToken, int(refreshTokenTTL.Seconds()), cookiePolicy)
 		c.JSON(http.StatusOK, LoginResponse{
 			AccessToken: accessToken,
 			User:        User{ID: userID, Email: user.Email, Role: user.Role},
 		})
 	}
-}
-
-// CreateTestUser creates the default test user in Firestore (for dev/CI).
-func CreateTestUser(ctx context.Context, fs *firestore.Client) {
-	pw := "test123"
-	hash, err := bcrypt.GenerateFromPassword([]byte(pw), bcrypt.DefaultCost)
-	if err != nil {
-		// best-effort: do not block startup
-		return
-	}
-	_ = CreateUser(ctx, fs, "test-user", "test@example.com", string(hash))
 }

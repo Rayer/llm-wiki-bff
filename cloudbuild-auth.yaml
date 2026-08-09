@@ -20,7 +20,7 @@ steps:
       - --tag
       - ${_IMAGE}
       - --file
-      - Dockerfile
+      - Dockerfile.auth
       - .
 
 images:

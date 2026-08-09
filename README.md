@@ -45,9 +45,9 @@ Start BFF + frontend through Docker Compose:
 make dev
 ```
 
-BFF listens on `http://localhost:8080`. Frontend listens on `http://localhost:3000`.
+BFF listens on `http://localhost:8080`, Auth listens on `http://localhost:8081`, and Frontend listens on `http://localhost:3000`.
 
-Local frontend login is enabled in BFF local mode:
+Local frontend login is enabled in Auth local mode:
 
 ```text
 email: demo@llm-wiki.dev
@@ -66,7 +66,7 @@ X-Project-ID: demo
 Example smoke checks:
 
 ```sh
-curl -X POST http://localhost:8080/api/v1/auth/login \
+curl -X POST http://localhost:8081/api/v1/auth/login \
   -H 'Content-Type: application/json' \
   -d '{"email":"demo@llm-wiki.dev","password":"demo123456"}'
 curl -H 'X-User-ID: local-user' http://localhost:8080/api/v1/projects
@@ -123,14 +123,14 @@ the manifest view when it exists and retains direct legacy reads only for
 projects that have not yet published a manifest. `--vault` remains the local
 developer workflow and is never used by the deployed worker.
 
-The BFF supports `FIRESTORE_DATABASE_ID`, `PIPELINE_JOB_URL`, and `ALLOWED_ORIGINS` environment overrides. Empty database and pipeline values preserve the legacy defaults; configured pipeline URLs must be HTTPS Cloud Run Jobs `:run` URLs on `run.googleapis.com` with the expected resource path.
+The BFF supports `FIRESTORE_DATABASE_ID`, `PIPELINE_JOB_URL`, and `ALLOWED_ORIGINS` environment overrides. Auth additionally requires the exact `ALLOWED_HOSTS` Host allowlist. Empty database and pipeline values preserve the legacy defaults; configured pipeline URLs must be HTTPS Cloud Run Jobs `:run` URLs on `run.googleapis.com` with the expected resource path.
 
 ## Useful Commands
 
 ```sh
 make build-sync
-go run . --local ./local-data
-LOCAL_DATA_DIR=./local-data DEV_JWT=true JWT_SECRET=dev-secret go run . --local ./local-data
+go run ./cmd/bff --local ./local-data
+LOCAL_DATA_DIR=./local-data DEV_JWT=true JWT_SECRET=dev-secret go run ./cmd/auth --local ./local-data
 ```
 
 ## Pipeline rate limits (LWC-138)

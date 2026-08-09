@@ -75,6 +75,57 @@ func TestDevWorkflowManualDispatchRequiresCanonicalDevelopSHA(t *testing.T) {
 	}
 }
 
+func TestAuthDeploymentAndRollbackReconcileAfterAttemptedMutation(t *testing.T) {
+	deploy := readWorkflow(t, ".github/workflows/deploy-auth.yml")
+	rollback := readWorkflow(t, ".github/workflows/rollback-auth.yml")
+
+	strict := workflowSection(t, deploy, "      - name: Capture and verify Auth deployment evidence", "      - name: Reconcile Auth deployment outcome")
+	strictUpload := workflowSection(t, deploy, "      - name: Upload Auth deployment evidence", "      - name: Reconcile Auth deployment outcome")
+	reconcile := workflowSection(t, deploy, "      - name: Reconcile Auth deployment outcome", "      - name: Upload Auth deployment reconciliation")
+	reconcileUpload := workflowSection(t, deploy, "      - name: Upload Auth deployment reconciliation", "      - name: Persist build image digest")
+	for _, want := range []string{
+		"if: ${{ always() && steps.deploy.outcome != 'skipped' }}",
+		"id: strict_verify",
+		".status.imageDigest",
+		"status.traffic",
+	} {
+		if !strings.Contains(strict, want) {
+			t.Errorf("strict deploy verification missing %q", want)
+		}
+	}
+	if !strings.Contains(strictUpload, "if: steps.strict_verify.outcome == 'success'") || strings.Contains(strictUpload, "if: always()") {
+		t.Fatal("strict deployment evidence upload must be success-only")
+	}
+	for _, want := range []string{"if: always()", "RECONCILIATION", "status.traffic", "version_http_status", "Cache-Control", "healthz_http_status", "provider_readback_available", "http_readback_available", "steps: {deploy:", "jq -n"} {
+		if !strings.Contains(reconcile, want) {
+			t.Errorf("deployment reconciliation missing %q", want)
+		}
+	}
+	if !strings.Contains(reconcileUpload, "if: always()") || !strings.Contains(reconcileUpload, "if-no-files-found: error") {
+		t.Fatal("deployment reconciliation upload must always upload its created artifact")
+	}
+	if strings.Contains(reconcile, "cat \"$VERSION_BODY\"") || strings.Contains(reconcile, "cat \"$SERVICE_JSON\"") || strings.Contains(reconcile, "response_body") {
+		t.Fatal("deployment reconciliation must not dump provider or HTTP response bodies")
+	}
+
+	readback := workflowSection(t, rollback, "      - name: Verify rollback read-back", "      - name: Capture normalized rollback outcome")
+	outcome := workflowSection(t, rollback, "      - name: Capture normalized rollback outcome", "      - name: Upload normalized rollback outcome")
+	for _, want := range []string{"if: ${{ always() && steps.mutate.outcome != 'skipped' }}", "status.traffic", "actual_selected_traffic", "actual_serving_revision", "actual_serving_image", "version_http_status", "Cache-Control"} {
+		if !strings.Contains(readback+outcome, want) {
+			t.Errorf("rollback reconciliation missing %q", want)
+		}
+	}
+	if !strings.Contains(outcome, "if: always()") || !strings.Contains(outcome, "jq -n") {
+		t.Fatal("rollback outcome must always create a normalized artifact")
+	}
+	if strings.Contains(outcome, "cat \"$BODY\"") || strings.Contains(outcome, "response_body") {
+		t.Fatal("rollback outcome must not dump HTTP response bodies")
+	}
+	if !strings.Contains(deploy, "previous_version_commit") || !strings.Contains(deploy, ".commit") {
+		t.Fatal("deploy rollback evidence must retain the previous canonical commit")
+	}
+}
+
 func TestWorkerDevWorkflowBindsManualDispatchToExactCanonicalDevelopSHA(t *testing.T) {
 	contents := readWorkflow(t, ".github/workflows/deploy-worker.yml")
 
@@ -327,26 +378,30 @@ func TestDevWorkflowPreflightsExistingIAMBeforeMutation(t *testing.T) {
 }
 
 func TestDevWorkflowYAMLAndRunBlocksAreExecutable(t *testing.T) {
-	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
-	var document any
-	if err := yaml.Unmarshal([]byte(contents), &document); err != nil {
-		t.Fatalf("deploy workflow is not valid YAML: %v", err)
-	}
+	for _, workflow := range []string{".github/workflows/deploy-bff.yml", ".github/workflows/deploy-auth.yml", ".github/workflows/rollback-auth.yml"} {
+		t.Run(workflow, func(t *testing.T) {
+			contents := readWorkflow(t, workflow)
+			var document any
+			if err := yaml.Unmarshal([]byte(contents), &document); err != nil {
+				t.Fatalf("deploy workflow is not valid YAML: %v", err)
+			}
 
-	runBlockPattern := regexp.MustCompile(`(?m)^\s+run: \|\n((?:\s{10,}.+\n?)+)`)
-	runs := runBlockPattern.FindAllStringSubmatch(contents, -1)
-	if len(runs) == 0 {
-		t.Fatal("deploy workflow has no executable run blocks")
-	}
-	for _, run := range runs {
-		body := strings.TrimSpace(run[1])
-		body = regexp.MustCompile(`(?m)^ {10}`).ReplaceAllString(body, "")
-		body = regexp.MustCompile(`\$\{\{[^}]*\}\}`).ReplaceAllString(body, "workflow-expression")
-		cmd := exec.Command("bash", "-n")
-		cmd.Stdin = strings.NewReader(body)
-		if output, err := cmd.CombinedOutput(); err != nil {
-			t.Fatalf("deploy workflow run block has invalid shell syntax: %v\n%s", err, output)
-		}
+			runBlockPattern := regexp.MustCompile(`(?m)^\s+run: \|\n((?:\s{10,}.+\n?)+)`)
+			runs := runBlockPattern.FindAllStringSubmatch(contents, -1)
+			if len(runs) == 0 {
+				t.Fatal("deploy workflow has no executable run blocks")
+			}
+			for _, run := range runs {
+				body := strings.TrimSpace(run[1])
+				body = regexp.MustCompile(`(?m)^ {10}`).ReplaceAllString(body, "")
+				body = regexp.MustCompile(`\$\{\{[^}]*\}\}`).ReplaceAllString(body, "workflow-expression")
+				cmd := exec.Command("bash", "-n")
+				cmd.Stdin = strings.NewReader(body)
+				if output, err := cmd.CombinedOutput(); err != nil {
+					t.Fatalf("deploy workflow run block has invalid shell syntax: %v\n%s", err, output)
+				}
+			}
+		})
 	}
 }
 
@@ -396,6 +451,297 @@ func TestBFFDevWorkflowPushesMainOnlyAndSupportsManualDispatch(t *testing.T) {
 	} {
 		if !strings.Contains(contents, want) {
 			t.Errorf("BFF dev workflow is missing trigger contract %q", want)
+		}
+	}
+}
+
+func TestAuthDevWorkflowUsesCanonicalSourceAndExistingPrerequisites(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/deploy-auth.yml")
+	if strings.Contains(contents, "  push:") {
+		t.Fatal("Auth dev workflow must be manual-only")
+	}
+	if strings.Count(contents, "ALLOWED_ORIGINS: https://llm-wiki-frontend-dev.vercel.app") != 2 {
+		t.Fatal("Auth dev workflow must set deployed ALLOWED_ORIGINS to the frontend dev origin in both build and deploy steps")
+	}
+	for _, forbidden := range []string{"http://localhost:3000", "http://127.0.0.1:3000"} {
+		if strings.Contains(contents, forbidden) {
+			t.Fatalf("Auth deployed workflow must not configure local CORS origin %q", forbidden)
+		}
+	}
+	for _, want := range []string{
+		"SERVICE_NAME: llm-wiki-auth-dev",
+		"AR_REPO: asia-east1-docker.pkg.dev/llm-wiki-cloud/cloud-run-images",
+		"ref: ${{ inputs.commit_sha }}",
+		"git fetch origin develop --force --no-tags",
+		"git rev-parse origin/develop",
+		"--config cloudbuild-auth.yaml",
+		"llm-wiki-auth:$GIT_SHA",
+		"FIRESTORE_DATABASE_ID: llm-wiki-cloud-dev",
+		"RUNTIME_SERVICE_ACCOUNT: lwc-auth-dev@llm-wiki-cloud.iam.gserviceaccount.com",
+		"JWT_SECRET_NAME: jwt-secret-dev",
+		"gcloud iam service-accounts describe",
+		"gcloud firestore databases describe",
+		"gcloud secrets describe",
+		"gcloud secrets get-iam-policy",
+		"gcloud run services get-iam-policy",
+		"roles/secretmanager.secretAccessor",
+		"roles/run.invoker",
+		"allUsers",
+		"gcloud builds describe \"$BUILD_ID\"",
+		"IMMUTABLE_IMAGE=\"${{ env.AR_REPO }}/llm-wiki-auth@$DIGEST\"",
+		"latestReadyRevisionName",
+		"status.imageDigest",
+		"auth-image-digest-$COMMIT_SHA.txt",
+		"name: auth-image-digest-${{ steps.image_digest.outputs.commit_sha }}",
+		"AUTH_DOMAIN: auth-dev.rayer.idv.tw",
+		"group: deploy-auth-dev",
+		"cancel-in-progress: false",
+		"install_components: beta",
+		"gcloud beta run domain-mappings describe",
+		"--domain \"$AUTH_DOMAIN\"",
+		"--region \"${{ env.REGION }}\"",
+		"--platform managed",
+		"--ingress all",
+		"--max-instances 1",
+		".metadata.annotations[\"run.googleapis.com/ingress\"]",
+		"auth-deployment-evidence-$COMMIT_SHA.json",
+		"previous_serving_revision",
+		"previous_image",
+		"new_revision",
+		"new_image",
+		"exact_commit",
+		"https://$AUTH_DOMAIN/api/v1/public/version",
+		"--max-time 20",
+		"Cache-Control: no-cache",
+		".commit == $commit and .service == $service",
+		"previous version read-back",
+		".service == $service and .revision == $revision",
+		"runtime service account",
+		"lwc-auth-dev@llm-wiki-cloud.iam.gserviceaccount.com",
+		"GCP_PROJECT",
+		"FIRESTORE_DATABASE_ID",
+		"ALLOWED_HOSTS",
+		"DEV_JWT",
+		"JWT_SECRET",
+		"jwt-secret-dev",
+		"private-ranges-only",
+		"status.traffic",
+		"Cache-Control",
+		"no-store",
+	} {
+		if !strings.Contains(contents, want) {
+			t.Errorf("Auth dev workflow is missing contract %q", want)
+		}
+	}
+	for _, forbidden := range []string{
+		"gcloud run jobs",
+		"add-iam-policy-binding",
+		"remove-iam-policy-binding",
+		"set-iam-policy",
+		"--allow-unauthenticated",
+		"DEEPSEEK_API_KEY",
+		"BUCKET=",
+		"PIPELINE_JOB",
+	} {
+		if strings.Contains(contents, forbidden) {
+			t.Errorf("Auth dev workflow must not contain %q", forbidden)
+		}
+	}
+	preflight := strings.Index(contents, "      - name: Verify existing dev Auth prerequisites")
+	build := strings.Index(contents, "gcloud builds submit")
+	deploy := strings.Index(contents, "gcloud run deploy")
+	if preflight < 0 || build < 0 || deploy < 0 || preflight > build || preflight > deploy {
+		t.Fatalf("Auth prerequisites must precede build and deploy: preflight=%d build=%d deploy=%d", preflight, build, deploy)
+	}
+	if strings.Count(contents, "gcloud run deploy") != 1 {
+		t.Fatalf("Auth dev workflow must have exactly one Cloud Run deploy command")
+	}
+	if strings.Count(contents, "AUTH_DOMAIN:") != 1 {
+		t.Fatalf("Auth dev workflow must declare one AUTH_DOMAIN value")
+	}
+	preflightDomain := strings.Index(contents, "gcloud beta run domain-mappings describe")
+	preflightBuild := strings.Index(contents, "gcloud builds submit")
+	if preflightDomain < 0 || preflightBuild < 0 || preflightDomain > preflightBuild {
+		t.Fatal("Auth domain mapping preflight must precede build mutation")
+	}
+	deployIndex := strings.Index(contents, "gcloud run deploy")
+	postDeploy := strings.LastIndex(contents, "https://$AUTH_DOMAIN/api/v1/public/version")
+	if postDeploy < 0 || postDeploy < deployIndex {
+		t.Fatal("Auth version read-back must follow deploy")
+	}
+}
+
+func TestBFFDevWorkflowLimitsStageACompatibilityToOneInstance(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
+	deploy := workflowSection(t, contents, "      - name: Build and deploy to Cloud Run", "      - name: Persist build image digest")
+	if !strings.Contains(deploy, "--max-instances 1") {
+		t.Fatal("BFF DEV deploy must cap Stage A compatibility to one instance")
+	}
+	if strings.Contains(readWorkflow(t, ".github/workflows/release-bff.yml"), "--max-instances 1") {
+		t.Fatal("production BFF release must not inherit the temporary DEV instance cap")
+	}
+}
+
+func TestAuthRollbackWorkflowIsManualDEVOnlyAndEvidenceFirst(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/rollback-auth.yml")
+	if strings.Contains(contents, "  push:") || strings.Contains(contents, "pull_request:") {
+		t.Fatal("Auth rollback must be manual-only")
+	}
+	for _, want := range []string{
+		"workflow_dispatch:",
+		"target_revision:",
+		"expected_image:",
+		"expected_commit:",
+		"environment: development",
+		"group: deploy-auth-dev",
+		"persist-credentials: false",
+		"^[a-z][a-z0-9-]{0,61}[a-z0-9]$",
+		"^[0-9a-f]{40}$",
+		"asia-east1-docker\\.pkg\\.dev/llm-wiki-cloud/cloud-run-images/llm-wiki-auth@sha256:[0-9a-f]{64}",
+		"gcloud run revisions describe",
+		"serving.knative.dev/service",
+		"status.imageDigest",
+		"llm-wiki-auth-dev",
+		"pre-mutation",
+		"actions/upload-artifact@v4",
+		"gcloud run services update-traffic",
+		"--to-revisions",
+		"status.traffic",
+		"/healthz",
+		"/api/v1/public/version",
+		"Cache-Control",
+		"no-store",
+		"if: always()",
+		"outcome",
+	} {
+		if !strings.Contains(contents, want) {
+			t.Errorf("Auth rollback workflow is missing contract %q", want)
+		}
+	}
+	for _, forbidden := range []string{
+		"gcloud run deploy",
+		"add-iam-policy-binding",
+		"remove-iam-policy-binding",
+		"set-iam-policy",
+		"iam service-accounts",
+		"--update-env-vars",
+		"--update-secrets",
+		"production",
+	} {
+		if strings.Contains(contents, forbidden) {
+			t.Errorf("Auth rollback workflow must not contain %q", forbidden)
+		}
+	}
+	if strings.Index(contents, "pre-mutation") > strings.Index(contents, "gcloud run services update-traffic") {
+		t.Fatal("rollback evidence must be created before traffic mutation")
+	}
+}
+
+func TestAuthWorkflowsUseServingRevisionAndBindSourceCommitBeforeMutation(t *testing.T) {
+	deploy := readWorkflow(t, ".github/workflows/deploy-auth.yml")
+	rollback := readWorkflow(t, ".github/workflows/rollback-auth.yml")
+
+	for _, want := range []string{
+		"@LWC_SOURCE_COMMIT=$GIT_SHA",
+		"assert_env LWC_SOURCE_COMMIT \"$COMMIT_SHA\"",
+		"runtime_source_commit",
+		"PREVIOUS_SERVING_REVISION",
+		"previous_serving_revision",
+		"NEW_REVISION",
+	} {
+		if !strings.Contains(deploy, want) {
+			t.Errorf("Auth deploy workflow is missing revision source contract %q", want)
+		}
+	}
+	preDeploy := workflowSection(t, deploy, "      - name: Capture pre-deploy Auth rollback evidence", "      - name: Upload pre-deploy Auth rollback evidence")
+	if strings.Contains(preDeploy, "latestReadyRevisionName") {
+		t.Fatal("pre-deploy rollback authority must come from serving traffic, not latestReadyRevisionName")
+	}
+	for _, want := range []string{
+		".status.traffic",
+		".percent // 0",
+		".revisionName // \"\"",
+		"previous_serving_revision",
+		"previous_version_revision",
+	} {
+		if !strings.Contains(preDeploy, want) {
+			t.Errorf("pre-deploy rollback evidence is missing serving revision contract %q", want)
+		}
+	}
+	if strings.Contains(deploy, "previous_ready_revision") || strings.Contains(deploy, "PREVIOUS_READY_REVISION") {
+		t.Fatal("Auth deploy evidence must not call the prior serving revision ready")
+	}
+
+	if strings.Contains(rollback, "latestReadyRevisionName") || strings.Contains(rollback, "CURRENT_READY_REVISION") || strings.Contains(rollback, "current_ready_revision") {
+		t.Fatal("Auth rollback must not use latestReadyRevisionName as current routing authority")
+	}
+	for _, want := range []string{
+		"LWC_SOURCE_COMMIT",
+		"expected_commit",
+		"type == \"Ready\"",
+		"current_serving_revision",
+		"current_image",
+		".status.traffic",
+	} {
+		if !strings.Contains(rollback, want) {
+			t.Errorf("Auth rollback workflow is missing pre-mutation contract %q", want)
+		}
+	}
+	mutation := strings.Index(rollback, "gcloud run services update-traffic")
+	if mutation < 0 {
+		t.Fatal("Auth rollback workflow is missing traffic mutation")
+	}
+	for _, check := range []string{"LWC_SOURCE_COMMIT", "type == \"Ready\"", "current_serving_revision"} {
+		if at := strings.Index(rollback, check); at < 0 || at > mutation {
+			t.Fatalf("Auth rollback must check %q before traffic mutation", check)
+		}
+	}
+}
+
+func TestDockerfileRestoresPreRemediationBuildSemantics(t *testing.T) {
+	contents := readWorkflow(t, "Dockerfile")
+	if strings.Contains(contents, "ENV CGO_ENABLED=0") {
+		t.Fatal("Dockerfile must not add a global CGO_ENABLED environment setting")
+	}
+	if !strings.Contains(contents, "RUN go generate ./... && CGO_ENABLED=0 go build") {
+		t.Fatal("Dockerfile must keep CGO_ENABLED scoped to the build instruction")
+	}
+}
+
+func TestAuthCloudBuildAndDockerfileUseDistinctBinaryAndImmutableIdentity(t *testing.T) {
+	cloudBuild := readWorkflow(t, "cloudbuild-auth.yaml")
+	dockerfile := readWorkflow(t, "Dockerfile.auth")
+	for _, want := range []string{
+		"--file",
+		"Dockerfile.auth",
+		"APP_VERSION=${_APP_VERSION}",
+		"GIT_SHA=${_GIT_SHA}",
+		"GIT_BRANCH=${_GIT_BRANCH}",
+		"GIT_TAG=${_GIT_TAG}",
+		"${_IMAGE}",
+	} {
+		if !strings.Contains(cloudBuild, want) {
+			t.Errorf("Auth Cloud Build config is missing %q", want)
+		}
+	}
+	for _, want := range []string{
+		"go build",
+		"./cmd/auth",
+		"ARG APP_VERSION=dev",
+		"ARG GIT_SHA=unknown",
+		"ARG GIT_BRANCH=unknown",
+		"ARG GIT_TAG=",
+		"org.opencontainers.image.version=${APP_VERSION}",
+		"org.opencontainers.image.revision=${GIT_SHA}",
+		"io.llm-wiki.image.tag=${GIT_SHA}",
+		"-X github.com/rayer/llm-wiki-bff/internal/buildinfo.ProductVersion=${APP_VERSION}",
+		"-X github.com/rayer/llm-wiki-bff/internal/buildinfo.GitSHA=${GIT_SHA}",
+		"-X github.com/rayer/llm-wiki-bff/internal/buildinfo.GitBranch=${GIT_BRANCH}",
+		"-X github.com/rayer/llm-wiki-bff/internal/buildinfo.GitTag=${GIT_TAG}",
+		"-X github.com/rayer/llm-wiki-bff/internal/buildinfo.ImageTag=${GIT_SHA}",
+	} {
+		if !strings.Contains(dockerfile, want) {
+			t.Errorf("Auth Dockerfile is missing %q", want)
 		}
 	}
 }
@@ -691,6 +1037,7 @@ func workflowSection(t *testing.T, contents, start, end string) string {
 func TestCloudRunWorkflowsUsePrivateRangesOnlyEgress(t *testing.T) {
 	for _, workflow := range []string{
 		".github/workflows/deploy-bff.yml",
+		".github/workflows/deploy-auth.yml",
 		".github/workflows/release-bff.yml",
 	} {
 		t.Run(workflow, func(t *testing.T) {

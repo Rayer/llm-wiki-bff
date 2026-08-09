@@ -4,11 +4,12 @@ IMAGE_TAG ?= $(shell git rev-parse HEAD)
 IMAGE := $(IMAGE_REPO):$(IMAGE_TAG)
 FRONTEND_DIR ?= ../llm-wiki-frontend
 BFF_PORT ?= 8080
+AUTH_PORT ?= 8081
 FRONTEND_PORT ?= 3000
 LOCAL_LOGIN_EMAIL ?= demo@llm-wiki.dev
 LOCAL_LOGIN_PASSWORD ?= demo123456
 
-.PHONY: docker-build docker-push deploy deploy-dev deploy-prod all build-sync setup local-config seed ensure-local-data dev support-bff support-frontend support-pipeline bff-local frontend-local local-token pipeline-test pipeline-run kill-local clean-local
+.PHONY: docker-build docker-push deploy deploy-dev deploy-prod all build-sync setup local-config seed ensure-local-data dev support-bff support-frontend support-pipeline bff-local auth-local frontend-local local-token pipeline-test pipeline-run kill-local clean-local
 
 docker-build:
 	docker build -t $(IMAGE) .
@@ -38,6 +39,7 @@ local-config:
 	@test -d "$(FRONTEND_DIR)" || { echo "Frontend repo not found: $(FRONTEND_DIR)" >&2; exit 1; }
 	@printf '%s\n' \
 		'NEXT_PUBLIC_API_URL=http://localhost:$(BFF_PORT)' \
+		'NEXT_PUBLIC_AUTH_URL=http://localhost:$(AUTH_PORT)' \
 		'NEXT_PUBLIC_DEV_USER_ID=local-user' \
 		'NEXT_PUBLIC_DEV_PROJECT_ID=demo' \
 		> "$(FRONTEND_DIR)/.env.local"
@@ -50,28 +52,31 @@ ensure-local-data:
 	@test -d local-data || $(MAKE) seed
 
 dev: local-config ensure-local-data
-	@$(MAKE) -j2 bff-local frontend-local
+	@$(MAKE) -j3 bff-local auth-local frontend-local
 
 support-bff: local-config ensure-local-data
-	@$(MAKE) frontend-local
+	@$(MAKE) -j2 auth-local frontend-local
 
 support-frontend: local-config ensure-local-data
-	@$(MAKE) bff-local
+	@$(MAKE) -j2 bff-local auth-local
 
 support-pipeline: local-config ensure-local-data
-	@$(MAKE) -j2 bff-local frontend-local
+	@$(MAKE) -j3 bff-local auth-local frontend-local
 
 bff-local:
-	PORT=$(BFF_PORT) LOCAL_DATA_DIR=./local-data DEV_JWT=true JWT_SECRET=dev-secret go run . --local ./local-data
+	PORT=$(BFF_PORT) LOCAL_DATA_DIR=./local-data DEV_JWT=true JWT_SECRET=dev-secret go run ./cmd/bff --local ./local-data
+
+auth-local:
+	PORT=$(AUTH_PORT) LOCAL_DATA_DIR=./local-data DEV_JWT=true JWT_SECRET=dev-secret go run ./cmd/auth --local ./local-data
 
 frontend-local:
 	cd "$(FRONTEND_DIR)" && NODE_ENV=development npm run dev -- --hostname 127.0.0.1 --port $(FRONTEND_PORT)
 
 local-token:
-	@BFF_URL='http://127.0.0.1:$(BFF_PORT)' \
+	@AUTH_URL='http://127.0.0.1:$(AUTH_PORT)' \
 		LOCAL_LOGIN_EMAIL='$(LOCAL_LOGIN_EMAIL)' \
 		LOCAL_LOGIN_PASSWORD='$(LOCAL_LOGIN_PASSWORD)' \
-		python3 -c 'import json, os, urllib.request; payload = json.dumps({"email": os.environ["LOCAL_LOGIN_EMAIL"], "password": os.environ["LOCAL_LOGIN_PASSWORD"]}).encode(); request = urllib.request.Request(os.environ["BFF_URL"] + "/api/v1/auth/login", data=payload, headers={"Content-Type": "application/json"}); response = json.load(urllib.request.urlopen(request)); token = response.get("access_token"); assert isinstance(token, str) and token, "login response has no access_token"; print(token)'
+		python3 -c 'import json, os, urllib.request; payload = json.dumps({"email": os.environ["LOCAL_LOGIN_EMAIL"], "password": os.environ["LOCAL_LOGIN_PASSWORD"]}).encode(); request = urllib.request.Request(os.environ["AUTH_URL"] + "/api/v1/auth/login", data=payload, headers={"Content-Type": "application/json"}); response = json.load(urllib.request.urlopen(request)); token = response.get("access_token"); assert isinstance(token, str) and token, "login response has no access_token"; print(token)'
 
 pipeline-test:
 	go test ./cmd/olw_worker
@@ -81,7 +86,7 @@ pipeline-run: ensure-local-data
 	go run ./cmd/olw_worker run '[["run","--auto-approve"]]' --vault ./local-data/users/local-user/projects/demo
 
 kill-local:
-	@ports='$(BFF_PORT) $(FRONTEND_PORT)'; \
+	@ports='$(BFF_PORT) $(AUTH_PORT) $(FRONTEND_PORT)'; \
 	listeners() { for port in $$ports; do lsof -tiTCP:$$port -sTCP:LISTEN 2>/dev/null || true; done | sort -u; }; \
 	pids="$$(listeners)"; \
 	if [ -z "$$pids" ]; then echo "No local listeners on ports $$ports"; exit 0; fi; \
