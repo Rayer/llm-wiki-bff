@@ -22,7 +22,7 @@ func TestProductionRouterExposesOnlyAuthPublicSurface(t *testing.T) {
 		http.MethodPost + " /api/v1/auth/login":    true,
 		http.MethodPost + " /api/v1/auth/refresh":  true,
 		http.MethodPost + " /api/v1/auth/logout":   true,
-		http.MethodGet + " /healthz":               true,
+		http.MethodGet + " /api/v1/public/healthz": true,
 		http.MethodGet + " /api/v1/public/version": true,
 	}
 
@@ -109,7 +109,7 @@ func TestAuthHostAllowlistRejectsBeforeRouteHandling(t *testing.T) {
 	}, false, nil, &syssettings.FakeStore{Enabled: true})
 
 	recorder := httptest.NewRecorder()
-	for _, rawURL := range []string{"http://wrong.example.test/healthz", "http://auth.example.test./healthz"} {
+	for _, rawURL := range []string{"http://wrong.example.test/api/v1/public/healthz", "http://auth.example.test./api/v1/public/healthz"} {
 		recorder = httptest.NewRecorder()
 		request := httptest.NewRequest(http.MethodGet, rawURL, nil)
 		router.ServeHTTP(recorder, request)
@@ -122,10 +122,17 @@ func TestAuthHostAllowlistRejectsBeforeRouteHandling(t *testing.T) {
 	}
 
 	recorder = httptest.NewRecorder()
-	request := httptest.NewRequest(http.MethodGet, "http://auth.example.test/healthz", nil)
+	request := httptest.NewRequest(http.MethodGet, "http://auth.example.test/api/v1/public/healthz", nil)
 	router.ServeHTTP(recorder, request)
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("allowed Host status = %d, want %d", recorder.Code, http.StatusOK)
+	}
+
+	recorder = httptest.NewRecorder()
+	request = httptest.NewRequest(http.MethodGet, "http://auth.example.test/healthz", nil)
+	router.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("former public health path status = %d, want %d", recorder.Code, http.StatusNotFound)
 	}
 }
 
@@ -134,7 +141,7 @@ func TestAuthLocalHostAllowlistAcceptsLocalhostOnlyInLocalMode(t *testing.T) {
 	localRouter := newProductionRouter(config.Config{DevJWT: true, JWTSecret: "test-secret"}, true, nil, &syssettings.FakeStore{Enabled: true})
 	for _, host := range []string{"localhost:8081", "127.0.0.1:8081"} {
 		recorder := httptest.NewRecorder()
-		request := httptest.NewRequest(http.MethodGet, "http://"+host+"/healthz", nil)
+		request := httptest.NewRequest(http.MethodGet, "http://"+host+"/api/v1/public/healthz", nil)
 		localRouter.ServeHTTP(recorder, request)
 		if recorder.Code != http.StatusOK {
 			t.Fatalf("local Host %q status = %d, want %d", host, recorder.Code, http.StatusOK)
@@ -143,7 +150,7 @@ func TestAuthLocalHostAllowlistAcceptsLocalhostOnlyInLocalMode(t *testing.T) {
 
 	productionRouter := newProductionRouter(config.Config{JWTSecret: "test-secret", AllowedOrigins: []string{"https://frontend.example"}}, false, nil, &syssettings.FakeStore{Enabled: true})
 	recorder := httptest.NewRecorder()
-	request := httptest.NewRequest(http.MethodGet, "http://localhost/healthz", nil)
+	request := httptest.NewRequest(http.MethodGet, "http://localhost/api/v1/public/healthz", nil)
 	productionRouter.ServeHTTP(recorder, request)
 	if recorder.Code != http.StatusBadRequest {
 		t.Fatalf("production localhost status = %d, want %d", recorder.Code, http.StatusBadRequest)
