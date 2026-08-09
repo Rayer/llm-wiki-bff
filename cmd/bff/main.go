@@ -207,6 +207,7 @@ func newProductionRouter(
 
 	// Temporary Stage A compatibility lane for the frontend Auth cutover.
 	authRoutes := r.Group("/api/v1/auth")
+	authRoutes.Use(auth.CompatibilityBodyLimit())
 	if localMode {
 		authRoutes.POST("/login", middleware.NewRateLimiter(10, time.Minute), auth.LocalDevLoginHandler(cfg.JWTSecret))
 		authRoutes.POST("/register", func(c *gin.Context) {

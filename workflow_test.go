@@ -75,6 +75,57 @@ func TestDevWorkflowManualDispatchRequiresCanonicalDevelopSHA(t *testing.T) {
 	}
 }
 
+func TestAuthDeploymentAndRollbackReconcileAfterAttemptedMutation(t *testing.T) {
+	deploy := readWorkflow(t, ".github/workflows/deploy-auth.yml")
+	rollback := readWorkflow(t, ".github/workflows/rollback-auth.yml")
+
+	strict := workflowSection(t, deploy, "      - name: Capture and verify Auth deployment evidence", "      - name: Reconcile Auth deployment outcome")
+	strictUpload := workflowSection(t, deploy, "      - name: Upload Auth deployment evidence", "      - name: Reconcile Auth deployment outcome")
+	reconcile := workflowSection(t, deploy, "      - name: Reconcile Auth deployment outcome", "      - name: Upload Auth deployment reconciliation")
+	reconcileUpload := workflowSection(t, deploy, "      - name: Upload Auth deployment reconciliation", "      - name: Persist build image digest")
+	for _, want := range []string{
+		"if: ${{ always() && steps.deploy.outcome != 'skipped' }}",
+		"id: strict_verify",
+		".status.imageDigest",
+		"status.traffic",
+	} {
+		if !strings.Contains(strict, want) {
+			t.Errorf("strict deploy verification missing %q", want)
+		}
+	}
+	if !strings.Contains(strictUpload, "if: steps.strict_verify.outcome == 'success'") || strings.Contains(strictUpload, "if: always()") {
+		t.Fatal("strict deployment evidence upload must be success-only")
+	}
+	for _, want := range []string{"if: always()", "RECONCILIATION", "status.traffic", "version_http_status", "Cache-Control", "healthz_http_status", "provider_readback_available", "http_readback_available", "steps: {deploy:", "jq -n"} {
+		if !strings.Contains(reconcile, want) {
+			t.Errorf("deployment reconciliation missing %q", want)
+		}
+	}
+	if !strings.Contains(reconcileUpload, "if: always()") || !strings.Contains(reconcileUpload, "if-no-files-found: error") {
+		t.Fatal("deployment reconciliation upload must always upload its created artifact")
+	}
+	if strings.Contains(reconcile, "cat \"$VERSION_BODY\"") || strings.Contains(reconcile, "cat \"$SERVICE_JSON\"") || strings.Contains(reconcile, "response_body") {
+		t.Fatal("deployment reconciliation must not dump provider or HTTP response bodies")
+	}
+
+	readback := workflowSection(t, rollback, "      - name: Verify rollback read-back", "      - name: Capture normalized rollback outcome")
+	outcome := workflowSection(t, rollback, "      - name: Capture normalized rollback outcome", "      - name: Upload normalized rollback outcome")
+	for _, want := range []string{"if: ${{ always() && steps.mutate.outcome != 'skipped' }}", "status.traffic", "actual_selected_traffic", "actual_serving_revision", "actual_serving_image", "version_http_status", "Cache-Control"} {
+		if !strings.Contains(readback+outcome, want) {
+			t.Errorf("rollback reconciliation missing %q", want)
+		}
+	}
+	if !strings.Contains(outcome, "if: always()") || !strings.Contains(outcome, "jq -n") {
+		t.Fatal("rollback outcome must always create a normalized artifact")
+	}
+	if strings.Contains(outcome, "cat \"$BODY\"") || strings.Contains(outcome, "response_body") {
+		t.Fatal("rollback outcome must not dump HTTP response bodies")
+	}
+	if !strings.Contains(deploy, "previous_version_commit") || !strings.Contains(deploy, ".commit") {
+		t.Fatal("deploy rollback evidence must retain the previous canonical commit")
+	}
+}
+
 func TestWorkerDevWorkflowBindsManualDispatchToExactCanonicalDevelopSHA(t *testing.T) {
 	contents := readWorkflow(t, ".github/workflows/deploy-worker.yml")
 

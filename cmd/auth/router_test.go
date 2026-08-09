@@ -194,3 +194,16 @@ func TestAuthRequestBodyLimitRejectsOversizedLogin(t *testing.T) {
 		t.Fatalf("oversized login status = %d, want %d", recorder.Code, http.StatusBadRequest)
 	}
 }
+
+func TestAuthRequestBodyLimitPreservesSmallMalformedLoginStatus(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	router := newProductionRouter(config.Config{DevJWT: true, JWTSecret: "test-secret"}, true, nil, &syssettings.FakeStore{Enabled: true})
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "http://localhost:8081/api/v1/auth/login", strings.NewReader(`{}`))
+	request.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("small malformed login status = %d, want %d", recorder.Code, http.StatusBadRequest)
+	}
+}

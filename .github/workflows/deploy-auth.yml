@@ -375,6 +375,10 @@ jobs:
           fi
           PREVIOUS_VERSION_SERVICE=$(jq -er '.service' "$PREVIOUS_VERSION_BODY")
           PREVIOUS_VERSION_REVISION=$(jq -er '.revision' "$PREVIOUS_VERSION_BODY")
+          if ! PREVIOUS_VERSION_COMMIT=$(jq -er '.commit | select(type == "string" and test("^[0-9a-f]{40}$"))' "$PREVIOUS_VERSION_BODY"); then
+            echo "Previous Auth version read-back did not contain a lowercase 40-character commit; refusing to deploy."
+            exit 1
+          fi
           ROLLBACK_EVIDENCE="auth-rollback-evidence-$COMMIT_SHA.json"
           jq -n \
             --arg service "$SERVICE_NAME" \
@@ -384,8 +388,9 @@ jobs:
             --arg previous_image "$PREVIOUS_IMAGE" \
             --arg previous_version_service "$PREVIOUS_VERSION_SERVICE" \
             --arg previous_version_revision "$PREVIOUS_VERSION_REVISION" \
+            --arg previous_version_commit "$PREVIOUS_VERSION_COMMIT" \
             --arg built_image "$IMMUTABLE_IMAGE" \
-            '{service: $service, domain: $domain, exact_commit: $commit, previous_serving_revision: $previous_serving_revision, previous_image: $previous_image, previous_version_service: $previous_version_service, previous_version_revision: $previous_version_revision, built_image: $built_image}' \
+            '{service: $service, domain: $domain, exact_commit: $commit, previous_serving_revision: $previous_serving_revision, previous_image: $previous_image, previous_version_service: $previous_version_service, previous_version_revision: $previous_version_revision, previous_version_commit: $previous_version_commit, built_image: $built_image}' \
             > "$ROLLBACK_EVIDENCE"
           echo "rollback_evidence=$ROLLBACK_EVIDENCE" >> "$GITHUB_OUTPUT"
 
@@ -423,7 +428,8 @@ jobs:
           echo "Deployed ${{ env.SERVICE_NAME }} ($GIT_SHA)"
 
       - name: Capture and verify Auth deployment evidence
-        if: always()
+        if: ${{ always() && steps.deploy.outcome != 'skipped' }}
+        id: strict_verify
         env:
           AR_REPO: ${{ env.AR_REPO }}
           COMMIT_SHA: ${{ steps.identity.outputs.git_sha }}
@@ -432,6 +438,9 @@ jobs:
         run: |
           set -euo pipefail
           EVIDENCE="auth-deployment-evidence-$COMMIT_SHA.json"
+          EVIDENCE_TMP="$EVIDENCE.tmp"
+          rm -f "$EVIDENCE" "$EVIDENCE_TMP" "$EVIDENCE_TMP.final"
+          trap 'rm -f "$EVIDENCE_TMP" "$EVIDENCE_TMP.final"' EXIT
           if ! SERVICE_JSON=$(gcloud run services describe "$SERVICE_NAME" \
             --region "${{ env.REGION }}" \
             --project "${{ env.PROJECT_ID }}" \
@@ -517,7 +526,7 @@ jobs:
           fi
 
           ROLLBACK_EVIDENCE="auth-rollback-evidence-$COMMIT_SHA.json"
-          if ! jq -e '(.previous_serving_revision | type == "string") and (.previous_image | type == "string")' "$ROLLBACK_EVIDENCE" >/dev/null; then
+          if ! jq -e '(.previous_serving_revision | type == "string") and (.previous_image | type == "string") and (.previous_version_commit | type == "string" and test("^[0-9a-f]{40}$"))' "$ROLLBACK_EVIDENCE" >/dev/null; then
             echo "Pre-deploy rollback evidence is missing or unreadable; refusing to publish evidence."
             exit 1
           fi
@@ -526,7 +535,7 @@ jobs:
             --arg new_image "$DEPLOYED_IMAGE_DIGEST" \
             '.new_revision = $new_revision | .new_image = $new_image' \
             "$ROLLBACK_EVIDENCE" \
-            > "$EVIDENCE"
+            > "$EVIDENCE_TMP"
 
           VERSION_BODY=$(mktemp)
           VERSION_HEADERS=$(mktemp)
@@ -560,16 +569,95 @@ jobs:
           jq --arg commit "$COMMIT_SHA" --arg service "$SERVICE_NAME" --arg revision "$NEW_REVISION" --arg runtime_source_commit "$RUNTIME_SOURCE_COMMIT" --arg status "$HTTP_STATUS" --arg health_status "$HEALTH_STATUS" \
             --arg runtime_service_account "$RUNTIME_SERVICE_ACCOUNT" --arg max_instances "$MAX_INSTANCES" --arg ingress "$INGRESS" --arg vpc_egress "$VPC_EGRESS" \
             '.exact_commit = $commit | .readback_service = $service | .readback_revision = $revision | .runtime_source_commit = $runtime_source_commit | .version_http_status = ($status | tonumber) | .healthz_http_status = ($health_status | tonumber) | .runtime_service_account = $runtime_service_account | .max_instances = ($max_instances | tonumber) | .ingress = $ingress | .vpc_egress = $vpc_egress | .jwt_secret_name = "jwt-secret-dev" | .runtime_env = {GCP_PROJECT: "llm-wiki-cloud", FIRESTORE_DATABASE_ID: "llm-wiki-cloud-dev", ALLOWED_ORIGINS: "https://llm-wiki-frontend-dev.vercel.app", ALLOWED_HOSTS: "auth-dev.rayer.idv.tw", DEV_JWT: "false"}' \
-            "$EVIDENCE" > "$EVIDENCE.tmp"
-          mv "$EVIDENCE.tmp" "$EVIDENCE"
+            "$EVIDENCE_TMP" > "$EVIDENCE_TMP.final"
+          mv "$EVIDENCE_TMP.final" "$EVIDENCE"
           echo "evidence=$EVIDENCE" >> "$GITHUB_OUTPUT"
 
       - name: Upload Auth deployment evidence
-        if: always()
+        if: steps.strict_verify.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: auth-deployment-evidence-${{ steps.identity.outputs.git_sha }}
           path: auth-deployment-evidence-${{ steps.identity.outputs.git_sha }}.json
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Reconcile Auth deployment outcome
+        if: always()
+        id: reconcile
+        env:
+          AR_REPO: ${{ env.AR_REPO }}
+          SERVICE_NAME: ${{ env.SERVICE_NAME }}
+          DEPLOY_OUTCOME: ${{ steps.deploy.outcome }}
+          STRICT_OUTCOME: ${{ steps.strict_verify.outcome }}
+        run: |
+          set +e
+          RECONCILIATION="auth-deployment-reconciliation-${{ steps.identity.outputs.git_sha }}.json"
+          HEADERS=$(mktemp)
+          VERSION_BODY=$(mktemp)
+          trap 'rm -f "$HEADERS" "$VERSION_BODY"' EXIT
+
+          SERVICE_JSON=""
+          PROVIDER_READBACK_AVAILABLE=false
+          if SERVICE_JSON=$(gcloud run services describe "$SERVICE_NAME" \
+            --region "${{ env.REGION }}" --project "${{ env.PROJECT_ID }}" --format=json --quiet 2>/dev/null); then
+            if jq -e 'type == "object"' <<<"$SERVICE_JSON" >/dev/null 2>&1; then
+              PROVIDER_READBACK_AVAILABLE=true
+            else
+              SERVICE_JSON=""
+            fi
+          fi
+          ACTUAL_TRAFFIC=$(jq -c '[.status.traffic[]? | {revisionName: (.revisionName // null), percent: (.percent // null), tag: (.tag // null), latestRevision: (.latestRevision // null)}]' <<<"$SERVICE_JSON" 2>/dev/null)
+          [[ "$ACTUAL_TRAFFIC" =~ ^\[ ]] || ACTUAL_TRAFFIC='[]'
+
+          SERVING_REVISIONS='[]'
+          while IFS= read -r revision; do
+            [[ "$revision" =~ ^[a-z][a-z0-9-]{0,61}[a-z0-9]$ ]] || continue
+            if REVISION_JSON=$(gcloud run revisions describe "$revision" --region "${{ env.REGION }}" --project "${{ env.PROJECT_ID }}" --format=json --quiet 2>/dev/null); then
+              IMAGE=$(jq -er '.status.imageDigest // empty' <<<"$REVISION_JSON" 2>/dev/null)
+              if [[ "$IMAGE" =~ ^${AR_REPO}/llm-wiki-auth@sha256:[0-9a-f]{64}$ ]]; then
+                ROW=$(jq -nc --arg revision "$revision" --arg image "$IMAGE" '{revisionName: $revision, image: $image}')
+                SERVING_REVISIONS=$(jq -c --argjson row "$ROW" '. + [$row]' <<<"$SERVING_REVISIONS")
+              fi
+            fi
+          done < <(jq -r '.status.traffic[]?.revisionName // empty' <<<"$SERVICE_JSON" 2>/dev/null)
+
+          VERSION_STATUS=000
+          CACHE_CONTROL=""
+          VERSION_FIELDS='{}'
+          if VERSION_STATUS=$(curl -sS --max-time 20 --connect-timeout 10 -H 'Cache-Control: no-cache' -D "$HEADERS" -o "$VERSION_BODY" -w '%{http_code}' "https://${{ env.AUTH_DOMAIN }}/api/v1/public/version" 2>/dev/null); then
+            CACHE_CONTROL=$(awk 'BEGIN{IGNORECASE=1} /^Cache-Control:/ {sub(/^[^:]*:[[:space:]]*/, ""); sub(/[[:space:]]*\r$/, ""); print; exit}' "$HEADERS")
+            VERSION_FIELDS=$(jq -c '{commit: (.commit // null), service: (.service // null), revision: (.revision // null)}' "$VERSION_BODY" 2>/dev/null)
+            [[ "$VERSION_FIELDS" =~ ^\{ ]] || VERSION_FIELDS='{}'
+          else
+            VERSION_STATUS=000
+          fi
+          HEALTH_STATUS=$(curl -sS --max-time 20 --connect-timeout 10 -o /dev/null -w '%{http_code}' "https://${{ env.AUTH_DOMAIN }}/healthz" 2>/dev/null)
+          [[ "$HEALTH_STATUS" =~ ^[0-9]{3}$ ]] || HEALTH_STATUS=000
+
+          jq -n \
+            --arg service "$SERVICE_NAME" \
+            --arg deploy "$DEPLOY_OUTCOME" \
+            --arg strict "$STRICT_OUTCOME" \
+            --argjson provider "$PROVIDER_READBACK_AVAILABLE" \
+            --argjson traffic "$ACTUAL_TRAFFIC" \
+            --argjson serving_revisions "$SERVING_REVISIONS" \
+            --arg version_status "$VERSION_STATUS" \
+            --arg cache_control "$CACHE_CONTROL" \
+            --argjson version_fields "$VERSION_FIELDS" \
+            --arg health_status "$HEALTH_STATUS" \
+            '{evidence: "reconciliation", service: $service, provider_readback_available: $provider, http_readback_available: ($version_status != "000" or $health_status != "000"), actual_traffic: $traffic, actual_serving_revisions: $serving_revisions, version_http_status: ($version_status | if . == "000" then null else tonumber end), version_cache_control: $cache_control, version: $version_fields, healthz_http_status: ($health_status | if . == "000" then null else tonumber end), steps: {deploy: $deploy, strict_verify: $strict}}' \
+            > "$RECONCILIATION"
+          test -s "$RECONCILIATION"
+          echo "reconciliation=$RECONCILIATION" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Upload Auth deployment reconciliation
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: auth-deployment-reconciliation-${{ steps.identity.outputs.git_sha }}
+          path: auth-deployment-reconciliation-${{ steps.identity.outputs.git_sha }}.json
           if-no-files-found: error
           retention-days: 90
 

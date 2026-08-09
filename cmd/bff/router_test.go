@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -49,6 +50,12 @@ func TestProductionRouterKeepsAuthCompatibilityLane(t *testing.T) {
 	}
 	if got := request("/api/v1/auth/logout", "").Code; got != http.StatusOK {
 		t.Fatalf("local compatibility logout status = %d, want %d", got, http.StatusOK)
+	}
+	if got := request("/api/v1/auth/login", `{}`).Code; got != http.StatusBadRequest {
+		t.Fatalf("small malformed local compatibility login status = %d, want %d", got, http.StatusBadRequest)
+	}
+	if got := request("/api/v1/auth/login", `{"email":"demo@llm-wiki.dev","password":"`+strings.Repeat("x", 64<<10)+`"}`).Code; got != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized local compatibility login status = %d, want %d", got, http.StatusRequestEntityTooLarge)
 	}
 
 	for i := 0; i < 11; i++ {

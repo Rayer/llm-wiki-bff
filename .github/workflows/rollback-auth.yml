@@ -182,6 +182,7 @@ jobs:
             --region "${{ env.REGION }}" --project "${{ env.PROJECT_ID }}" --quiet
 
       - name: Verify rollback read-back
+        if: ${{ always() && steps.mutate.outcome != 'skipped' }}
         id: readback
         env:
           TARGET_REVISION: ${{ inputs.target_revision }}
@@ -232,7 +233,46 @@ jobs:
           EXPECTED_IMAGE: ${{ inputs.expected_image }}
           EXPECTED_COMMIT: ${{ inputs.expected_commit }}
         run: |
-          set -euo pipefail
+          set +e
+          OUTCOME_FILE="auth-rollback-outcome-${GITHUB_RUN_ID}.json"
+          HEADERS=$(mktemp)
+          VERSION_BODY=$(mktemp)
+          trap 'rm -f "$HEADERS" "$VERSION_BODY"' EXIT
+
+          SERVICE_JSON=""
+          PROVIDER_READBACK_AVAILABLE=false
+          if SERVICE_JSON=$(gcloud run services describe "${{ env.SERVICE_NAME }}" \
+            --region "${{ env.REGION }}" --project "${{ env.PROJECT_ID }}" --format=json --quiet 2>/dev/null); then
+            if jq -e 'type == "object"' <<<"$SERVICE_JSON" >/dev/null 2>&1; then
+              PROVIDER_READBACK_AVAILABLE=true
+            else
+              SERVICE_JSON=""
+            fi
+          fi
+          ACTUAL_TRAFFIC=$(jq -c '[.status.traffic[]? | {revisionName: (.revisionName // null), percent: (.percent // null), tag: (.tag // null), latestRevision: (.latestRevision // null)}]' <<<"$SERVICE_JSON" 2>/dev/null)
+          [[ "$ACTUAL_TRAFFIC" =~ ^\[ ]] || ACTUAL_TRAFFIC='[]'
+          ACTUAL_SERVING_REVISION=$(jq -er 'first(.status.traffic[]? | select((.percent // 0) == 100 and (.tag? == null)) | .revisionName) // empty' <<<"$SERVICE_JSON" 2>/dev/null)
+          ACTUAL_SERVING_IMAGE=""
+          if [[ "$ACTUAL_SERVING_REVISION" =~ ^[a-z][a-z0-9-]{0,61}[a-z0-9]$ ]]; then
+            if SERVING_REVISION_JSON=$(gcloud run revisions describe "$ACTUAL_SERVING_REVISION" \
+              --region "${{ env.REGION }}" --project "${{ env.PROJECT_ID }}" --format=json --quiet 2>/dev/null); then
+              ACTUAL_SERVING_IMAGE=$(jq -er '.status.imageDigest // empty' <<<"$SERVING_REVISION_JSON" 2>/dev/null)
+            fi
+          fi
+
+          VERSION_STATUS=000
+          CACHE_CONTROL=""
+          VERSION_FIELDS='{}'
+          if VERSION_STATUS=$(curl -sS --max-time 20 --connect-timeout 10 -D "$HEADERS" -o "$VERSION_BODY" -w '%{http_code}' "https://${{ env.AUTH_DOMAIN }}/api/v1/public/version" 2>/dev/null); then
+            CACHE_CONTROL=$(awk 'BEGIN{IGNORECASE=1} /^Cache-Control:/ {sub(/^[^:]*:[[:space:]]*/, ""); sub(/[[:space:]]*\r$/, ""); print; exit}' "$HEADERS")
+            VERSION_FIELDS=$(jq -c '{commit: (.commit // null), service: (.service // null), revision: (.revision // null)}' "$VERSION_BODY" 2>/dev/null)
+            [[ "$VERSION_FIELDS" =~ ^\{ ]] || VERSION_FIELDS='{}'
+          else
+            VERSION_STATUS=000
+          fi
+          HEALTH_STATUS=$(curl -sS --max-time 20 --connect-timeout 10 -o /dev/null -w '%{http_code}' "https://${{ env.AUTH_DOMAIN }}/healthz" 2>/dev/null)
+          [[ "$HEALTH_STATUS" =~ ^[0-9]{3}$ ]] || HEALTH_STATUS=000
+
           jq -n \
             --arg outcome "$JOB_STATUS" \
             --arg service "${{ env.SERVICE_NAME }}" \
@@ -243,8 +283,18 @@ jobs:
             --arg capture "$CAPTURE_OUTCOME" \
             --arg mutate "$MUTATE_OUTCOME" \
             --arg readback "$READBACK_OUTCOME" \
-            '{evidence: "outcome", outcome: $outcome, service: $service, target_revision: $target_revision, expected_image: $expected_image, expected_commit: $expected_commit, steps: {validate: $validate, capture: $capture, mutate: $mutate, readback: $readback}}' \
-            > auth-rollback-outcome-${GITHUB_RUN_ID}.json
+            --argjson provider "$PROVIDER_READBACK_AVAILABLE" \
+            --argjson traffic "$ACTUAL_TRAFFIC" \
+            --arg actual_serving_revision "$ACTUAL_SERVING_REVISION" \
+            --arg actual_serving_image "$ACTUAL_SERVING_IMAGE" \
+            --arg version_status "$VERSION_STATUS" \
+            --arg cache_control "$CACHE_CONTROL" \
+            --argjson version_fields "$VERSION_FIELDS" \
+            --arg health_status "$HEALTH_STATUS" \
+            '{evidence: "outcome", outcome: $outcome, service: $service, target_revision: $target_revision, expected_image: $expected_image, expected_commit: $expected_commit, provider_readback_available: $provider, http_readback_available: ($version_status != "000" or $health_status != "000"), actual_selected_traffic: $traffic, actual_serving_revision: ($actual_serving_revision | if length > 0 then . else null end), actual_serving_image: ($actual_serving_image | if length > 0 then . else null end), version_http_status: ($version_status | if . == "000" then null else tonumber end), version_cache_control: $cache_control, version: $version_fields, healthz_http_status: ($health_status | if . == "000" then null else tonumber end), steps: {validate: $validate, capture: $capture, mutate: $mutate, readback: $readback}}' \
+            > "$OUTCOME_FILE"
+          test -s "$OUTCOME_FILE"
+          exit 0
 
       - name: Upload normalized rollback outcome
         if: always()

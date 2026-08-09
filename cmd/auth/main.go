@@ -88,7 +88,7 @@ func newProductionRouter(cfg config.Config, localMode bool, fsClient *firestorec
 	}))
 
 	authRoutes := r.Group("/api/v1/auth")
-	authRoutes.Use(authRequestBodyLimit())
+	authRoutes.Use(auth.RequestBodyLimit())
 	if localMode {
 		authRoutes.POST("/login", middleware.NewRateLimiter(10, time.Minute), auth.LocalDevLoginHandler(cfg.JWTSecret))
 		authRoutes.POST("/register", func(c *gin.Context) {
@@ -117,17 +117,6 @@ func newProductionRouter(cfg config.Config, localMode bool, fsClient *firestorec
 	r.GET("/api/v1/public/version", buildinfo.Handler())
 
 	return r
-}
-
-const maxAuthRequestBodyBytes = 64 << 10
-
-func authRequestBodyLimit() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		if c.Request.Body != nil {
-			c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxAuthRequestBodyBytes)
-		}
-		c.Next()
-	}
 }
 
 func authHostAllowlist(cfg config.Config, localMode bool) gin.HandlerFunc {
