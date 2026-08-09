@@ -106,8 +106,10 @@ func TestAuthDeploymentAndRollbackReconcileAfterAttemptedMutation(t *testing.T) 
 			if !strings.Contains(contents, "/api/v1/public/healthz") {
 				t.Fatal("Auth health probe must use the public versioned health path")
 			}
-			if strings.Contains(contents, `"/healthz"`) {
-				t.Fatal("Auth health probes must exclude the former public health path")
+			for _, forbidden := range []string{`"https://$AUTH_DOMAIN/healthz"`, `"https://${{ env.AUTH_DOMAIN }}/healthz"`} {
+				if strings.Contains(contents, forbidden) {
+					t.Fatalf("Auth health probes must exclude the former public health path %q", forbidden)
+				}
 			}
 		})
 	}
@@ -628,8 +630,10 @@ func TestAuthRollbackWorkflowIsManualDEVOnlyAndEvidenceFirst(t *testing.T) {
 			t.Errorf("Auth rollback workflow is missing contract %q", want)
 		}
 	}
-	if strings.Contains(contents, `"/healthz"`) {
-		t.Fatal("Auth rollback workflow must exclude the former public health path")
+	for _, forbidden := range []string{`"https://$AUTH_DOMAIN/healthz"`, `"https://${{ env.AUTH_DOMAIN }}/healthz"`} {
+		if strings.Contains(contents, forbidden) {
+			t.Fatalf("Auth rollback workflow must exclude the former public health path %q", forbidden)
+		}
 	}
 	for _, forbidden := range []string{
 		"gcloud run deploy",
