@@ -122,7 +122,8 @@ jobs:
             exit 1
           fi
 
-          if ! gcloud firestore databases describe "$FIRESTORE_DATABASE_ID" \
+          if ! gcloud firestore databases describe \
+            --database "$FIRESTORE_DATABASE_ID" \
             --project "${{ env.PROJECT_ID }}" \
             --format=json \
             --quiet >/dev/null; then
@@ -588,11 +589,16 @@ jobs:
         env:
           AR_REPO: ${{ env.AR_REPO }}
           SERVICE_NAME: ${{ env.SERVICE_NAME }}
+          EVIDENCE_ID: ${{ steps.source.outputs.candidate_sha || format('run-{0}', github.run_id) }}
           DEPLOY_OUTCOME: ${{ steps.deploy.outcome }}
           STRICT_OUTCOME: ${{ steps.strict_verify.outcome }}
         run: |
           set +e
-          RECONCILIATION="auth-deployment-reconciliation-${{ steps.identity.outputs.git_sha }}.json"
+          if [[ ! "$EVIDENCE_ID" =~ ^([0-9a-f]{40}|run-[0-9]+)$ ]]; then
+            echo "invalid reconciliation evidence identity"
+            exit 1
+          fi
+          RECONCILIATION="auth-deployment-reconciliation-$EVIDENCE_ID.json"
           HEADERS=$(mktemp)
           VERSION_BODY=$(mktemp)
           trap 'rm -f "$HEADERS" "$VERSION_BODY"' EXIT
@@ -635,7 +641,7 @@ jobs:
           HEALTH_STATUS=$(curl -sS --max-time 20 --connect-timeout 10 -o /dev/null -w '%{http_code}' "https://${{ env.AUTH_DOMAIN }}/api/v1/public/healthz" 2>/dev/null)
           [[ "$HEALTH_STATUS" =~ ^[0-9]{3}$ ]] || HEALTH_STATUS=000
 
-          jq -n \
+          if ! jq -n \
             --arg service "$SERVICE_NAME" \
             --arg deploy "$DEPLOY_OUTCOME" \
             --arg strict "$STRICT_OUTCOME" \
@@ -647,17 +653,23 @@ jobs:
             --argjson version_fields "$VERSION_FIELDS" \
             --arg health_status "$HEALTH_STATUS" \
             '{evidence: "reconciliation", service: $service, provider_readback_available: $provider, http_readback_available: ($version_status != "000" or $health_status != "000"), actual_traffic: $traffic, actual_serving_revisions: $serving_revisions, version_http_status: ($version_status | if . == "000" then null else tonumber end), version_cache_control: $cache_control, version: $version_fields, healthz_http_status: ($health_status | if . == "000" then null else tonumber end), steps: {deploy: $deploy, strict_verify: $strict}}' \
-            > "$RECONCILIATION"
-          test -s "$RECONCILIATION"
+            > "$RECONCILIATION"; then
+            echo "Unable to materialize Auth deployment reconciliation evidence; refusing to publish."
+            exit 1
+          fi
+          if [[ ! -s "$RECONCILIATION" ]]; then
+            echo "Auth deployment reconciliation evidence is missing or empty; refusing to publish."
+            exit 1
+          fi
+          echo "evidence_id=$EVIDENCE_ID" >> "$GITHUB_OUTPUT"
           echo "reconciliation=$RECONCILIATION" >> "$GITHUB_OUTPUT"
-          exit 0
 
       - name: Upload Auth deployment reconciliation
-        if: always()
+        if: ${{ always() && steps.reconcile.outputs.evidence_id != '' && steps.reconcile.outputs.reconciliation != '' }}
         uses: actions/upload-artifact@v4
         with:
-          name: auth-deployment-reconciliation-${{ steps.identity.outputs.git_sha }}
-          path: auth-deployment-reconciliation-${{ steps.identity.outputs.git_sha }}.json
+          name: auth-deployment-reconciliation-${{ steps.reconcile.outputs.evidence_id }}
+          path: ${{ steps.reconcile.outputs.reconciliation }}
           if-no-files-found: error
           retention-days: 90
 
