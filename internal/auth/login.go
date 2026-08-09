@@ -1,7 +1,6 @@
 package auth
 
 import (
-	"context"
 	"net/http"
 
 	"cloud.google.com/go/firestore"
@@ -55,7 +54,6 @@ type RateLimitErrorResponse struct {
 //	@Failure		503		{object}	ErrorResponse
 //	@Failure		429		{object}	RateLimitErrorResponse
 //	@Header			429		{integer}	Retry-After	"Seconds until the rate limit window resets"
-//	@Router			/api/v1/auth/login [post]
 func LoginHandler(fsClient *firestore.Client, jwtSecret string) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var req LoginRequest
@@ -89,15 +87,4 @@ func LoginHandler(fsClient *firestore.Client, jwtSecret string) gin.HandlerFunc 
 			User:        User{ID: userID, Email: user.Email, Role: user.Role},
 		})
 	}
-}
-
-// CreateTestUser creates the default test user in Firestore (for dev/CI).
-func CreateTestUser(ctx context.Context, fs *firestore.Client) {
-	pw := "test123"
-	hash, err := bcrypt.GenerateFromPassword([]byte(pw), bcrypt.DefaultCost)
-	if err != nil {
-		// best-effort: do not block startup
-		return
-	}
-	_ = CreateUser(ctx, fs, "test-user", "test@example.com", string(hash))
 }

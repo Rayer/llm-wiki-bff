@@ -27,7 +27,6 @@ type userLookupFunc func(ctx context.Context, fs *firestore.Client, userID strin
 //	@Failure		401		{object}	ErrorResponse
 //	@Failure		500		{object}	ErrorResponse
 //	@Failure		503		{object}	ErrorResponse
-//	@Router			/api/v1/auth/refresh [post]
 func RefreshHandler(fsClient *firestore.Client, jwtSecret string) gin.HandlerFunc {
 	return refreshHandler(fsClient, jwtSecret, GetUser)
 }

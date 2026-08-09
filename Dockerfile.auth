@@ -1,4 +1,4 @@
-# Multi-stage Go build
+# Multi-stage Go build for the standalone Auth service.
 FROM golang:1.26-alpine AS build
 
 ARG APP_VERSION=dev
@@ -10,12 +10,12 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN go generate ./... && CGO_ENABLED=0 go build -ldflags="-s -w \
+RUN CGO_ENABLED=0 go build -ldflags="-s -w \
   -X github.com/rayer/llm-wiki-bff/internal/buildinfo.ProductVersion=${APP_VERSION} \
   -X github.com/rayer/llm-wiki-bff/internal/buildinfo.GitSHA=${GIT_SHA} \
   -X github.com/rayer/llm-wiki-bff/internal/buildinfo.GitBranch=${GIT_BRANCH} \
   -X github.com/rayer/llm-wiki-bff/internal/buildinfo.GitTag=${GIT_TAG} \
-  -X github.com/rayer/llm-wiki-bff/internal/buildinfo.ImageTag=${GIT_SHA}" -o /bff ./cmd/bff
+  -X github.com/rayer/llm-wiki-bff/internal/buildinfo.ImageTag=${GIT_SHA}" -o /auth ./cmd/auth
 
 # Runtime
 FROM gcr.io/distroless/static-debian12:nonroot
@@ -32,7 +32,7 @@ LABEL org.opencontainers.image.version=${APP_VERSION} \
       io.llm-wiki.git.tag=${GIT_TAG} \
       io.llm-wiki.image.tag=${GIT_SHA}
 
-COPY --from=build /bff /bff
+COPY --from=build /auth /auth
 
 EXPOSE 8080
-ENTRYPOINT ["/bff"]
+ENTRYPOINT ["/auth"]

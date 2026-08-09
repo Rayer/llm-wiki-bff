@@ -1,0 +1,530 @@
+name: Deploy Auth to Cloud Run (dev)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: Full lowercase commit SHA to deploy from canonical develop
+        required: true
+        type: string
+
+env:
+  PROJECT_ID: llm-wiki-cloud
+  SERVICE_NAME: llm-wiki-auth-dev
+  REGION: asia-east1
+  AR_REPO: asia-east1-docker.pkg.dev/llm-wiki-cloud/cloud-run-images
+  AUTH_DOMAIN: auth-dev.rayer.idv.tw
+
+concurrency:
+  group: deploy-auth-dev
+  cancel-in-progress: false
+
+jobs:
+  test-and-deploy:
+    name: Test & Deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 80
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.commit_sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate deployment source
+        id: source
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          REF_NAME: ${{ github.ref_name }}
+          COMMIT_SHA: ${{ inputs.commit_sha }}
+          GITHUB_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            if [[ "$REF" != "refs/heads/develop" || "$REF_NAME" != "develop" ]]; then
+              echo "manual deployment must use the canonical develop branch"
+              exit 1
+            fi
+            if [[ ! "$COMMIT_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "commit_sha must be a 40-character lowercase commit SHA"
+              exit 1
+            fi
+            CANDIDATE_SHA="$COMMIT_SHA"
+            git fetch origin develop --force --no-tags
+            REMOTE_DEVELOP_SHA=$(git rev-parse origin/develop)
+            if [[ "$CANDIDATE_SHA" != "$REMOTE_DEVELOP_SHA" ]]; then
+              echo "input commit SHA does not match current origin/develop"
+              exit 1
+            fi
+          elif [[ "$EVENT_NAME" == "push" ]]; then
+            if [[ ! "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "github.sha must be a 40-character lowercase commit SHA"
+              exit 1
+            fi
+            CANDIDATE_SHA="$GITHUB_SHA"
+          else
+            echo "unsupported deployment event: $EVENT_NAME"
+            exit 1
+          fi
+          CHECKED_OUT_SHA=$(git rev-parse HEAD)
+          if [[ "$CANDIDATE_SHA" != "$CHECKED_OUT_SHA" ]]; then
+            echo "input commit SHA does not match checked-out HEAD"
+            exit 1
+          fi
+          echo "candidate_sha=$CANDIDATE_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache: true
+
+      - name: Run Go tests
+        run: go test ./... -count=1
+
+      - name: Run Go vet
+        run: go vet ./...
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v3
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+          install_components: beta
+
+      - name: Verify existing dev Auth prerequisites
+        run: |
+          set -euo pipefail
+          RUNTIME_SERVICE_ACCOUNT="lwc-auth-dev@llm-wiki-cloud.iam.gserviceaccount.com"
+          JWT_SECRET_NAME="jwt-secret-dev"
+          FIRESTORE_DATABASE_ID="llm-wiki-cloud-dev"
+
+          if ! gcloud iam service-accounts describe "$RUNTIME_SERVICE_ACCOUNT" \
+            --project "${{ env.PROJECT_ID }}" \
+            --format=json \
+            --quiet >/dev/null; then
+            echo "runtime service account $RUNTIME_SERVICE_ACCOUNT is missing or unreadable; refusing to deploy"
+            exit 1
+          fi
+
+          if ! gcloud artifacts repositories describe "cloud-run-images" \
+            --location "${{ env.REGION }}" \
+            --project "${{ env.PROJECT_ID }}" \
+            --format=json \
+            --quiet >/dev/null; then
+            echo "Artifact Registry repository cloud-run-images is missing or unreadable; refusing to deploy"
+            exit 1
+          fi
+
+          if ! gcloud firestore databases describe "$FIRESTORE_DATABASE_ID" \
+            --project "${{ env.PROJECT_ID }}" \
+            --format=json \
+            --quiet >/dev/null; then
+            echo "Firestore database $FIRESTORE_DATABASE_ID is missing or unreadable; refusing to deploy"
+            exit 1
+          fi
+
+          if ! gcloud secrets describe "$JWT_SECRET_NAME" \
+            --project "${{ env.PROJECT_ID }}" \
+            --format=json \
+            --quiet >/dev/null; then
+            echo "JWT secret $JWT_SECRET_NAME is missing or unreadable; refusing to deploy"
+            exit 1
+          fi
+
+          if ! SECRET_IAM_POLICY=$(gcloud secrets get-iam-policy "$JWT_SECRET_NAME" \
+            --project "${{ env.PROJECT_ID }}" \
+            --format=json \
+            --quiet); then
+            echo "unable to read IAM policy for secret $JWT_SECRET_NAME; refusing to deploy"
+            exit 1
+          fi
+          if ! jq -e --arg member "serviceAccount:$RUNTIME_SERVICE_ACCOUNT" \
+            'any(.bindings[]?; .role == "roles/secretmanager.secretAccessor" and any(.members[]?; . == $member))' \
+            <<<"$SECRET_IAM_POLICY" >/dev/null; then
+            echo "JWT secret IAM policy does not grant the runtime service account access; refusing to deploy"
+            exit 1
+          fi
+
+          if ! SERVICE_IAM_POLICY=$(gcloud run services get-iam-policy "${{ env.SERVICE_NAME }}" \
+            --region "${{ env.REGION }}" \
+            --project "${{ env.PROJECT_ID }}" \
+            --format=json \
+            --quiet); then
+            echo "unable to read IAM policy for ${{ env.SERVICE_NAME }}; refusing to deploy"
+            exit 1
+          fi
+          if ! jq -e \
+            'any(.bindings[]?; .role == "roles/run.invoker" and any(.members[]?; . == "allUsers"))' \
+            <<<"$SERVICE_IAM_POLICY" >/dev/null; then
+            echo "Auth service IAM policy does not grant the required public invoker role; refusing to deploy"
+            exit 1
+          fi
+
+          if ! DOMAIN_MAPPING=$(gcloud beta run domain-mappings describe \
+            --domain "$AUTH_DOMAIN" \
+            --region "${{ env.REGION }}" \
+            --platform managed \
+            --project "${{ env.PROJECT_ID }}" \
+            --format=json \
+            --quiet); then
+            echo "Auth domain mapping $AUTH_DOMAIN is missing or unreadable; refusing to deploy"
+            exit 1
+          fi
+          if ! jq -e --arg service "${{ env.SERVICE_NAME }}" '.spec.routeName == $service' <<<"$DOMAIN_MAPPING" >/dev/null; then
+            echo "Auth domain mapping $AUTH_DOMAIN does not target ${{ env.SERVICE_NAME }}; refusing to deploy"
+            exit 1
+          fi
+
+          if ! SERVICE_JSON=$(gcloud run services describe "${{ env.SERVICE_NAME }}" \
+            --region "${{ env.REGION }}" \
+            --project "${{ env.PROJECT_ID }}" \
+            --format=json \
+            --quiet); then
+            echo "Auth service ${{ env.SERVICE_NAME }} is missing or unreadable; refusing to deploy"
+            exit 1
+          fi
+          if ! jq -er '(.metadata.annotations["run.googleapis.com/ingress"] // "all") | select(. == "all")' <<<"$SERVICE_JSON" >/dev/null; then
+            echo "Auth service ingress is not public; refusing to deploy"
+            exit 1
+          fi
+          printf '%s\n' "$SERVICE_JSON" > auth-service-before.json
+
+      - name: Resolve build identity
+        id: identity
+        run: |
+          set -euo pipefail
+          APP_VERSION=$(go run ./cmd/versioncheck VERSION)
+          GIT_SHA=$(git rev-parse HEAD)
+          if [[ ! "$GIT_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "GIT_SHA must be a 40-character lowercase commit SHA"
+            exit 1
+          fi
+          GIT_BRANCH="${GITHUB_REF_NAME}"
+          if [[ ! "$GIT_BRANCH" =~ ^[0-9A-Za-z][0-9A-Za-z._/-]*$ ]]; then
+            echo "GIT_BRANCH is invalid: $GIT_BRANCH"
+            exit 1
+          fi
+          mapfile -t exact_tags < <(git tag --points-at HEAD --format='%(refname:strip=2)')
+          if (( ${#exact_tags[@]} > 1 )); then
+            echo "multiple exact git tags point at HEAD"
+            exit 1
+          fi
+          GIT_TAG="${exact_tags[0]:-}"
+          if [[ -n "$GIT_TAG" && ! "$GIT_TAG" =~ ^[0-9A-Za-z][0-9A-Za-z._/-]*$ ]]; then
+            echo "GIT_TAG is invalid: $GIT_TAG"
+            exit 1
+          fi
+          echo "app_version=$APP_VERSION" >> "$GITHUB_OUTPUT"
+          echo "git_sha=$GIT_SHA" >> "$GITHUB_OUTPUT"
+          echo "git_branch=$GIT_BRANCH" >> "$GITHUB_OUTPUT"
+          echo "git_tag=$GIT_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Build Auth image
+        id: build
+        env:
+          FIRESTORE_DATABASE_ID: llm-wiki-cloud-dev
+          RUNTIME_SERVICE_ACCOUNT: lwc-auth-dev@llm-wiki-cloud.iam.gserviceaccount.com
+          JWT_SECRET_NAME: jwt-secret-dev
+          ALLOWED_ORIGINS: https://llm-wiki-frontend-dev.vercel.app,http://localhost:3000,http://127.0.0.1:3000
+          APP_VERSION: ${{ steps.identity.outputs.app_version }}
+          GIT_SHA: ${{ steps.identity.outputs.git_sha }}
+          GIT_BRANCH: ${{ steps.identity.outputs.git_branch }}
+          GIT_TAG: ${{ steps.identity.outputs.git_tag }}
+        run: |
+          set -euo pipefail
+          IMAGE="${{ env.AR_REPO }}/llm-wiki-auth:$GIT_SHA"
+          echo "Building ${IMAGE}…"
+          BUILD_ID=$(gcloud builds submit \
+            --config cloudbuild-auth.yaml \
+            --substitutions="_IMAGE=$IMAGE,_APP_VERSION=$APP_VERSION,_GIT_SHA=$GIT_SHA,_GIT_BRANCH=$GIT_BRANCH,_GIT_TAG=$GIT_TAG" \
+            --timeout=600s \
+            --async \
+            --suppress-logs \
+            --format='value(id)' \
+            --quiet)
+          if [[ ! "$BUILD_ID" =~ ^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$ ]]; then
+            echo "Cloud Build submission returned an invalid build ID: $BUILD_ID"
+            exit 1
+          fi
+          echo "Submitted Cloud Build $BUILD_ID; waiting for completion…"
+
+          STATUS=""
+          # Cloud Build's default queue TTL is 3600s; add the 600s build
+          # timeout and a 120s polling buffer so valid queued builds can finish.
+          POLL_DEADLINE=$((SECONDS + 4320))
+          while (( SECONDS < POLL_DEADLINE )); do
+            if ! STATUS=$(gcloud builds describe "$BUILD_ID" \
+              --project="${{ env.PROJECT_ID }}" \
+              --format='value(status)' \
+              --quiet); then
+              echo "Unable to read Cloud Build $BUILD_ID status; failing closed."
+              exit 1
+            fi
+            case "$STATUS" in
+              SUCCESS)
+                echo "Cloud Build $BUILD_ID completed successfully."
+                break
+                ;;
+              PENDING|QUEUED|WORKING)
+                sleep 15
+                ;;
+              FAILURE|INTERNAL_ERROR|TIMEOUT|CANCELLED|EXPIRED|STATUS_UNKNOWN|UNKNOWN|"")
+                echo "Cloud Build $BUILD_ID ended with status '${STATUS:-empty}'; refusing to deploy."
+                exit 1
+                ;;
+              *)
+                echo "Cloud Build $BUILD_ID returned unknown status '$STATUS'; refusing to deploy."
+                exit 1
+                ;;
+            esac
+          done
+          if [[ "$STATUS" != SUCCESS ]]; then
+            echo "Timed out waiting for Cloud Build $BUILD_ID after 4320 seconds; refusing to deploy."
+            exit 1
+          fi
+
+          if ! BUILD_RESULT=$(gcloud builds describe "$BUILD_ID" \
+            --project="${{ env.PROJECT_ID }}" \
+            --format=json \
+            --quiet); then
+            echo "Unable to read successful Cloud Build $BUILD_ID result; failing closed."
+            exit 1
+          fi
+          if ! RESULT_IMAGES=$(jq -cer --arg image "$IMAGE" \
+            '[.results.images[]? | select(.name == $image)]' <<<"$BUILD_RESULT"); then
+            echo "Cloud Build $BUILD_ID returned an unreadable image result; failing closed."
+            exit 1
+          fi
+          RESULT_IMAGE_COUNT=$(jq -er 'length' <<<"$RESULT_IMAGES")
+          if [[ "$RESULT_IMAGE_COUNT" != "1" ]]; then
+            echo "Cloud Build $BUILD_ID returned $RESULT_IMAGE_COUNT image results for $IMAGE; refusing to deploy."
+            exit 1
+          fi
+          DIGEST=$(jq -er '.[0].digest' <<<"$RESULT_IMAGES")
+          if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "Cloud Build $BUILD_ID returned an invalid image digest; refusing to deploy."
+            exit 1
+          fi
+          IMMUTABLE_IMAGE="${{ env.AR_REPO }}/llm-wiki-auth@$DIGEST"
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          echo "immutable_image=$IMMUTABLE_IMAGE" >> "$GITHUB_OUTPUT"
+
+
+      - name: Capture pre-deploy Auth rollback evidence
+        id: rollback
+        env:
+          AR_REPO: ${{ env.AR_REPO }}
+          COMMIT_SHA: ${{ steps.identity.outputs.git_sha }}
+          SERVICE_NAME: ${{ env.SERVICE_NAME }}
+          IMMUTABLE_IMAGE: ${{ steps.build.outputs.immutable_image }}
+        run: |
+          set -euo pipefail
+          if ! PREVIOUS_READY_REVISION=$(jq -er '.status.latestReadyRevisionName' auth-service-before.json); then
+            echo "Cloud Run did not report a previous latest ready revision; refusing to deploy."
+            exit 1
+          fi
+          if ! PREVIOUS_REVISION_JSON=$(gcloud run revisions describe "$PREVIOUS_READY_REVISION" \
+            --region "${{ env.REGION }}" \
+            --project "${{ env.PROJECT_ID }}" \
+            --format=json \
+            --quiet); then
+            echo "Unable to read previous ready revision $PREVIOUS_READY_REVISION; refusing to deploy."
+            exit 1
+          fi
+          if ! PREVIOUS_IMAGE=$(jq -er '.status.imageDigest' <<<"$PREVIOUS_REVISION_JSON"); then
+            echo "Previous ready revision has no readable immutable image; refusing to deploy."
+            exit 1
+          fi
+          IMAGE_PATTERN="^${AR_REPO}/llm-wiki-auth@sha256:[0-9a-f]{64}$"
+          if [[ ! "$PREVIOUS_IMAGE" =~ $IMAGE_PATTERN ]]; then
+            echo "Previous ready revision image is not an immutable full image reference; refusing to deploy."
+            exit 1
+          fi
+          ROLLBACK_EVIDENCE="auth-rollback-evidence-$COMMIT_SHA.json"
+          jq -n \
+            --arg service "$SERVICE_NAME" \
+            --arg domain "$AUTH_DOMAIN" \
+            --arg commit "$COMMIT_SHA" \
+            --arg previous_ready_revision "$PREVIOUS_READY_REVISION" \
+            --arg previous_image "$PREVIOUS_IMAGE" \
+            --arg built_image "$IMMUTABLE_IMAGE" \
+            '{service: $service, domain: $domain, exact_commit: $commit, previous_ready_revision: $previous_ready_revision, previous_image: $previous_image, built_image: $built_image}' \
+            > "$ROLLBACK_EVIDENCE"
+          echo "rollback_evidence=$ROLLBACK_EVIDENCE" >> "$GITHUB_OUTPUT"
+
+      - name: Upload pre-deploy Auth rollback evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: auth-rollback-evidence-${{ steps.identity.outputs.git_sha }}
+          path: ${{ steps.rollback.outputs.rollback_evidence }}
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Deploy Auth to Cloud Run
+        id: deploy
+        env:
+          FIRESTORE_DATABASE_ID: llm-wiki-cloud-dev
+          RUNTIME_SERVICE_ACCOUNT: lwc-auth-dev@llm-wiki-cloud.iam.gserviceaccount.com
+          JWT_SECRET_NAME: jwt-secret-dev
+          ALLOWED_ORIGINS: https://llm-wiki-frontend-dev.vercel.app,http://localhost:3000,http://127.0.0.1:3000
+          ALLOWED_HOSTS: ${{ env.AUTH_DOMAIN }}
+          IMMUTABLE_IMAGE: ${{ steps.build.outputs.immutable_image }}
+          GIT_SHA: ${{ steps.identity.outputs.git_sha }}
+        run: |
+          set -euo pipefail
+          gcloud run deploy "${{ env.SERVICE_NAME }}" \
+            --image "$IMMUTABLE_IMAGE" \
+            --region "${{ env.REGION }}" \
+            --service-account "$RUNTIME_SERVICE_ACCOUNT" \
+            --network default --subnet default \
+            --vpc-egress private-ranges-only \
+            --ingress all \
+            --max-instances 1 \
+            --update-secrets "JWT_SECRET=$JWT_SECRET_NAME:latest" \
+            --update-env-vars "^@^GCP_PROJECT=${{ env.PROJECT_ID }}@FIRESTORE_DATABASE_ID=$FIRESTORE_DATABASE_ID@ALLOWED_ORIGINS=$ALLOWED_ORIGINS@ALLOWED_HOSTS=$ALLOWED_HOSTS@DEV_JWT=false" \
+            --quiet
+          echo "Deployed ${{ env.SERVICE_NAME }} ($GIT_SHA)"
+
+      - name: Capture and verify Auth deployment evidence
+        if: always()
+        env:
+          AR_REPO: ${{ env.AR_REPO }}
+          COMMIT_SHA: ${{ steps.identity.outputs.git_sha }}
+          SERVICE_NAME: ${{ env.SERVICE_NAME }}
+          IMMUTABLE_IMAGE: ${{ steps.build.outputs.immutable_image }}
+        run: |
+          set -euo pipefail
+          EVIDENCE="auth-deployment-evidence-$COMMIT_SHA.json"
+          if ! SERVICE_JSON=$(gcloud run services describe "$SERVICE_NAME" \
+            --region "${{ env.REGION }}" \
+            --project "${{ env.PROJECT_ID }}" \
+            --format=json \
+            --quiet); then
+            echo "Unable to read Auth service after deploy; refusing to publish evidence."
+            exit 1
+          fi
+          if ! NEW_READY_REVISION=$(jq -er '.status.latestReadyRevisionName' <<<"$SERVICE_JSON"); then
+            echo "Cloud Run did not report a new latest ready revision; refusing to publish evidence."
+            exit 1
+          fi
+          if ! REVISION_JSON=$(gcloud run revisions describe "$NEW_READY_REVISION" \
+            --region "${{ env.REGION }}" \
+            --project "${{ env.PROJECT_ID }}" \
+            --format=json \
+            --quiet); then
+            echo "Unable to read new ready revision $NEW_READY_REVISION; refusing to publish evidence."
+            exit 1
+          fi
+          if ! DEPLOYED_IMAGE_DIGEST=$(jq -er '.status.imageDigest' <<<"$REVISION_JSON"); then
+            echo "New ready revision has no readable immutable image; refusing to publish evidence."
+            exit 1
+          fi
+          IMAGE_PATTERN="^${AR_REPO}/llm-wiki-auth@sha256:[0-9a-f]{64}$"
+          if [[ ! "$DEPLOYED_IMAGE_DIGEST" =~ $IMAGE_PATTERN || "$DEPLOYED_IMAGE_DIGEST" != "$IMMUTABLE_IMAGE" ]]; then
+            echo "New ready revision image does not match the deployed immutable image; refusing to publish evidence."
+            exit 1
+          fi
+          ROLLBACK_EVIDENCE="auth-rollback-evidence-$COMMIT_SHA.json"
+          if ! jq -e '(.previous_ready_revision | type == "string") and (.previous_image | type == "string")' "$ROLLBACK_EVIDENCE" >/dev/null; then
+            echo "Pre-deploy rollback evidence is missing or unreadable; refusing to publish evidence."
+            exit 1
+          fi
+          jq \
+            --arg new_ready_revision "$NEW_READY_REVISION" \
+            --arg new_image "$DEPLOYED_IMAGE_DIGEST" \
+            '.new_ready_revision = $new_ready_revision | .new_image = $new_image' \
+            "$ROLLBACK_EVIDENCE" \
+            > "$EVIDENCE"
+
+          VERSION_BODY=$(mktemp)
+          trap 'rm -f "$VERSION_BODY"' EXIT
+          HTTP_STATUS=$(curl -sS --max-time 20 --connect-timeout 10 \
+            -H 'Cache-Control: no-cache' \
+            -o "$VERSION_BODY" \
+            -w '%{http_code}' \
+            "https://$AUTH_DOMAIN/api/v1/public/version")
+          if [[ "$HTTP_STATUS" != "200" ]]; then
+            echo "Auth version read-back returned HTTP $HTTP_STATUS; refusing to publish evidence."
+            exit 1
+          fi
+          if ! jq -e --arg commit "$COMMIT_SHA" --arg service "$SERVICE_NAME" \
+            '.commit == $commit and .service == $service' "$VERSION_BODY" >/dev/null; then
+            echo "Auth version read-back did not match the exact commit and service identity; refusing to publish evidence."
+            exit 1
+          fi
+          jq --arg commit "$COMMIT_SHA" --arg service "$SERVICE_NAME" --arg status "$HTTP_STATUS" \
+            '.exact_commit = $commit | .readback_service = $service | .version_http_status = ($status | tonumber)' \
+            "$EVIDENCE" > "$EVIDENCE.tmp"
+          mv "$EVIDENCE.tmp" "$EVIDENCE"
+          echo "evidence=$EVIDENCE" >> "$GITHUB_OUTPUT"
+
+      - name: Upload Auth deployment evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: auth-deployment-evidence-${{ steps.identity.outputs.git_sha }}
+          path: auth-deployment-evidence-${{ steps.identity.outputs.git_sha }}.json
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Persist build image digest
+        id: image_digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          COMMIT_SHA="${{ steps.identity.outputs.git_sha }}"
+          if [[ ! "$COMMIT_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "built commit SHA must be a 40-character lowercase commit SHA"
+            exit 1
+          fi
+          if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "Cloud Build image digest is missing or invalid"
+            exit 1
+          fi
+          DIGEST_FILE="auth-image-digest-$COMMIT_SHA.txt"
+          printf '%s\n' "$DIGEST" > "$DIGEST_FILE"
+          echo "commit_sha=$COMMIT_SHA" >> "$GITHUB_OUTPUT"
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          echo "digest_file=$DIGEST_FILE" >> "$GITHUB_OUTPUT"
+          echo "Persisted Cloud Build image digest $DIGEST"
+
+      - name: Upload image digest artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: auth-image-digest-${{ steps.image_digest.outputs.commit_sha }}
+          path: ${{ steps.image_digest.outputs.digest_file }}
+          if-no-files-found: error
+
+      - name: Tag deployed dev image (fail-closed)
+        env:
+          IMMUTABLE_IMAGE: ${{ env.AR_REPO }}/llm-wiki-auth@${{ steps.image_digest.outputs.digest }}
+        run: |
+          set -euo pipefail
+          DEV_IMAGE_TAG="${{ env.AR_REPO }}/llm-wiki-auth:dev-${{ steps.identity.outputs.git_sha }}"
+          gcloud artifacts docker tags add \
+            "$IMMUTABLE_IMAGE" \
+            "$DEV_IMAGE_TAG" \
+            --quiet
+
+      - name: Show deployment info
+        run: |
+          gcloud run services describe ${{ env.SERVICE_NAME }} \
+            --region ${{ env.REGION }} \
+            --format="value(status.url)"

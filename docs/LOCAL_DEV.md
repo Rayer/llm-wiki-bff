@@ -73,6 +73,7 @@ Defaults:
 
 ```text
 BFF_PORT=8080
+AUTH_PORT=8081
 FRONTEND_PORT=3000
 ```
 
@@ -89,6 +90,7 @@ The generated Frontend `.env.local` automatically uses `BFF_PORT`.
 ```text
 Frontend: http://127.0.0.1:3000
 BFF:      http://127.0.0.1:8080
+Auth:     http://127.0.0.1:8081
 ```
 
 ## Local authentication
@@ -102,7 +104,7 @@ user ID:  local-user
 role:     admin
 ```
 
-Get a fresh 15-minute JWT from the running BFF:
+Get a fresh 15-minute JWT from the running Auth service:
 
 ```bash
 TOKEN="$(make local-token)"
@@ -116,10 +118,10 @@ curl -fsS \
   http://127.0.0.1:8080/api/v1/admin/settings
 ```
 
-When overriding the BFF port:
+When overriding the Auth port:
 
 ```bash
-TOKEN="$(make local-token BFF_PORT=18080)"
+TOKEN="$(make local-token AUTH_PORT=18081)"
 ```
 
 The credential and `JWT_SECRET=dev-secret` are local-only. Do not use them for deployed environments, and do not commit a generated JWT.
@@ -135,7 +137,7 @@ make kill-local
 For overridden ports:
 
 ```bash
-make kill-local BFF_PORT=18080 FRONTEND_PORT=13000
+make kill-local BFF_PORT=18080 AUTH_PORT=18081 FRONTEND_PORT=13000
 ```
 
 ## Generated local config
@@ -144,11 +146,12 @@ make kill-local BFF_PORT=18080 FRONTEND_PORT=13000
 
 ```dotenv
 NEXT_PUBLIC_API_URL=http://localhost:8080
+NEXT_PUBLIC_AUTH_URL=http://localhost:8081
 NEXT_PUBLIC_DEV_USER_ID=local-user
 NEXT_PUBLIC_DEV_PROJECT_ID=demo
 ```
 
-The Makefile supplies the BFF local environment automatically. Reset demo data with:
+The Makefile supplies the BFF and Auth local environments automatically. Reset demo data with:
 
 ```bash
 make seed

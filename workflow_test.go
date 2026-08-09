@@ -327,26 +327,30 @@ func TestDevWorkflowPreflightsExistingIAMBeforeMutation(t *testing.T) {
 }
 
 func TestDevWorkflowYAMLAndRunBlocksAreExecutable(t *testing.T) {
-	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
-	var document any
-	if err := yaml.Unmarshal([]byte(contents), &document); err != nil {
-		t.Fatalf("deploy workflow is not valid YAML: %v", err)
-	}
+	for _, workflow := range []string{".github/workflows/deploy-bff.yml", ".github/workflows/deploy-auth.yml"} {
+		t.Run(workflow, func(t *testing.T) {
+			contents := readWorkflow(t, workflow)
+			var document any
+			if err := yaml.Unmarshal([]byte(contents), &document); err != nil {
+				t.Fatalf("deploy workflow is not valid YAML: %v", err)
+			}
 
-	runBlockPattern := regexp.MustCompile(`(?m)^\s+run: \|\n((?:\s{10,}.+\n?)+)`)
-	runs := runBlockPattern.FindAllStringSubmatch(contents, -1)
-	if len(runs) == 0 {
-		t.Fatal("deploy workflow has no executable run blocks")
-	}
-	for _, run := range runs {
-		body := strings.TrimSpace(run[1])
-		body = regexp.MustCompile(`(?m)^ {10}`).ReplaceAllString(body, "")
-		body = regexp.MustCompile(`\$\{\{[^}]*\}\}`).ReplaceAllString(body, "workflow-expression")
-		cmd := exec.Command("bash", "-n")
-		cmd.Stdin = strings.NewReader(body)
-		if output, err := cmd.CombinedOutput(); err != nil {
-			t.Fatalf("deploy workflow run block has invalid shell syntax: %v\n%s", err, output)
-		}
+			runBlockPattern := regexp.MustCompile(`(?m)^\s+run: \|\n((?:\s{10,}.+\n?)+)`)
+			runs := runBlockPattern.FindAllStringSubmatch(contents, -1)
+			if len(runs) == 0 {
+				t.Fatal("deploy workflow has no executable run blocks")
+			}
+			for _, run := range runs {
+				body := strings.TrimSpace(run[1])
+				body = regexp.MustCompile(`(?m)^ {10}`).ReplaceAllString(body, "")
+				body = regexp.MustCompile(`\$\{\{[^}]*\}\}`).ReplaceAllString(body, "workflow-expression")
+				cmd := exec.Command("bash", "-n")
+				cmd.Stdin = strings.NewReader(body)
+				if output, err := cmd.CombinedOutput(); err != nil {
+					t.Fatalf("deploy workflow run block has invalid shell syntax: %v\n%s", err, output)
+				}
+			}
+		})
 	}
 }
 
@@ -396,6 +400,135 @@ func TestBFFDevWorkflowPushesMainOnlyAndSupportsManualDispatch(t *testing.T) {
 	} {
 		if !strings.Contains(contents, want) {
 			t.Errorf("BFF dev workflow is missing trigger contract %q", want)
+		}
+	}
+}
+
+func TestAuthDevWorkflowUsesCanonicalSourceAndExistingPrerequisites(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/deploy-auth.yml")
+	for _, want := range []string{
+		"SERVICE_NAME: llm-wiki-auth-dev",
+		"AR_REPO: asia-east1-docker.pkg.dev/llm-wiki-cloud/cloud-run-images",
+		"ref: ${{ github.event_name == 'workflow_dispatch' && inputs.commit_sha || github.sha }}",
+		"git fetch origin develop --force --no-tags",
+		"git rev-parse origin/develop",
+		"--config cloudbuild-auth.yaml",
+		"llm-wiki-auth:$GIT_SHA",
+		"FIRESTORE_DATABASE_ID: llm-wiki-cloud-dev",
+		"RUNTIME_SERVICE_ACCOUNT: lwc-auth-dev@llm-wiki-cloud.iam.gserviceaccount.com",
+		"JWT_SECRET_NAME: jwt-secret-dev",
+		"gcloud iam service-accounts describe",
+		"gcloud firestore databases describe",
+		"gcloud secrets describe",
+		"gcloud secrets get-iam-policy",
+		"gcloud run services get-iam-policy",
+		"roles/secretmanager.secretAccessor",
+		"roles/run.invoker",
+		"allUsers",
+		"gcloud builds describe \"$BUILD_ID\"",
+		"IMMUTABLE_IMAGE=\"${{ env.AR_REPO }}/llm-wiki-auth@$DIGEST\"",
+		"latestReadyRevisionName",
+		"status.imageDigest",
+		"auth-image-digest-$COMMIT_SHA.txt",
+		"name: auth-image-digest-${{ steps.image_digest.outputs.commit_sha }}",
+		"AUTH_DOMAIN: auth-dev.rayer.idv.tw",
+		"group: deploy-auth-dev",
+		"cancel-in-progress: false",
+		"install_components: beta",
+		"gcloud beta run domain-mappings describe",
+		"--domain \"$AUTH_DOMAIN\"",
+		"--region \"${{ env.REGION }}\"",
+		"--platform managed",
+		"--ingress all",
+		"--max-instances 1",
+		".metadata.annotations[\"run.googleapis.com/ingress\"]",
+		"auth-deployment-evidence-$COMMIT_SHA.json",
+		"previous_ready_revision",
+		"previous_image",
+		"new_ready_revision",
+		"new_image",
+		"exact_commit",
+		"https://$AUTH_DOMAIN/api/v1/public/version",
+		"--max-time 20",
+		"Cache-Control: no-cache",
+		".commit == $commit and .service == $service",
+	} {
+		if !strings.Contains(contents, want) {
+			t.Errorf("Auth dev workflow is missing contract %q", want)
+		}
+	}
+	for _, forbidden := range []string{
+		"gcloud run jobs",
+		"add-iam-policy-binding",
+		"remove-iam-policy-binding",
+		"set-iam-policy",
+		"--allow-unauthenticated",
+		"DEEPSEEK_API_KEY",
+		"BUCKET=",
+		"PIPELINE_JOB",
+	} {
+		if strings.Contains(contents, forbidden) {
+			t.Errorf("Auth dev workflow must not contain %q", forbidden)
+		}
+	}
+	preflight := strings.Index(contents, "      - name: Verify existing dev Auth prerequisites")
+	build := strings.Index(contents, "gcloud builds submit")
+	deploy := strings.Index(contents, "gcloud run deploy")
+	if preflight < 0 || build < 0 || deploy < 0 || preflight > build || preflight > deploy {
+		t.Fatalf("Auth prerequisites must precede build and deploy: preflight=%d build=%d deploy=%d", preflight, build, deploy)
+	}
+	if strings.Count(contents, "gcloud run deploy") != 1 {
+		t.Fatalf("Auth dev workflow must have exactly one Cloud Run deploy command")
+	}
+	if strings.Count(contents, "AUTH_DOMAIN:") != 1 {
+		t.Fatalf("Auth dev workflow must declare one AUTH_DOMAIN value")
+	}
+	preflightDomain := strings.Index(contents, "gcloud beta run domain-mappings describe")
+	preflightBuild := strings.Index(contents, "gcloud builds submit")
+	if preflightDomain < 0 || preflightBuild < 0 || preflightDomain > preflightBuild {
+		t.Fatal("Auth domain mapping preflight must precede build mutation")
+	}
+	deployIndex := strings.Index(contents, "gcloud run deploy")
+	postDeploy := strings.Index(contents, "https://$AUTH_DOMAIN/api/v1/public/version")
+	if postDeploy < 0 || postDeploy < deployIndex {
+		t.Fatal("Auth version read-back must follow deploy")
+	}
+}
+
+func TestAuthCloudBuildAndDockerfileUseDistinctBinaryAndImmutableIdentity(t *testing.T) {
+	cloudBuild := readWorkflow(t, "cloudbuild-auth.yaml")
+	dockerfile := readWorkflow(t, "Dockerfile.auth")
+	for _, want := range []string{
+		"--file",
+		"Dockerfile.auth",
+		"APP_VERSION=${_APP_VERSION}",
+		"GIT_SHA=${_GIT_SHA}",
+		"GIT_BRANCH=${_GIT_BRANCH}",
+		"GIT_TAG=${_GIT_TAG}",
+		"${_IMAGE}",
+	} {
+		if !strings.Contains(cloudBuild, want) {
+			t.Errorf("Auth Cloud Build config is missing %q", want)
+		}
+	}
+	for _, want := range []string{
+		"go build",
+		"./cmd/auth",
+		"ARG APP_VERSION=dev",
+		"ARG GIT_SHA=unknown",
+		"ARG GIT_BRANCH=unknown",
+		"ARG GIT_TAG=",
+		"org.opencontainers.image.version=${APP_VERSION}",
+		"org.opencontainers.image.revision=${GIT_SHA}",
+		"io.llm-wiki.image.tag=${GIT_SHA}",
+		"-X github.com/rayer/llm-wiki-bff/internal/buildinfo.ProductVersion=${APP_VERSION}",
+		"-X github.com/rayer/llm-wiki-bff/internal/buildinfo.GitSHA=${GIT_SHA}",
+		"-X github.com/rayer/llm-wiki-bff/internal/buildinfo.GitBranch=${GIT_BRANCH}",
+		"-X github.com/rayer/llm-wiki-bff/internal/buildinfo.GitTag=${GIT_TAG}",
+		"-X github.com/rayer/llm-wiki-bff/internal/buildinfo.ImageTag=${GIT_SHA}",
+	} {
+		if !strings.Contains(dockerfile, want) {
+			t.Errorf("Auth Dockerfile is missing %q", want)
 		}
 	}
 }
@@ -691,6 +824,7 @@ func workflowSection(t *testing.T, contents, start, end string) string {
 func TestCloudRunWorkflowsUsePrivateRangesOnlyEgress(t *testing.T) {
 	for _, workflow := range []string{
 		".github/workflows/deploy-bff.yml",
+		".github/workflows/deploy-auth.yml",
 		".github/workflows/release-bff.yml",
 	} {
 		t.Run(workflow, func(t *testing.T) {

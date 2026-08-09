@@ -19,7 +19,6 @@ type LogoutResponse struct {
 //	@Produce		json
 //	@Success		200	{object}	LogoutResponse
 //	@Header			200	{string}	Set-Cookie	"refresh_token; Path=/; Domain=rayer.idv.tw; Max-Age=0; HttpOnly; Secure; SameSite=Lax"
-//	@Router			/api/v1/auth/logout [post]
 func LogoutHandler() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		setRefreshTokenCookie(c, "", -1)
