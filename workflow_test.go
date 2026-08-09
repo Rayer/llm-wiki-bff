@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
@@ -113,8 +114,8 @@ func TestAuthDeploymentAndRollbackReconcileAfterAttemptedMutation(t *testing.T) 
 			}
 		})
 	}
-	if !strings.Contains(reconcileUpload, "if: always()") || !strings.Contains(reconcileUpload, "if-no-files-found: error") {
-		t.Fatal("deployment reconciliation upload must always upload its created artifact")
+	if !strings.Contains(reconcileUpload, "always()") || !strings.Contains(reconcileUpload, "if-no-files-found: error") {
+		t.Fatal("deployment reconciliation upload must run after the attempted mutation and require its created artifact")
 	}
 	if strings.Contains(reconcile, "cat \"$VERSION_BODY\"") || strings.Contains(reconcile, "cat \"$SERVICE_JSON\"") || strings.Contains(reconcile, "response_body") {
 		t.Fatal("deployment reconciliation must not dump provider or HTTP response bodies")
@@ -581,6 +582,171 @@ func TestAuthDevWorkflowUsesCanonicalSourceAndExistingPrerequisites(t *testing.T
 	if postDeploy < 0 || postDeploy < deployIndex {
 		t.Fatal("Auth version read-back must follow deploy")
 	}
+}
+
+func TestAuthPreflightUsesNamedFirestoreDatabaseAndSourceReconciliationIdentity(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/deploy-auth.yml")
+	preflight := workflowSection(t, contents, "      - name: Verify existing dev Auth prerequisites", "      - name: Resolve build identity")
+	if !strings.Contains(preflight, "gcloud firestore databases describe \\") || !strings.Contains(preflight, "            --database \"$FIRESTORE_DATABASE_ID\"") {
+		t.Error("Auth Firestore preflight must use the named --database flag")
+	}
+	if strings.Contains(preflight, "gcloud firestore databases describe \"$FIRESTORE_DATABASE_ID\"") {
+		t.Error("Auth Firestore preflight must not pass the database ID positionally")
+	}
+
+	reconcile := workflowSection(t, contents, "      - name: Reconcile Auth deployment outcome", "      - name: Persist build image digest")
+	if want := "EVIDENCE_ID: ${{ steps.source.outputs.candidate_sha || format('run-{0}', github.run_id) }}"; !strings.Contains(reconcile, want) {
+		t.Fatalf("Auth reconciliation must prefer the validated source SHA and fall back to the run ID: missing %q", want)
+	}
+	if strings.Contains(reconcile, "inputs.commit_sha") || strings.Contains(reconcile, "auth-deployment-reconciliation-${{ steps.source.outputs.candidate_sha }}") {
+		t.Fatal("Auth reconciliation must not use raw input or an empty-prone source expression in a filename")
+	}
+	if !strings.Contains(reconcile, `if [[ ! "$EVIDENCE_ID" =~ ^([0-9a-f]{40}|run-[0-9]+)$ ]]; then`) {
+		t.Fatal("Auth reconciliation must validate the evidence identity before creating a filename")
+	}
+
+	run := workflowSection(t, reconcile, "        run: |", "\n\n      - name: Upload Auth deployment reconciliation")
+	run = regexp.MustCompile(`(?m)^ {10}`).ReplaceAllString(strings.TrimPrefix(run, "        run: |\n"), "")
+	filenameAt := strings.Index(run, "HEADERS=$(mktemp)")
+	if filenameAt < 0 {
+		t.Fatal("Auth reconciliation identity prelude is missing")
+	}
+	identityPrelude := run[:filenameAt]
+	for _, tc := range []struct {
+		name       string
+		evidenceID string
+		wantPath   string
+	}{
+		{name: "validated candidate SHA", evidenceID: strings.Repeat("a", 40), wantPath: "auth-deployment-reconciliation-" + strings.Repeat("a", 40) + ".json"},
+		{name: "source validation fallback", evidenceID: "run-123456789", wantPath: "auth-deployment-reconciliation-run-123456789.json"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := exec.Command("bash", "-c", identityPrelude+`printf '%s\n' "$EVIDENCE_ID" "$RECONCILIATION"`)
+			cmd.Env = append(os.Environ(), "EVIDENCE_ID="+tc.evidenceID)
+			output, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("reconciliation identity prelude failed: %v\n%s", err, output)
+			}
+			if got := strings.TrimSpace(string(output)); got != tc.evidenceID+"\n"+tc.wantPath {
+				t.Fatalf("reconciliation identity output = %q, want %q", got, tc.evidenceID+"\n"+tc.wantPath)
+			}
+		})
+	}
+	cmd := exec.Command("bash", "-c", identityPrelude)
+	cmd.Env = append(os.Environ(), "EVIDENCE_ID=bad/name")
+	if output, err := cmd.CombinedOutput(); err == nil {
+		t.Fatalf("unsafe reconciliation identity was accepted: %s", output)
+	}
+
+	if !strings.Contains(reconcile, `echo "evidence_id=$EVIDENCE_ID" >> "$GITHUB_OUTPUT"`) || !strings.Contains(reconcile, `echo "reconciliation=$RECONCILIATION" >> "$GITHUB_OUTPUT"`) {
+		t.Fatal("Auth reconciliation must output both its evidence ID and generated path")
+	}
+	reconcileUpload := workflowSection(t, contents, "      - name: Upload Auth deployment reconciliation", "      - name: Persist build image digest")
+	if !strings.Contains(reconcileUpload, "name: auth-deployment-reconciliation-${{ steps.reconcile.outputs.evidence_id }}") || !strings.Contains(reconcileUpload, "path: ${{ steps.reconcile.outputs.reconciliation }}") {
+		t.Fatal("Auth reconciliation upload must use the reconcile step outputs")
+	}
+	if !strings.Contains(reconcileUpload, "steps.reconcile.outputs.evidence_id != ''") || !strings.Contains(reconcileUpload, "steps.reconcile.outputs.reconciliation != ''") {
+		t.Fatal("Auth reconciliation upload must not run with empty reconcile outputs")
+	}
+	if strings.Contains(reconcileUpload, "steps.source.outputs.candidate_sha") || strings.Contains(reconcileUpload, "path: auth-deployment-reconciliation-") {
+		t.Fatal("Auth reconciliation upload must not reconstruct a possibly empty filename")
+	}
+	if strings.Contains(reconcile, "auth-deployment-reconciliation-${{ steps.identity.outputs.git_sha }}") {
+		t.Error("Auth reconciliation naming and path must not depend on the later identity step")
+	}
+
+	strictAndDigest := workflowSection(t, contents, "      - name: Capture and verify Auth deployment evidence", "      - name: Show deployment info")
+	for _, want := range []string{
+		"COMMIT_SHA: ${{ steps.identity.outputs.git_sha }}",
+		"name: auth-deployment-evidence-${{ steps.identity.outputs.git_sha }}",
+		"path: auth-deployment-evidence-${{ steps.identity.outputs.git_sha }}.json",
+		"COMMIT_SHA=\"${{ steps.identity.outputs.git_sha }}\"",
+		"DEV_IMAGE_TAG=\"${{ env.AR_REPO }}/llm-wiki-auth:dev-${{ steps.identity.outputs.git_sha }}\"",
+	} {
+		if !strings.Contains(strictAndDigest, want) {
+			t.Errorf("Auth strict evidence/image digest identity binding changed: missing %q", want)
+		}
+	}
+}
+
+func TestAuthReconciliationMaterializationFailsClosedBeforeOutputs(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/deploy-auth.yml")
+	reconcile := workflowSection(t, contents, "      - name: Reconcile Auth deployment outcome", "      - name: Upload Auth deployment reconciliation")
+	materializeAt := strings.Index(reconcile, "          if ! jq -n \\")
+	if materializeAt < 0 {
+		t.Fatal("Auth reconciliation materialization is missing")
+	}
+	epilogue := reconcile[materializeAt:]
+	epilogue = regexp.MustCompile(`(?m)^ {10}`).ReplaceAllString(epilogue, "")
+
+	ifGuardAt := strings.Index(epilogue, "if ! jq -n")
+	emptyGuardAt := strings.Index(epilogue, `if [[ ! -s "$RECONCILIATION" ]]; then`)
+	outputAt := strings.Index(epilogue, `echo "evidence_id=$EVIDENCE_ID" >> "$GITHUB_OUTPUT"`)
+	if ifGuardAt < 0 || emptyGuardAt < 0 || outputAt < 0 || ifGuardAt >= emptyGuardAt || emptyGuardAt >= outputAt {
+		t.Fatal("Auth reconciliation must materialize, verify non-empty output, then export outputs")
+	}
+	if strings.Contains(epilogue, `test -s "$RECONCILIATION"`) || strings.Contains(epilogue, "exit 0") {
+		t.Fatal("Auth reconciliation must not use a non-fatal bare test or unconditional success exit")
+	}
+
+	fakeBin := t.TempDir()
+	if err := os.WriteFile(filepath.Join(fakeBin, "jq"), []byte("#!/usr/bin/env bash\ncase ${JQ_MODE:-valid} in\nfail) exit 1 ;;\nempty) exit 0 ;;\nesac\nprintf '%s\\n' '{\"evidence\":\"reconciliation\"}'\n"), 0o755); err != nil {
+		t.Fatalf("write fake jq: %v", err)
+	}
+	run := func(t *testing.T, mode string) (string, error) {
+		t.Helper()
+		dir := t.TempDir()
+		reconciliation := filepath.Join(dir, "reconciliation.json")
+		outputPath := filepath.Join(dir, "github-output")
+		env := os.Environ()
+		for i, value := range env {
+			if strings.HasPrefix(value, "PATH=") {
+				env[i] = "PATH=" + fakeBin + ":" + os.Getenv("PATH")
+			}
+		}
+		env = append(env,
+			"SERVICE_NAME=llm-wiki-auth-dev",
+			"DEPLOY_OUTCOME=failure",
+			"STRICT_OUTCOME=failure",
+			"PROVIDER_READBACK_AVAILABLE=false",
+			"ACTUAL_TRAFFIC=[]",
+			"SERVING_REVISIONS=[]",
+			"VERSION_STATUS=000",
+			"CACHE_CONTROL=",
+			"VERSION_FIELDS={}",
+			"HEALTH_STATUS=000",
+			"EVIDENCE_ID=run-123",
+			"RECONCILIATION="+reconciliation,
+			"GITHUB_OUTPUT="+outputPath,
+			"JQ_MODE="+mode,
+		)
+		cmd := exec.Command("bash", "-c", epilogue)
+		cmd.Env = env
+		return stringOutput(cmd, outputPath)
+	}
+
+	for _, mode := range []string{"fail", "empty"} {
+		if output, err := run(t, mode); err == nil || output != "" {
+			t.Fatalf("%s materialization reached output export: err=%v output=%q", mode, err, output)
+		}
+	}
+	if output, err := run(t, "valid"); err != nil {
+		t.Fatalf("valid materialization failed: %v", err)
+	} else {
+		lines := strings.Split(strings.TrimSpace(output), "\n")
+		if len(lines) != 2 || lines[0] != "evidence_id=run-123" || !strings.HasPrefix(lines[1], "reconciliation=") {
+			t.Fatalf("valid materialization output = %q", output)
+		}
+	}
+}
+
+func stringOutput(cmd *exec.Cmd, outputPath string) (string, error) {
+	err := cmd.Run()
+	contents, readErr := os.ReadFile(outputPath)
+	if readErr != nil && !os.IsNotExist(readErr) {
+		return "", readErr
+	}
+	return string(contents), err
 }
 
 func TestBFFDevWorkflowLimitsStageACompatibilityToOneInstance(t *testing.T) {
