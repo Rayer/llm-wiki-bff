@@ -561,7 +561,7 @@ jobs:
             echo "Auth version read-back did not match the exact commit, service, and revision identity; refusing to publish evidence."
             exit 1
           fi
-          HEALTH_STATUS=$(curl -sS --max-time 20 --connect-timeout 10 -o /dev/null -w '%{http_code}' "https://$AUTH_DOMAIN/healthz")
+          HEALTH_STATUS=$(curl -sS --max-time 20 --connect-timeout 10 -o /dev/null -w '%{http_code}' "https://$AUTH_DOMAIN/api/v1/public/healthz")
           if [[ "$HEALTH_STATUS" != "200" ]]; then
             echo "Auth healthz read-back returned HTTP $HEALTH_STATUS"
             exit 1
@@ -632,7 +632,7 @@ jobs:
           else
             VERSION_STATUS=000
           fi
-          HEALTH_STATUS=$(curl -sS --max-time 20 --connect-timeout 10 -o /dev/null -w '%{http_code}' "https://${{ env.AUTH_DOMAIN }}/healthz" 2>/dev/null)
+          HEALTH_STATUS=$(curl -sS --max-time 20 --connect-timeout 10 -o /dev/null -w '%{http_code}' "https://${{ env.AUTH_DOMAIN }}/api/v1/public/healthz" 2>/dev/null)
           [[ "$HEALTH_STATUS" =~ ^[0-9]{3}$ ]] || HEALTH_STATUS=000
 
           jq -n \
