@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
@@ -666,6 +667,86 @@ func TestAuthPreflightUsesNamedFirestoreDatabaseAndSourceReconciliationIdentity(
 			t.Errorf("Auth strict evidence/image digest identity binding changed: missing %q", want)
 		}
 	}
+}
+
+func TestAuthReconciliationMaterializationFailsClosedBeforeOutputs(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/deploy-auth.yml")
+	reconcile := workflowSection(t, contents, "      - name: Reconcile Auth deployment outcome", "      - name: Upload Auth deployment reconciliation")
+	materializeAt := strings.Index(reconcile, "          if ! jq -n \\")
+	if materializeAt < 0 {
+		t.Fatal("Auth reconciliation materialization is missing")
+	}
+	epilogue := reconcile[materializeAt:]
+	epilogue = regexp.MustCompile(`(?m)^ {10}`).ReplaceAllString(epilogue, "")
+
+	ifGuardAt := strings.Index(epilogue, "if ! jq -n")
+	emptyGuardAt := strings.Index(epilogue, `if [[ ! -s "$RECONCILIATION" ]]; then`)
+	outputAt := strings.Index(epilogue, `echo "evidence_id=$EVIDENCE_ID" >> "$GITHUB_OUTPUT"`)
+	if ifGuardAt < 0 || emptyGuardAt < 0 || outputAt < 0 || ifGuardAt >= emptyGuardAt || emptyGuardAt >= outputAt {
+		t.Fatal("Auth reconciliation must materialize, verify non-empty output, then export outputs")
+	}
+	if strings.Contains(epilogue, `test -s "$RECONCILIATION"`) || strings.Contains(epilogue, "exit 0") {
+		t.Fatal("Auth reconciliation must not use a non-fatal bare test or unconditional success exit")
+	}
+
+	fakeBin := t.TempDir()
+	if err := os.WriteFile(filepath.Join(fakeBin, "jq"), []byte("#!/usr/bin/env bash\ncase ${JQ_MODE:-valid} in\nfail) exit 1 ;;\nempty) exit 0 ;;\nesac\nprintf '%s\\n' '{\"evidence\":\"reconciliation\"}'\n"), 0o755); err != nil {
+		t.Fatalf("write fake jq: %v", err)
+	}
+	run := func(t *testing.T, mode string) (string, error) {
+		t.Helper()
+		dir := t.TempDir()
+		reconciliation := filepath.Join(dir, "reconciliation.json")
+		outputPath := filepath.Join(dir, "github-output")
+		env := os.Environ()
+		for i, value := range env {
+			if strings.HasPrefix(value, "PATH=") {
+				env[i] = "PATH=" + fakeBin + ":" + os.Getenv("PATH")
+			}
+		}
+		env = append(env,
+			"SERVICE_NAME=llm-wiki-auth-dev",
+			"DEPLOY_OUTCOME=failure",
+			"STRICT_OUTCOME=failure",
+			"PROVIDER_READBACK_AVAILABLE=false",
+			"ACTUAL_TRAFFIC=[]",
+			"SERVING_REVISIONS=[]",
+			"VERSION_STATUS=000",
+			"CACHE_CONTROL=",
+			"VERSION_FIELDS={}",
+			"HEALTH_STATUS=000",
+			"EVIDENCE_ID=run-123",
+			"RECONCILIATION="+reconciliation,
+			"GITHUB_OUTPUT="+outputPath,
+			"JQ_MODE="+mode,
+		)
+		cmd := exec.Command("bash", "-c", epilogue)
+		cmd.Env = env
+		return stringOutput(cmd, outputPath)
+	}
+
+	for _, mode := range []string{"fail", "empty"} {
+		if output, err := run(t, mode); err == nil || output != "" {
+			t.Fatalf("%s materialization reached output export: err=%v output=%q", mode, err, output)
+		}
+	}
+	if output, err := run(t, "valid"); err != nil {
+		t.Fatalf("valid materialization failed: %v", err)
+	} else {
+		lines := strings.Split(strings.TrimSpace(output), "\n")
+		if len(lines) != 2 || lines[0] != "evidence_id=run-123" || !strings.HasPrefix(lines[1], "reconciliation=") {
+			t.Fatalf("valid materialization output = %q", output)
+		}
+	}
+}
+
+func stringOutput(cmd *exec.Cmd, outputPath string) (string, error) {
+	err := cmd.Run()
+	contents, readErr := os.ReadFile(outputPath)
+	if readErr != nil && !os.IsNotExist(readErr) {
+		return "", readErr
+	}
+	return string(contents), err
 }
 
 func TestBFFDevWorkflowLimitsStageACompatibilityToOneInstance(t *testing.T) {
