@@ -1,0 +1,224 @@
+name: Rollback Auth to Cloud Run (dev)
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_revision:
+        description: Exact ready Cloud Run Auth revision to receive 100% traffic
+        required: true
+        type: string
+      expected_image:
+        description: Exact immutable Auth image expected on the target revision
+        required: true
+        type: string
+      expected_commit:
+        description: Exact lowercase 40-character source commit expected by Auth version
+        required: true
+        type: string
+
+env:
+  PROJECT_ID: llm-wiki-cloud
+  SERVICE_NAME: llm-wiki-auth-dev
+  REGION: asia-east1
+  AR_REPO: asia-east1-docker.pkg.dev/llm-wiki-cloud/cloud-run-images
+  AUTH_DOMAIN: auth-dev.rayer.idv.tw
+
+concurrency:
+  group: deploy-auth-dev
+  cancel-in-progress: false
+
+jobs:
+  rollback:
+    name: Rollback Auth traffic (dev)
+    runs-on: ubuntu-latest
+    environment: development
+    timeout-minutes: 30
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout workflow ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Validate rollback inputs before cloud auth
+        id: validate
+        env:
+          TARGET_REVISION: ${{ inputs.target_revision }}
+          EXPECTED_IMAGE: ${{ inputs.expected_image }}
+          EXPECTED_COMMIT: ${{ inputs.expected_commit }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$TARGET_REVISION" =~ ^[a-z][a-z0-9-]{0,61}[a-z0-9]$ ]]; then
+            echo "target_revision has an invalid Cloud Run revision format"
+            exit 1
+          fi
+          if [[ ! "$EXPECTED_IMAGE" =~ ^asia-east1-docker\.pkg\.dev/llm-wiki-cloud/cloud-run-images/llm-wiki-auth@sha256:[0-9a-f]{64}$ ]]; then
+            echo "expected_image must be the exact immutable DEV Auth image reference"
+            exit 1
+          fi
+          if [[ ! "$EXPECTED_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "expected_commit must be a 40-character lowercase commit SHA"
+            exit 1
+          fi
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v3
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+
+      - name: Verify exact target and capture pre-mutation evidence
+        id: capture
+        env:
+          TARGET_REVISION: ${{ inputs.target_revision }}
+          EXPECTED_IMAGE: ${{ inputs.expected_image }}
+          EXPECTED_COMMIT: ${{ inputs.expected_commit }}
+        run: |
+          set -euo pipefail
+          if ! TARGET_REVISION_JSON=$(gcloud run revisions describe "$TARGET_REVISION" \
+            --region "${{ env.REGION }}" --project "${{ env.PROJECT_ID }}" --format=json --quiet); then
+            echo "Unable to read target Auth revision; refusing to mutate traffic"
+            exit 1
+          fi
+          TARGET_NAME=$(jq -er '.metadata.name // empty' <<<"$TARGET_REVISION_JSON")
+          TARGET_SERVICE=$(jq -er '(.metadata.labels["serving.knative.dev/service"] // .metadata.annotations["serving.knative.dev/service"] // empty)' <<<"$TARGET_REVISION_JSON")
+          TARGET_IMAGE=$(jq -er '.status.imageDigest // empty' <<<"$TARGET_REVISION_JSON")
+          if [[ "$TARGET_NAME" != "$TARGET_REVISION" || "$TARGET_SERVICE" != "${{ env.SERVICE_NAME }}" ]]; then
+            echo "target revision identity mismatch: expected DEV Auth service and exact revision"
+            exit 1
+          fi
+          if [[ "$TARGET_IMAGE" != "$EXPECTED_IMAGE" ]]; then
+            echo "target revision image digest mismatch"
+            exit 1
+          fi
+
+          if ! SERVICE_JSON=$(gcloud run services describe "${{ env.SERVICE_NAME }}" \
+            --region "${{ env.REGION }}" --project "${{ env.PROJECT_ID }}" --format=json --quiet); then
+            echo "Unable to read DEV Auth service; refusing to mutate traffic"
+            exit 1
+          fi
+          CURRENT_READY_REVISION=$(jq -er '.status.latestReadyRevisionName // empty' <<<"$SERVICE_JSON")
+          if ! CURRENT_REVISION_JSON=$(gcloud run revisions describe "$CURRENT_READY_REVISION" \
+            --region "${{ env.REGION }}" --project "${{ env.PROJECT_ID }}" --format=json --quiet); then
+            echo "Unable to read current ready Auth revision; refusing to mutate traffic"
+            exit 1
+          fi
+          CURRENT_IMAGE=$(jq -er '.status.imageDigest // empty' <<<"$CURRENT_REVISION_JSON")
+          CURRENT_TRAFFIC=$(jq -cer '[.status.traffic[]? | {revision: (.revisionName // ""), percent: (.percent // 0)}]' <<<"$SERVICE_JSON")
+          PRE_EVIDENCE="auth-rollback-pre-mutation-${GITHUB_RUN_ID}.json"
+          jq -n \
+            --arg service "${{ env.SERVICE_NAME }}" \
+            --arg target_revision "$TARGET_REVISION" \
+            --arg target_image "$EXPECTED_IMAGE" \
+            --arg target_commit "$EXPECTED_COMMIT" \
+            --arg current_ready_revision "$CURRENT_READY_REVISION" \
+            --arg current_image "$CURRENT_IMAGE" \
+            --argjson current_traffic "$CURRENT_TRAFFIC" \
+            '{evidence: "pre-mutation", service: $service, target_revision: $target_revision, target_image: $target_image, expected_commit: $target_commit, current_ready_revision: $current_ready_revision, current_image: $current_image, current_traffic: $current_traffic}' \
+            > "$PRE_EVIDENCE"
+          echo "pre_evidence=$PRE_EVIDENCE" >> "$GITHUB_OUTPUT"
+
+      - name: Upload pre-mutation rollback evidence
+        if: steps.capture.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: auth-rollback-pre-mutation-${{ github.run_id }}
+          path: ${{ steps.capture.outputs.pre_evidence }}
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Move exactly 100% DEV traffic
+        id: mutate
+        env:
+          TARGET_REVISION: ${{ inputs.target_revision }}
+        run: |
+          set -euo pipefail
+          gcloud run services update-traffic "${{ env.SERVICE_NAME }}" \
+            --to-revisions "$TARGET_REVISION=100" \
+            --region "${{ env.REGION }}" --project "${{ env.PROJECT_ID }}" --quiet
+
+      - name: Verify rollback read-back
+        id: readback
+        env:
+          TARGET_REVISION: ${{ inputs.target_revision }}
+          EXPECTED_COMMIT: ${{ inputs.expected_commit }}
+        run: |
+          set -euo pipefail
+          SERVICE_JSON=$(gcloud run services describe "${{ env.SERVICE_NAME }}" \
+            --region "${{ env.REGION }}" --project "${{ env.PROJECT_ID }}" --format=json --quiet)
+          if ! jq -e --arg revision "$TARGET_REVISION" \
+            '([.status.traffic[]? | select(.revisionName == $revision) | .percent] | length == 1 and .[0] == 100)' \
+            <<<"$SERVICE_JSON" >/dev/null; then
+            echo "rollback traffic read-back is not exactly 100% on the requested revision"
+            exit 1
+          fi
+          HEADERS=$(mktemp)
+          BODY=$(mktemp)
+          trap 'rm -f "$HEADERS" "$BODY"' EXIT
+          HEALTH_STATUS=$(curl -sS --max-time 20 --connect-timeout 10 -o /dev/null -w '%{http_code}' "https://${{ env.AUTH_DOMAIN }}/healthz")
+          if [[ "$HEALTH_STATUS" != "200" ]]; then
+            echo "Auth healthz read-back returned HTTP $HEALTH_STATUS"
+            exit 1
+          fi
+          VERSION_STATUS=$(curl -sS --max-time 20 --connect-timeout 10 -D "$HEADERS" -o "$BODY" -w '%{http_code}' "https://${{ env.AUTH_DOMAIN }}/api/v1/public/version")
+          if [[ "$VERSION_STATUS" != "200" ]]; then
+            echo "Auth version read-back returned HTTP $VERSION_STATUS"
+            exit 1
+          fi
+          CACHE_CONTROL=$(awk 'BEGIN{IGNORECASE=1} /^Cache-Control:/ {sub(/^[^:]*:[[:space:]]*/, ""); sub(/[[:space:]]*\r$/, ""); print; exit}' "$HEADERS")
+          if [[ "${CACHE_CONTROL,,}" != "no-store" ]]; then
+            echo "Auth version Cache-Control mismatch: expected no-store"
+            exit 1
+          fi
+          if ! jq -e --arg commit "$EXPECTED_COMMIT" --arg service "${{ env.SERVICE_NAME }}" --arg revision "$TARGET_REVISION" \
+            '.commit == $commit and .service == $service and .revision == $revision' "$BODY" >/dev/null; then
+            echo "Auth version identity does not match the requested commit, service, and revision"
+            exit 1
+          fi
+
+      - name: Capture normalized rollback outcome
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+          VALIDATE_OUTCOME: ${{ steps.validate.outcome }}
+          CAPTURE_OUTCOME: ${{ steps.capture.outcome }}
+          MUTATE_OUTCOME: ${{ steps.mutate.outcome }}
+          READBACK_OUTCOME: ${{ steps.readback.outcome }}
+          TARGET_REVISION: ${{ inputs.target_revision }}
+          EXPECTED_IMAGE: ${{ inputs.expected_image }}
+          EXPECTED_COMMIT: ${{ inputs.expected_commit }}
+        run: |
+          set -euo pipefail
+          jq -n \
+            --arg outcome "$JOB_STATUS" \
+            --arg service "${{ env.SERVICE_NAME }}" \
+            --arg target_revision "$TARGET_REVISION" \
+            --arg expected_image "$EXPECTED_IMAGE" \
+            --arg expected_commit "$EXPECTED_COMMIT" \
+            --arg validate "$VALIDATE_OUTCOME" \
+            --arg capture "$CAPTURE_OUTCOME" \
+            --arg mutate "$MUTATE_OUTCOME" \
+            --arg readback "$READBACK_OUTCOME" \
+            '{evidence: "outcome", outcome: $outcome, service: $service, target_revision: $target_revision, expected_image: $expected_image, expected_commit: $expected_commit, steps: {validate: $validate, capture: $capture, mutate: $mutate, readback: $readback}}' \
+            > auth-rollback-outcome-${GITHUB_RUN_ID}.json
+
+      - name: Upload normalized rollback outcome
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: auth-rollback-outcome-${{ github.run_id }}
+          path: auth-rollback-outcome-${{ github.run_id }}.json
+          if-no-files-found: error
+          retention-days: 90

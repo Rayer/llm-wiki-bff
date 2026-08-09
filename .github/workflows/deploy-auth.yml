@@ -1,8 +1,6 @@
 name: Deploy Auth to Cloud Run (dev)
 
 on:
-  push:
-    branches: [develop]
   workflow_dispatch:
     inputs:
       commit_sha:
@@ -35,7 +33,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.commit_sha || github.sha }}
+          ref: ${{ inputs.commit_sha }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -49,30 +47,23 @@ jobs:
           GITHUB_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
-            if [[ "$REF" != "refs/heads/develop" || "$REF_NAME" != "develop" ]]; then
-              echo "manual deployment must use the canonical develop branch"
-              exit 1
-            fi
-            if [[ ! "$COMMIT_SHA" =~ ^[0-9a-f]{40}$ ]]; then
-              echo "commit_sha must be a 40-character lowercase commit SHA"
-              exit 1
-            fi
-            CANDIDATE_SHA="$COMMIT_SHA"
-            git fetch origin develop --force --no-tags
-            REMOTE_DEVELOP_SHA=$(git rev-parse origin/develop)
-            if [[ "$CANDIDATE_SHA" != "$REMOTE_DEVELOP_SHA" ]]; then
-              echo "input commit SHA does not match current origin/develop"
-              exit 1
-            fi
-          elif [[ "$EVENT_NAME" == "push" ]]; then
-            if [[ ! "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]; then
-              echo "github.sha must be a 40-character lowercase commit SHA"
-              exit 1
-            fi
-            CANDIDATE_SHA="$GITHUB_SHA"
-          else
-            echo "unsupported deployment event: $EVENT_NAME"
+          if [[ "$EVENT_NAME" != "workflow_dispatch" ]]; then
+            echo "Auth deployment is manual-only"
+            exit 1
+          fi
+          if [[ "$REF_NAME" != "develop" || "$REF" != "refs/heads/develop" ]]; then
+            echo "manual deployment must use the canonical develop branch"
+            exit 1
+          fi
+          if [[ ! "$COMMIT_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "commit_sha must be a 40-character lowercase commit SHA"
+            exit 1
+          fi
+          CANDIDATE_SHA="$COMMIT_SHA"
+          git fetch origin develop --force --no-tags
+          REMOTE_DEVELOP_SHA=$(git rev-parse origin/develop)
+          if [[ "$CANDIDATE_SHA" != "$REMOTE_DEVELOP_SHA" ]]; then
+            echo "input commit SHA does not match current origin/develop"
             exit 1
           fi
           CHECKED_OUT_SHA=$(git rev-parse HEAD)
@@ -356,6 +347,26 @@ jobs:
             echo "Previous ready revision image is not an immutable full image reference; refusing to deploy."
             exit 1
           fi
+
+          # previous version read-back proves the prior revision is an Auth-compatible rollback target.
+          PREVIOUS_VERSION_BODY=$(mktemp)
+          trap 'rm -f "$PREVIOUS_VERSION_BODY"' EXIT
+          HTTP_STATUS=$(curl -sS --max-time 20 --connect-timeout 10 \
+            -H 'Cache-Control: no-cache' \
+            -o "$PREVIOUS_VERSION_BODY" \
+            -w '%{http_code}' \
+            "https://$AUTH_DOMAIN/api/v1/public/version")
+          if [[ "$HTTP_STATUS" != "200" ]]; then
+            echo "Previous Auth version read-back returned HTTP $HTTP_STATUS; refusing to deploy."
+            exit 1
+          fi
+          if ! jq -e --arg service "$SERVICE_NAME" --arg revision "$PREVIOUS_READY_REVISION" \
+            '.service == $service and .revision == $revision' "$PREVIOUS_VERSION_BODY" >/dev/null; then
+            echo "Previous version read-back did not identify the exact Auth service and ready revision; refusing to deploy."
+            exit 1
+          fi
+          PREVIOUS_VERSION_SERVICE=$(jq -er '.service' "$PREVIOUS_VERSION_BODY")
+          PREVIOUS_VERSION_REVISION=$(jq -er '.revision' "$PREVIOUS_VERSION_BODY")
           ROLLBACK_EVIDENCE="auth-rollback-evidence-$COMMIT_SHA.json"
           jq -n \
             --arg service "$SERVICE_NAME" \
@@ -363,8 +374,10 @@ jobs:
             --arg commit "$COMMIT_SHA" \
             --arg previous_ready_revision "$PREVIOUS_READY_REVISION" \
             --arg previous_image "$PREVIOUS_IMAGE" \
+            --arg previous_version_service "$PREVIOUS_VERSION_SERVICE" \
+            --arg previous_version_revision "$PREVIOUS_VERSION_REVISION" \
             --arg built_image "$IMMUTABLE_IMAGE" \
-            '{service: $service, domain: $domain, exact_commit: $commit, previous_ready_revision: $previous_ready_revision, previous_image: $previous_image, built_image: $built_image}' \
+            '{service: $service, domain: $domain, exact_commit: $commit, previous_ready_revision: $previous_ready_revision, previous_image: $previous_image, previous_version_service: $previous_version_service, previous_version_revision: $previous_version_revision, built_image: $built_image}' \
             > "$ROLLBACK_EVIDENCE"
           echo "rollback_evidence=$ROLLBACK_EVIDENCE" >> "$GITHUB_OUTPUT"
 
@@ -440,6 +453,59 @@ jobs:
             echo "New ready revision image does not match the deployed immutable image; refusing to publish evidence."
             exit 1
           fi
+
+          EXPECTED_RUNTIME_SERVICE_ACCOUNT="lwc-auth-dev@llm-wiki-cloud.iam.gserviceaccount.com"
+          if ! RUNTIME_SERVICE_ACCOUNT=$(printf '%s\n%s\n' "$REVISION_JSON" "$SERVICE_JSON" | jq -s -er ' (.[0].spec.serviceAccountName // .[0].spec.serviceAccount // .[0].spec.serviceAccountEmail // .[1].spec.template.spec.serviceAccountName // .[1].spec.template.spec.serviceAccount // .[1].spec.template.spec.serviceAccountEmail // empty) | select(type == "string" and length > 0)'); then
+            echo "New Auth revision runtime service account is unreadable; refusing to publish evidence."
+            exit 1
+          fi
+          if [[ "$RUNTIME_SERVICE_ACCOUNT" != "$EXPECTED_RUNTIME_SERVICE_ACCOUNT" ]]; then
+            echo "New Auth revision runtime service account mismatch: expected $EXPECTED_RUNTIME_SERVICE_ACCOUNT"
+            exit 1
+          fi
+
+          env_value() {
+            jq -er --arg name "$1" '[.spec.template.spec.containers[]?.env[]? | select(.name == $name) | .value // empty] | if length == 1 then .[0] else empty end' <<<"$SERVICE_JSON"
+          }
+          secret_name() {
+            jq -er --arg name "$1" '[.spec.template.spec.containers[]?.env[]? | select(.name == $name) | (.valueFrom.secretKeyRef.name // .valueSource.secretKeyRef.secret // empty)] | if length == 1 then .[0] else empty end' <<<"$SERVICE_JSON"
+          }
+          assert_env() {
+            local name="$1" expected="$2" actual
+            if ! actual=$(env_value "$name") || [[ "$actual" != "$expected" ]]; then
+              echo "Auth runtime env mismatch for $name: expected $expected"
+              exit 1
+            fi
+          }
+          assert_env GCP_PROJECT "${{ env.PROJECT_ID }}"
+          assert_env FIRESTORE_DATABASE_ID "llm-wiki-cloud-dev"
+          assert_env ALLOWED_ORIGINS "https://llm-wiki-frontend-dev.vercel.app"
+          assert_env ALLOWED_HOSTS "$AUTH_DOMAIN"
+          assert_env DEV_JWT "false"
+          if ! JWT_SECRET_REF=$(secret_name JWT_SECRET) || [[ "$JWT_SECRET_REF" != "jwt-secret-dev" ]]; then
+            echo "Auth runtime JWT_SECRET is not a reference to jwt-secret-dev"
+            exit 1
+          fi
+
+          if ! MAX_INSTANCES=$(jq -er '(.spec.template.metadata.annotations["autoscaling.knative.dev/maxScale"] // .spec.template.metadata.annotations["run.googleapis.com/maxScale"] // .spec.template.scaling.maxInstanceCount // .spec.template.spec.maxInstanceCount // empty) | tostring' <<<"$SERVICE_JSON") || [[ "$MAX_INSTANCES" != "1" ]]; then
+            echo "Auth runtime max instances mismatch: expected 1"
+            exit 1
+          fi
+          if ! INGRESS=$(jq -er '(.metadata.annotations["run.googleapis.com/ingress"] // .spec.ingress // "all") | tostring' <<<"$SERVICE_JSON") || [[ "$INGRESS" != "all" ]]; then
+            echo "Auth runtime ingress mismatch: expected all"
+            exit 1
+          fi
+          if ! VPC_EGRESS=$(jq -er '(.spec.template.metadata.annotations["run.googleapis.com/vpc-access-egress"] // .metadata.annotations["run.googleapis.com/vpc-access-egress"] // .spec.template.vpcAccess.egress // empty) | tostring' <<<"$SERVICE_JSON") || [[ "$VPC_EGRESS" != "private-ranges-only" ]]; then
+            echo "Auth runtime VPC egress mismatch: expected private-ranges-only"
+            exit 1
+          fi
+          if ! jq -e --arg revision "$NEW_READY_REVISION" \
+            '([.status.traffic[]? | select(.revisionName == $revision) | .percent] | length == 1 and .[0] == 100)' \
+            <<<"$SERVICE_JSON" >/dev/null; then
+            echo "Auth traffic read-back is not exactly 100% on the new ready revision"
+            exit 1
+          fi
+
           ROLLBACK_EVIDENCE="auth-rollback-evidence-$COMMIT_SHA.json"
           if ! jq -e '(.previous_ready_revision | type == "string") and (.previous_image | type == "string")' "$ROLLBACK_EVIDENCE" >/dev/null; then
             echo "Pre-deploy rollback evidence is missing or unreadable; refusing to publish evidence."
@@ -453,9 +519,11 @@ jobs:
             > "$EVIDENCE"
 
           VERSION_BODY=$(mktemp)
-          trap 'rm -f "$VERSION_BODY"' EXIT
+          VERSION_HEADERS=$(mktemp)
+          trap 'rm -f "$VERSION_BODY" "$VERSION_HEADERS"' EXIT
           HTTP_STATUS=$(curl -sS --max-time 20 --connect-timeout 10 \
             -H 'Cache-Control: no-cache' \
+            -D "$VERSION_HEADERS" \
             -o "$VERSION_BODY" \
             -w '%{http_code}' \
             "https://$AUTH_DOMAIN/api/v1/public/version")
@@ -463,13 +531,25 @@ jobs:
             echo "Auth version read-back returned HTTP $HTTP_STATUS; refusing to publish evidence."
             exit 1
           fi
-          if ! jq -e --arg commit "$COMMIT_SHA" --arg service "$SERVICE_NAME" \
-            '.commit == $commit and .service == $service' "$VERSION_BODY" >/dev/null; then
-            echo "Auth version read-back did not match the exact commit and service identity; refusing to publish evidence."
+          CACHE_CONTROL=$(awk 'BEGIN{IGNORECASE=1} /^Cache-Control:/ {sub(/^[^:]*:[[:space:]]*/, ""); sub(/[[:space:]]*\r$/, ""); print; exit}' "$VERSION_HEADERS")
+          if [[ "${CACHE_CONTROL,,}" != "no-store" ]]; then
+            echo "Auth version read-back Cache-Control mismatch: expected no-store"
             exit 1
           fi
-          jq --arg commit "$COMMIT_SHA" --arg service "$SERVICE_NAME" --arg status "$HTTP_STATUS" \
-            '.exact_commit = $commit | .readback_service = $service | .version_http_status = ($status | tonumber)' \
+          if ! jq -e --arg commit "$COMMIT_SHA" --arg service "$SERVICE_NAME" \
+            --arg revision "$NEW_READY_REVISION" \
+            '.commit == $commit and .service == $service and .revision == $revision' "$VERSION_BODY" >/dev/null; then
+            echo "Auth version read-back did not match the exact commit, service, and revision identity; refusing to publish evidence."
+            exit 1
+          fi
+          HEALTH_STATUS=$(curl -sS --max-time 20 --connect-timeout 10 -o /dev/null -w '%{http_code}' "https://$AUTH_DOMAIN/healthz")
+          if [[ "$HEALTH_STATUS" != "200" ]]; then
+            echo "Auth healthz read-back returned HTTP $HEALTH_STATUS"
+            exit 1
+          fi
+          jq --arg commit "$COMMIT_SHA" --arg service "$SERVICE_NAME" --arg revision "$NEW_READY_REVISION" --arg status "$HTTP_STATUS" --arg health_status "$HEALTH_STATUS" \
+            --arg runtime_service_account "$RUNTIME_SERVICE_ACCOUNT" --arg max_instances "$MAX_INSTANCES" --arg ingress "$INGRESS" --arg vpc_egress "$VPC_EGRESS" \
+            '.exact_commit = $commit | .readback_service = $service | .readback_revision = $revision | .version_http_status = ($status | tonumber) | .healthz_http_status = ($health_status | tonumber) | .runtime_service_account = $runtime_service_account | .max_instances = ($max_instances | tonumber) | .ingress = $ingress | .vpc_egress = $vpc_egress | .jwt_secret_name = "jwt-secret-dev" | .runtime_env = {GCP_PROJECT: "llm-wiki-cloud", FIRESTORE_DATABASE_ID: "llm-wiki-cloud-dev", ALLOWED_ORIGINS: "https://llm-wiki-frontend-dev.vercel.app", ALLOWED_HOSTS: "auth-dev.rayer.idv.tw", DEV_JWT: "false"}' \
             "$EVIDENCE" > "$EVIDENCE.tmp"
           mv "$EVIDENCE.tmp" "$EVIDENCE"
           echo "evidence=$EVIDENCE" >> "$GITHUB_OUTPUT"
