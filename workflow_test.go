@@ -454,9 +454,9 @@ func TestAuthDevWorkflowUsesCanonicalSourceAndExistingPrerequisites(t *testing.T
 		"--max-instances 1",
 		".metadata.annotations[\"run.googleapis.com/ingress\"]",
 		"auth-deployment-evidence-$COMMIT_SHA.json",
-		"previous_ready_revision",
+		"previous_serving_revision",
 		"previous_image",
-		"new_ready_revision",
+		"new_revision",
 		"new_image",
 		"exact_commit",
 		"https://$AUTH_DOMAIN/api/v1/public/version",
@@ -583,6 +583,77 @@ func TestAuthRollbackWorkflowIsManualDEVOnlyAndEvidenceFirst(t *testing.T) {
 	}
 	if strings.Index(contents, "pre-mutation") > strings.Index(contents, "gcloud run services update-traffic") {
 		t.Fatal("rollback evidence must be created before traffic mutation")
+	}
+}
+
+func TestAuthWorkflowsUseServingRevisionAndBindSourceCommitBeforeMutation(t *testing.T) {
+	deploy := readWorkflow(t, ".github/workflows/deploy-auth.yml")
+	rollback := readWorkflow(t, ".github/workflows/rollback-auth.yml")
+
+	for _, want := range []string{
+		"@LWC_SOURCE_COMMIT=$GIT_SHA",
+		"assert_env LWC_SOURCE_COMMIT \"$COMMIT_SHA\"",
+		"runtime_source_commit",
+		"PREVIOUS_SERVING_REVISION",
+		"previous_serving_revision",
+		"NEW_REVISION",
+	} {
+		if !strings.Contains(deploy, want) {
+			t.Errorf("Auth deploy workflow is missing revision source contract %q", want)
+		}
+	}
+	preDeploy := workflowSection(t, deploy, "      - name: Capture pre-deploy Auth rollback evidence", "      - name: Upload pre-deploy Auth rollback evidence")
+	if strings.Contains(preDeploy, "latestReadyRevisionName") {
+		t.Fatal("pre-deploy rollback authority must come from serving traffic, not latestReadyRevisionName")
+	}
+	for _, want := range []string{
+		".status.traffic",
+		".percent // 0",
+		".revisionName // \"\"",
+		"previous_serving_revision",
+		"previous_version_revision",
+	} {
+		if !strings.Contains(preDeploy, want) {
+			t.Errorf("pre-deploy rollback evidence is missing serving revision contract %q", want)
+		}
+	}
+	if strings.Contains(deploy, "previous_ready_revision") || strings.Contains(deploy, "PREVIOUS_READY_REVISION") {
+		t.Fatal("Auth deploy evidence must not call the prior serving revision ready")
+	}
+
+	if strings.Contains(rollback, "latestReadyRevisionName") || strings.Contains(rollback, "CURRENT_READY_REVISION") || strings.Contains(rollback, "current_ready_revision") {
+		t.Fatal("Auth rollback must not use latestReadyRevisionName as current routing authority")
+	}
+	for _, want := range []string{
+		"LWC_SOURCE_COMMIT",
+		"expected_commit",
+		"type == \"Ready\"",
+		"current_serving_revision",
+		"current_image",
+		".status.traffic",
+	} {
+		if !strings.Contains(rollback, want) {
+			t.Errorf("Auth rollback workflow is missing pre-mutation contract %q", want)
+		}
+	}
+	mutation := strings.Index(rollback, "gcloud run services update-traffic")
+	if mutation < 0 {
+		t.Fatal("Auth rollback workflow is missing traffic mutation")
+	}
+	for _, check := range []string{"LWC_SOURCE_COMMIT", "type == \"Ready\"", "current_serving_revision"} {
+		if at := strings.Index(rollback, check); at < 0 || at > mutation {
+			t.Fatalf("Auth rollback must check %q before traffic mutation", check)
+		}
+	}
+}
+
+func TestDockerfileRestoresPreRemediationBuildSemantics(t *testing.T) {
+	contents := readWorkflow(t, "Dockerfile")
+	if strings.Contains(contents, "ENV CGO_ENABLED=0") {
+		t.Fatal("Dockerfile must not add a global CGO_ENABLED environment setting")
+	}
+	if !strings.Contains(contents, "RUN go generate ./... && CGO_ENABLED=0 go build") {
+		t.Fatal("Dockerfile must keep CGO_ENABLED scoped to the build instruction")
 	}
 }
 

@@ -103,19 +103,51 @@ jobs:
             echo "target revision image digest mismatch"
             exit 1
           fi
+          if ! TARGET_SOURCE_COMMIT=$(jq -er '
+            [(.spec.containers[]?.env[]?), (.spec.template.spec.containers[]?.env[]?)]
+            | map(select(.name == "LWC_SOURCE_COMMIT"))
+            | if length == 1 and (.[0].value | type) == "string" and (.[0].value | length) > 0 then .[0].value else empty end
+          ' <<<"$TARGET_REVISION_JSON"); then
+            echo "target revision must contain exactly one non-empty LWC_SOURCE_COMMIT value"
+            exit 1
+          fi
+          if [[ "$TARGET_SOURCE_COMMIT" != "$EXPECTED_COMMIT" ]]; then
+            echo "target revision source commit does not match expected_commit"
+            exit 1
+          fi
+          if ! jq -e '([.status.conditions[]? | select(.type == "Ready")] | length == 1 and .[0].status == "True")' <<<"$TARGET_REVISION_JSON" >/dev/null; then
+            echo "target revision does not have exactly one Ready condition with status True"
+            exit 1
+          fi
 
           if ! SERVICE_JSON=$(gcloud run services describe "${{ env.SERVICE_NAME }}" \
             --region "${{ env.REGION }}" --project "${{ env.PROJECT_ID }}" --format=json --quiet); then
             echo "Unable to read DEV Auth service; refusing to mutate traffic"
             exit 1
           fi
-          CURRENT_READY_REVISION=$(jq -er '.status.latestReadyRevisionName // empty' <<<"$SERVICE_JSON")
-          if ! CURRENT_REVISION_JSON=$(gcloud run revisions describe "$CURRENT_READY_REVISION" \
+          if ! CURRENT_SERVING_REVISION=$(jq -er '
+            .status.traffic as $traffic |
+            if ($traffic | type) != "array" or ($traffic | length) != 1 then empty
+            elif ($traffic[0].percent // 0) != 100 then empty
+            elif (($traffic[0].revisionName // "") | type) != "string" or (($traffic[0].revisionName // "") | length) == 0 then empty
+            elif ($traffic[0].tag? != null) then empty
+            else $traffic[0].revisionName
+            end
+          ' <<<"$SERVICE_JSON"); then
+            echo "Auth service does not report exactly one untagged 100% serving revision; refusing to mutate traffic"
+            exit 1
+          fi
+          if ! CURRENT_REVISION_JSON=$(gcloud run revisions describe "$CURRENT_SERVING_REVISION" \
             --region "${{ env.REGION }}" --project "${{ env.PROJECT_ID }}" --format=json --quiet); then
-            echo "Unable to read current ready Auth revision; refusing to mutate traffic"
+            echo "Unable to read current serving Auth revision; refusing to mutate traffic"
             exit 1
           fi
           CURRENT_IMAGE=$(jq -er '.status.imageDigest // empty' <<<"$CURRENT_REVISION_JSON")
+          IMAGE_PATTERN="^asia-east1-docker\.pkg\.dev/llm-wiki-cloud/cloud-run-images/llm-wiki-auth@sha256:[0-9a-f]{64}$"
+          if [[ ! "$CURRENT_IMAGE" =~ $IMAGE_PATTERN ]]; then
+            echo "current serving Auth revision image is not immutable"
+            exit 1
+          fi
           CURRENT_TRAFFIC=$(jq -cer '[.status.traffic[]? | {revision: (.revisionName // ""), percent: (.percent // 0)}]' <<<"$SERVICE_JSON")
           PRE_EVIDENCE="auth-rollback-pre-mutation-${GITHUB_RUN_ID}.json"
           jq -n \
@@ -123,10 +155,10 @@ jobs:
             --arg target_revision "$TARGET_REVISION" \
             --arg target_image "$EXPECTED_IMAGE" \
             --arg target_commit "$EXPECTED_COMMIT" \
-            --arg current_ready_revision "$CURRENT_READY_REVISION" \
+            --arg current_serving_revision "$CURRENT_SERVING_REVISION" \
             --arg current_image "$CURRENT_IMAGE" \
             --argjson current_traffic "$CURRENT_TRAFFIC" \
-            '{evidence: "pre-mutation", service: $service, target_revision: $target_revision, target_image: $target_image, expected_commit: $target_commit, current_ready_revision: $current_ready_revision, current_image: $current_image, current_traffic: $current_traffic}' \
+            '{evidence: "pre-mutation", service: $service, target_revision: $target_revision, target_image: $target_image, expected_commit: $target_commit, current_serving_revision: $current_serving_revision, current_image: $current_image, current_traffic: $current_traffic}' \
             > "$PRE_EVIDENCE"
           echo "pre_evidence=$PRE_EVIDENCE" >> "$GITHUB_OUTPUT"
 

@@ -326,25 +326,33 @@ jobs:
           IMMUTABLE_IMAGE: ${{ steps.build.outputs.immutable_image }}
         run: |
           set -euo pipefail
-          if ! PREVIOUS_READY_REVISION=$(jq -er '.status.latestReadyRevisionName' auth-service-before.json); then
-            echo "Cloud Run did not report a previous latest ready revision; refusing to deploy."
+          if ! PREVIOUS_SERVING_REVISION=$(jq -er '
+            .status.traffic as $traffic |
+            if ($traffic | type) != "array" or ($traffic | length) != 1 then empty
+            elif ($traffic[0].percent // 0) != 100 then empty
+            elif (($traffic[0].revisionName // "") | type) != "string" or (($traffic[0].revisionName // "") | length) == 0 then empty
+            elif ($traffic[0].tag? != null) then empty
+            else $traffic[0].revisionName
+            end
+          ' auth-service-before.json); then
+            echo "Cloud Run did not report exactly one untagged 100% serving revision; refusing to deploy."
             exit 1
           fi
-          if ! PREVIOUS_REVISION_JSON=$(gcloud run revisions describe "$PREVIOUS_READY_REVISION" \
+          if ! PREVIOUS_REVISION_JSON=$(gcloud run revisions describe "$PREVIOUS_SERVING_REVISION" \
             --region "${{ env.REGION }}" \
             --project "${{ env.PROJECT_ID }}" \
             --format=json \
             --quiet); then
-            echo "Unable to read previous ready revision $PREVIOUS_READY_REVISION; refusing to deploy."
+            echo "Unable to read previous serving revision $PREVIOUS_SERVING_REVISION; refusing to deploy."
             exit 1
           fi
           if ! PREVIOUS_IMAGE=$(jq -er '.status.imageDigest' <<<"$PREVIOUS_REVISION_JSON"); then
-            echo "Previous ready revision has no readable immutable image; refusing to deploy."
+            echo "Previous serving revision has no readable immutable image; refusing to deploy."
             exit 1
           fi
           IMAGE_PATTERN="^${AR_REPO}/llm-wiki-auth@sha256:[0-9a-f]{64}$"
           if [[ ! "$PREVIOUS_IMAGE" =~ $IMAGE_PATTERN ]]; then
-            echo "Previous ready revision image is not an immutable full image reference; refusing to deploy."
+            echo "Previous serving revision image is not an immutable full image reference; refusing to deploy."
             exit 1
           fi
 
@@ -360,9 +368,9 @@ jobs:
             echo "Previous Auth version read-back returned HTTP $HTTP_STATUS; refusing to deploy."
             exit 1
           fi
-          if ! jq -e --arg service "$SERVICE_NAME" --arg revision "$PREVIOUS_READY_REVISION" \
+          if ! jq -e --arg service "$SERVICE_NAME" --arg revision "$PREVIOUS_SERVING_REVISION" \
             '.service == $service and .revision == $revision' "$PREVIOUS_VERSION_BODY" >/dev/null; then
-            echo "Previous version read-back did not identify the exact Auth service and ready revision; refusing to deploy."
+            echo "Previous version read-back did not identify the exact Auth service and serving revision; refusing to deploy."
             exit 1
           fi
           PREVIOUS_VERSION_SERVICE=$(jq -er '.service' "$PREVIOUS_VERSION_BODY")
@@ -372,12 +380,12 @@ jobs:
             --arg service "$SERVICE_NAME" \
             --arg domain "$AUTH_DOMAIN" \
             --arg commit "$COMMIT_SHA" \
-            --arg previous_ready_revision "$PREVIOUS_READY_REVISION" \
+            --arg previous_serving_revision "$PREVIOUS_SERVING_REVISION" \
             --arg previous_image "$PREVIOUS_IMAGE" \
             --arg previous_version_service "$PREVIOUS_VERSION_SERVICE" \
             --arg previous_version_revision "$PREVIOUS_VERSION_REVISION" \
             --arg built_image "$IMMUTABLE_IMAGE" \
-            '{service: $service, domain: $domain, exact_commit: $commit, previous_ready_revision: $previous_ready_revision, previous_image: $previous_image, previous_version_service: $previous_version_service, previous_version_revision: $previous_version_revision, built_image: $built_image}' \
+            '{service: $service, domain: $domain, exact_commit: $commit, previous_serving_revision: $previous_serving_revision, previous_image: $previous_image, previous_version_service: $previous_version_service, previous_version_revision: $previous_version_revision, built_image: $built_image}' \
             > "$ROLLBACK_EVIDENCE"
           echo "rollback_evidence=$ROLLBACK_EVIDENCE" >> "$GITHUB_OUTPUT"
 
@@ -410,7 +418,7 @@ jobs:
             --ingress all \
             --max-instances 1 \
             --update-secrets "JWT_SECRET=$JWT_SECRET_NAME:latest" \
-            --update-env-vars "^@^GCP_PROJECT=${{ env.PROJECT_ID }}@FIRESTORE_DATABASE_ID=$FIRESTORE_DATABASE_ID@ALLOWED_ORIGINS=$ALLOWED_ORIGINS@ALLOWED_HOSTS=$ALLOWED_HOSTS@DEV_JWT=false" \
+            --update-env-vars "^@^GCP_PROJECT=${{ env.PROJECT_ID }}@FIRESTORE_DATABASE_ID=$FIRESTORE_DATABASE_ID@ALLOWED_ORIGINS=$ALLOWED_ORIGINS@ALLOWED_HOSTS=$ALLOWED_HOSTS@DEV_JWT=false@LWC_SOURCE_COMMIT=$GIT_SHA" \
             --quiet
           echo "Deployed ${{ env.SERVICE_NAME }} ($GIT_SHA)"
 
@@ -432,25 +440,25 @@ jobs:
             echo "Unable to read Auth service after deploy; refusing to publish evidence."
             exit 1
           fi
-          if ! NEW_READY_REVISION=$(jq -er '.status.latestReadyRevisionName' <<<"$SERVICE_JSON"); then
+          if ! NEW_REVISION=$(jq -er '.status.latestReadyRevisionName // empty' <<<"$SERVICE_JSON"); then
             echo "Cloud Run did not report a new latest ready revision; refusing to publish evidence."
             exit 1
           fi
-          if ! REVISION_JSON=$(gcloud run revisions describe "$NEW_READY_REVISION" \
+          if ! REVISION_JSON=$(gcloud run revisions describe "$NEW_REVISION" \
             --region "${{ env.REGION }}" \
             --project "${{ env.PROJECT_ID }}" \
             --format=json \
             --quiet); then
-            echo "Unable to read new ready revision $NEW_READY_REVISION; refusing to publish evidence."
+            echo "Unable to read new revision $NEW_REVISION; refusing to publish evidence."
             exit 1
           fi
           if ! DEPLOYED_IMAGE_DIGEST=$(jq -er '.status.imageDigest' <<<"$REVISION_JSON"); then
-            echo "New ready revision has no readable immutable image; refusing to publish evidence."
+            echo "New revision has no readable immutable image; refusing to publish evidence."
             exit 1
           fi
           IMAGE_PATTERN="^${AR_REPO}/llm-wiki-auth@sha256:[0-9a-f]{64}$"
           if [[ ! "$DEPLOYED_IMAGE_DIGEST" =~ $IMAGE_PATTERN || "$DEPLOYED_IMAGE_DIGEST" != "$IMMUTABLE_IMAGE" ]]; then
-            echo "New ready revision image does not match the deployed immutable image; refusing to publish evidence."
+            echo "New revision image does not match the deployed immutable image; refusing to publish evidence."
             exit 1
           fi
 
@@ -465,7 +473,7 @@ jobs:
           fi
 
           env_value() {
-            jq -er --arg name "$1" '[.spec.template.spec.containers[]?.env[]? | select(.name == $name) | .value // empty] | if length == 1 then .[0] else empty end' <<<"$SERVICE_JSON"
+            jq -er --arg name "$1" '[.spec.template.spec.containers[]?.env[]? | select(.name == $name)] | if length == 1 and (.[0].value | type) == "string" then .[0].value else empty end' <<<"$SERVICE_JSON"
           }
           secret_name() {
             jq -er --arg name "$1" '[.spec.template.spec.containers[]?.env[]? | select(.name == $name) | (.valueFrom.secretKeyRef.name // .valueSource.secretKeyRef.secret // empty)] | if length == 1 then .[0] else empty end' <<<"$SERVICE_JSON"
@@ -482,6 +490,8 @@ jobs:
           assert_env ALLOWED_ORIGINS "https://llm-wiki-frontend-dev.vercel.app"
           assert_env ALLOWED_HOSTS "$AUTH_DOMAIN"
           assert_env DEV_JWT "false"
+          assert_env LWC_SOURCE_COMMIT "$COMMIT_SHA"
+          RUNTIME_SOURCE_COMMIT=$(env_value LWC_SOURCE_COMMIT)
           if ! JWT_SECRET_REF=$(secret_name JWT_SECRET) || [[ "$JWT_SECRET_REF" != "jwt-secret-dev" ]]; then
             echo "Auth runtime JWT_SECRET is not a reference to jwt-secret-dev"
             exit 1
@@ -499,22 +509,22 @@ jobs:
             echo "Auth runtime VPC egress mismatch: expected private-ranges-only"
             exit 1
           fi
-          if ! jq -e --arg revision "$NEW_READY_REVISION" \
+          if ! jq -e --arg revision "$NEW_REVISION" \
             '([.status.traffic[]? | select(.revisionName == $revision) | .percent] | length == 1 and .[0] == 100)' \
             <<<"$SERVICE_JSON" >/dev/null; then
-            echo "Auth traffic read-back is not exactly 100% on the new ready revision"
+            echo "Auth traffic read-back is not exactly 100% on the new revision"
             exit 1
           fi
 
           ROLLBACK_EVIDENCE="auth-rollback-evidence-$COMMIT_SHA.json"
-          if ! jq -e '(.previous_ready_revision | type == "string") and (.previous_image | type == "string")' "$ROLLBACK_EVIDENCE" >/dev/null; then
+          if ! jq -e '(.previous_serving_revision | type == "string") and (.previous_image | type == "string")' "$ROLLBACK_EVIDENCE" >/dev/null; then
             echo "Pre-deploy rollback evidence is missing or unreadable; refusing to publish evidence."
             exit 1
           fi
           jq \
-            --arg new_ready_revision "$NEW_READY_REVISION" \
+            --arg new_revision "$NEW_REVISION" \
             --arg new_image "$DEPLOYED_IMAGE_DIGEST" \
-            '.new_ready_revision = $new_ready_revision | .new_image = $new_image' \
+            '.new_revision = $new_revision | .new_image = $new_image' \
             "$ROLLBACK_EVIDENCE" \
             > "$EVIDENCE"
 
@@ -537,7 +547,7 @@ jobs:
             exit 1
           fi
           if ! jq -e --arg commit "$COMMIT_SHA" --arg service "$SERVICE_NAME" \
-            --arg revision "$NEW_READY_REVISION" \
+            --arg revision "$NEW_REVISION" \
             '.commit == $commit and .service == $service and .revision == $revision' "$VERSION_BODY" >/dev/null; then
             echo "Auth version read-back did not match the exact commit, service, and revision identity; refusing to publish evidence."
             exit 1
@@ -547,9 +557,9 @@ jobs:
             echo "Auth healthz read-back returned HTTP $HEALTH_STATUS"
             exit 1
           fi
-          jq --arg commit "$COMMIT_SHA" --arg service "$SERVICE_NAME" --arg revision "$NEW_READY_REVISION" --arg status "$HTTP_STATUS" --arg health_status "$HEALTH_STATUS" \
+          jq --arg commit "$COMMIT_SHA" --arg service "$SERVICE_NAME" --arg revision "$NEW_REVISION" --arg runtime_source_commit "$RUNTIME_SOURCE_COMMIT" --arg status "$HTTP_STATUS" --arg health_status "$HEALTH_STATUS" \
             --arg runtime_service_account "$RUNTIME_SERVICE_ACCOUNT" --arg max_instances "$MAX_INSTANCES" --arg ingress "$INGRESS" --arg vpc_egress "$VPC_EGRESS" \
-            '.exact_commit = $commit | .readback_service = $service | .readback_revision = $revision | .version_http_status = ($status | tonumber) | .healthz_http_status = ($health_status | tonumber) | .runtime_service_account = $runtime_service_account | .max_instances = ($max_instances | tonumber) | .ingress = $ingress | .vpc_egress = $vpc_egress | .jwt_secret_name = "jwt-secret-dev" | .runtime_env = {GCP_PROJECT: "llm-wiki-cloud", FIRESTORE_DATABASE_ID: "llm-wiki-cloud-dev", ALLOWED_ORIGINS: "https://llm-wiki-frontend-dev.vercel.app", ALLOWED_HOSTS: "auth-dev.rayer.idv.tw", DEV_JWT: "false"}' \
+            '.exact_commit = $commit | .readback_service = $service | .readback_revision = $revision | .runtime_source_commit = $runtime_source_commit | .version_http_status = ($status | tonumber) | .healthz_http_status = ($health_status | tonumber) | .runtime_service_account = $runtime_service_account | .max_instances = ($max_instances | tonumber) | .ingress = $ingress | .vpc_egress = $vpc_egress | .jwt_secret_name = "jwt-secret-dev" | .runtime_env = {GCP_PROJECT: "llm-wiki-cloud", FIRESTORE_DATABASE_ID: "llm-wiki-cloud-dev", ALLOWED_ORIGINS: "https://llm-wiki-frontend-dev.vercel.app", ALLOWED_HOSTS: "auth-dev.rayer.idv.tw", DEV_JWT: "false"}' \
             "$EVIDENCE" > "$EVIDENCE.tmp"
           mv "$EVIDENCE.tmp" "$EVIDENCE"
           echo "evidence=$EVIDENCE" >> "$GITHUB_OUTPUT"
