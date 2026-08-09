@@ -111,7 +111,7 @@ func newProductionRouter(cfg config.Config, localMode bool, fsClient *firestorec
 		authRoutes.POST("/logout", auth.LogoutHandlerWithCookiePolicy(auth.HostRefreshCookiePolicy()))
 	}
 
-	r.GET("/healthz", func(c *gin.Context) {
+	r.GET("/api/v1/public/healthz", func(c *gin.Context) {
 		c.Status(http.StatusOK)
 	})
 	r.GET("/api/v1/public/version", buildinfo.Handler())

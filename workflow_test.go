@@ -101,6 +101,16 @@ func TestAuthDeploymentAndRollbackReconcileAfterAttemptedMutation(t *testing.T) 
 			t.Errorf("deployment reconciliation missing %q", want)
 		}
 	}
+	for name, contents := range map[string]string{"deploy": deploy, "rollback": rollback} {
+		t.Run(name+" health probe path", func(t *testing.T) {
+			if !strings.Contains(contents, "/api/v1/public/healthz") {
+				t.Fatal("Auth health probe must use the public versioned health path")
+			}
+			if strings.Contains(contents, `"/healthz"`) {
+				t.Fatal("Auth health probes must exclude the former public health path")
+			}
+		})
+	}
 	if !strings.Contains(reconcileUpload, "if: always()") || !strings.Contains(reconcileUpload, "if-no-files-found: error") {
 		t.Fatal("deployment reconciliation upload must always upload its created artifact")
 	}
@@ -607,7 +617,7 @@ func TestAuthRollbackWorkflowIsManualDEVOnlyAndEvidenceFirst(t *testing.T) {
 		"gcloud run services update-traffic",
 		"--to-revisions",
 		"status.traffic",
-		"/healthz",
+		"/api/v1/public/healthz",
 		"/api/v1/public/version",
 		"Cache-Control",
 		"no-store",
@@ -617,6 +627,9 @@ func TestAuthRollbackWorkflowIsManualDEVOnlyAndEvidenceFirst(t *testing.T) {
 		if !strings.Contains(contents, want) {
 			t.Errorf("Auth rollback workflow is missing contract %q", want)
 		}
+	}
+	if strings.Contains(contents, `"/healthz"`) {
+		t.Fatal("Auth rollback workflow must exclude the former public health path")
 	}
 	for _, forbidden := range []string{
 		"gcloud run deploy",
