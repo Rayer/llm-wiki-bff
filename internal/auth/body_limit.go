@@ -1,6 +1,8 @@
 package auth
 
 import (
+	"bytes"
+	"io"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
@@ -23,13 +25,33 @@ func CompatibilityBodyLimit() gin.HandlerFunc {
 
 func requestBodyLimit(oversizedStatus int) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		if c.Request.Body != nil {
+		if c.Request.Body == nil {
+			c.Next()
+			return
+		}
+
+		if oversizedStatus == 0 || c.Request.ContentLength > 0 {
 			c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, MaxRequestBodyBytes)
 		}
 		if c.Request.ContentLength > MaxRequestBodyBytes && oversizedStatus != 0 {
 			c.AbortWithStatus(oversizedStatus)
 			return
 		}
+		if oversizedStatus == 0 || c.Request.ContentLength > 0 {
+			c.Next()
+			return
+		}
+
+		body, err := io.ReadAll(io.LimitReader(c.Request.Body, MaxRequestBodyBytes+1))
+		if err != nil {
+			c.AbortWithStatus(http.StatusBadRequest)
+			return
+		}
+		if int64(len(body)) > MaxRequestBodyBytes {
+			c.AbortWithStatus(oversizedStatus)
+			return
+		}
+		c.Request.Body = io.NopCloser(bytes.NewReader(body))
 		c.Next()
 	}
 }
