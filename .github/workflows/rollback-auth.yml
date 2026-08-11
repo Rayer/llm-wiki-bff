@@ -21,7 +21,7 @@ env:
   SERVICE_NAME: llm-wiki-auth-dev
   REGION: asia-east1
   AR_REPO: asia-east1-docker.pkg.dev/llm-wiki-cloud/cloud-run-images
-  AUTH_DOMAIN: auth-dev.rayer.idv.tw
+  AUTH_DOMAIN: auth.dev.rayer.idv.tw
 
 concurrency:
   group: deploy-auth-dev
