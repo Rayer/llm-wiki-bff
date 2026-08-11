@@ -14,6 +14,7 @@ env:
   REGION: asia-east1
   AR_REPO: asia-east1-docker.pkg.dev/llm-wiki-cloud/cloud-run-images
   AUTH_DOMAIN: auth.dev.rayer.idv.tw
+  LEGACY_AUTH_DOMAIN: auth-dev.rayer.idv.tw
 
 concurrency:
   group: deploy-auth-dev
@@ -364,7 +365,7 @@ jobs:
             -H 'Cache-Control: no-cache' \
             -o "$PREVIOUS_VERSION_BODY" \
             -w '%{http_code}' \
-            "https://$AUTH_DOMAIN/api/v1/public/version")
+            "https://$LEGACY_AUTH_DOMAIN/api/v1/public/version")
           if [[ "$HTTP_STATUS" != "200" ]]; then
             echo "Previous Auth version read-back returned HTTP $HTTP_STATUS; refusing to deploy."
             exit 1
@@ -385,13 +386,14 @@ jobs:
             --arg service "$SERVICE_NAME" \
             --arg domain "$AUTH_DOMAIN" \
             --arg commit "$COMMIT_SHA" \
+            --arg previous_version_probe_domain "$LEGACY_AUTH_DOMAIN" \
             --arg previous_serving_revision "$PREVIOUS_SERVING_REVISION" \
             --arg previous_image "$PREVIOUS_IMAGE" \
             --arg previous_version_service "$PREVIOUS_VERSION_SERVICE" \
             --arg previous_version_revision "$PREVIOUS_VERSION_REVISION" \
             --arg previous_version_commit "$PREVIOUS_VERSION_COMMIT" \
             --arg built_image "$IMMUTABLE_IMAGE" \
-            '{service: $service, domain: $domain, exact_commit: $commit, previous_serving_revision: $previous_serving_revision, previous_image: $previous_image, previous_version_service: $previous_version_service, previous_version_revision: $previous_version_revision, previous_version_commit: $previous_version_commit, built_image: $built_image}' \
+            '{service: $service, domain: $domain, previous_version_probe_domain: $previous_version_probe_domain, exact_commit: $commit, previous_serving_revision: $previous_serving_revision, previous_image: $previous_image, previous_version_service: $previous_version_service, previous_version_revision: $previous_version_revision, previous_version_commit: $previous_version_commit, built_image: $built_image}' \
             > "$ROLLBACK_EVIDENCE"
           echo "rollback_evidence=$ROLLBACK_EVIDENCE" >> "$GITHUB_OUTPUT"
 
