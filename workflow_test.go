@@ -473,8 +473,8 @@ func TestAuthDevWorkflowUsesCanonicalSourceAndExistingPrerequisites(t *testing.T
 	if strings.Contains(contents, "  push:") {
 		t.Fatal("Auth dev workflow must be manual-only")
 	}
-	if strings.Count(contents, "ALLOWED_ORIGINS: https://llm-wiki-frontend-dev.vercel.app") != 2 {
-		t.Fatal("Auth dev workflow must set deployed ALLOWED_ORIGINS to the frontend dev origin in both build and deploy steps")
+	if strings.Count(contents, "ALLOWED_ORIGINS: https://wiki.dev.rayer.idv.tw,https://llm-wiki-frontend-dev.vercel.app") != 2 {
+		t.Fatal("Auth dev workflow must set both DEV browser origins in build and deploy steps")
 	}
 	for _, forbidden := range []string{"http://localhost:3000", "http://127.0.0.1:3000"} {
 		if strings.Contains(contents, forbidden) {
@@ -506,7 +506,7 @@ func TestAuthDevWorkflowUsesCanonicalSourceAndExistingPrerequisites(t *testing.T
 		"status.imageDigest",
 		"auth-image-digest-$COMMIT_SHA.txt",
 		"name: auth-image-digest-${{ steps.image_digest.outputs.commit_sha }}",
-		"AUTH_DOMAIN: auth-dev.rayer.idv.tw",
+		"AUTH_DOMAIN: auth.dev.rayer.idv.tw",
 		"group: deploy-auth-dev",
 		"cancel-in-progress: false",
 		"install_components: beta",
@@ -546,6 +546,15 @@ func TestAuthDevWorkflowUsesCanonicalSourceAndExistingPrerequisites(t *testing.T
 			t.Errorf("Auth dev workflow is missing contract %q", want)
 		}
 	}
+	for _, want := range []string{
+		"ALLOWED_HOSTS: auth.dev.rayer.idv.tw,auth-dev.rayer.idv.tw",
+		`assert_env ALLOWED_HOSTS "auth.dev.rayer.idv.tw,auth-dev.rayer.idv.tw"`,
+		`ALLOWED_ORIGINS: "https://wiki.dev.rayer.idv.tw,https://llm-wiki-frontend-dev.vercel.app"`,
+	} {
+		if !strings.Contains(contents, want) {
+			t.Errorf("Auth dev workflow is missing migration contract %q", want)
+		}
+	}
 	for _, forbidden := range []string{
 		"gcloud run jobs",
 		"add-iam-policy-binding",
@@ -581,6 +590,18 @@ func TestAuthDevWorkflowUsesCanonicalSourceAndExistingPrerequisites(t *testing.T
 	postDeploy := strings.LastIndex(contents, "https://$AUTH_DOMAIN/api/v1/public/version")
 	if postDeploy < 0 || postDeploy < deployIndex {
 		t.Fatal("Auth version read-back must follow deploy")
+	}
+}
+
+func TestBFFDevWorkflowAllowsBothMigrationOrigins(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
+	for _, want := range []string{
+		"ALLOWED_ORIGINS: https://wiki.dev.rayer.idv.tw,https://llm-wiki-frontend-dev.vercel.app,http://localhost:3000,http://127.0.0.1:3000",
+		"@ALLOWED_ORIGINS=${{ env.ALLOWED_ORIGINS }}",
+	} {
+		if !strings.Contains(contents, want) {
+			t.Errorf("BFF DEV workflow is missing migration origin contract %q", want)
+		}
 	}
 }
 

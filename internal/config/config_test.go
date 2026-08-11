@@ -153,15 +153,28 @@ func TestLoadEnvironmentSelectionDefaults(t *testing.T) {
 }
 
 func TestLoadAllowedHostsFromEnv(t *testing.T) {
-	t.Setenv("ALLOWED_HOSTS", " auth-dev.rayer.idv.tw, auth-dev.rayer.idv.tw ")
+	t.Setenv("ALLOWED_HOSTS", " auth.dev.rayer.idv.tw, auth-dev.rayer.idv.tw ")
 
 	cfg, err := Load(writeConfig(t, "dev_jwt = false\n"))
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
-	want := []string{"auth-dev.rayer.idv.tw"}
+	want := []string{"auth.dev.rayer.idv.tw", "auth-dev.rayer.idv.tw"}
 	if !reflect.DeepEqual(cfg.AllowedHosts, want) {
 		t.Fatalf("AllowedHosts = %#v, want %#v", cfg.AllowedHosts, want)
+	}
+}
+
+func TestLoadDevMigrationOriginsFromEnv(t *testing.T) {
+	t.Setenv("ALLOWED_ORIGINS", "https://wiki.dev.rayer.idv.tw, https://llm-wiki-frontend-dev.vercel.app")
+
+	cfg, err := Load(writeConfig(t, "dev_jwt = false\n"))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	want := []string{"https://wiki.dev.rayer.idv.tw", "https://llm-wiki-frontend-dev.vercel.app"}
+	if !reflect.DeepEqual(cfg.AllowedOrigins, want) {
+		t.Fatalf("AllowedOrigins = %#v, want %#v", cfg.AllowedOrigins, want)
 	}
 }
 
