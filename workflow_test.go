@@ -980,6 +980,25 @@ func TestAuthDeployPostVerifyUsesServingTrafficAndLatestCreated(t *testing.T) {
 	}
 }
 
+func TestAuthDeployUsesSupportedExplicitTrafficPromotionCommand(t *testing.T) {
+	deploy := readWorkflow(t, ".github/workflows/deploy-auth.yml")
+	section := workflowSection(t, deploy, "      - name: Deploy Auth to Cloud Run", "      - name: Capture and verify Auth deployment evidence")
+	deployAt := strings.Index(section, "gcloud run deploy")
+	promoteAt := strings.Index(section, "gcloud run services update-traffic")
+	if deployAt < 0 || promoteAt < 0 || deployAt >= promoteAt {
+		t.Fatal("Auth deploy must create the revision before explicit traffic promotion")
+	}
+	if strings.Contains(section[deployAt:promoteAt], "--to-latest") {
+		t.Fatal("gcloud run deploy does not support --to-latest")
+	}
+	if !strings.Contains(section[promoteAt:], "--to-latest") {
+		t.Fatal("Auth traffic promotion must explicitly use services update-traffic --to-latest")
+	}
+	if strings.Count(section, "gcloud run services update-traffic") != 1 {
+		t.Fatal("Auth deploy must contain exactly one explicit traffic promotion command")
+	}
+}
+
 func TestDockerfileRestoresPreRemediationBuildSemantics(t *testing.T) {
 	contents := readWorkflow(t, "Dockerfile")
 	if strings.Contains(contents, "ENV CGO_ENABLED=0") {

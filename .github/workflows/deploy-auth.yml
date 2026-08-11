@@ -425,9 +425,13 @@ jobs:
             --vpc-egress private-ranges-only \
             --ingress all \
             --max-instances 1 \
-            --to-latest \
             --update-secrets "JWT_SECRET=$JWT_SECRET_NAME:latest" \
             --update-env-vars "^@^GCP_PROJECT=${{ env.PROJECT_ID }}@FIRESTORE_DATABASE_ID=$FIRESTORE_DATABASE_ID@ALLOWED_ORIGINS=$ALLOWED_ORIGINS@ALLOWED_HOSTS=$ALLOWED_HOSTS@DEV_JWT=false@LWC_SOURCE_COMMIT=$GIT_SHA" \
+            --quiet
+          gcloud run services update-traffic "${{ env.SERVICE_NAME }}" \
+            --region "${{ env.REGION }}" \
+            --project "${{ env.PROJECT_ID }}" \
+            --to-latest \
             --quiet
           echo "Deployed ${{ env.SERVICE_NAME }} ($GIT_SHA)"
 
