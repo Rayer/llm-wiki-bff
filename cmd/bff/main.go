@@ -203,7 +203,7 @@ func newProductionRouter(
 		AllowCredentials: true,
 	}))
 
-	registerPublicRoutes(r, settingsStore)
+	registerPublicRoutes(r, settingsStore, cfg.AuthServiceURL)
 
 	// Temporary Stage A compatibility lane for the frontend Auth cutover.
 	authRoutes := r.Group("/api/v1/auth")
@@ -285,9 +285,19 @@ func newProductionRouter(
 	return r
 }
 
-func registerPublicRoutes(r *gin.Engine, settingsStore syssettings.RegistrationGate) {
+func registerPublicRoutes(r *gin.Engine, settingsStore syssettings.RegistrationGate, authServiceURL string) {
 	// Public routes are registered on the root router, outside JWT and project middleware.
-	r.GET("/api/v1/public/config", syssettings.PublicConfigHandler(settingsStore))
+	r.GET("/api/v1/public/config", func(c *gin.Context) {
+		settings, err := settingsStore.GetSettings(c.Request.Context())
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"registration_enabled": settings.RegistrationEnabled,
+			"auth_service_url":     authServiceURL,
+		})
+	})
 	r.GET("/api/v1/public/version", buildinfo.Handler())
 }
 

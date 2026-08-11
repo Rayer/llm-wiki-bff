@@ -15,6 +15,7 @@ const (
 	DefaultPipelineCooldownSeconds = 3600
 	DefaultPipelineMinNewRaw       = 1
 	DefaultPipelineJobURL          = "https://run.googleapis.com/v2/projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline:run"
+	DefaultAuthServiceURL          = "https://auth.dev.rayer.idv.tw"
 )
 
 var defaultAllowedOrigins = []string{
@@ -50,6 +51,10 @@ type Config struct {
 	// Registration gate (LWC-149). Env: REGISTRATION_ENABLED (true/false/1/0).
 	// Nil means unset; resolution falls back to default true when Firestore doc is absent.
 	RegistrationEnabled *bool
+
+	// AuthServiceURL is the public URL of the dedicated auth service (LWC-258).
+	// Env: AUTH_SERVICE_URL. Default: https://auth.dev.rayer.idv.tw
+	AuthServiceURL string
 }
 
 // UserConfig holds a hardcoded user for authentication.
@@ -81,6 +86,7 @@ func Load(path string) (Config, error) {
 	v.BindEnv("pipeline_min_new_raw", "PIPELINE_MIN_NEW_RAW")
 	v.BindEnv("pipeline_demo_user_ids", "PIPELINE_DEMO_USER_IDS")
 	v.BindEnv("registration_enabled", "REGISTRATION_ENABLED")
+	v.BindEnv("auth_service_url", "AUTH_SERVICE_URL")
 
 	if err := v.ReadInConfig(); err != nil {
 		var notFound viper.ConfigFileNotFoundError
@@ -120,6 +126,11 @@ func Load(path string) (Config, error) {
 		}
 	}
 
+	authServiceURL := strings.TrimSpace(v.GetString("auth_service_url"))
+	if authServiceURL == "" {
+		authServiceURL = DefaultAuthServiceURL
+	}
+
 	cfg := Config{
 		GCPProject:              v.GetString("gcp_project"),
 		Bucket:                  v.GetString("bucket"),
@@ -139,6 +150,7 @@ func Load(path string) (Config, error) {
 		PipelineMinNewRaw:       minNewRaw,
 		PipelineDemoUserIDs:     splitCommaList(v.GetString("pipeline_demo_user_ids")),
 		RegistrationEnabled:     registrationEnabled,
+		AuthServiceURL:          authServiceURL,
 	}
 	return cfg, nil
 }

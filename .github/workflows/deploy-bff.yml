@@ -265,7 +265,7 @@ jobs:
             --vpc-egress private-ranges-only \
             --max-instances 1 \
             --update-secrets "JWT_SECRET=${{ env.JWT_SECRET_NAME }}:latest,DEEPSEEK_API_KEY=deepseek-apikey:latest" \
-            --update-env-vars "^@^GCP_PROJECT=${{ env.PROJECT_ID }}@BUCKET=${{ env.BUCKET }}@FIRESTORE_DATABASE_ID=${{ env.FIRESTORE_DATABASE_ID }}@PIPELINE_JOB_URL=https://run.googleapis.com/v2/projects/${{ env.PROJECT_ID }}/locations/${{ env.REGION }}/jobs/${{ env.PIPELINE_JOB_NAME }}:run@ALLOWED_ORIGINS=${{ env.ALLOWED_ORIGINS }}@DEV_JWT=false" \
+            --update-env-vars "^@^GCP_PROJECT=${{ env.PROJECT_ID }}@BUCKET=${{ env.BUCKET }}@FIRESTORE_DATABASE_ID=${{ env.FIRESTORE_DATABASE_ID }}@PIPELINE_JOB_URL=https://run.googleapis.com/v2/projects/${{ env.PROJECT_ID }}/locations/${{ env.REGION }}/jobs/${{ env.PIPELINE_JOB_NAME }}:run@ALLOWED_ORIGINS=${{ env.ALLOWED_ORIGINS }}@AUTH_SERVICE_URL=https://auth.dev.rayer.idv.tw@DEV_JWT=false" \
             --quiet
           echo "✅ Deployed ${{ env.SERVICE_NAME }} ($GIT_SHA)"
 
