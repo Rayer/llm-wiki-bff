@@ -13,7 +13,7 @@ env:
   SERVICE_NAME: llm-wiki-auth-dev
   REGION: asia-east1
   AR_REPO: asia-east1-docker.pkg.dev/llm-wiki-cloud/cloud-run-images
-  AUTH_DOMAIN: auth-dev.rayer.idv.tw
+  AUTH_DOMAIN: auth.dev.rayer.idv.tw
 
 concurrency:
   group: deploy-auth-dev
@@ -233,7 +233,7 @@ jobs:
           FIRESTORE_DATABASE_ID: llm-wiki-cloud-dev
           RUNTIME_SERVICE_ACCOUNT: lwc-auth-dev@llm-wiki-cloud.iam.gserviceaccount.com
           JWT_SECRET_NAME: jwt-secret-dev
-          ALLOWED_ORIGINS: https://llm-wiki-frontend-dev.vercel.app
+          ALLOWED_ORIGINS: https://wiki.dev.rayer.idv.tw,https://llm-wiki-frontend-dev.vercel.app
           APP_VERSION: ${{ steps.identity.outputs.app_version }}
           GIT_SHA: ${{ steps.identity.outputs.git_sha }}
           GIT_BRANCH: ${{ steps.identity.outputs.git_branch }}
@@ -409,8 +409,8 @@ jobs:
           FIRESTORE_DATABASE_ID: llm-wiki-cloud-dev
           RUNTIME_SERVICE_ACCOUNT: lwc-auth-dev@llm-wiki-cloud.iam.gserviceaccount.com
           JWT_SECRET_NAME: jwt-secret-dev
-          ALLOWED_ORIGINS: https://llm-wiki-frontend-dev.vercel.app
-          ALLOWED_HOSTS: ${{ env.AUTH_DOMAIN }}
+          ALLOWED_ORIGINS: https://wiki.dev.rayer.idv.tw,https://llm-wiki-frontend-dev.vercel.app
+          ALLOWED_HOSTS: auth.dev.rayer.idv.tw,auth-dev.rayer.idv.tw
           IMMUTABLE_IMAGE: ${{ steps.build.outputs.immutable_image }}
           GIT_SHA: ${{ steps.identity.outputs.git_sha }}
         run: |
@@ -497,8 +497,8 @@ jobs:
           }
           assert_env GCP_PROJECT "${{ env.PROJECT_ID }}"
           assert_env FIRESTORE_DATABASE_ID "llm-wiki-cloud-dev"
-          assert_env ALLOWED_ORIGINS "https://llm-wiki-frontend-dev.vercel.app"
-          assert_env ALLOWED_HOSTS "$AUTH_DOMAIN"
+          assert_env ALLOWED_ORIGINS "https://wiki.dev.rayer.idv.tw,https://llm-wiki-frontend-dev.vercel.app"
+          assert_env ALLOWED_HOSTS "auth.dev.rayer.idv.tw,auth-dev.rayer.idv.tw"
           assert_env DEV_JWT "false"
           assert_env LWC_SOURCE_COMMIT "$COMMIT_SHA"
           RUNTIME_SOURCE_COMMIT=$(env_value LWC_SOURCE_COMMIT)
@@ -569,7 +569,7 @@ jobs:
           fi
           jq --arg commit "$COMMIT_SHA" --arg service "$SERVICE_NAME" --arg revision "$NEW_REVISION" --arg runtime_source_commit "$RUNTIME_SOURCE_COMMIT" --arg status "$HTTP_STATUS" --arg health_status "$HEALTH_STATUS" \
             --arg runtime_service_account "$RUNTIME_SERVICE_ACCOUNT" --arg max_instances "$MAX_INSTANCES" --arg ingress "$INGRESS" --arg vpc_egress "$VPC_EGRESS" \
-            '.exact_commit = $commit | .readback_service = $service | .readback_revision = $revision | .runtime_source_commit = $runtime_source_commit | .version_http_status = ($status | tonumber) | .healthz_http_status = ($health_status | tonumber) | .runtime_service_account = $runtime_service_account | .max_instances = ($max_instances | tonumber) | .ingress = $ingress | .vpc_egress = $vpc_egress | .jwt_secret_name = "jwt-secret-dev" | .runtime_env = {GCP_PROJECT: "llm-wiki-cloud", FIRESTORE_DATABASE_ID: "llm-wiki-cloud-dev", ALLOWED_ORIGINS: "https://llm-wiki-frontend-dev.vercel.app", ALLOWED_HOSTS: "auth-dev.rayer.idv.tw", DEV_JWT: "false"}' \
+            '.exact_commit = $commit | .readback_service = $service | .readback_revision = $revision | .runtime_source_commit = $runtime_source_commit | .version_http_status = ($status | tonumber) | .healthz_http_status = ($health_status | tonumber) | .runtime_service_account = $runtime_service_account | .max_instances = ($max_instances | tonumber) | .ingress = $ingress | .vpc_egress = $vpc_egress | .jwt_secret_name = "jwt-secret-dev" | .runtime_env = {GCP_PROJECT: "llm-wiki-cloud", FIRESTORE_DATABASE_ID: "llm-wiki-cloud-dev", ALLOWED_ORIGINS: "https://wiki.dev.rayer.idv.tw,https://llm-wiki-frontend-dev.vercel.app", ALLOWED_HOSTS: "auth.dev.rayer.idv.tw,auth-dev.rayer.idv.tw", DEV_JWT: "false"}' \
             "$EVIDENCE_TMP" > "$EVIDENCE_TMP.final"
           mv "$EVIDENCE_TMP.final" "$EVIDENCE"
           echo "evidence=$EVIDENCE" >> "$GITHUB_OUTPUT"
