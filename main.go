@@ -177,7 +177,7 @@ func main() {
 		settingsStore = syssettings.NewStore(nil, cfg.RegistrationEnabled)
 	}
 
-	registerPublicRoutes(r, settingsStore)
+	registerPublicRoutes(r, settingsStore, cfg.AuthServiceURL)
 
 	// Public auth routes (no auth middleware)
 	authRoutes := r.Group("/api/v1/auth")
@@ -261,9 +261,19 @@ func main() {
 	log.Fatal(r.Run(":" + cfg.Port))
 }
 
-func registerPublicRoutes(r *gin.Engine, settingsStore syssettings.RegistrationGate) {
+func registerPublicRoutes(r *gin.Engine, settingsStore syssettings.RegistrationGate, authServiceURL string) {
 	// Public routes are registered on the root router, outside JWT and project middleware.
-	r.GET("/api/v1/public/config", syssettings.PublicConfigHandler(settingsStore))
+	r.GET("/api/v1/public/config", func(c *gin.Context) {
+		settings, err := settingsStore.GetSettings(c.Request.Context())
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"registration_enabled": settings.RegistrationEnabled,
+			"auth_service_url":     authServiceURL,
+		})
+	})
 	r.GET("/api/v1/public/version", buildinfo.Handler())
 }
 
