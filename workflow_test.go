@@ -578,9 +578,6 @@ func TestAuthDevWorkflowUsesCanonicalSourceAndExistingPrerequisites(t *testing.T
 	if strings.Count(contents, "gcloud run deploy") != 1 {
 		t.Fatalf("Auth dev workflow must have exactly one Cloud Run deploy command")
 	}
-	if strings.Count(contents, "AUTH_DOMAIN:") != 1 {
-		t.Fatalf("Auth dev workflow must declare one AUTH_DOMAIN value")
-	}
 	preflightDomain := strings.Index(contents, "gcloud beta run domain-mappings describe")
 	preflightBuild := strings.Index(contents, "gcloud builds submit")
 	if preflightDomain < 0 || preflightBuild < 0 || preflightDomain > preflightBuild {
@@ -590,6 +587,56 @@ func TestAuthDevWorkflowUsesCanonicalSourceAndExistingPrerequisites(t *testing.T
 	postDeploy := strings.LastIndex(contents, "https://$AUTH_DOMAIN/api/v1/public/version")
 	if postDeploy < 0 || postDeploy < deployIndex {
 		t.Fatal("Auth version read-back must follow deploy")
+	}
+	authDomainCount := strings.Count(contents, "AUTH_DOMAIN: auth.dev.rayer.idv.tw")
+	if authDomainCount != 1 {
+		t.Fatalf("Auth workflow must declare canonical AUTH_DOMAIN exactly once, got %d", authDomainCount)
+	}
+	if !strings.Contains(contents, "LEGACY_AUTH_DOMAIN: auth-dev.rayer.idv.tw") {
+		t.Fatal("Auth workflow must declare legacy auth probe domain")
+	}
+}
+
+func TestAuthDeployUsesLegacyDomainForPreDeployRollbackProbeAndCanonicalPostDeployReadback(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/deploy-auth.yml")
+	preDeploy := workflowSection(t, contents, "      - name: Capture pre-deploy Auth rollback evidence", "      - name: Upload pre-deploy Auth rollback evidence")
+	if !strings.Contains(preDeploy, `"https://$LEGACY_AUTH_DOMAIN/api/v1/public/version"`) {
+		t.Error("pre-deploy Auth rollback evidence must probe legacy host version endpoint")
+	}
+	if strings.Contains(preDeploy, `"https://$AUTH_DOMAIN/api/v1/public/version"`) {
+		t.Error("pre-deploy Auth rollback probe must not use canonical host")
+	}
+	if !strings.Contains(preDeploy, `--arg previous_version_probe_domain "$LEGACY_AUTH_DOMAIN"`) || !strings.Contains(preDeploy, "previous_version_probe_domain") {
+		t.Error("pre-deploy Auth rollback evidence must record the legacy probe domain")
+	}
+
+	postDeploy := workflowSection(t, contents, "      - name: Capture and verify Auth deployment evidence", "      - name: Upload Auth deployment evidence")
+	if !strings.Contains(postDeploy, `"https://$AUTH_DOMAIN/api/v1/public/version"`) {
+		t.Fatal("post-deploy Auth evidence capture must probe canonical version endpoint")
+	}
+	if !strings.Contains(postDeploy, `"https://$AUTH_DOMAIN/api/v1/public/healthz"`) {
+		t.Fatal("post-deploy Auth evidence capture must probe canonical healthz endpoint")
+	}
+	if strings.Contains(postDeploy, `"https://$LEGACY_AUTH_DOMAIN/api/v1/public/version"`) {
+		t.Fatal("post-deploy Auth evidence capture must not probe legacy domain")
+	}
+
+	legacyPreDeployProbeAt := strings.Index(contents, "https://$LEGACY_AUTH_DOMAIN/api/v1/public/version")
+	deployAt := strings.Index(contents, "      - name: Deploy Auth to Cloud Run")
+	if legacyPreDeployProbeAt < 0 || deployAt < 0 {
+		t.Fatal("Auth workflow is missing legacy probe or deploy step")
+	}
+	if legacyPreDeployProbeAt > deployAt {
+		t.Fatal("legacy pre-deploy version read-back must happen before Cloud Run deploy")
+	}
+
+	canonicalReadBackAt := strings.Index(contents, "https://$AUTH_DOMAIN/api/v1/public/version")
+	if canonicalReadBackAt < 0 || canonicalReadBackAt < deployAt {
+		t.Fatal("canonical version read-back must happen at or after Cloud Run deploy")
+	}
+	canonicalHealthAt := strings.Index(contents, "https://$AUTH_DOMAIN/api/v1/public/healthz")
+	if canonicalHealthAt < 0 || canonicalHealthAt < deployAt {
+		t.Fatal("canonical healthz read-back must happen at or after Cloud Run deploy")
 	}
 }
 
