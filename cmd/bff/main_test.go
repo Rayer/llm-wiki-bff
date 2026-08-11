@@ -108,7 +108,7 @@ func TestPublicVersionRouteDoesNotRequireAuthOrProject(t *testing.T) {
 	router := gin.New()
 	v1 := router.Group("/api/v1")
 	v1.Use(auth.JWTAuth(config.Config{JWTSecret: "test-secret"}), auth.ProjectMiddleware())
-	registerPublicRoutes(router, &syssettings.FakeStore{Enabled: true})
+	registerPublicRoutes(router, &syssettings.FakeStore{Enabled: true}, "https://auth.dev.rayer.idv.tw")
 
 	recorder := httptest.NewRecorder()
 	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/v1/public/version", nil))
