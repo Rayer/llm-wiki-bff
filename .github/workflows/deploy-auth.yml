@@ -425,6 +425,7 @@ jobs:
             --vpc-egress private-ranges-only \
             --ingress all \
             --max-instances 1 \
+            --to-latest \
             --update-secrets "JWT_SECRET=$JWT_SECRET_NAME:latest" \
             --update-env-vars "^@^GCP_PROJECT=${{ env.PROJECT_ID }}@FIRESTORE_DATABASE_ID=$FIRESTORE_DATABASE_ID@ALLOWED_ORIGINS=$ALLOWED_ORIGINS@ALLOWED_HOSTS=$ALLOWED_HOSTS@DEV_JWT=false@LWC_SOURCE_COMMIT=$GIT_SHA" \
             --quiet
@@ -452,8 +453,23 @@ jobs:
             echo "Unable to read Auth service after deploy; refusing to publish evidence."
             exit 1
           fi
-          if ! NEW_REVISION=$(jq -er '.status.latestReadyRevisionName // empty' <<<"$SERVICE_JSON"); then
-            echo "Cloud Run did not report a new latest ready revision; refusing to publish evidence."
+          if ! LATEST_CREATED_REVISION=$(jq -er '.status.latestCreatedRevisionName // empty' <<<"$SERVICE_JSON"); then
+            echo "Cloud Run did not report a new latest created revision; refusing to publish evidence."
+            exit 1
+          fi
+          if ! NEW_REVISION=$(jq -er '
+            .status.traffic as $traffic |
+            if ($traffic | type) != "array" or ($traffic | length) != 1 then empty
+            elif (($traffic[0].percent // 0) != 100) then empty
+            elif (($traffic[0].revisionName // "") | type) != "string" or (($traffic[0].revisionName // "") | length) == 0 then empty
+            elif ($traffic[0].tag? != null) then empty
+            else $traffic[0].revisionName
+            end' <<<"$SERVICE_JSON"); then
+            echo "Cloud Run did not report exactly one untagged 100% serving revision; refusing to publish evidence."
+            exit 1
+          fi
+          if [[ "$NEW_REVISION" != "$LATEST_CREATED_REVISION" ]]; then
+            echo "Auth service reported latest created revision $LATEST_CREATED_REVISION but serving revision $NEW_REVISION; refusing to publish evidence."
             exit 1
           fi
           if ! REVISION_JSON=$(gcloud run revisions describe "$NEW_REVISION" \
@@ -617,6 +633,8 @@ jobs:
           fi
           ACTUAL_TRAFFIC=$(jq -c '[.status.traffic[]? | {revisionName: (.revisionName // null), percent: (.percent // null), tag: (.tag // null), latestRevision: (.latestRevision // null)}]' <<<"$SERVICE_JSON" 2>/dev/null)
           [[ "$ACTUAL_TRAFFIC" =~ ^\[ ]] || ACTUAL_TRAFFIC='[]'
+          LATEST_CREATED_REVISION=$(jq -cer '.status.latestCreatedRevisionName // ""' <<<"$SERVICE_JSON" 2>/dev/null)
+          [[ "$LATEST_CREATED_REVISION" == "null" ]] && LATEST_CREATED_REVISION=""
 
           SERVING_REVISIONS='[]'
           while IFS= read -r revision; do
@@ -648,13 +666,14 @@ jobs:
             --arg deploy "$DEPLOY_OUTCOME" \
             --arg strict "$STRICT_OUTCOME" \
             --argjson provider "$PROVIDER_READBACK_AVAILABLE" \
+            --arg latest_created_revision "$LATEST_CREATED_REVISION" \
             --argjson traffic "$ACTUAL_TRAFFIC" \
             --argjson serving_revisions "$SERVING_REVISIONS" \
             --arg version_status "$VERSION_STATUS" \
             --arg cache_control "$CACHE_CONTROL" \
             --argjson version_fields "$VERSION_FIELDS" \
             --arg health_status "$HEALTH_STATUS" \
-            '{evidence: "reconciliation", service: $service, provider_readback_available: $provider, http_readback_available: ($version_status != "000" or $health_status != "000"), actual_traffic: $traffic, actual_serving_revisions: $serving_revisions, version_http_status: ($version_status | if . == "000" then null else tonumber end), version_cache_control: $cache_control, version: $version_fields, healthz_http_status: ($health_status | if . == "000" then null else tonumber end), steps: {deploy: $deploy, strict_verify: $strict}}' \
+            '{evidence: "reconciliation", service: $service, provider_readback_available: $provider, latest_created_revision: $latest_created_revision, http_readback_available: ($version_status != "000" or $health_status != "000"), actual_traffic: $traffic, actual_serving_revisions: $serving_revisions, version_http_status: ($version_status | if . == "000" then null else tonumber end), version_cache_control: $cache_control, version: $version_fields, healthz_http_status: ($health_status | if . == "000" then null else tonumber end), steps: {deploy: $deploy, strict_verify: $strict}}' \
             > "$RECONCILIATION"; then
             echo "Unable to materialize Auth deployment reconciliation evidence; refusing to publish."
             exit 1
