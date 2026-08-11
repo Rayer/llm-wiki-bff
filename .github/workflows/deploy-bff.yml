@@ -172,7 +172,7 @@ jobs:
           PIPELINE_JOB_NAME: olw-pipeline-dev
           RUNTIME_SERVICE_ACCOUNT: lwc-bff-dev@llm-wiki-cloud.iam.gserviceaccount.com
           JWT_SECRET_NAME: jwt-secret-dev
-          ALLOWED_ORIGINS: https://llm-wiki-frontend-dev.vercel.app,http://localhost:3000,http://127.0.0.1:3000
+          ALLOWED_ORIGINS: https://wiki.dev.rayer.idv.tw,https://llm-wiki-frontend-dev.vercel.app,http://localhost:3000,http://127.0.0.1:3000
           APP_VERSION: ${{ steps.identity.outputs.app_version }}
           GIT_SHA: ${{ steps.identity.outputs.git_sha }}
           GIT_BRANCH: ${{ steps.identity.outputs.git_branch }}
