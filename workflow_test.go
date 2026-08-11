@@ -502,7 +502,7 @@ func TestAuthDevWorkflowUsesCanonicalSourceAndExistingPrerequisites(t *testing.T
 		"allUsers",
 		"gcloud builds describe \"$BUILD_ID\"",
 		"IMMUTABLE_IMAGE=\"${{ env.AR_REPO }}/llm-wiki-auth@$DIGEST\"",
-		"latestReadyRevisionName",
+		"latestCreatedRevisionName",
 		"status.imageDigest",
 		"auth-image-digest-$COMMIT_SHA.txt",
 		"name: auth-image-digest-${{ steps.image_digest.outputs.commit_sha }}",
@@ -946,6 +946,37 @@ func TestAuthWorkflowsUseServingRevisionAndBindSourceCommitBeforeMutation(t *tes
 		if at := strings.Index(rollback, check); at < 0 || at > mutation {
 			t.Fatalf("Auth rollback must check %q before traffic mutation", check)
 		}
+	}
+}
+func TestAuthDeployPostVerifyUsesServingTrafficAndLatestCreated(t *testing.T) {
+	deploy := readWorkflow(t, ".github/workflows/deploy-auth.yml")
+	section := workflowSection(t, deploy, "      - name: Capture and verify Auth deployment evidence", "      - name: Upload Auth deployment evidence")
+	for _, want := range []string{
+		"if ! LATEST_CREATED_REVISION=$(jq -er '.status.latestCreatedRevisionName // empty' <<<\"$SERVICE_JSON\")",
+		"if ! NEW_REVISION=$(jq -er '",
+		".status.traffic as $traffic |",
+		"($traffic[0].percent // 0) != 100",
+		"($traffic[0].revisionName // \"\")",
+		"($traffic[0].tag? != null)",
+		`[[ "$NEW_REVISION" != "$LATEST_CREATED_REVISION" ]]`,
+		"gcloud run revisions describe \"$NEW_REVISION\"",
+	} {
+		if !strings.Contains(section, want) {
+			t.Errorf("Auth post-deploy evidence is missing contract %q", want)
+		}
+	}
+	if strings.Contains(section, "latestReadyRevisionName") {
+		t.Fatal("Auth post-deploy evidence must not read latestReadyRevisionName")
+	}
+	selectorAt := strings.Index(section, "if ! NEW_REVISION=$(jq -er '")
+	describeAt := strings.Index(section, "if ! REVISION_JSON=$(gcloud run revisions describe \"$NEW_REVISION\"")
+	if selectorAt < 0 || describeAt < 0 || selectorAt > describeAt {
+		t.Fatal("Auth post-deploy evidence must select revision from service traffic before revision describe")
+	}
+
+	reconcile := workflowSection(t, deploy, "      - name: Reconcile Auth deployment outcome", "      - name: Upload Auth deployment reconciliation")
+	if !strings.Contains(reconcile, "latest_created_revision:") {
+		t.Fatal("Auth reconciliation should report latest_created_revision")
 	}
 }
 
