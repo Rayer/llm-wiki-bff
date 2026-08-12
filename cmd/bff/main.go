@@ -1,4 +1,5 @@
-//go:generate sh -c "cd ../.. && go run github.com/swaggo/swag/cmd/swag@v1.16.4 init -g cmd/bff/main.go -o docs --parseDependency"
+//go:generate sh -c "cd ../.. && go run github.com/swaggo/swag/cmd/swag@v1.16.4 init -g cmd/bff/main.go -o docs --parseDependency && python3 scripts/postprocess_swagger.py --docs-dir docs"
+// The global generator may expose unrelated baseline drift; LWC-174 validation asserts its own artifacts.
 
 package main
 
@@ -245,6 +246,7 @@ func newProductionRouter(
 		v1.GET("/ready", hV1.Ready)
 		v1.GET("/projects", hV1.ListProjects)
 		v1.POST("/init-project", hV1.InitProject)
+		v1.PATCH("/projects/:projectID", hV1.RenameProject)
 		v1.GET("/projects/:pid/status", hV1.ProjectStatus)
 	}
 

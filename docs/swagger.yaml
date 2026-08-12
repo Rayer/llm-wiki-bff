@@ -508,6 +508,15 @@ definitions:
       registration_enabled:
         type: boolean
     type: object
+  v1.adminRenameProjectResponse:
+    properties:
+      id:
+        type: string
+      name:
+        type: string
+      user_id:
+        type: string
+    type: object
   v1.pipelineStatusResponse:
     properties:
       last_execution:
@@ -520,6 +529,21 @@ definitions:
         items:
           type: string
         type: array
+    type: object
+  v1.renameProjectRequest:
+    additionalProperties: false
+    properties:
+      name:
+        type: string
+    required:
+    - name
+    type: object
+  v1.renameProjectResponse:
+    properties:
+      id:
+        type: string
+      name:
+        type: string
     type: object
 info:
   contact:
@@ -609,7 +633,7 @@ paths:
     patch:
       consumes:
       - application/json
-      description: Updates the name field on a Firestore project document.
+      description: Updates the name field on a Firestore project document. The JSON body is limited to 1024 bytes; name is trimmed and must be 1-64 Unicode code points.
       parameters:
       - description: Project doc ID ({userID}_{projectID})
         in: path
@@ -621,18 +645,14 @@ paths:
         name: body
         required: true
         schema:
-          properties:
-            name:
-              type: string
-          type: object
+          $ref: '#/definitions/v1.renameProjectRequest'
       produces:
       - application/json
       responses:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/v1.adminRenameProjectResponse'
         "400":
           description: Bad Request
           schema:
@@ -647,6 +667,10 @@ paths:
             $ref: '#/definitions/handler.ErrorResponse'
         "404":
           description: Not Found
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+        "413":
+          description: Request Entity Too Large
           schema:
             $ref: '#/definitions/handler.ErrorResponse'
         "500":
@@ -1198,6 +1222,58 @@ paths:
       security:
       - DevUserAuth: []
       summary: List user projects
+      tags:
+      - projects
+  /api/v1/projects/{projectID}:
+    patch:
+      consumes:
+      - application/json
+      description: Updates only the display name of a project owned by the authenticated
+        user. The JSON body is limited to 1024 bytes; name is trimmed and must be
+        1-64 Unicode code points.
+      parameters:
+      - description: Project ID
+        in: path
+        name: projectID
+        required: true
+        type: string
+      - description: New project name
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/v1.renameProjectRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/v1.renameProjectResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+        "413":
+          description: Request Entity Too Large
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+      security:
+      - BearerAuth: []
+      - DevUserAuth: []
+      summary: Rename an owned project
       tags:
       - projects
   /api/v1/public/config:

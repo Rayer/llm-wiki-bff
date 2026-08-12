@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"cloud.google.com/go/firestore"
 	"github.com/gin-gonic/gin"
@@ -50,8 +49,8 @@ func (h *Handler) InitProject(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, handler.ErrorResponse{Error: "invalid JSON: " + err.Error()})
 		return
 	}
-	name := strings.TrimSpace(req.Name)
-	if name == "" || utf8.RuneCountInString(name) > 64 {
+	name, err := normalizeProjectName(req.Name)
+	if err != nil {
 		c.JSON(http.StatusBadRequest, handler.ErrorResponse{Error: "name must be 1-64 characters"})
 		return
 	}

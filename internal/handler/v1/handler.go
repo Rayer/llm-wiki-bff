@@ -30,6 +30,8 @@ type Handler struct {
 	metadataTokenURL             string
 	cloudRunJobURL               string
 	projectExists                func(context.Context, string) error
+	projectRename                func(context.Context, string, string, string) error
+	projectRenameTransaction     projectRenameTransactionAdapter
 	adminProjectRecordLoader     func(context.Context, string) (adminProjectRecord, error)
 	adminDeleteBackend           adminDeleteBackend
 	rebuildIndex                 func(context.Context, string, string) (wikiindex.IDMap, error)
