@@ -186,6 +186,94 @@ func (h *Handler) ListProjects(c *gin.Context) {
 	c.JSON(http.StatusOK, resp)
 }
 
+// RenameProject handles PATCH /api/v1/projects/{projectID} for the owner.
+//
+//	@Summary		Rename an owned project
+//	@Description	Updates only the display name of a project owned by the authenticated user. The JSON body is limited to 1024 bytes; name is trimmed and must be 1-64 Unicode code points.
+//	@Tags			projects
+//	@Accept			json
+//	@Produce		json
+//	@Param			projectID	path	string	true	"Project ID"
+//	@Param			body		body	renameProjectRequest	true	"New project name"
+//	@Success		200	{object}	renameProjectResponse
+//	@Failure		400	{object}	handler.ErrorResponse
+//	@Failure		401	{object}	handler.ErrorResponse
+//	@Failure		404	{object}	handler.ErrorResponse
+//	@Failure		413	{object}	handler.ErrorResponse
+//	@Failure		500	{object}	handler.ErrorResponse
+//	@Security		BearerAuth
+//	@Security		DevUserAuth
+//	@Router			/api/v1/projects/{projectID} [patch]
+func (h *Handler) RenameProject(c *gin.Context) {
+	userID := strings.TrimSpace(c.GetString("userID"))
+	if userID == "" {
+		c.JSON(http.StatusUnauthorized, handler.ErrorResponse{Error: "user not authenticated"})
+		return
+	}
+	projectID := strings.TrimSpace(c.Param("projectID"))
+	if !auth.ValidPathSegment(projectID) {
+		c.JSON(http.StatusBadRequest, handler.ErrorResponse{Error: "invalid project ID"})
+		return
+	}
+
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxRenameRequestBytes)
+	var body renameProjectRequest
+	if err := decodeRenameProjectJSON(c.Request.Body, &body); err != nil {
+		if errors.Is(err, errRenameBodyTooLarge) {
+			c.JSON(http.StatusRequestEntityTooLarge, handler.ErrorResponse{Error: "request body too large"})
+			return
+		}
+		c.JSON(http.StatusBadRequest, handler.ErrorResponse{Error: "invalid JSON: " + err.Error()})
+		return
+	}
+	name, err := normalizeProjectName(body.Name)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, handler.ErrorResponse{Error: err.Error()})
+		return
+	}
+
+	if err := h.renameOwnedProject(c.Request.Context(), userID, projectID, name); err != nil {
+		switch {
+		case errors.Is(err, errProjectNotFound):
+			c.JSON(http.StatusNotFound, handler.ErrorResponse{Error: "project not found"})
+		case errors.Is(err, errFirestoreNotConfigured):
+			c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "Firestore client is not configured"})
+		default:
+			c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "project update unavailable"})
+		}
+		return
+	}
+
+	c.JSON(http.StatusOK, renameProjectResponse{ID: projectID, Name: name})
+}
+
+func (h *Handler) renameOwnedProject(ctx context.Context, userID, projectID, name string) error {
+	adapter := h.projectRenameTransaction
+	if adapter == nil {
+		if h.firestore != nil && h.firestore.Raw() != nil {
+			adapter = firestoreProjectRenameTransaction{client: h.firestore.Raw()}
+		}
+	}
+	if adapter == nil && h.projectRename != nil {
+		if err := h.projectRename(ctx, userID, projectID, name); err != nil {
+			return err
+		}
+		logProjectRename("updated", userID, projectID)
+		return nil
+	}
+	if adapter == nil {
+		return errFirestoreNotConfigured
+	}
+	if err := adapter.RenameProject(ctx, userID, projectID, name, func(docID string, data map[string]interface{}) bool {
+		kind, record, ok := classifyAdminProjectDocForOwner(docID, data, userID)
+		return ok && kind == adminRealProjectDoc && record.projectID == projectID
+	}); err != nil {
+		return err
+	}
+	logProjectRename("updated", userID, projectID)
+	return nil
+}
+
 func (h *Handler) listFirestoreProjects(ctx context.Context, userID string) ([]handler.ProjectResponse, error) {
 	iter := h.firestore.Raw().Collection("projects").Documents(ctx)
 	defer iter.Stop()
@@ -2484,17 +2572,18 @@ func (h *Handler) AdminDeleteProject(c *gin.Context) {
 // AdminRenameProject handles PATCH /admin/projects/{id}.
 //
 //	@Summary		Rename a project (admin)
-//	@Description	Updates the name field on a Firestore project document.
+//	@Description	Updates the name field on a Firestore project document. The JSON body is limited to 1024 bytes; name is trimmed and must be 1-64 Unicode code points.
 //	@Tags			admin
 //	@Accept			json
 //	@Produce		json
 //	@Param			id		path		string	true	"Project doc ID ({userID}_{projectID})"
-//	@Param			body	body		object{name=string}	true	"New project name"
-//	@Success		200		{object}	map[string]any
+//	@Param			body	body	renameProjectRequest	true	"New project name"
+//	@Success		200		{object}	adminRenameProjectResponse
 //	@Failure		400		{object}	handler.ErrorResponse
 //	@Failure		401		{object}	handler.ErrorResponse
 //	@Failure		403		{object}	handler.ErrorResponse
 //	@Failure		404		{object}	handler.ErrorResponse
+//	@Failure		413		{object}	handler.ErrorResponse
 //	@Failure		500		{object}	handler.ErrorResponse
 //	@Security		BearerAuth
 //	@Router			/api/v1/admin/projects/{id} [patch]
@@ -2506,15 +2595,23 @@ func (h *Handler) AdminRenameProject(c *gin.Context) {
 		return
 	}
 
-	var body struct {
-		Name string `json:"name"`
-	}
-	if err := c.ShouldBindJSON(&body); err != nil {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxRenameRequestBytes)
+	var body renameProjectRequest
+	if err := decodeRenameProjectJSON(c.Request.Body, &body); err != nil {
+		if errors.Is(err, errRenameBodyTooLarge) {
+			c.JSON(http.StatusRequestEntityTooLarge, handler.ErrorResponse{Error: "request body too large"})
+			return
+		}
 		c.JSON(http.StatusBadRequest, handler.ErrorResponse{Error: "invalid JSON: " + err.Error()})
 		return
 	}
-	if strings.TrimSpace(body.Name) == "" {
-		c.JSON(http.StatusBadRequest, handler.ErrorResponse{Error: "name is required"})
+	name, err := normalizeProjectName(body.Name)
+	if err != nil {
+		if strings.TrimSpace(body.Name) == "" {
+			c.JSON(http.StatusBadRequest, handler.ErrorResponse{Error: "name is required"})
+			return
+		}
+		c.JSON(http.StatusBadRequest, handler.ErrorResponse{Error: err.Error()})
 		return
 	}
 	if h.firestore == nil || h.firestore.Raw() == nil {
@@ -2522,32 +2619,26 @@ func (h *Handler) AdminRenameProject(c *gin.Context) {
 		return
 	}
 
-	fs := h.firestore.Raw()
 	ctx := c.Request.Context()
-
-	docRef := fs.Collection("projects").Doc(docID)
-	_, err := docRef.Get(ctx)
+	adapter := h.projectRenameTransaction
+	if adapter == nil {
+		adapter = firestoreProjectRenameTransaction{client: h.firestore.Raw()}
+	}
+	err = adapter.RenameProject(ctx, uid, pid, name, func(classifiedDocID string, data map[string]interface{}) bool {
+		kind, record, ok := classifyAdminProjectDoc(classifiedDocID, data)
+		return ok && kind == adminRealProjectDoc && record.userID == uid && record.projectID == pid
+	})
 	if err != nil {
-		if status.Code(err) == codes.NotFound {
+		if errors.Is(err, errProjectNotFound) || status.Code(err) == codes.NotFound {
 			c.JSON(http.StatusNotFound, handler.ErrorResponse{Error: "project not found"})
 			return
 		}
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "project unavailable"})
-		return
-	}
-
-	if _, err := docRef.Update(ctx, []firestore.Update{
-		{Path: "name", Value: body.Name},
-	}); err != nil {
 		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "project update unavailable"})
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{
-		"id":      docID,
-		"name":    body.Name,
-		"user_id": uid,
-	})
+	logProjectRename("updated", uid, pid)
+	c.JSON(http.StatusOK, adminRenameProjectResponse{ID: docID, Name: name, UserID: uid})
 }
 
 // AdminRebuildIndex handles POST /admin/projects/{id}/rebuild-index.

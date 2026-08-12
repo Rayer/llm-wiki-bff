@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -18,6 +19,7 @@ import (
 	handlerv1 "github.com/rayer/llm-wiki-bff/internal/handler/v1"
 	"github.com/rayer/llm-wiki-bff/internal/middleware"
 	"github.com/rayer/llm-wiki-bff/internal/syssettings"
+	"gopkg.in/yaml.v3"
 )
 
 func TestSwaggerDoesNotDocumentAuthRoutes(t *testing.T) {
@@ -100,6 +102,71 @@ func TestSwaggerQueryRequestDoesNotExposeProjectField(t *testing.T) {
 	}
 	if _, ok := definition.Properties["project"]; ok {
 		t.Fatal(`swagger schema still advertises "project" for handler.QueryRequest`)
+	}
+}
+
+func TestSwaggerOwnerRenameContractIsExactAcrossArtifacts(t *testing.T) {
+	data, err := os.ReadFile("../../docs/swagger.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var jsonDoc struct {
+		Paths       map[string]map[string]json.RawMessage `json:"paths"`
+		Definitions map[string]struct {
+			Properties           map[string]json.RawMessage `json:"properties"`
+			Required             []string                   `json:"required"`
+			AdditionalProperties *bool                      `json:"additionalProperties"`
+		} `json:"definitions"`
+	}
+	if err := json.Unmarshal(data, &jsonDoc); err != nil {
+		t.Fatal(err)
+	}
+	operation := jsonDoc.Paths["/api/v1/projects/{projectID}"]["patch"]
+	var patch struct {
+		Security   []map[string][]string `json:"security"`
+		Parameters []struct {
+			In     string `json:"in"`
+			Schema struct {
+				Ref string `json:"$ref"`
+			} `json:"schema"`
+		} `json:"parameters"`
+	}
+	if err := json.Unmarshal(operation, &patch); err != nil {
+		t.Fatal(err)
+	}
+	if len(patch.Security) != 2 || patch.Security[0]["BearerAuth"] == nil || patch.Security[1]["DevUserAuth"] == nil {
+		t.Fatalf("security=%v, want BearerAuth and DevUserAuth", patch.Security)
+	}
+	var bodySchemaRef string
+	for _, parameter := range patch.Parameters {
+		if parameter.In == "body" {
+			bodySchemaRef = parameter.Schema.Ref
+		}
+	}
+	if bodySchemaRef != "#/definitions/v1.renameProjectRequest" {
+		t.Fatalf("body schema=%q, want named renameProjectRequest", bodySchemaRef)
+	}
+	body := jsonDoc.Definitions["v1.renameProjectRequest"]
+	if len(body.Required) != 1 || body.Required[0] != "name" || body.AdditionalProperties == nil || *body.AdditionalProperties {
+		t.Fatalf("rename request schema=%+v, want required name and additionalProperties false", body)
+	}
+
+	for _, path := range []string{"../../docs/swagger.yaml", "../../docs/docs.go"} {
+		artifact, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.HasSuffix(path, ".yaml") {
+			var yamlDoc map[string]interface{}
+			if err := yaml.Unmarshal(artifact, &yamlDoc); err != nil {
+				t.Fatalf("decode %s: %v", path, err)
+			}
+			if !strings.Contains(string(artifact), "v1.renameProjectRequest") || !strings.Contains(string(artifact), "additionalProperties: false") {
+				t.Fatalf("%s is missing the named closed request schema", path)
+			}
+		} else if !strings.Contains(string(artifact), `"v1.renameProjectRequest"`) || !strings.Contains(string(artifact), `"additionalProperties": false`) {
+			t.Fatalf("%s is missing the named closed request schema", path)
+		}
 	}
 }
 
@@ -199,6 +266,80 @@ func TestProductionRouterRegistersRawScrapeRouteUnderAuthAndProjectMiddleware(t 
 	}
 	if got := rawBody["error"]; got != "fake raw scrape handler" {
 		t.Fatalf("raw scrape error = %q, want %q", got, "fake raw scrape handler")
+	}
+}
+
+func TestProductionRouterRegistersOwnerProjectRenameRoute(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	router := newProductionRouter(
+		config.Config{DevJWT: true, JWTSecret: "test-secret", AllowedOrigins: []string{"http://example.test"}},
+		false,
+		nil,
+		nil,
+		handlerv1.New(nil, nil, nil, nil, nil, nil),
+		&syssettings.FakeStore{Enabled: true},
+		nil,
+	)
+
+	registered := 0
+	for _, route := range router.Routes() {
+		if route.Method == http.MethodPatch && route.Path == "/api/v1/projects/:projectID" {
+			registered++
+		}
+	}
+	if registered != 1 {
+		t.Fatalf("PATCH /api/v1/projects/:projectID registered %d times, want exactly once", registered)
+	}
+}
+
+func TestProductionRouterOwnerProjectRenameUsesAuthenticatedOwner(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	var gotUserID, gotProjectID, gotName string
+	h := handlerv1.New(nil, nil, nil, nil, nil, nil)
+	h.SetProjectRenameFunc(func(_ context.Context, userID, projectID, name string) error {
+		gotUserID, gotProjectID, gotName = userID, projectID, name
+		return nil
+	})
+	router := newProductionRouter(
+		config.Config{DevJWT: true, JWTSecret: "test-secret", AllowedOrigins: []string{"http://example.test"}},
+		false,
+		nil,
+		nil,
+		h,
+		&syssettings.FakeStore{Enabled: true},
+		nil,
+	)
+
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPatch, "/api/v1/projects/project-1", strings.NewReader(`{"name":"  Renamed  "}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-User-ID", "owner-1")
+	router.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if gotUserID != "owner-1" || gotProjectID != "project-1" || gotName != "Renamed" {
+		t.Fatalf("rename args=(%q,%q,%q)", gotUserID, gotProjectID, gotName)
+	}
+}
+
+func TestProductionRouterOwnerProjectRenameKeepsExistingAnonymousAuthBehavior(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	router := newProductionRouter(
+		config.Config{JWTSecret: "test-secret", AllowedOrigins: []string{"http://example.test"}},
+		false,
+		nil,
+		nil,
+		handlerv1.New(nil, nil, nil, nil, nil, nil),
+		&syssettings.FakeStore{Enabled: true},
+		nil,
+	)
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodPatch, "/api/v1/projects/project-1", strings.NewReader(`{"name":"Renamed"}`)))
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("anonymous status=%d body=%s, want 401", recorder.Code, recorder.Body.String())
 	}
 }
 
