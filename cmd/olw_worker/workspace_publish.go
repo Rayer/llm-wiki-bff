@@ -517,6 +517,20 @@ func recoverInterruptedPublish(vault string) error {
 	return rollbackPublish(vault, journal)
 }
 
+func publishJournalCommitted(vault string) bool {
+	r, err := os.OpenRoot(vault)
+	if err != nil {
+		return false
+	}
+	defer r.Close()
+	data, err := r.ReadFile(publishJournal)
+	if err != nil {
+		return false
+	}
+	var journal publishJournalRecord
+	return json.Unmarshal(data, &journal) == nil && journal.Phase == publishPhaseCommitted
+}
+
 func cleanupCommittedPublish(vault string, journal publishJournalRecord) error {
 	if err := validatePublishJournal(journal); err != nil {
 		return fmt.Errorf("invalid interrupted publish journal; refusing cleanup: %w", err)
