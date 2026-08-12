@@ -8,10 +8,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1061,6 +1064,9 @@ func TestWorkspaceRequiresFirstCommandToBeRunBeforeLeaseOrExecution(t *testing.T
 					t.Fatalf("invalid batch wrote %s: %v", path, err)
 				}
 			}
+			if data, readErr := os.ReadFile(filepath.Join(vault, "cache", "pipeline-invalid.log")); readErr == nil && strings.Contains(string(data), `"event":"worker_failure"`) {
+				t.Fatalf("pre-ownership rejection emitted worker_failure: %q", data)
+			}
 		})
 	}
 }
@@ -1341,6 +1347,630 @@ func TestWorkspaceFailurePublishesCappedRedactedLog(t *testing.T) {
 	data, err := os.ReadFile(filepath.Join(vault, "cache", "pipeline-failed.log"))
 	if err != nil || strings.Contains(string(data), "very-secret") || !strings.Contains(string(data), "[REDACTED]") {
 		t.Fatalf("failure log=%q err=%v", data, err)
+	}
+}
+
+func TestWorkspaceOwnedChildFailurePublishesWorkerFailureEvent(t *testing.T) {
+	old := execOLW
+	t.Cleanup(func() { execOLW = old })
+	vault := workspaceVault(t, "original")
+	child := exec.Command("sh", "-c", "exit 23")
+	execOLW = func(_ context.Context, _ string, _ []string, _ []string, stdout, _ io.Writer) error {
+		if _, err := io.WriteString(stdout, "child output resource-visible api-secret\n"); err != nil {
+			t.Fatal(err)
+		}
+		return child.Run()
+	}
+	cfg := workerConfig{
+		VaultPath: vault, UserID: "user-visible", ProjectID: "project-visible", APIKey: "api-secret",
+		ExecutionID: "owned-failure", Workspace: true, WorkspaceDir: t.TempDir(), Postprocess: true,
+	}
+	if err := runWorkerBatch(context.Background(), cfg, `[["run"]]`); err == nil {
+		t.Fatal("run unexpectedly succeeded")
+	}
+	data, err := os.ReadFile(filepath.Join(vault, "cache", "pipeline-owned-failure.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "child output resource-visible") || strings.Contains(string(data), "api-secret") {
+		t.Fatalf("published log=%q", data)
+	}
+	var failure struct {
+		Event      string `json:"event"`
+		Stage      string `json:"stage"`
+		ErrorClass string `json:"error_class"`
+		Child      string `json:"child_command"`
+		ExitCode   *int   `json:"exit_code"`
+	}
+	var failures int
+	for _, line := range strings.Split(string(data), "\n") {
+		if err := json.Unmarshal([]byte(line), &failure); err == nil && failure.Event == "worker_failure" {
+			failures++
+		}
+	}
+	if failures != 1 || failure.Stage != string(failureStageSyntoRun) || failure.ErrorClass != string(failureClassChildExit) || failure.Child != string(failureChildRun) || failure.ExitCode == nil || *failure.ExitCode != 23 {
+		t.Fatalf("worker failure count=%d record=%+v log=%q", failures, failure, data)
+	}
+}
+
+func TestWorkspacePostLeaseTerminalStageMatrix(t *testing.T) {
+	tests := []struct {
+		name  string
+		stage failureStage
+		set   func(*workspaceBatchHooks, error)
+	}{
+		{name: "recover interrupted publish", stage: failureStageGenerationPublish, set: func(h *workspaceBatchHooks, err error) {
+			h.recoverInterruptedPublish = func(string) error { return err }
+		}},
+		{name: "source snapshot", stage: failureStageInputMaterialization, set: func(h *workspaceBatchHooks, err error) {
+			h.snapshotSources = func(string) ([]sourceSnapshot, error) { return nil, err }
+		}},
+		{name: "concept snapshot", stage: failureStageInputMaterialization, set: func(h *workspaceBatchHooks, err error) {
+			h.snapshotConcepts = func(string, ...[]sourceSnapshot) ([]conceptSnapshot, error) { return nil, err }
+		}},
+		{name: "workspace creation", stage: failureStageInputMaterialization, set: func(h *workspaceBatchHooks, err error) {
+			h.createWorkspace = func(string, string) (string, error) { return "", err }
+		}},
+		{name: "snapshot materialization", stage: failureStageInputMaterialization, set: func(h *workspaceBatchHooks, err error) {
+			h.materializeSnapshots = func(string, []sourceSnapshot) error { return err }
+		}},
+		{name: "synto run", stage: failureStageSyntoRun, set: func(h *workspaceBatchHooks, err error) {
+			h.runWorkerBatchAtVault = func(context.Context, workerConfig, [][]string, string) error {
+				return newWorkerFailure(context.Background(), failureStageSyntoRun, failureClassChildExit, failureChildRun, err)
+			}
+		}},
+		{name: "source reconciliation", stage: failureStageSourceReconciliation, set: func(h *workspaceBatchHooks, err error) {
+			h.runWorkerBatchAtVault = func(context.Context, workerConfig, [][]string, string) error { return nil }
+			h.reconcileWorkspaceSources = func(string, []sourceSnapshot) error { return err }
+		}},
+		{name: "concept reconciliation", stage: failureStageConceptReconciliation, set: func(h *workspaceBatchHooks, err error) {
+			h.runWorkerBatchAtVault = func(context.Context, workerConfig, [][]string, string) error { return nil }
+			h.reconcileWorkspaceConcepts = func(string, []conceptSnapshot, ...[]sourceSnapshot) error { return err }
+		}},
+		{name: "generation publish", stage: failureStageGenerationPublish, set: func(h *workspaceBatchHooks, err error) {
+			h.runWorkerBatchAtVault = func(context.Context, workerConfig, [][]string, string) error { return nil }
+			h.syncWorkspaceOutputs = func(string, string, string) error { return err }
+		}},
+		{name: "receipt recording", stage: failureStageReceiptRecording, set: func(h *workspaceBatchHooks, err error) {
+			h.runWorkerBatchAtVault = func(context.Context, workerConfig, [][]string, string) error { return nil }
+			h.syncWorkspaceOutputs = func(string, string, string) error { return nil }
+			h.recordSuccess = func(string, []sourceSnapshot, time.Time) error { return err }
+		}},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			oldHooks := localWorkspaceBatchHooks
+			t.Cleanup(func() { localWorkspaceBatchHooks = oldHooks })
+			hooks := oldHooks
+			failure := errors.New("injected " + tc.name)
+			hooks.runWorkerBatchAtVault = func(context.Context, workerConfig, [][]string, string) error { return nil }
+			hooks.reconcileWorkspaceSources = func(string, []sourceSnapshot) error { return nil }
+			hooks.reconcileWorkspaceConcepts = func(string, []conceptSnapshot, ...[]sourceSnapshot) error { return nil }
+			tc.set(&hooks, failure)
+			localWorkspaceBatchHooks = hooks
+
+			vault := workspaceVault(t, "original")
+			cfg := workerConfig{VaultPath: vault, ExecutionID: "matrix-" + strings.ReplaceAll(tc.name, " ", "-"), WorkspaceDir: t.TempDir(), Postprocess: true}
+			if err := runWorkerBatch(context.Background(), cfg, `[["run"]]`); err == nil {
+				t.Fatal("run unexpectedly succeeded")
+			}
+			data, err := os.ReadFile(filepath.Join(vault, "cache", "pipeline-"+cfg.ExecutionID+".log"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got struct {
+				Event string       `json:"event"`
+				Stage failureStage `json:"stage"`
+			}
+			failures := 0
+			for _, line := range strings.Split(string(data), "\n") {
+				if json.Unmarshal([]byte(line), &got) == nil && got.Event == "worker_failure" {
+					failures++
+				}
+			}
+			if failures != 1 || got.Stage != tc.stage {
+				t.Fatalf("worker_failure count=%d stage=%q want count=1 stage=%q log=%q", failures, got.Stage, tc.stage, data)
+			}
+		})
+	}
+}
+
+func TestWorkspaceCleanupAndLeaseFailuresRecordOneTerminalEvent(t *testing.T) {
+	tests := []struct {
+		name      string
+		configure func(*workspaceBatchHooks, error)
+		wantCause error
+		wantStage failureStage
+	}{
+		{name: "workspace cleanup", configure: func(h *workspaceBatchHooks, err error) {
+			h.runWorkerBatchAtVault = func(context.Context, workerConfig, [][]string, string) error { return nil }
+			h.syncWorkspaceOutputs = func(string, string, string) error { return nil }
+			h.recordSuccess = func(string, []sourceSnapshot, time.Time) error { return nil }
+			h.removeWorkspace = func(string) error { return err }
+		}, wantStage: failureStageLeaseCleanup},
+		{name: "lease cleanup", configure: func(h *workspaceBatchHooks, err error) {
+			h.runWorkerBatchAtVault = func(context.Context, workerConfig, [][]string, string) error { return nil }
+			h.syncWorkspaceOutputs = func(string, string, string) error { return nil }
+			h.recordSuccess = func(string, []sourceSnapshot, time.Time) error { return nil }
+			h.releaseVaultLease = func(*vaultLease) error { return err }
+		}, wantStage: failureStageLeaseCleanup},
+		{name: "primary wins cleanup", configure: func(h *workspaceBatchHooks, err error) {
+			primary := errors.New("primary failure")
+			h.runWorkerBatchAtVault = func(context.Context, workerConfig, [][]string, string) error { return primary }
+			h.removeWorkspace = func(string) error { return err }
+		}, wantCause: errors.New("primary failure"), wantStage: failureStageSyntoRun},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			oldHooks := localWorkspaceBatchHooks
+			t.Cleanup(func() { localWorkspaceBatchHooks = oldHooks })
+			hooks := oldHooks
+			cleanupErr := errors.New("injected " + tc.name)
+			hooks.reconcileWorkspaceSources = func(string, []sourceSnapshot) error { return nil }
+			hooks.reconcileWorkspaceConcepts = func(string, []conceptSnapshot, ...[]sourceSnapshot) error { return nil }
+			tc.configure(&hooks, cleanupErr)
+			localWorkspaceBatchHooks = hooks
+
+			vault := workspaceVault(t, "original")
+			cfg := workerConfig{VaultPath: vault, ExecutionID: "cleanup-" + strings.ReplaceAll(tc.name, " ", "-"), WorkspaceDir: t.TempDir(), Postprocess: true}
+			runErr := runWorkerBatch(context.Background(), cfg, `[["run"]]`)
+			if runErr == nil {
+				t.Fatal("run unexpectedly succeeded")
+			}
+			if tc.wantCause != nil && !strings.Contains(runErr.Error(), tc.wantCause.Error()) {
+				t.Fatalf("error=%v, want primary cause %q", runErr, tc.wantCause)
+			}
+			data, err := os.ReadFile(filepath.Join(vault, "cache", "pipeline-"+cfg.ExecutionID+".log"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got struct {
+				Event string       `json:"event"`
+				Stage failureStage `json:"stage"`
+			}
+			failures := 0
+			for _, line := range strings.Split(string(data), "\n") {
+				if json.Unmarshal([]byte(line), &got) == nil && got.Event == "worker_failure" {
+					failures++
+				}
+			}
+			wantStage := tc.wantStage
+			if tc.name == "primary wins cleanup" {
+				wantStage = failureStageSyntoRun
+			}
+			if failures != 1 || got.Stage != wantStage {
+				t.Fatalf("worker_failure count=%d stage=%q want count=1 stage=%q log=%q", failures, got.Stage, wantStage, data)
+			}
+		})
+	}
+}
+
+func TestWorkspaceConcurrentOwnedFailuresPublishOneWorkerFailureEvent(t *testing.T) {
+	old := execOLW
+	t.Cleanup(func() { execOLW = old })
+	vault := workspaceVault(t, "original")
+	workspaceDir := t.TempDir()
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	childErr := errors.New("primary api-secret")
+	execOLW = func(_ context.Context, _ string, _ []string, _ []string, stdout, _ io.Writer) error {
+		_, _ = io.WriteString(stdout, "child output\n")
+		once.Do(func() { close(started) })
+		<-release
+		return childErr
+	}
+	cfg := workerConfig{VaultPath: vault, APIKey: "api-secret", ExecutionID: "concurrent-failure", Workspace: true, WorkspaceDir: workspaceDir, Postprocess: true}
+	firstErr := make(chan error, 1)
+	go func() { firstErr <- runWorkerBatch(context.Background(), cfg, `[["run"]]`) }()
+	<-started
+	secondErr := runWorkerBatch(context.Background(), cfg, `[["run"]]`)
+	if secondErr == nil {
+		t.Fatal("duplicate workspace run unexpectedly succeeded")
+	}
+	close(release)
+	if err := <-firstErr; err == nil || !errors.Is(err, childErr) {
+		t.Fatalf("first error=%v, want primary child failure", err)
+	}
+	data, err := os.ReadFile(filepath.Join(vault, "cache", "pipeline-concurrent-failure.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(string(data), `"event":"worker_failure"`); got != 1 {
+		t.Fatalf("worker_failure count=%d, want 1: %q", got, data)
+	}
+}
+
+func TestWorkspaceFailureRecordingIsBestEffortAndKeepsPrimary(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(t *testing.T, vault, workspace, executionID string)
+	}{
+		{
+			name: "append",
+			setup: func(t *testing.T, _, workspace, executionID string) {
+				path, err := pipelineLogPath(workspace, executionID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Remove(path); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Mkdir(path, 0o755); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "publish",
+			setup: func(t *testing.T, vault, _, executionID string) {
+				if err := os.Mkdir(filepath.Join(vault, "cache", "pipeline-"+executionID+".log"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			oldExec := execOLW
+			t.Cleanup(func() { execOLW = oldExec })
+			oldWarning := warnCloudFailurePipelineLog
+			oldOutput := log.Writer()
+			var warningOutput bytes.Buffer
+			warningCount := 0
+			warnCloudFailurePipelineLog = func(cfg workerConfig, failure error, secrets []string) {
+				warningCount++
+				oldWarning(cfg, failure, secrets)
+			}
+			log.SetOutput(&warningOutput)
+			t.Cleanup(func() {
+				warnCloudFailurePipelineLog = oldWarning
+				log.SetOutput(oldOutput)
+			})
+
+			vault := workspaceVault(t, "original")
+			workspaceDir := t.TempDir()
+			executionID := "recording-" + tc.name
+			primary := errors.New("primary execution api-secret")
+			execOLW = func(_ context.Context, workspace string, _ []string, _ []string, _, _ io.Writer) error {
+				tc.setup(t, vault, workspace, executionID)
+				return primary
+			}
+			cfg := workerConfig{VaultPath: vault, UserID: "user-visible", ProjectID: "project-visible", APIKey: "api-secret", ExecutionID: executionID, Workspace: true, WorkspaceDir: workspaceDir, Postprocess: true}
+			err := runWorkerBatch(context.Background(), cfg, `[["run"]]`)
+			if err == nil || !errors.Is(err, primary) || strings.Contains(err.Error(), "pipeline log") {
+				t.Fatalf("error=%v, want unchanged primary execution category", err)
+			}
+			if warningCount != 1 || strings.Count(warningOutput.String(), "WARNING cloud failure pipeline log recording failed") != 1 {
+				t.Fatalf("warning count=%d output=%q, want exactly one warning", warningCount, warningOutput.String())
+			}
+			if strings.Contains(warningOutput.String(), "api-secret") || !strings.Contains(warningOutput.String(), string(failureStageSyntoRun)) {
+				t.Fatalf("warning=%q, want redaction and truthful stage", warningOutput.String())
+			}
+			status, statusErr := readSourceStatus(vault)
+			if statusErr != nil || status.Sources["s1"].FailedFingerprint == "" || status.Sources["s1"].Error == "" {
+				t.Fatalf("recordFailure status=%+v err=%v", status, statusErr)
+			}
+			if tc.name == "publish" {
+				if info, statErr := os.Stat(filepath.Join(vault, "cache", "pipeline-"+executionID+".log")); statErr != nil || !info.IsDir() {
+					t.Fatalf("publish sink was retried or replaced: info=%v err=%v", info, statErr)
+				}
+			}
+		})
+	}
+}
+
+func TestWorkspaceSuccessPublishesZeroWorkerFailureEvents(t *testing.T) {
+	old := execOLW
+	t.Cleanup(func() { execOLW = old })
+	vault := workspaceVault(t, "original")
+	execOLW = func(_ context.Context, _ string, _ []string, _ []string, stdout, _ io.Writer) error {
+		_, _ = io.WriteString(stdout, "successful child output\n")
+		return nil
+	}
+	cfg := workerConfig{VaultPath: vault, ExecutionID: "successful", Workspace: true, WorkspaceDir: t.TempDir(), Postprocess: true}
+	if err := runWorkerBatch(context.Background(), cfg, `[["run"]]`); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(vault, "cache", "pipeline-successful.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(string(data), `"event":"worker_failure"`); got != 0 {
+		t.Fatalf("success emitted worker_failure count=%d: %q", got, data)
+	}
+}
+
+func TestStandaloneCommandsRecordOwnedTerminalFailuresOnce(t *testing.T) {
+	commands := []struct {
+		name string
+		run  func(context.Context, workerConfig) error
+		set  func(*workspaceBatchHooks, error)
+	}{
+		{name: "postprocess", run: runPostprocessCommand, set: func(h *workspaceBatchHooks, err error) {
+			h.runPostprocessWithProvider = func(context.Context, string, suggestedqueries.Provider, io.Writer) error { return err }
+		}},
+		{name: "suggested-queries", run: runSuggestedQueriesCommand, set: func(h *workspaceBatchHooks, err error) {
+			h.runSuggestedQueriesStage = func(context.Context, string, suggestedqueries.Provider) error { return err }
+		}},
+	}
+	cases := []struct {
+		name        string
+		stage       failureStage
+		wantPrimary bool
+		set         func(*workspaceBatchHooks, string, error)
+	}{
+		{name: "invalid publish journal", stage: failureStageGenerationPublish, set: func(h *workspaceBatchHooks, _ string, err error) {
+			h.recoverInterruptedPublish = func(string) error { return err }
+		}},
+		{name: "workspace creation", stage: failureStageInputMaterialization, set: func(h *workspaceBatchHooks, _ string, err error) {
+			h.createWorkspace = func(string, string) (string, error) { return "", err }
+		}},
+		{name: "processing", stage: failureStagePostprocess, set: func(h *workspaceBatchHooks, _ string, err error) {
+			h.runPostprocessWithProvider = func(context.Context, string, suggestedqueries.Provider, io.Writer) error { return err }
+			h.runSuggestedQueriesStage = func(context.Context, string, suggestedqueries.Provider) error { return err }
+		}},
+		{name: "publish", stage: failureStageGenerationPublish, set: func(h *workspaceBatchHooks, _ string, err error) {
+			h.syncWorkspaceOutputs = func(string, string, string) error { return err }
+		}},
+		{name: "workspace cleanup", stage: failureStageLeaseCleanup, set: func(h *workspaceBatchHooks, _ string, err error) {
+			h.removeWorkspace = func(string) error { return err }
+		}},
+		{name: "primary plus cleanup", stage: failureStagePostprocess, wantPrimary: true, set: func(h *workspaceBatchHooks, _ string, err error) {
+			h.runPostprocessWithProvider = func(context.Context, string, suggestedqueries.Provider, io.Writer) error { return err }
+			h.runSuggestedQueriesStage = func(context.Context, string, suggestedqueries.Provider) error { return err }
+			h.removeWorkspace = func(string) error { return errors.New("later cleanup") }
+		}},
+		{name: "lease cleanup", stage: failureStageLeaseCleanup, set: func(h *workspaceBatchHooks, _ string, err error) {
+			h.releaseVaultLease = func(*vaultLease) error { return err }
+		}},
+	}
+	for _, command := range commands {
+		command := command
+		t.Run(command.name, func(t *testing.T) {
+			for _, tc := range cases {
+				tc := tc
+				t.Run(tc.name, func(t *testing.T) {
+					oldHooks := localWorkspaceBatchHooks
+					t.Cleanup(func() { localWorkspaceBatchHooks = oldHooks })
+					hooks := oldHooks
+					workspace := t.TempDir()
+					hooks.acquireVaultLease = func(string, string) (*vaultLease, error) {
+						return &vaultLease{root: t.TempDir(), owner: "test"}, nil
+					}
+					hooks.createWorkspace = func(string, string) (string, error) { return workspace, nil }
+					hooks.recoverInterruptedPublish = func(string) error { return nil }
+					hooks.runPostprocessWithProvider = func(context.Context, string, suggestedqueries.Provider, io.Writer) error { return nil }
+					hooks.runSuggestedQueriesStage = func(context.Context, string, suggestedqueries.Provider) error { return nil }
+					hooks.syncWorkspaceOutputs = func(string, string, string) error { return nil }
+					hooks.removeWorkspace = func(string) error { return nil }
+					hooks.releaseVaultLease = func(*vaultLease) error { return nil }
+					failure := errors.New("injected " + tc.name)
+					tc.set(&hooks, workspace, failure)
+					localWorkspaceBatchHooks = hooks
+
+					vault := t.TempDir()
+					cfg := workerConfig{VaultPath: vault, ExecutionID: "standalone-" + command.name + "-" + strings.ReplaceAll(tc.name, " ", "-"), SuggestedQueries: true}
+					runErr := command.run(context.Background(), cfg)
+					if runErr == nil {
+						t.Fatal("command unexpectedly succeeded")
+					}
+					if tc.wantPrimary && (runErr == nil || runErr.Error() != failure.Error()) {
+						t.Fatalf("error=%v, want unchanged primary %q", runErr, failure)
+					}
+					data, err := os.ReadFile(filepath.Join(vault, "cache", "pipeline-"+cfg.ExecutionID+".log"))
+					if err != nil {
+						t.Fatal(err)
+					}
+					var got struct {
+						Event string       `json:"event"`
+						Stage failureStage `json:"stage"`
+					}
+					failures := 0
+					for _, line := range strings.Split(string(data), "\n") {
+						if json.Unmarshal([]byte(line), &got) == nil && got.Event == "worker_failure" {
+							failures++
+						}
+					}
+					if failures != 1 || got.Stage != tc.stage {
+						t.Fatalf("worker_failure count=%d stage=%q want count=1 stage=%q log=%q", failures, got.Stage, tc.stage, data)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestStandaloneCommandsKeepPrimaryAndIsolateRawLogFailure(t *testing.T) {
+	commands := []struct {
+		name string
+		run  func(context.Context, workerConfig) error
+		set  func(*workspaceBatchHooks, error)
+	}{
+		{name: "postprocess", run: runPostprocessCommand, set: func(h *workspaceBatchHooks, err error) {
+			h.runPostprocessWithProvider = func(context.Context, string, suggestedqueries.Provider, io.Writer) error { return err }
+		}},
+		{name: "suggested-queries", run: runSuggestedQueriesCommand, set: func(h *workspaceBatchHooks, err error) {
+			h.runSuggestedQueriesStage = func(context.Context, string, suggestedqueries.Provider) error { return err }
+		}},
+	}
+	for _, command := range commands {
+		command := command
+		t.Run(command.name, func(t *testing.T) {
+			oldHooks := localWorkspaceBatchHooks
+			t.Cleanup(func() { localWorkspaceBatchHooks = oldHooks })
+			hooks := oldHooks
+			workspace := t.TempDir()
+			hooks.acquireVaultLease = func(string, string) (*vaultLease, error) { return &vaultLease{root: t.TempDir(), owner: "test"}, nil }
+			hooks.createWorkspace = func(string, string) (string, error) { return workspace, nil }
+			hooks.recoverInterruptedPublish = func(string) error { return nil }
+			hooks.syncWorkspaceOutputs = func(string, string, string) error { return nil }
+			hooks.removeWorkspace = func(string) error { return nil }
+			hooks.releaseVaultLease = func(*vaultLease) error { return nil }
+			localWorkspaceBatchHooks = hooks
+
+			vault := t.TempDir()
+			cfg := workerConfig{VaultPath: vault, ExecutionID: "raw-failure-" + command.name, APIKey: "api-secret", SuggestedQueries: true}
+			primary := errors.New("primary api-secret")
+			command.set(&hooks, primary)
+			hooks.runPostprocessWithProvider = func(context.Context, string, suggestedqueries.Provider, io.Writer) error {
+				return primary
+			}
+			hooks.runSuggestedQueriesStage = func(context.Context, string, suggestedqueries.Provider) error {
+				return primary
+			}
+			os.MkdirAll(filepath.Join(workspace, "cache"), 0o755)
+			if err := os.Mkdir(filepath.Join(workspace, "cache", "pipeline-"+cfg.ExecutionID+".log"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			localWorkspaceBatchHooks = hooks
+
+			oldWarning := warnCloudFailurePipelineLog
+			warningCount := 0
+			warnCloudFailurePipelineLog = func(workerConfig, error, []string) { warningCount++ }
+			t.Cleanup(func() { warnCloudFailurePipelineLog = oldWarning })
+			err := command.run(context.Background(), cfg)
+			if err == nil || err.Error() != primary.Error() || !errors.Is(err, primary) {
+				t.Fatalf("error=%v, want unchanged primary", err)
+			}
+			if warningCount != 1 {
+				t.Fatalf("raw-log warning count=%d, want 1", warningCount)
+			}
+		})
+	}
+}
+
+func TestStandaloneCommandsHaveZeroEventsBeforeLeaseAndOnSuccess(t *testing.T) {
+	commands := []struct {
+		name string
+		run  func(context.Context, workerConfig) error
+	}{
+		{name: "postprocess", run: runPostprocessCommand},
+		{name: "suggested-queries", run: runSuggestedQueriesCommand},
+	}
+	for _, command := range commands {
+		command := command
+		t.Run(command.name, func(t *testing.T) {
+			vault := t.TempDir()
+			originalHooks := localWorkspaceBatchHooks
+			t.Cleanup(func() { localWorkspaceBatchHooks = originalHooks })
+			hooks := originalHooks
+			hooks.acquireVaultLease = func(string, string) (*vaultLease, error) { return nil, errors.New("lease unavailable") }
+			localWorkspaceBatchHooks = hooks
+			cfg := workerConfig{VaultPath: vault, ExecutionID: "pre-lease-" + command.name, SuggestedQueries: true}
+			if err := command.run(context.Background(), cfg); err == nil {
+				t.Fatal("pre-lease command unexpectedly succeeded")
+			}
+			if _, err := os.Stat(filepath.Join(vault, "cache", "pipeline-"+cfg.ExecutionID+".log")); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("pre-lease raw log=%v, want absent", err)
+			}
+
+			hooks = originalHooks
+			hooks.acquireVaultLease = func(string, string) (*vaultLease, error) { return &vaultLease{root: t.TempDir(), owner: "test"}, nil }
+			workspace := t.TempDir()
+			hooks.createWorkspace = func(string, string) (string, error) { return workspace, nil }
+			hooks.recoverInterruptedPublish = func(string) error { return nil }
+			hooks.runPostprocessWithProvider = func(context.Context, string, suggestedqueries.Provider, io.Writer) error { return nil }
+			hooks.runSuggestedQueriesStage = func(context.Context, string, suggestedqueries.Provider) error { return nil }
+			hooks.syncWorkspaceOutputs = func(string, string, string) error { return nil }
+			hooks.removeWorkspace = func(string) error { return nil }
+			hooks.releaseVaultLease = func(*vaultLease) error { return nil }
+			localWorkspaceBatchHooks = hooks
+			cfg.ExecutionID = "success-" + command.name
+			if err := command.run(context.Background(), cfg); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := os.Stat(filepath.Join(vault, "cache", "pipeline-"+cfg.ExecutionID+".log")); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("success raw log=%v, want absent", err)
+			}
+		})
+	}
+}
+
+func TestStandaloneCommandsRecordInvalidPublishJournalAfterLease(t *testing.T) {
+	commands := []struct {
+		name string
+		run  func(context.Context, workerConfig) error
+	}{
+		{name: "postprocess", run: runPostprocessCommand},
+		{name: "suggested-queries", run: runSuggestedQueriesCommand},
+	}
+	for _, command := range commands {
+		command := command
+		t.Run(command.name, func(t *testing.T) {
+			vault := t.TempDir()
+			mustWriteFile(t, filepath.Join(vault, publishJournal), []byte(`{"phase":"committed","stage":"bad","backup":"bad"}`))
+			cfg := workerConfig{VaultPath: vault, ExecutionID: "invalid-journal-" + command.name, WorkspaceDir: t.TempDir(), SuggestedQueries: true}
+			if err := command.run(context.Background(), cfg); err == nil {
+				t.Fatal("command unexpectedly succeeded")
+			}
+			data, err := os.ReadFile(filepath.Join(vault, "cache", "pipeline-"+cfg.ExecutionID+".log"))
+			if err != nil || strings.Count(string(data), `"event":"worker_failure"`) != 1 || !strings.Contains(string(data), `"stage":"generation_publish"`) {
+				t.Fatalf("failure log=%q err=%v", data, err)
+			}
+		})
+	}
+}
+
+func TestStandaloneCommandsSerializeOwnedFailureRecording(t *testing.T) {
+	commands := []struct {
+		name string
+		run  func(context.Context, workerConfig) error
+		set  func(*workspaceBatchHooks, chan<- struct{}, <-chan struct{}, error)
+	}{
+		{name: "postprocess", run: runPostprocessCommand, set: func(h *workspaceBatchHooks, started chan<- struct{}, release <-chan struct{}, primary error) {
+			h.runPostprocessWithProvider = func(context.Context, string, suggestedqueries.Provider, io.Writer) error {
+				close(started)
+				<-release
+				return primary
+			}
+		}},
+		{name: "suggested-queries", run: runSuggestedQueriesCommand, set: func(h *workspaceBatchHooks, started chan<- struct{}, release <-chan struct{}, primary error) {
+			h.runSuggestedQueriesStage = func(context.Context, string, suggestedqueries.Provider) error {
+				close(started)
+				<-release
+				return primary
+			}
+		}},
+	}
+	for _, command := range commands {
+		command := command
+		t.Run(command.name, func(t *testing.T) {
+			oldHooks := localWorkspaceBatchHooks
+			t.Cleanup(func() { localWorkspaceBatchHooks = oldHooks })
+			hooks := oldHooks
+			workspaceDir := t.TempDir()
+			hooks.createWorkspace = createWorkspace
+			hooks.removeWorkspace = os.RemoveAll
+			localWorkspaceBatchHooks = hooks
+			vault := workspaceVault(t, "original")
+			cfg := workerConfig{VaultPath: vault, ExecutionID: "standalone-race-" + command.name, WorkspaceDir: workspaceDir, SuggestedQueries: true}
+			started := make(chan struct{})
+			release := make(chan struct{})
+			primary := errors.New("primary failure")
+			command.set(&hooks, started, release, primary)
+			localWorkspaceBatchHooks = hooks
+
+			firstErr := make(chan error, 1)
+			go func() { firstErr <- command.run(context.Background(), cfg) }()
+			<-started
+			if secondErr := command.run(context.Background(), cfg); secondErr == nil {
+				t.Fatal("overlapping command unexpectedly succeeded")
+			}
+			close(release)
+			if err := <-firstErr; err == nil || !errors.Is(err, primary) {
+				t.Fatalf("first error=%v, want primary", err)
+			}
+			data, err := os.ReadFile(filepath.Join(vault, "cache", "pipeline-"+cfg.ExecutionID+".log"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := strings.Count(string(data), `"event":"worker_failure"`); got != 1 {
+				t.Fatalf("worker_failure count=%d, want 1: %q", got, data)
+			}
+		})
 	}
 }
 

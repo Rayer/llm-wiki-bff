@@ -21,6 +21,7 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	cloudstorage "cloud.google.com/go/storage"
@@ -54,6 +55,19 @@ var errObjectNotFound = errors.New("object not found")
 
 const cloudManifestReadbackTimeout = 3 * time.Second
 const cloudFailureRecordingTimeout = 5 * time.Second
+
+var workerFailureLogMu sync.Mutex
+
+// Tests replace this seam to assert the independent warning without capturing
+// the process logger.
+var warnCloudFailurePipelineLog = func(cfg workerConfig, failure error, secrets []string) {
+	diagnostic := diagnosticForError(failure)
+	redact := func(value string) string {
+		return string(redactDiagnosticBytes([]byte(value), append(logSecrets(cfg), secrets...)))
+	}
+	log.Printf("WARNING cloud failure pipeline log recording failed execution_id=%q project_id=%q stage=%q detail_code=%q",
+		redact(cfg.ExecutionID), redact(cfg.ProjectID), diagnostic.Stage, diagnostic.DetailCode)
+}
 
 var errManifestCommitOutcomeUnknown = errors.New("manifest commit outcome unknown")
 var errCloudFailureRecording = errors.New("failure state recording failed")
@@ -321,12 +335,10 @@ func runCloudSuggestedQueries(ctx context.Context, cfg workerConfig, objects obj
 	workspace := ""
 	defer func() {
 		if cleanupErr := lease.Release(ctx); cleanupErr != nil {
-			recordingCtx, cancel := cloudFailureRecordingContext(ctx)
-			defer cancel()
 			if result == nil {
 				if committed {
 					failure := newWorkerFailure(nil, failureStageLeaseCleanup, failureClassIO, "", cleanupErr)
-					if diagnosticErr := writeCloudFailureDiagnosticWithContext(recordingCtx, objects, prefix, cfg, failure); diagnosticErr != nil {
+					if recordErr := writeCloudFailureLogAndDiagnostic(ctx, objects, prefix, "", cfg, failure); recordErr != nil {
 						result = errors.Join(annotateError(errCloudCommittedCleanup, cleanupErr), cloudFailureRecordingError{failureDiagnostic: true})
 					} else {
 						result = annotateError(errCloudCommittedCleanup, cleanupErr)
@@ -334,8 +346,6 @@ func runCloudSuggestedQueries(ctx context.Context, cfg workerConfig, objects obj
 				} else {
 					result = cleanupErr
 				}
-			} else {
-				result = errors.Join(result, cleanupErr)
 			}
 		}
 	}()
@@ -380,11 +390,8 @@ func runCloudSuggestedQueries(ctx context.Context, cfg workerConfig, objects obj
 
 	if _, _, err := publishCloudGenerationFromStart(ctx, objects, prefix, workspace, snapshots, manifestData, manifestAttrs, true); err != nil {
 		if errors.Is(err, errManifestCommitOutcomeUnknown) {
-			recordingCtx, cancel := cloudFailureRecordingContext(ctx)
-			logErr := writeCloudPipelineLog(recordingCtx, objects, prefix, workspace, cfg)
-			cancel()
-			if logErr != nil {
-				return errors.Join(errManifestCommitOutcomeUnknown, errCloudPipelineLogRecording)
+			if recordErr := recordCloudAmbiguousManifestFailure(ctx, objects, prefix, workspace, cfg); recordErr != nil {
+				return errors.Join(errManifestCommitOutcomeUnknown, recordErr)
 			}
 			return errManifestCommitOutcomeUnknown
 		}
@@ -402,7 +409,7 @@ func runCloudSuggestedQueries(ctx context.Context, cfg workerConfig, objects obj
 	committed = true
 	if err := writeCloudReceipts(ctx, objects, prefix, workspace, cfg, snapshots); err != nil {
 		failure := preserveWorkerFailure(err, failureStageReceiptRecording, failureClassRecordingFailure)
-		if diagnosticErr := writeCloudFailureDiagnostic(ctx, objects, prefix, cfg, failure); diagnosticErr != nil {
+		if recordErr := writeCloudFailureLogAndDiagnostic(ctx, objects, prefix, workspace, cfg, failure); recordErr != nil {
 			return errors.Join(annotateError(errCloudCommittedReceipt, failure), cloudFailureRecordingError{failureDiagnostic: true})
 		}
 		return annotateError(errCloudCommittedReceipt, failure)
@@ -428,12 +435,10 @@ func runCloudWorkerBatch(ctx context.Context, cfg workerConfig, commands [][]str
 	workspace := ""
 	defer func() {
 		if cleanupErr := lease.Release(ctx); cleanupErr != nil {
-			recordingCtx, cancel := cloudFailureRecordingContext(ctx)
-			defer cancel()
 			if result == nil {
 				if committed {
 					failure := newWorkerFailure(nil, failureStageLeaseCleanup, failureClassIO, "", cleanupErr)
-					if diagnosticErr := writeCloudFailureDiagnosticWithContext(recordingCtx, objects, prefix, cfg, failure); diagnosticErr != nil {
+					if recordErr := writeCloudFailureLogAndDiagnostic(ctx, objects, prefix, "", cfg, failure); recordErr != nil {
 						result = errors.Join(annotateError(errCloudCommittedCleanup, cleanupErr), cloudFailureRecordingError{failureDiagnostic: true})
 					} else {
 						result = annotateError(errCloudCommittedCleanup, cleanupErr)
@@ -441,8 +446,6 @@ func runCloudWorkerBatch(ctx context.Context, cfg workerConfig, commands [][]str
 				} else {
 					result = cleanupErr
 				}
-			} else {
-				result = errors.Join(result, cleanupErr)
 			}
 		}
 	}()
@@ -521,11 +524,8 @@ func runCloudWorkerBatch(ctx context.Context, cfg workerConfig, commands [][]str
 	}
 	if _, _, err := publishCloudGenerationFromStart(ctx, objects, prefix, workspace, snapshots, manifestData, manifestAttrs, manifestAttrs.Generation > 0); err != nil {
 		if errors.Is(err, errManifestCommitOutcomeUnknown) {
-			recordingCtx, cancel := cloudFailureRecordingContext(ctx)
-			logErr := writeCloudPipelineLog(recordingCtx, objects, prefix, workspace, cfg)
-			cancel()
-			if logErr != nil {
-				return errors.Join(errManifestCommitOutcomeUnknown, errCloudPipelineLogRecording)
+			if recordErr := recordCloudAmbiguousManifestFailure(ctx, objects, prefix, workspace, cfg); recordErr != nil {
+				return errors.Join(errManifestCommitOutcomeUnknown, recordErr)
 			}
 			return errManifestCommitOutcomeUnknown
 		}
@@ -543,7 +543,7 @@ func runCloudWorkerBatch(ctx context.Context, cfg workerConfig, commands [][]str
 	committed = true
 	if err := writeCloudReceipts(ctx, objects, prefix, workspace, cfg, snapshots); err != nil {
 		failure := preserveWorkerFailure(err, failureStageReceiptRecording, failureClassRecordingFailure)
-		if diagnosticErr := writeCloudFailureDiagnostic(ctx, objects, prefix, cfg, failure); diagnosticErr != nil {
+		if recordErr := writeCloudFailureLogAndDiagnostic(ctx, objects, prefix, workspace, cfg, failure); recordErr != nil {
 			return errors.Join(annotateError(errCloudCommittedReceipt, failure), cloudFailureRecordingError{failureDiagnostic: true})
 		}
 		return annotateError(errCloudCommittedReceipt, failure)
@@ -1082,7 +1082,7 @@ func snapshotFingerprint(s []sourceSnapshot) string {
 }
 func writeCloudReceipts(ctx context.Context, objects objectStore, prefix, workspace string, cfg workerConfig, snapshots []sourceSnapshot) error {
 	if err := writeCloudPipelineLog(ctx, objects, prefix, workspace, cfg); err != nil {
-		return err
+		warnCloudFailurePipelineLog(cfg, newWorkerFailure(ctx, failureStageReceiptRecording, failureClassRecordingFailure, "", err), nil)
 	}
 	return mergeCloudSuccess(ctx, objects, prefix, snapshots)
 }
@@ -1093,16 +1093,134 @@ func writeCloudFailureReceipts(ctx context.Context, objects objectStore, prefix,
 	if len(secrets) > 0 {
 		failureSecrets = secrets[0]
 	}
-	logErr := appendWorkerFailurePipelineLog(workspace, cfg, failure, failureSecrets)
-	if logErr == nil {
-		logErr = writeCloudPipelineLog(recordingCtx, objects, prefix, workspace, cfg)
-	}
+	_ = recordCloudFailurePipelineLog(recordingCtx, objects, prefix, workspace, cfg, failure, failureSecrets)
 	statusErr := mergeCloudFailure(recordingCtx, objects, prefix, snapshots)
 	diagnosticErr := writeCloudFailureDiagnosticWithContext(recordingCtx, objects, prefix, cfg, failure)
-	if logErr == nil && statusErr == nil && diagnosticErr == nil {
+	if statusErr == nil && diagnosticErr == nil {
 		return nil
 	}
-	return cloudFailureRecordingError{pipelineLog: logErr != nil, sourceStatus: statusErr != nil, failureDiagnostic: diagnosticErr != nil}
+	return cloudFailureRecordingError{sourceStatus: statusErr != nil, failureDiagnostic: diagnosticErr != nil}
+}
+
+func writeCloudFailureLogAndDiagnostic(ctx context.Context, objects objectStore, prefix, workspace string, cfg workerConfig, failure error, secrets ...[]string) error {
+	recordingCtx, cancel := cloudFailureRecordingContext(ctx)
+	defer cancel()
+	var failureSecrets []string
+	if len(secrets) > 0 {
+		failureSecrets = secrets[0]
+	}
+	_ = recordCloudFailurePipelineLog(recordingCtx, objects, prefix, workspace, cfg, failure, failureSecrets)
+	diagnosticErr := writeCloudFailureDiagnosticWithContext(recordingCtx, objects, prefix, cfg, failure)
+	if diagnosticErr == nil {
+		return nil
+	}
+	return cloudFailureRecordingError{failureDiagnostic: true}
+}
+
+func recordCloudAmbiguousManifestFailure(ctx context.Context, objects objectStore, prefix, workspace string, cfg workerConfig) error {
+	failure := newWorkerFailure(nil, failureStageGenerationPublish, failureClassIO, "", errManifestCommitOutcomeUnknown)
+	recordingCtx, cancel := cloudFailureRecordingContext(ctx)
+	defer cancel()
+	_ = recordCloudFailurePipelineLog(recordingCtx, objects, prefix, workspace, cfg, failure, nil)
+	if err := writeCloudFailureDiagnosticWithContext(recordingCtx, objects, prefix, cfg, failure); err != nil {
+		return cloudFailureRecordingError{failureDiagnostic: true}
+	}
+	return nil
+}
+
+func recordCloudFailurePipelineLog(ctx context.Context, objects objectStore, prefix, workspace string, cfg workerConfig, failure error, secrets []string) (err error) {
+	// ponytail: global lock; use per-log keys only if worker throughput makes this measurable.
+	workerFailureLogMu.Lock()
+	defer workerFailureLogMu.Unlock()
+	defer func() {
+		if err != nil {
+			warnCloudFailurePipelineLog(cfg, failure, secrets)
+		}
+	}()
+	return recordCloudFailurePipelineLogLocked(ctx, objects, prefix, workspace, cfg, failure, secrets)
+}
+
+func recordCloudFailurePipelineLogLocked(ctx context.Context, objects objectStore, prefix, workspace string, cfg workerConfig, failure error, secrets []string) error {
+	if workspace != "" {
+		if err := appendWorkerFailurePipelineLogLocked(workspace, cfg, failure, secrets); err != nil {
+			return err
+		}
+		return writeCloudPipelineLog(ctx, objects, prefix, workspace, cfg)
+	}
+	path := prefix + "cache/pipeline-" + cfg.ExecutionID + ".log"
+	data, _, err := objects.Read(ctx, path, 0, maxPipelineLog+1)
+	exists := err == nil
+	if err != nil && !isObjectNotFound(err) {
+		return err
+	}
+	if exists && hasWorkerFailureEvent(data) {
+		return nil
+	}
+	data, err = workerFailurePipelineLogData(data, exists, cfg, failure, secrets)
+	if err != nil {
+		return err
+	}
+	_, err = objects.Write(ctx, path, data, nil, objectConditions{})
+	return err
+}
+
+func recordLocalWorkerFailureLog(workspace, vault string, cfg workerConfig, failure error, published bool) (err error) {
+	workerFailureLogMu.Lock()
+	defer workerFailureLogMu.Unlock()
+	defer func() {
+		if err != nil {
+			warnCloudFailurePipelineLog(cfg, failure, nil)
+		}
+	}()
+
+	if workspace != "" && !published {
+		if err = appendWorkerFailurePipelineLogLocked(workspace, cfg, failure, nil); err != nil {
+			return err
+		}
+		var alreadyRecorded bool
+		alreadyRecorded, err = localVaultHasWorkerFailure(vault, cfg)
+		if err != nil || alreadyRecorded {
+			return err
+		}
+		return publishWorkspaceFailureLog(workspace, vault, cfg)
+	}
+	return appendWorkerFailurePipelineLogLocked(vault, cfg, failure, nil)
+}
+
+func localVaultHasWorkerFailure(vault string, cfg workerConfig) (bool, error) {
+	path, err := pipelineLogPath(vault, cfg.ExecutionID)
+	if err != nil {
+		return false, err
+	}
+	name := filepath.ToSlash(filepath.Join("cache", filepath.Base(path)))
+	root, err := os.OpenRoot(vault)
+	if err != nil {
+		return false, err
+	}
+	defer root.Close()
+	info, err := root.Lstat(name)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return false, fmt.Errorf("failure log %q is not a regular file", name)
+	}
+	file, err := root.Open(name)
+	if err != nil {
+		return false, err
+	}
+	data, readErr := io.ReadAll(io.LimitReader(file, int64(maxPipelineLog)+1))
+	closeErr := file.Close()
+	if readErr != nil {
+		return false, readErr
+	}
+	if closeErr != nil {
+		return false, closeErr
+	}
+	return hasWorkerFailureEvent(data), nil
 }
 
 type workerFailureLogRecord struct {
@@ -1110,14 +1228,30 @@ type workerFailureLogRecord struct {
 	Stage      failureStage               `json:"stage"`
 	ErrorClass failureErrorClass          `json:"error_class"`
 	DetailCode conceptReconcileDetailCode `json:"detail_code,omitempty"`
+	Child      failureChildCommand        `json:"child_command,omitempty"`
+	ExitCode   *int                       `json:"exit_code,omitempty"`
 	Cause      string                     `json:"cause"`
 }
 
-func appendWorkerFailurePipelineLog(workspace string, cfg workerConfig, failure error, secrets []string) error {
-	diagnostic := diagnosticForError(failure)
-	if diagnostic.Stage != failureStageSourceReconciliation && diagnostic.Stage != failureStageConceptReconciliation {
-		return nil
-	}
+type workerStartLogRecord struct {
+	Event       string `json:"event"`
+	UserID      string `json:"user_id"`
+	ProjectID   string `json:"project_id"`
+	ExecutionID string `json:"execution_id"`
+}
+
+func appendWorkerFailurePipelineLog(workspace string, cfg workerConfig, failure error, secrets []string) (err error) {
+	workerFailureLogMu.Lock()
+	defer workerFailureLogMu.Unlock()
+	defer func() {
+		if err != nil {
+			warnCloudFailurePipelineLog(cfg, failure, secrets)
+		}
+	}()
+	return appendWorkerFailurePipelineLogLocked(workspace, cfg, failure, secrets)
+}
+
+func appendWorkerFailurePipelineLogLocked(workspace string, cfg workerConfig, failure error, secrets []string) (err error) {
 	path, err := pipelineLogPath(workspace, cfg.ExecutionID)
 	if err != nil {
 		return err
@@ -1132,23 +1266,65 @@ func appendWorkerFailurePipelineLog(workspace string, cfg workerConfig, failure 
 	}
 	defer root.Close()
 	info, err := root.Lstat(filepath.FromSlash(rel))
-	if err != nil {
+	exists := err == nil
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+	if exists && (info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular()) {
 		return fmt.Errorf("pipeline log is not a regular file")
 	}
-	file, err := root.Open(filepath.FromSlash(rel))
+	var data []byte
+	if exists {
+		file, err := root.Open(filepath.FromSlash(rel))
+		if err != nil {
+			return err
+		}
+		data, err = io.ReadAll(io.LimitReader(file, int64(maxPipelineLog)+1))
+		closeErr := file.Close()
+		if err != nil {
+			return err
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+	}
+	if hasWorkerFailureEvent(data) {
+		return nil
+	}
+	data, err = workerFailurePipelineLogData(data, exists, cfg, failure, secrets)
 	if err != nil {
 		return err
 	}
-	data, readErr := io.ReadAll(io.LimitReader(file, int64(maxPipelineLog)+1))
-	closeErr := file.Close()
-	if readErr != nil {
-		return readErr
+	perm := os.FileMode(0o600)
+	if exists {
+		perm = info.Mode().Perm()
 	}
-	if closeErr != nil {
-		return closeErr
+	return atomicRootWrite(root, rel, data, perm)
+}
+
+func hasWorkerFailureEvent(data []byte) bool {
+	for _, line := range bytes.Split(data, []byte{'\n'}) {
+		var record struct {
+			Event string `json:"event"`
+		}
+		if json.Unmarshal(line, &record) == nil && record.Event == "worker_failure" {
+			return true
+		}
+	}
+	return false
+}
+
+func workerFailurePipelineLogData(data []byte, exists bool, cfg workerConfig, failure error, secrets []string) ([]byte, error) {
+	diagnostic := diagnosticForError(failure)
+	secrets = append(logSecrets(cfg), secrets...)
+	if !exists {
+		startup, err := json.Marshal(workerStartLogRecord{
+			Event: "worker_start", UserID: cfg.UserID, ProjectID: cfg.ProjectID, ExecutionID: cfg.ExecutionID,
+		})
+		if err != nil {
+			return nil, err
+		}
+		data = append(redactDiagnosticBytes(startup, secrets), '\n')
 	}
 	confirmedOverflow := len(data) > maxPipelineLog
 	if confirmedOverflow {
@@ -1159,24 +1335,25 @@ func appendWorkerFailurePipelineLog(workspace string, cfg workerConfig, failure 
 		data = data[:len(data)-len(marker)]
 		confirmedOverflow = true
 	}
-	secrets = append(logSecrets(cfg), secrets...)
 	cause := truncateDiagnostic(string(redactDiagnosticBytes([]byte(failure.Error()), secrets)), maxWorkerArgBytes)
 	record, err := json.Marshal(workerFailureLogRecord{
 		Event:      "worker_failure",
 		Stage:      diagnostic.Stage,
 		ErrorClass: diagnostic.ErrorClass,
 		DetailCode: diagnostic.DetailCode,
+		Child:      diagnostic.Child,
+		ExitCode:   diagnostic.ExitCode,
 		Cause:      cause,
 	})
 	if err != nil {
-		return err
+		return nil, err
 	}
 	record = append(redactDiagnosticBytes(record, secrets), '\n')
 	data, err = composeWorkerFailurePipelineLog(data, record, confirmedOverflow)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return atomicRootWrite(root, rel, data, info.Mode().Perm())
+	return data, nil
 }
 
 func composeWorkerFailurePipelineLog(child, record []byte, confirmedOverflow bool) ([]byte, error) {

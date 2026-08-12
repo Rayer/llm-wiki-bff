@@ -73,6 +73,42 @@ var pipelineLiveDestination = func(stream pipelineStream) io.Writer {
 var pipelineDurableDestination = func(file *os.File) io.Writer { return file }
 var pipelineControlDestination = func() io.Writer { return os.Stderr }
 
+type workspaceBatchHooks struct {
+	acquireVaultLease          func(string, string) (*vaultLease, error)
+	recoverInterruptedPublish  func(string) error
+	snapshotSources            func(string) ([]sourceSnapshot, error)
+	snapshotConcepts           func(string, ...[]sourceSnapshot) ([]conceptSnapshot, error)
+	createWorkspace            func(string, string) (string, error)
+	materializeSnapshots       func(string, []sourceSnapshot) error
+	runWorkerBatchAtVault      func(context.Context, workerConfig, [][]string, string) error
+	reconcileWorkspaceSources  func(string, []sourceSnapshot) error
+	reconcileWorkspaceConcepts func(string, []conceptSnapshot, ...[]sourceSnapshot) error
+	syncWorkspaceOutputs       func(string, string, string) error
+	runPostprocessWithProvider func(context.Context, string, suggestedqueries.Provider, io.Writer) error
+	runSuggestedQueriesStage   func(context.Context, string, suggestedqueries.Provider) error
+	recordSuccess              func(string, []sourceSnapshot, time.Time) error
+	removeWorkspace            func(string) error
+	releaseVaultLease          func(*vaultLease) error
+}
+
+var localWorkspaceBatchHooks = workspaceBatchHooks{
+	acquireVaultLease:          acquireVaultLease,
+	recoverInterruptedPublish:  recoverInterruptedPublish,
+	snapshotSources:            snapshotSources,
+	snapshotConcepts:           snapshotConcepts,
+	createWorkspace:            createWorkspace,
+	materializeSnapshots:       materializeSnapshots,
+	runWorkerBatchAtVault:      runWorkerBatchAtVault,
+	reconcileWorkspaceSources:  reconcileWorkspaceSources,
+	reconcileWorkspaceConcepts: reconcileWorkspaceConcepts,
+	syncWorkspaceOutputs:       syncWorkspaceOutputs,
+	runPostprocessWithProvider: runPostprocessWithProvider,
+	runSuggestedQueriesStage:   runSuggestedQueriesStage,
+	recordSuccess:              recordSuccess,
+	removeWorkspace:            os.RemoveAll,
+	releaseVaultLease:          func(lease *vaultLease) error { return lease.Release() },
+}
+
 var buildNonce = "local"
 
 const (
@@ -427,85 +463,172 @@ func runWorkerBatchAtVault(ctx context.Context, cfg workerConfig, commands [][]s
 	return nil
 }
 
+type localLeaseLifecycle struct {
+	vault     string
+	cfg       workerConfig
+	workspace string
+	published bool
+	failure   error
+	recorded  bool
+}
+
+func (l *localLeaseLifecycle) fail(err error, stage failureStage, class failureErrorClass) error {
+	if err != nil {
+		l.failure = preserveWorkerFailure(err, stage, class)
+	}
+	return err
+}
+
+func (l *localLeaseLifecycle) recordFailure() {
+	if l.failure == nil || l.recorded {
+		return
+	}
+	l.recorded = true
+	workspace := l.workspace
+	if l.published {
+		workspace = ""
+	}
+	_ = recordLocalWorkerFailureLog(workspace, l.vault, l.cfg, l.failure, l.published)
+}
+
+func (l *localLeaseLifecycle) finish(runErr *error, lease *vaultLease, removeWorkspace func(string) error, releaseLease func(*vaultLease) error) {
+	if l.failure == nil && *runErr != nil {
+		l.failure = *runErr
+	}
+	l.recordFailure()
+
+	var cleanupErr error
+	if l.workspace != "" {
+		cleanupErr = removeWorkspace(l.workspace)
+		if cleanupErr == nil {
+			l.workspace = ""
+		} else if l.failure == nil {
+			l.failure = newWorkerFailure(nil, failureStageLeaseCleanup, failureClassIO, "", fmt.Errorf("cleanup workspace: %w", cleanupErr))
+			*runErr = l.failure
+			l.recordFailure()
+		}
+	}
+
+	if err := releaseLease(lease); err != nil {
+		if *runErr == nil {
+			*runErr = err
+		}
+		if l.failure == nil {
+			l.failure = newWorkerFailure(nil, failureStageLeaseCleanup, failureClassIO, "", err)
+			l.recordFailure()
+		}
+	}
+}
+
 // runWorkerBatchWorkspace keeps the mounted vault immutable while Synto runs.
 // Receipts are written only after every durable output has been copied back.
 func runWorkerBatchWorkspace(ctx context.Context, cfg workerConfig, commands [][]string, vault string) (runErr error) {
 	if !cfg.Postprocess {
-		workspace, err := createWorkspace(cfg.WorkspaceDir, vault)
+		workspace, err := localWorkspaceBatchHooks.createWorkspace(cfg.WorkspaceDir, vault)
 		if err != nil {
 			return err
 		}
-		defer os.RemoveAll(workspace)
-		return runWorkerBatchAtVault(ctx, cfg, commands, workspace)
+		defer localWorkspaceBatchHooks.removeWorkspace(workspace)
+		return localWorkspaceBatchHooks.runWorkerBatchAtVault(ctx, cfg, commands, workspace)
 	}
 	if !startsWithFullOLWRun(commands) {
 		return errors.New("workspace mode requires the Synto run command before recording ingestion receipts")
 	}
-	lease, err := acquireVaultLease(vault, cfg.ExecutionID)
+	lease, err := localWorkspaceBatchHooks.acquireVaultLease(vault, cfg.ExecutionID)
 	if err != nil {
 		return err
 	}
+	workspace := ""
+	terminalAttempted := false
+	workspacePublished := false
+	recordTerminal := func(failure error, published bool) {
+		if failure == nil || terminalAttempted {
+			return
+		}
+		terminalAttempted = true
+		_ = recordLocalWorkerFailureLog(workspace, vault, cfg, failure, published)
+	}
 	defer func() {
-		if err := lease.Release(); err != nil && runErr == nil {
-			runErr = err
+		if err := localWorkspaceBatchHooks.releaseVaultLease(lease); err != nil && runErr == nil {
+			runErr = newWorkerFailure(nil, failureStageLeaseCleanup, failureClassIO, "", err)
+			recordTerminal(runErr, true)
 		}
 	}()
-	if err := recoverInterruptedPublish(vault); err != nil {
-		return err
+	defer func() {
+		if runErr != nil {
+			recordTerminal(runErr, workspacePublished)
+		}
+	}()
+	if err := localWorkspaceBatchHooks.recoverInterruptedPublish(vault); err != nil {
+		return preserveWorkerFailure(err, failureStageGenerationPublish, failureClassIO)
 	}
-	snapshots, err := snapshotSources(vault)
+	snapshots, err := localWorkspaceBatchHooks.snapshotSources(vault)
 	if err != nil {
-		return err
+		return preserveWorkerFailure(err, failureStageInputMaterialization, failureClassUnknown)
 	}
-	priorConcepts, err := snapshotConcepts(vault, snapshots)
+	priorConcepts, err := localWorkspaceBatchHooks.snapshotConcepts(vault, snapshots)
 	if err != nil {
-		return err
+		return preserveWorkerFailure(err, failureStageInputMaterialization, failureClassUnknown)
 	}
-	workspace, err := createWorkspace(cfg.WorkspaceDir, vault)
+	workspace, err = localWorkspaceBatchHooks.createWorkspace(cfg.WorkspaceDir, vault)
 	if err != nil {
-		return err
+		return preserveWorkerFailure(err, failureStageInputMaterialization, failureClassIO)
 	}
 	defer func() {
-		if err := os.RemoveAll(workspace); err != nil && runErr == nil {
-			runErr = fmt.Errorf("cleanup workspace: %w", err)
+		if runErr != nil {
+			recordTerminal(runErr, workspacePublished)
+		}
+		if err := localWorkspaceBatchHooks.removeWorkspace(workspace); err != nil && runErr == nil {
+			runErr = newWorkerFailure(nil, failureStageLeaseCleanup, failureClassIO, "", fmt.Errorf("cleanup workspace: %w", err))
+			recordTerminal(runErr, true)
 		}
 	}()
 
-	if err := materializeSnapshots(workspace, snapshots); err != nil {
-		return err
+	if err := localWorkspaceBatchHooks.materializeSnapshots(workspace, snapshots); err != nil {
+		return preserveWorkerFailure(err, failureStageInputMaterialization, failureClassUnknown)
 	}
-	err = runWorkerBatchAtVault(ctx, cfg, commands, workspace)
+	err = localWorkspaceBatchHooks.runWorkerBatchAtVault(ctx, cfg, commands, workspace)
 	if err != nil {
-		logErr := publishWorkspaceFailureLog(workspace, vault, cfg)
-		var recordErr error
-		recordErr = recordFailure(vault, snapshots, err)
-		if recordErr != nil || logErr != nil {
-			return errors.Join(err, logErr, recordErr)
+		failure := preserveWorkerFailure(err, failureStageSyntoRun, failureClassUnknown)
+		if recordErr := recordFailure(vault, snapshots, failure); recordErr != nil {
+			return errors.Join(failure, preserveWorkerFailure(recordErr, failureStageReceiptRecording, failureClassRecordingFailure))
 		}
-		return err
+		return failure
 	}
-	if err := reconcileWorkspaceSources(workspace, snapshots); err != nil {
-		recordErr := recordFailure(vault, snapshots, err)
+	if err := localWorkspaceBatchHooks.reconcileWorkspaceSources(workspace, snapshots); err != nil {
+		failure := preserveWorkerFailure(err, failureStageSourceReconciliation, failureClassUnknown)
+		recordErr := recordFailure(vault, snapshots, failure)
 		if recordErr != nil {
-			return errors.Join(err, recordErr)
+			return errors.Join(failure, preserveWorkerFailure(recordErr, failureStageReceiptRecording, failureClassRecordingFailure))
 		}
-		return err
+		return failure
 	}
-	if err := reconcileWorkspaceConcepts(workspace, priorConcepts, snapshots); err != nil {
-		recordErr := recordFailure(vault, snapshots, err)
+	if err := localWorkspaceBatchHooks.reconcileWorkspaceConcepts(workspace, priorConcepts, snapshots); err != nil {
+		failure := preserveWorkerFailure(err, failureStageConceptReconciliation, failureClassUnknown)
+		recordErr := recordFailure(vault, snapshots, failure)
 		if recordErr != nil {
-			return errors.Join(err, recordErr)
+			return errors.Join(failure, preserveWorkerFailure(recordErr, failureStageReceiptRecording, failureClassRecordingFailure))
 		}
-		return err
+		return failure
 	}
-	if err := syncWorkspaceOutputs(workspace, vault, cfg.ExecutionID); err != nil {
-		recordErr := recordFailure(vault, snapshots, err)
+	if err := localWorkspaceBatchHooks.syncWorkspaceOutputs(workspace, vault, cfg.ExecutionID); err != nil {
+		workspacePublished = publishJournalCommitted(vault)
+		failureClass := failureClassIO
+		if errors.Is(err, errObjectGenerationConflict) {
+			failureClass = failureClassPublishConflict
+		}
+		failure := preserveWorkerFailure(err, failureStageGenerationPublish, failureClass)
+		recordErr := recordFailure(vault, snapshots, failure)
 		if recordErr != nil {
-			return errors.Join(err, recordErr)
+			return errors.Join(failure, preserveWorkerFailure(recordErr, failureStageReceiptRecording, failureClassRecordingFailure))
 		}
-		return err
+		return failure
 	}
-	return recordSuccess(vault, snapshots, time.Now().UTC())
+	workspacePublished = true
+	if err := localWorkspaceBatchHooks.recordSuccess(vault, snapshots, time.Now().UTC()); err != nil {
+		return preserveWorkerFailure(err, failureStageReceiptRecording, failureClassRecordingFailure)
+	}
+	return nil
 }
 
 func runPostprocessCommand(ctx context.Context, cfg workerConfig) (runErr error) {
@@ -518,27 +641,35 @@ func runPostprocessCommand(ctx context.Context, cfg workerConfig) (runErr error)
 	if err != nil {
 		return err
 	}
-	lease, err := acquireVaultLease(vault, cfg.ExecutionID)
+	lease, err := localWorkspaceBatchHooks.acquireVaultLease(vault, cfg.ExecutionID)
 	if err != nil {
 		return err
 	}
+	lifecycle := &localLeaseLifecycle{vault: vault, cfg: cfg}
 	defer func() {
-		if err := lease.Release(); err != nil && runErr == nil {
-			runErr = err
-		}
+		lifecycle.finish(&runErr, lease, localWorkspaceBatchHooks.removeWorkspace, localWorkspaceBatchHooks.releaseVaultLease)
 	}()
-	if err := recoverInterruptedPublish(vault); err != nil {
-		return err
+	if err := localWorkspaceBatchHooks.recoverInterruptedPublish(vault); err != nil {
+		return lifecycle.fail(err, failureStageGenerationPublish, failureClassIO)
 	}
-	workspace, err := createWorkspace(cfg.WorkspaceDir, vault)
+	workspace, err := localWorkspaceBatchHooks.createWorkspace(cfg.WorkspaceDir, vault)
+	lifecycle.workspace = workspace
 	if err != nil {
-		return err
+		return lifecycle.fail(err, failureStageInputMaterialization, failureClassIO)
 	}
-	defer os.RemoveAll(workspace)
-	if err := runPostprocessWithProvider(ctx, workspace, suggestedQueryProvider(cfg), nil); err != nil {
-		return err
+	if err := localWorkspaceBatchHooks.runPostprocessWithProvider(ctx, workspace, suggestedQueryProvider(cfg), nil); err != nil {
+		return lifecycle.fail(err, failureStagePostprocess, failureClassIO)
 	}
-	return syncWorkspaceOutputs(workspace, vault, cfg.ExecutionID)
+	if err := localWorkspaceBatchHooks.syncWorkspaceOutputs(workspace, vault, cfg.ExecutionID); err != nil {
+		lifecycle.published = publishJournalCommitted(vault)
+		failureClass := failureClassIO
+		if errors.Is(err, errObjectGenerationConflict) {
+			failureClass = failureClassPublishConflict
+		}
+		return lifecycle.fail(err, failureStageGenerationPublish, failureClass)
+	}
+	lifecycle.published = true
+	return nil
 }
 
 // runSuggestedQueriesCommand regenerates query chips only, then publishes.
@@ -565,27 +696,35 @@ func runSuggestedQueriesCommand(ctx context.Context, cfg workerConfig) (runErr e
 	if err != nil {
 		return err
 	}
-	lease, err := acquireVaultLease(vault, cfg.ExecutionID)
+	lease, err := localWorkspaceBatchHooks.acquireVaultLease(vault, cfg.ExecutionID)
 	if err != nil {
 		return err
 	}
+	lifecycle := &localLeaseLifecycle{vault: vault, cfg: cfg}
 	defer func() {
-		if err := lease.Release(); err != nil && runErr == nil {
-			runErr = err
-		}
+		lifecycle.finish(&runErr, lease, localWorkspaceBatchHooks.removeWorkspace, localWorkspaceBatchHooks.releaseVaultLease)
 	}()
-	if err := recoverInterruptedPublish(vault); err != nil {
-		return err
+	if err := localWorkspaceBatchHooks.recoverInterruptedPublish(vault); err != nil {
+		return lifecycle.fail(err, failureStageGenerationPublish, failureClassIO)
 	}
-	workspace, err := createWorkspace(cfg.WorkspaceDir, vault)
+	workspace, err := localWorkspaceBatchHooks.createWorkspace(cfg.WorkspaceDir, vault)
+	lifecycle.workspace = workspace
 	if err != nil {
-		return err
+		return lifecycle.fail(err, failureStageInputMaterialization, failureClassIO)
 	}
-	defer os.RemoveAll(workspace)
-	if err := runSuggestedQueriesStage(ctx, workspace, suggestedQueryProvider(cfg)); err != nil {
-		return err
+	if err := localWorkspaceBatchHooks.runSuggestedQueriesStage(ctx, workspace, suggestedQueryProvider(cfg)); err != nil {
+		return lifecycle.fail(err, failureStagePostprocess, failureClassIO)
 	}
-	return syncWorkspaceOutputs(workspace, vault, cfg.ExecutionID)
+	if err := localWorkspaceBatchHooks.syncWorkspaceOutputs(workspace, vault, cfg.ExecutionID); err != nil {
+		lifecycle.published = publishJournalCommitted(vault)
+		failureClass := failureClassIO
+		if errors.Is(err, errObjectGenerationConflict) {
+			failureClass = failureClassPublishConflict
+		}
+		return lifecycle.fail(err, failureStageGenerationPublish, failureClass)
+	}
+	lifecycle.published = true
+	return nil
 }
 
 func parseCommandBatch(raw string) ([][]string, error) {
