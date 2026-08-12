@@ -7,6 +7,7 @@ ARG GIT_BRANCH=unknown
 ARG GIT_TAG=
 
 WORKDIR /src
+RUN apk add --no-cache python3
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
