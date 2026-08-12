@@ -1009,6 +1009,16 @@ func TestDockerfileRestoresPreRemediationBuildSemantics(t *testing.T) {
 	}
 }
 
+func TestDockerfileProvidesPythonForBFFGeneration(t *testing.T) {
+	contents := readWorkflow(t, "Dockerfile")
+	buildStage := contents[:strings.Index(contents, "# Runtime")]
+	pythonInstall := strings.Index(buildStage, "apk add --no-cache python3")
+	generate := strings.Index(buildStage, "RUN go generate ./...")
+	if pythonInstall < 0 || generate < 0 || pythonInstall > generate {
+		t.Fatal("BFF build stage must provide python3 before go generate")
+	}
+}
+
 func TestAuthCloudBuildAndDockerfileUseDistinctBinaryAndImmutableIdentity(t *testing.T) {
 	cloudBuild := readWorkflow(t, "cloudbuild-auth.yaml")
 	dockerfile := readWorkflow(t, "Dockerfile.auth")
