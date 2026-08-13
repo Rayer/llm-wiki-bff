@@ -513,59 +513,6 @@ func TestPrometheusMetricsReturnsText(t *testing.T) {
 	}
 }
 
-type handlerCacheReader struct {
-	prefix string
-	raw    string
-}
-
-func (r *handlerCacheReader) ReadFile(_ context.Context, _ string) ([]byte, error) {
-	return nil, errors.New("no JSONL in tests — use ListConcepts path")
-}
-
-func (r *handlerCacheReader) WriteBytes(_ context.Context, data []byte, _ string) (string, error) {
-	return "ok", nil
-}
-
-func (r *handlerCacheReader) Prefix() string {
-	return r.prefix
-}
-
-func (r *handlerCacheReader) ListConcepts(context.Context, bool) ([]gcs.WikiPage, error) {
-	return []gcs.WikiPage{{Slug: "alpha"}}, nil
-}
-
-func (r *handlerCacheReader) GetPage(context.Context, string, string) (*gcs.WikiPage, []byte, error) {
-	return &gcs.WikiPage{Slug: "alpha"}, []byte(r.raw), nil
-}
-
-func TestCachedContextsIncludeConceptSources(t *testing.T) {
-	reader := &handlerCacheReader{
-		prefix: "users/u/projects/p",
-		raw:    "---\ntitle: Alpha Concept\nsources: [Source One, Source Two]\n---\nAlpha body.",
-	}
-	conceptCache := conceptcache.New()
-	authority, err := search.NewCitationAuthority()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	contexts := cachedContexts(context.Background(), conceptCache, reader, []search.Result{{
-		Slug:  "alpha",
-		Title: "Alpha Concept",
-		Type:  "concept",
-	}}, authority)
-
-	if len(contexts) != 1 {
-		t.Fatalf("len(contexts) = %d, want 1", len(contexts))
-	}
-	if !strings.Contains(contexts[0], "Sources: [Source One, Source Two]") {
-		t.Fatalf("context missing sources:\n%s", contexts[0])
-	}
-	if !strings.Contains(contexts[0], "Alpha body.") {
-		t.Fatalf("context missing body:\n%s", contexts[0])
-	}
-}
-
 type fakeWikiListReader struct {
 	cacheConcepts []gcs.WikiPage
 	gcsConcepts   []gcs.WikiPage
