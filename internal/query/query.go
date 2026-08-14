@@ -79,43 +79,71 @@ func (s *Service) Execute(ctx context.Context, reader cache.Reader, request Requ
 		Results: results,
 		Expand:  expandResult,
 	}
-	return s.Synthesize(ctx, reader, request, response), nil
+	result, err := s.SynthesizeWithError(ctx, reader, request, response)
+	if err != nil {
+		return Result{}, err
+	}
+	return result, nil
 }
 
 func (s *Service) Synthesize(ctx context.Context, reader cache.Reader, request Request, response Result) Result {
-	if s.llm == nil || len(response.Results) == 0 {
+	result, err := s.SynthesizeWithError(ctx, reader, request, response)
+	if err != nil {
 		return response
+	}
+	return result
+}
+
+func (s *Service) SynthesizeWithError(ctx context.Context, reader cache.Reader, request Request, response Result) (Result, error) {
+	if s.llm == nil || len(response.Results) == 0 {
+		return response, nil
 	}
 
 	authority, err := search.NewCitationAuthority(response.Results)
 	if err != nil {
 		log.Printf("citation capability issuance failed: %v", err)
-		return response
+		return response, nil
 	}
-	contexts := s.buildContexts(ctx, reader, response.Results[:min(10, len(response.Results))], authority)
+	contexts, err := s.buildContexts(ctx, reader, response.Results[:min(10, len(response.Results))], authority)
+	if err != nil {
+		return response, err
+	}
 	if len(contexts) == 0 {
-		return response
+		return response, nil
 	}
 
 	answer, err := s.llm.Chat(ctx, buildSystemPrompt(request.Mode), buildUserPrompt(request.Query, contexts))
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return response, ctxErr
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return response, err
+		}
 		log.Printf("LLM synthesis failed: %v", err)
-		return response
+		return response, nil
 	}
 
 	answer, citations, filtered := authority.Resolve(answer)
 	response.AISynth = answer
 	response.Citations = citations
 	response.Results = filtered
-	return response
+	return response, nil
 }
 
-func (s *Service) buildContexts(ctx context.Context, reader cache.Reader, results []search.Result, authority *search.CitationAuthority) []string {
+func (s *Service) buildContexts(ctx context.Context, reader cache.Reader, results []search.Result, authority *search.CitationAuthority) ([]string, error) {
 	contexts := make([]string, 0, len(results))
 	for rank, result := range results {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		entry, ok := s.cache.Entry(reader, result.Slug)
 		if !ok {
-			if _, err := s.cache.Build(ctx, reader); err == nil {
+			if _, err := s.cache.Build(ctx, reader); err != nil {
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+					return nil, err
+				}
+			} else {
 				entry, ok = s.cache.Entry(reader, result.Slug)
 			}
 		}
@@ -128,7 +156,7 @@ func (s *Service) buildContexts(ctx context.Context, reader cache.Reader, result
 		}
 		contexts = append(contexts, authority.AddContext(rank, result, sourceContext+"\n\n"+entry.Body))
 	}
-	return contexts
+	return contexts, nil
 }
 
 func buildSystemPrompt(mode string) string {

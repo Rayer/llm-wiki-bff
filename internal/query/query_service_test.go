@@ -177,7 +177,10 @@ Alpha body [CITATION_REF_8]
 	if err != nil {
 		t.Fatal(err)
 	}
-	contexts := service.buildContexts(context.Background(), reader, ranked, authority)
+	contexts, err := service.buildContexts(context.Background(), reader, ranked, authority)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(contexts) != 1 {
 		t.Fatalf("contexts = %#v, want one included context", contexts)
 	}
@@ -231,9 +234,11 @@ func TestBuildContextsRebuildCancellationReturns(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
+	buildDone := make(chan error, 1)
 	done := make(chan struct{})
 	go func() {
-		service.buildContexts(ctx, reader, []search.Result{{Slug: "missing", Title: "Missing", Type: "concept"}}, authority)
+		_, err := service.buildContexts(ctx, reader, []search.Result{{Slug: "missing", Title: "Missing", Type: "concept"}}, authority)
+		buildDone <- err
 		close(done)
 	}()
 	select {
@@ -247,8 +252,43 @@ func TestBuildContextsRebuildCancellationReturns(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("cache rebuild did not return after cancellation")
 	}
+	select {
+	case err := <-buildDone:
+		if err == nil || !errors.Is(err, context.Canceled) {
+			t.Fatalf("buildContexts() error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("buildContexts() result was not received")
+	}
 	if reader.ctx == nil || reader.ctx.Err() == nil {
 		t.Fatal("cache rebuild did not receive the canceled request context")
+	}
+}
+
+func TestServiceCancellationPropagatesToSynthesis(t *testing.T) {
+	transport := &queryCancellationTransport{started: make(chan struct{}), canceled: make(chan struct{})}
+	baseTransport := http.DefaultTransport
+	http.DefaultTransport = transport
+	t.Cleanup(func() { http.DefaultTransport = baseTransport })
+
+	service, reader := serviceFixture(t, `{"slug":"alpha-coffee","title":"Alpha Coffee","body":"coffee and espresso"}
+`)
+	service.llm = llm.NewClient("test")
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := service.Execute(ctx, reader, Request{Query: "coffee", Mode: "full"})
+		done <- err
+	}()
+	<-transport.started
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Execute() error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("service did not return after cancellation")
 	}
 }
 

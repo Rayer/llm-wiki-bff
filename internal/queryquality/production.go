@@ -40,7 +40,11 @@ func (e *ProductionExecutor) Execute(ctx context.Context, reader cache.Reader, r
 		return query.Result{}, err
 	}
 	if e.synthesizer != nil {
-		result = e.synthesizer.Synthesize(ctx, reader, request, result)
+		var err error
+		result, err = e.synthesizer.SynthesizeWithError(ctx, reader, request, result)
+		if err != nil {
+			return query.Result{}, err
+		}
 	}
 	return result, nil
 }

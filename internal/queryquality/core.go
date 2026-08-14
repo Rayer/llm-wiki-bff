@@ -293,6 +293,13 @@ func validateCriterion(criterion Criterion) error {
 	if criterion.Proof == "lexical" && len(criterion.Terms) == 0 {
 		return errors.New("lexical criterion requires terms")
 	}
+	if criterion.Proof == "lexical" {
+		for _, term := range criterion.Terms {
+			if strings.TrimSpace(term) == "" {
+				return errors.New("lexical criterion term cannot be empty")
+			}
+		}
+	}
 	return nil
 }
 
@@ -1014,10 +1021,9 @@ func (randomSelector) Select(ctx context.Context, input SelectionInput) (Selecti
 			selected[candidate.Slug] = selectionDecision(candidate, true, "selected", false)
 		}
 		remaining := eligible[exploitCount:]
-		picks := rand.New(rand.NewSource(input.Seed)).Perm(len(remaining))
-		for _, index := range picks[:minInt(slots, len(remaining))] {
-			candidate := remaining[index]
-			selected[candidate.Slug] = selectionDecision(candidate, true, "selected_for_exploration", true)
+		explorationCount := minInt(slots, len(remaining))
+		if err := appendExplorationSelections(ctx, rand.New(rand.NewSource(input.Seed)), remaining, explorationCount, selected); err != nil {
+			return SelectionResult{}, err
 		}
 	}
 	decisions := make([]SelectedCandidate, 0, len(input.Candidates))
@@ -1046,6 +1052,22 @@ func selectionDecision(candidate CandidateEvidence, selected bool, reason string
 		tier = "high"
 	}
 	return SelectedCandidate{Slug: candidate.Slug, Title: candidate.Title, Selected: selected, Reason: reason, Score: candidate.Score, Tier: tier, Exploration: exploration}
+}
+
+func appendExplorationSelections(ctx context.Context, rng *rand.Rand, candidates []CandidateEvidence, explorationCount int, selected map[string]SelectedCandidate) error {
+	for index := 0; index < explorationCount; index++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if len(candidates) <= index {
+			return nil
+		}
+		swap := index + rng.Intn(len(candidates)-index)
+		candidates[index], candidates[swap] = candidates[swap], candidates[index]
+		candidate := candidates[index]
+		selected[candidate.Slug] = selectionDecision(candidate, true, "selected_for_exploration", true)
+	}
+	return nil
 }
 
 func minInt(a, b int) int {

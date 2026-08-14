@@ -4,12 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/rayer/llm-wiki-bff/internal/cache"
 	"github.com/rayer/llm-wiki-bff/internal/gcs"
+	"github.com/rayer/llm-wiki-bff/internal/llm"
 	"github.com/rayer/llm-wiki-bff/internal/query"
 	"github.com/rayer/llm-wiki-bff/internal/queryquality"
 	"github.com/rayer/llm-wiki-bff/internal/search"
@@ -93,6 +95,7 @@ func TestDecodePlanRequiresStrictMinimalV1Contract(t *testing.T) {
 		{name: "empty plan", response: strings.Replace(valid, `{"kind":"location","value":"Taipei","terms":["Taipei"],"proof":"lexical"}`, ``, 1), raw: "Taipei cafe"},
 		{name: "raw query mismatch", response: valid, raw: "different"},
 		{name: "criterion missing proof", response: strings.Replace(valid, `,"proof":"lexical"`, ``, 1), raw: "Taipei cafe"},
+		{name: "whitespace lexical term", response: strings.Replace(valid, `"terms":["Taipei"]`, `"terms":["   "]`, 1), raw: "Taipei cafe"},
 		{name: "lexical criterion has no terms", response: strings.Replace(valid, `"terms":["Taipei"]`, `"terms":[]`, 1), raw: "Taipei cafe"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -100,6 +103,26 @@ func TestDecodePlanRequiresStrictMinimalV1Contract(t *testing.T) {
 				t.Fatal("DecodePlan() error = nil, want contract rejection")
 			}
 		})
+	}
+}
+
+func TestQueryPlanValidationRejectsWhitespaceTermsAndCannotMatchAllCandidates(t *testing.T) {
+	plan := queryquality.QueryPlan{
+		RawQuery: "coffee",
+		Required: []queryquality.Criterion{{Kind: "topic", Value: "coffee", Terms: []string{"   "}, Proof: "lexical"}},
+	}
+	if err := queryquality.ValidateQueryPlan(plan); err == nil {
+		t.Fatal("ValidateQueryPlan() error = nil, want lexical term rejection")
+	}
+
+	service := queryquality.NewService(
+		fixedPlanExpander{plan: plan},
+		queryquality.NewLexicalMatcher(nil),
+		queryquality.NewSelector(),
+		nil,
+	)
+	if _, err := service.Execute(context.Background(), &jsonlReader{data: []byte(`{"slug":"x","title":"coffee shop","body":"coffee here"}\n`)}, query.Request{Query: "coffee"}); err == nil {
+		t.Fatal("Execute() error = nil, want lexical term rejection in production path")
 	}
 }
 
@@ -189,6 +212,74 @@ func TestMatchingAndSelectionPreserveCancellation(t *testing.T) {
 		t.Fatalf("Match() error = %v, want context.Canceled", err)
 	}
 	if _, err := queryquality.NewSelector().Select(ctx, queryquality.SelectionInput{Candidates: []queryquality.CandidateEvidence{{Slug: "coffee", Eligible: true}}, Limit: 1}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Select() error = %v, want context.Canceled", err)
+	}
+}
+
+func TestProductionExecutorSynthesisCancellationDoesNotFallback(t *testing.T) {
+	transport := &queryCancellationTransport{started: make(chan struct{}), canceled: make(chan struct{})}
+	baseTransport := http.DefaultTransport
+	http.DefaultTransport = transport
+	t.Cleanup(func() { http.DefaultTransport = baseTransport })
+
+	synthesizer := query.NewService(cache.New(), nil, llm.NewClient("test"))
+	legacy := &countingExecutor{}
+	executor, err := queryquality.NewProductionExecutor(cache.New(), fakeProvider{response: `{"raw_query":"coffee","required":[],"excluded":[],"preferred":[{"kind":"topic","value":"coffee","terms":["coffee"],"proof":"lexical"}],"goals":[],"supporting_dimensions":[],"acceptable_alternatives":[],"ambiguity":[],"fallback":false}`}, legacy, synthesizer, queryquality.DefaultOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := executor.Execute(ctx, &jsonlReader{data: []byte(`{"slug":"coffee","title":"Coffee","body":"coffee"}` + "\n")}, query.Request{Query: "coffee", Mode: "wiki"})
+		done <- err
+	}()
+	<-transport.started
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Execute() error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("executor did not return after cancellation")
+	}
+	if legacy.called {
+		t.Fatal("cancellation must not invoke legacy fallback")
+	}
+}
+
+func TestSelectorDeterministicReplayAndContextCancellation(t *testing.T) {
+	input := queryquality.SelectionInput{
+		Candidates: []queryquality.CandidateEvidence{
+			{Slug: "a", Title: "A", Eligible: true, Score: 3},
+			{Slug: "b", Title: "B", Eligible: true, Score: 2},
+			{Slug: "c", Title: "C", Eligible: true, Score: 1},
+			{Slug: "d", Title: "D", Eligible: true, Score: 0},
+		},
+		Limit:            2,
+		ExplorationSlots: 2,
+		Seed:             7,
+	}
+	first, err := queryquality.NewSelector().Select(context.Background(), input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := queryquality.NewSelector().Select(context.Background(), input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstJSON, _ := json.Marshal(first)
+	secondJSON, _ := json.Marshal(second)
+	if string(firstJSON) != string(secondJSON) {
+		t.Fatalf("selection replay differs: %s vs %s", firstJSON, secondJSON)
+	}
+	if len(first.Selected) == 0 {
+		t.Fatal("selection result is empty")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := queryquality.NewSelector().Select(ctx, input); !errors.Is(err, context.Canceled) {
 		t.Fatalf("Select() error = %v, want context.Canceled", err)
 	}
 }
@@ -317,6 +408,14 @@ func (testPlanExpander) ExpandPlan(context.Context, string, queryquality.Criteri
 	return queryquality.QueryPlan{}, nil
 }
 
+type fixedPlanExpander struct {
+	plan queryquality.QueryPlan
+}
+
+func (f fixedPlanExpander) ExpandPlan(context.Context, string, queryquality.CriterionPolicy, []cache.Entry) (queryquality.QueryPlan, error) {
+	return f.plan, nil
+}
+
 func (p *promptProvider) Chat(_ context.Context, system, user string) (string, error) {
 	p.system, p.user = system, user
 	return p.response, nil
@@ -341,6 +440,18 @@ func (p blockingProvider) Chat(ctx context.Context, _, _ string) (string, error)
 	close(p.started)
 	<-ctx.Done()
 	return "", ctx.Err()
+}
+
+type queryCancellationTransport struct {
+	started  chan struct{}
+	canceled chan struct{}
+}
+
+func (t queryCancellationTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	close(t.started)
+	<-req.Context().Done()
+	close(t.canceled)
+	return nil, req.Context().Err()
 }
 
 type jsonlReader struct {
