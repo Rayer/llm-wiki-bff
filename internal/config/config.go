@@ -16,6 +16,7 @@ const (
 	DefaultPipelineMinNewRaw       = 1
 	DefaultPipelineJobURL          = "https://run.googleapis.com/v2/projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline:run"
 	DefaultAuthServiceURL          = "https://auth.dev.rayer.idv.tw"
+	DefaultQueryExpansionModel     = "deepseek-v4-pro"
 )
 
 var defaultAllowedOrigins = []string{
@@ -33,6 +34,7 @@ type Config struct {
 	ProjectID           string
 	Port                string
 	DeepSeekAPIKey      string
+	QueryExpansionModel string
 	JWTSecret           string
 	DevJWT              bool
 	LocalDataDir        string
@@ -75,6 +77,7 @@ func Load(path string) (Config, error) {
 	v.SetDefault("pipeline_cooldown_seconds", DefaultPipelineCooldownSeconds)
 	v.SetDefault("pipeline_min_new_raw", DefaultPipelineMinNewRaw)
 	v.SetDefault("pipeline_job_url", DefaultPipelineJobURL)
+	v.SetDefault("query_expansion_model", DefaultQueryExpansionModel)
 	v.AutomaticEnv()
 	v.BindEnv("deepseek_api_key")
 	v.BindEnv("firestore_database_id", "FIRESTORE_DATABASE_ID")
@@ -87,6 +90,7 @@ func Load(path string) (Config, error) {
 	v.BindEnv("pipeline_demo_user_ids", "PIPELINE_DEMO_USER_IDS")
 	v.BindEnv("registration_enabled", "REGISTRATION_ENABLED")
 	v.BindEnv("auth_service_url", "AUTH_SERVICE_URL")
+	v.BindEnv("query_expansion_model", "QUERY_EXPANSION_MODEL")
 
 	if err := v.ReadInConfig(); err != nil {
 		var notFound viper.ConfigFileNotFoundError
@@ -130,6 +134,13 @@ func Load(path string) (Config, error) {
 	if authServiceURL == "" {
 		authServiceURL = DefaultAuthServiceURL
 	}
+	queryExpansionModel := strings.TrimSpace(v.GetString("query_expansion_model"))
+	if queryExpansionModel == "" {
+		queryExpansionModel = DefaultQueryExpansionModel
+	}
+	if queryExpansionModel != DefaultQueryExpansionModel {
+		return Config{}, fmt.Errorf("query_expansion_model must be %s", DefaultQueryExpansionModel)
+	}
 
 	cfg := Config{
 		GCPProject:              v.GetString("gcp_project"),
@@ -139,6 +150,7 @@ func Load(path string) (Config, error) {
 		ProjectID:               v.GetString("project_id"),
 		Port:                    v.GetString("port"),
 		DeepSeekAPIKey:          v.GetString("deepseek_api_key"),
+		QueryExpansionModel:     queryExpansionModel,
 		JWTSecret:               v.GetString("jwt_secret"),
 		DevJWT:                  v.GetBool("dev_jwt"),
 		LocalDataDir:            v.GetString("local_data_dir"),

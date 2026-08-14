@@ -1,26 +1,185 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/rayer/llm-wiki-bff/internal/auth"
+	conceptcache "github.com/rayer/llm-wiki-bff/internal/cache"
 	"github.com/rayer/llm-wiki-bff/internal/config"
 	"github.com/rayer/llm-wiki-bff/internal/firestore"
 	"github.com/rayer/llm-wiki-bff/internal/gcs"
 	handlerraw "github.com/rayer/llm-wiki-bff/internal/handler"
 	handlerv1 "github.com/rayer/llm-wiki-bff/internal/handler/v1"
+	"github.com/rayer/llm-wiki-bff/internal/localfs"
 	"github.com/rayer/llm-wiki-bff/internal/middleware"
+	"github.com/rayer/llm-wiki-bff/internal/query"
+	"github.com/rayer/llm-wiki-bff/internal/queryquality"
 	"github.com/rayer/llm-wiki-bff/internal/syssettings"
 	"gopkg.in/yaml.v3"
 )
+
+func TestDefaultProductionQueryCompositionUsesThreeHostExecutor(t *testing.T) {
+	executor, err := newProductionQueryExecutor(config.Config{}, conceptcache.New())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := executor.(*queryquality.ProductionExecutor); !ok {
+		t.Fatalf("production executor = %T, want queryquality.ProductionExecutor", executor)
+	}
+}
+
+func TestProductionQueryCompositionRejectsNonBaselineModel(t *testing.T) {
+	_, err := newProductionQueryExecutor(config.Config{QueryExpansionModel: "deepseek-chat"}, conceptcache.New())
+	if err == nil {
+		t.Fatal("newProductionQueryExecutor() error = nil, want fixed baseline rejection")
+	}
+}
+
+func TestDefaultProductionQueryCompositionRunsThroughV1QueryPath(t *testing.T) {
+	root := localfs.New(t.TempDir())
+	if _, err := root.Scope("user", "project").WriteBytes(context.Background(), []byte(`{"slug":"legacy-hit","title":"Legacy Hit","body":"coffee"}`+"\n"), conceptcache.GCSPath); err != nil {
+		t.Fatal(err)
+	}
+	conceptCache := conceptcache.New()
+	executor, err := newProductionQueryExecutor(config.Config{}, conceptCache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := handlerv1.New(root, nil, nil, conceptCache, nil, nil)
+	h.SetQueryExecutor(executor)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/api/v1/query", bytes.NewBufferString(`{"q":"coffee","mode":"wiki"}`))
+	c.Set("userID", "user")
+	c.Set("projectID", "project")
+	h.Query(c)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	var response handlerraw.QueryResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Results) != 1 || response.Results[0].Slug != "legacy-hit" {
+		t.Fatalf("V1 production result = %#v", response.Results)
+	}
+}
+
+func TestProductionInvalidStructuredPlanUsesChatLegacyExpansion(t *testing.T) {
+	root := localfs.New(t.TempDir())
+	reader := root.Scope("user", "project")
+	if _, err := reader.WriteBytes(context.Background(), []byte(`{"slug":"coffee","title":"Coffee","body":"coffee"}`+"\n"), conceptcache.GCSPath); err != nil {
+		t.Fatal(err)
+	}
+	transport := &productionFallbackTransport{}
+	previousTransport := http.DefaultTransport
+	http.DefaultTransport = transport
+	t.Cleanup(func() { http.DefaultTransport = previousTransport })
+	executor, err := newProductionQueryExecutor(config.Config{DeepSeekAPIKey: "test-key"}, conceptcache.New())
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := executor.Execute(context.Background(), reader, query.Request{Query: "coffee", Mode: "wiki"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Results) != 1 || result.Results[0].Slug != "coffee" {
+		t.Fatalf("result = %#v", result.Results)
+	}
+	if len(transport.requests) < 2 {
+		t.Fatalf("HTTP calls = %d, want structured plus legacy expansion", len(transport.requests))
+	}
+	if transport.requests[0].Model != "deepseek-v4-pro" || transport.requests[0].Temperature == nil || *transport.requests[0].Temperature != 0 {
+		t.Fatalf("structured request = %#v", transport.requests[0])
+	}
+	if transport.requests[1].Model != "deepseek-chat" || transport.requests[1].Temperature != nil {
+		t.Fatalf("legacy request = %#v", transport.requests[1])
+	}
+}
+
+func TestDefaultProductionQueryCompositionPreservesRequestCancellation(t *testing.T) {
+	root := localfs.New(t.TempDir())
+	if _, err := root.Scope("user", "project").WriteBytes(context.Background(), []byte(`{"slug":"candidate","title":"Candidate","body":"coffee"}`+"\n"), conceptcache.GCSPath); err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	previousTransport := http.DefaultTransport
+	http.DefaultTransport = productionCancellationTransport{started: started}
+	defer func() { http.DefaultTransport = previousTransport }()
+	executor, err := newProductionQueryExecutor(config.Config{DeepSeekAPIKey: "test-key"}, conceptcache.New())
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := handlerv1.New(root, nil, nil, conceptcache.New(), nil, nil)
+	h.SetQueryExecutor(executor)
+	ctx, cancel := context.WithCancel(context.Background())
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/query", bytes.NewBufferString(`{"q":"coffee"}`)).WithContext(ctx)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = request
+	c.Set("userID", "user")
+	c.Set("projectID", "project")
+	done := make(chan struct{})
+	go func() {
+		h.Query(c)
+		close(done)
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("production expansion provider did not start")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("production query did not return after cancellation")
+	}
+}
+
+type productionCancellationTransport struct{ started chan struct{} }
+
+func (t productionCancellationTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	close(t.started)
+	<-req.Context().Done()
+	return nil, req.Context().Err()
+}
+
+type productionRequest struct {
+	Model       string   `json:"model"`
+	Temperature *float64 `json:"temperature"`
+}
+
+type productionFallbackTransport struct{ requests []productionRequest }
+
+func (t *productionFallbackTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	body, err := io.ReadAll(req.Body)
+	if err != nil {
+		return nil, err
+	}
+	var captured productionRequest
+	if err := json.Unmarshal(body, &captured); err != nil {
+		return nil, err
+	}
+	t.requests = append(t.requests, captured)
+	content := "not-json"
+	if len(t.requests) == 2 {
+		content = `{"keywords":["coffee"]}`
+	}
+	response := `{"choices":[{"message":{"content":` + strconv.Quote(content) + `}}]}`
+	return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(response)), Header: make(http.Header)}, nil
+}
 
 func TestSwaggerDoesNotDocumentAuthRoutes(t *testing.T) {
 	document := readSwaggerDocument(t)

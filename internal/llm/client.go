@@ -12,9 +12,11 @@ import (
 
 // Client calls the DeepSeek API (OpenAI-compatible endpoint).
 type Client struct {
-	apiKey  string
-	baseURL string
-	client  *http.Client
+	apiKey      string
+	baseURL     string
+	client      *http.Client
+	model       string
+	temperature *float64
 }
 
 const maxChatResponseBytes = 64 * 1024
@@ -25,8 +27,14 @@ type chatMessage struct {
 }
 
 type chatRequest struct {
-	Model    string        `json:"model"`
-	Messages []chatMessage `json:"messages"`
+	Model       string        `json:"model"`
+	Messages    []chatMessage `json:"messages"`
+	Temperature *float64      `json:"temperature,omitempty"`
+}
+
+type ClientOptions struct {
+	Model       string
+	Temperature *float64
 }
 
 type chatChoice struct {
@@ -39,24 +47,34 @@ type chatResponse struct {
 
 // NewClient creates a DeepSeek API client. If apiKey is empty, returns nil.
 func NewClient(apiKey string) *Client {
+	return NewClientWithOptions(apiKey, ClientOptions{Model: "deepseek-chat"})
+}
+
+func NewClientWithOptions(apiKey string, options ClientOptions) *Client {
 	if apiKey == "" {
 		return nil
 	}
+	if options.Model == "" {
+		options.Model = "deepseek-chat"
+	}
 	return &Client{
-		apiKey:  apiKey,
-		baseURL: "https://api.deepseek.com",
-		client:  &http.Client{Timeout: 60 * time.Second},
+		apiKey:      apiKey,
+		baseURL:     "https://api.deepseek.com",
+		client:      &http.Client{Timeout: 60 * time.Second},
+		model:       options.Model,
+		temperature: options.Temperature,
 	}
 }
 
 // Chat sends a system + user message and returns the assistant's reply.
 func (c *Client) Chat(ctx context.Context, systemPrompt, userMessage string) (string, error) {
 	body := chatRequest{
-		Model: "deepseek-chat",
+		Model: c.model,
 		Messages: []chatMessage{
 			{Role: "system", Content: systemPrompt},
 			{Role: "user", Content: userMessage},
 		},
+		Temperature: c.temperature,
 	}
 
 	data, err := json.Marshal(body)
@@ -86,7 +104,7 @@ func (c *Client) Chat(ctx context.Context, systemPrompt, userMessage string) (st
 	}
 
 	if resp.StatusCode != 200 {
-		return "", fmt.Errorf("api error %d: %s", resp.StatusCode, string(respData[:min(len(respData), 200)]))
+		return "", fmt.Errorf("api error %d", resp.StatusCode)
 	}
 
 	var cr chatResponse

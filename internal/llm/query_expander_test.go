@@ -3,7 +3,10 @@ package llm
 import (
 	"context"
 	"errors"
+	"io"
+	"log"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 )
@@ -158,9 +161,38 @@ func TestQueryExpanderExpandPropagatesCancellation(t *testing.T) {
 	}
 }
 
+func TestQueryExpanderParseFailureLogOmitsRawQuery(t *testing.T) {
+	marker := "sensitive-query-marker-268"
+	previousWriter := log.Writer()
+	previousFlags := log.Flags()
+	var output strings.Builder
+	log.SetFlags(0)
+	log.SetOutput(&output)
+	t.Cleanup(func() {
+		log.SetOutput(previousWriter)
+		log.SetFlags(previousFlags)
+	})
+	expander := &QueryExpander{
+		client:       &Client{apiKey: "test", baseURL: "http://expander.test", client: &http.Client{Transport: invalidExpansionTransport{}}},
+		systemPrompt: "test",
+	}
+	if _, err := expander.Expand(context.Background(), marker); err == nil {
+		t.Fatal("Expand() error = nil, want parse failure")
+	}
+	if strings.Contains(output.String(), marker) {
+		t.Fatalf("log leaked raw query: %q", output.String())
+	}
+}
+
 type blockingExpansionTransport struct {
 	started  chan struct{}
 	canceled chan struct{}
+}
+
+type invalidExpansionTransport struct{}
+
+func (invalidExpansionTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"choices":[{"message":{"content":"invalid"}}]}`)), Header: make(http.Header)}, nil
 }
 
 func (t blockingExpansionTransport) RoundTrip(req *http.Request) (*http.Response, error) {

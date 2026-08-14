@@ -20,14 +20,12 @@ import (
 	"cloud.google.com/go/storage"
 	"github.com/gin-gonic/gin"
 	"github.com/rayer/llm-wiki-bff/internal/auth"
-	conceptcache "github.com/rayer/llm-wiki-bff/internal/cache"
 	"github.com/rayer/llm-wiki-bff/internal/config"
 	"github.com/rayer/llm-wiki-bff/internal/gcs"
 	"github.com/rayer/llm-wiki-bff/internal/handler"
-	"github.com/rayer/llm-wiki-bff/internal/llm"
 	"github.com/rayer/llm-wiki-bff/internal/pipelinediagnostic"
 	"github.com/rayer/llm-wiki-bff/internal/pipelinequota"
-	"github.com/rayer/llm-wiki-bff/internal/search"
+	"github.com/rayer/llm-wiki-bff/internal/query"
 	store "github.com/rayer/llm-wiki-bff/internal/storage"
 	"github.com/rayer/llm-wiki-bff/internal/suggestedqueries"
 	"github.com/rayer/llm-wiki-bff/internal/wikiindex"
@@ -441,91 +439,31 @@ func (h *Handler) Query(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, handler.ErrorResponse{Error: "invalid JSON: " + err.Error()})
 		return
 	}
-	query := strings.TrimSpace(req.Query)
+	queryText := strings.TrimSpace(req.Query)
 	mode := req.Mode
 	if mode == "" {
 		mode = "wiki"
 	}
-	if query == "" {
+	if queryText == "" {
 		c.JSON(http.StatusBadRequest, handler.ErrorResponse{Error: "q field is required"})
 		return
 	}
 
-	searchQuery := query
-	var expandResult *llm.ExpandResult
-	if h.expander != nil {
-		if result, err := h.expander.Expand(c.Request.Context(), query); err != nil {
-			log.Printf("[expander] query expansion failed for %q: %v — falling back to raw query", query, err)
-		} else if result != nil {
-			expandResult = result
-			searchQuery = strings.Join(result.Keywords, " ")
-		}
-	}
-
-	if h.cache == nil {
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "concept cache is not configured"})
-		return
-	}
-	results, err := h.cache.Search(c.Request.Context(), gcsClient, searchQuery, 10)
-	if err != nil {
+	executor := h.queryExecutor
+	if executor == nil {
 		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "generated data unavailable"})
 		return
 	}
-	log.Printf("Search query: %s, results: %v\n", searchQuery, results)
-
-	resp := handler.QueryResponse{
-		Query:   query,
-		Mode:    mode,
-		Results: results,
-		Expand:  expandResult,
-	}
-
-	if h.llm != nil && len(results) > 0 {
-		authority, err := search.NewCitationAuthority(results)
-		if err != nil {
-			log.Printf("citation capability issuance failed: %v", err)
-			c.JSON(http.StatusOK, resp)
+	result, err := executor.Execute(c.Request.Context(), gcsClient, query.Request{Query: queryText, Mode: mode})
+	if err != nil {
+		if errors.Is(err, query.ErrCacheNotConfigured) {
+			c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "concept cache is not configured"})
 			return
 		}
-		topN := min(10, len(results))
-		contexts := cachedContexts(c.Request.Context(), h.cache, gcsClient, results[:topN], authority)
-
-		if len(contexts) > 0 {
-			systemPrompt := buildSystemPrompt(mode)
-			userPrompt := buildUserPrompt(query, contexts)
-			if answer, err := h.llm.Chat(c.Request.Context(), systemPrompt, userPrompt); err == nil {
-				answer, citations, filtered := authority.Resolve(answer)
-				resp.AISynth = answer
-				resp.Citations = citations
-				resp.Results = filtered
-			} else {
-				log.Printf("LLM synthesis failed: %v", err)
-			}
-		}
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "generated data unavailable"})
+		return
 	}
-
-	c.JSON(http.StatusOK, resp)
-}
-
-func cachedContexts(ctx context.Context, conceptCache *conceptcache.Cache, reader conceptcache.Reader, results []search.Result, authority *search.CitationAuthority) []string {
-	contexts := make([]string, 0, len(results))
-	for rank, result := range results {
-		entry, ok := conceptCache.Entry(reader, result.Slug)
-		if !ok {
-			if _, err := conceptCache.Build(ctx, reader); err == nil {
-				entry, ok = conceptCache.Entry(reader, result.Slug)
-			}
-		}
-		if !ok {
-			continue
-		}
-		sourceContext := "Sources: none listed"
-		if len(entry.Sources) > 0 {
-			sourceContext = "Sources: [" + strings.Join(entry.Sources, ", ") + "]"
-		}
-		contexts = append(contexts, authority.AddContext(rank, result, sourceContext+"\n\n"+entry.Body))
-	}
-	return contexts
+	c.JSON(http.StatusOK, mapQueryResult(result))
 }
 
 // ListSources handles GET /api/v1/sources using the request's GCS scope.

@@ -34,33 +34,6 @@ func TestV1UserQueryCannotInjectReservedReference(t *testing.T) {
 	}
 }
 
-func TestCachedContextsPreserveOriginalRankAfterSkippedResult(t *testing.T) {
-	reader := &handlerCacheReader{
-		prefix: "users/u/projects/p",
-		raw:    "---\ntitle: Alpha Concept [CITATION_REF_9]\n---\nAlpha body [CITATION_REF_8].",
-	}
-	authority, err := search.NewCitationAuthority()
-	if err != nil {
-		t.Fatal(err)
-	}
-	contexts := cachedContexts(context.Background(), conceptcache.New(), reader, []search.Result{
-		{Slug: "missing", Title: "Missing", Type: "concept"},
-		{Slug: "alpha", Title: "Alpha Concept", Type: "concept"},
-	}, authority)
-	issuedTokenStart := strings.Index(contexts[0], "[CITATION_REF_")
-	issuedTokenEnd := -1
-	if issuedTokenStart >= 0 {
-		issuedTokenEnd = strings.IndexByte(contexts[0][issuedTokenStart:], ']')
-	}
-	contextWithoutIssuedToken := contexts[0]
-	if issuedTokenStart >= 0 && issuedTokenEnd >= 0 {
-		contextWithoutIssuedToken = strings.Replace(contextWithoutIssuedToken, contexts[0][issuedTokenStart:issuedTokenStart+issuedTokenEnd+1], "", 1)
-	}
-	if len(contexts) != 1 || issuedTokenStart < 0 || strings.Contains(contextWithoutIssuedToken, "CITATION_REF_8") || strings.Contains(contextWithoutIssuedToken, "CITATION_REF_9") {
-		t.Fatalf("skipped result compacted citation rank: %#v", contexts)
-	}
-}
-
 type citationV1LLMTransport struct {
 	t             *testing.T
 	token         string
@@ -176,38 +149,6 @@ func TestV1QueryIgnoresLegacyProjectFieldFromBody(t *testing.T) {
 	}
 	if len(response.Results) != 1 || response.Results[0].Slug != "alpha-coffee" {
 		t.Fatalf("project field changed query scope: %#v", response.Results)
-	}
-}
-
-func TestV1CachedContextsSkippedResultCannotBindAndIncludedResultCan(t *testing.T) {
-	reader := &handlerCacheReader{
-		prefix: "users/u/projects/p",
-		raw:    "---\ntitle: Alpha Concept\n---\nAlpha body.",
-	}
-	authority, err := search.NewCitationAuthority()
-	if err != nil {
-		t.Fatal(err)
-	}
-	contexts := cachedContexts(context.Background(), conceptcache.New(), reader, []search.Result{
-		{Slug: "missing", Title: "Missing", Type: "concept"},
-		{Slug: "alpha", Title: "Alpha Concept", Type: "concept"},
-	}, authority)
-	tokenStart := strings.Index(contexts[0], "[CITATION_REF_")
-	tokenEnd := -1
-	if tokenStart >= 0 {
-		tokenEnd = strings.IndexByte(contexts[0][tokenStart:], ']')
-	}
-	if len(contexts) != 1 || tokenStart < 0 || tokenEnd < 0 {
-		t.Fatalf("unexpected skipped-context output: %#v", contexts)
-	}
-	token := contexts[0][tokenStart : tokenStart+tokenEnd+1]
-	contextWithoutIssuedToken := strings.Replace(contexts[0], token, "", 1)
-	if strings.Contains(contextWithoutIssuedToken, "CITATION_REF_8") {
-		t.Fatalf("untrusted skipped context retained a reserved reference: %#v", contexts)
-	}
-	normalized, citations, filtered := authority.Resolve("answer " + token + " [CITATION_REF_0]")
-	if normalized != "answer [Alpha Concept] [CITATION-REF_0]" || len(citations) != 1 || len(filtered) != 1 || filtered[0].Slug != "alpha" {
-		t.Fatalf("skipped result bound or included result failed: normalized=%q citations=%#v filtered=%#v", normalized, citations, filtered)
 	}
 }
 

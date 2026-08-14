@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/rand"
 	"sort"
@@ -75,6 +76,8 @@ func (c *Cache) Build(ctx context.Context, reader conceptReader) ([]Entry, error
 		if project, ok := c.project(reader); ok {
 			return cloneEntries(project.entries), nil
 		}
+	} else if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return nil, err
 	}
 
 	return c.buildFromPages(ctx, reader)
@@ -83,6 +86,9 @@ func (c *Cache) Build(ctx context.Context, reader conceptReader) ([]Entry, error
 func (c *Cache) buildFromPages(ctx context.Context, reader conceptReader) ([]Entry, error) {
 	concepts, err := reader.ListConcepts(ctx, false)
 	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, err
+		}
 		return nil, fmt.Errorf("list concepts: %w", err)
 	}
 
@@ -120,6 +126,9 @@ func (c *Cache) buildFromPages(ctx context.Context, reader conceptReader) ([]Ent
 
 	entries := make([]Entry, 0, len(concepts))
 	for result := range results {
+		if errors.Is(result.err, context.Canceled) || errors.Is(result.err, context.DeadlineExceeded) {
+			return nil, result.err
+		}
 		if result.err == nil {
 			entries = append(entries, result.entry)
 		}
@@ -266,6 +275,8 @@ func (c *Cache) All(ctx context.Context, reader conceptReader) ([]Entry, error) 
 		if project, ok := c.project(reader); ok {
 			return cloneEntries(project.entries), nil
 		}
+	} else if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return nil, err
 	}
 	return c.Build(ctx, reader)
 }

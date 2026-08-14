@@ -12,6 +12,7 @@ import (
 	conceptcache "github.com/rayer/llm-wiki-bff/internal/cache"
 	"github.com/rayer/llm-wiki-bff/internal/firestore"
 	"github.com/rayer/llm-wiki-bff/internal/llm"
+	"github.com/rayer/llm-wiki-bff/internal/query"
 	"github.com/rayer/llm-wiki-bff/internal/search"
 	store "github.com/rayer/llm-wiki-bff/internal/storage"
 	"github.com/rayer/llm-wiki-bff/internal/wikiindex"
@@ -19,12 +20,13 @@ import (
 
 // Handler holds the dependencies for the V1 API.
 type Handler struct {
-	store     store.RootStore
-	firestore *firestore.Client
-	index     *search.Index
-	cache     *conceptcache.Cache
-	llm       *llm.Client
-	expander  *llm.QueryExpander
+	store         store.RootStore
+	firestore     *firestore.Client
+	index         *search.Index
+	cache         *conceptcache.Cache
+	llm           *llm.Client
+	expander      *llm.QueryExpander
+	queryExecutor query.Executor
 
 	httpClient                   *http.Client
 	metadataTokenURL             string
@@ -72,11 +74,16 @@ func New(wikiStore store.RootStore, fs *firestore.Client, idx *search.Index, cac
 		cache:         cache,
 		llm:           llmClient,
 		expander:      expander,
+		queryExecutor: query.NewService(cache, expander, llmClient),
 		idRoutingMaps: make(map[string]dualIDMap),
 		listCache:     make(map[string]cachedLists),
 		listCacheKeys: make(map[string]map[string]struct{}),
 		httpClient:    &http.Client{Timeout: 30 * time.Second},
 	}
+}
+
+func (h *Handler) SetQueryExecutor(executor query.Executor) {
+	h.queryExecutor = executor
 }
 
 // SetRebuildIndexFunc overrides rebuild behavior for environments that do not
