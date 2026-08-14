@@ -180,10 +180,14 @@ func (e StructuredPlanExpander) ExpandPlanWithTrace(ctx context.Context, raw str
 	if err := ctx.Err(); err != nil {
 		return QueryPlan{}, ExpansionInfo{}, err
 	}
+	decodePlan := e.decodePlan
+	if decodePlan == nil {
+		decodePlan = DecodePlan
+	}
 	if e.provider != nil {
 		response, err := e.provider.Chat(ctx, structuredPlanSystemPrompt, structuredPlanUserPrompt(raw, policy))
 		if err == nil {
-			if plan, decodeErr := e.decodePlan(response, raw); decodeErr == nil {
+			if plan, decodeErr := decodePlan(response, raw); decodeErr == nil {
 				return plan, ExpansionInfo{Source: "structured-llm"}, nil
 			}
 			if e.fallback == nil {

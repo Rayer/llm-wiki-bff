@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"testing"
@@ -378,6 +379,69 @@ func TestStructuredPlanExpanderPreservesCancellationBeforeFallbackWithoutProvide
 	}
 }
 
+func TestStructuredPlanExpanderCancellationFallbackPolicy(t *testing.T) {
+	fallbackPlan := queryquality.QueryPlan{
+		Preferred: []queryquality.Criterion{
+			{Kind: "topic", Value: "coffee", Terms: []string{"coffee"}, Proof: "lexical"},
+		},
+	}
+	tests := []struct {
+		name                 string
+		err                  error
+		wantFallbackCalls    int
+		wantErr              error
+		requireNoPlan         bool
+	}{
+		{name: "provider-cancelled", err: context.Canceled, wantFallbackCalls: 0, wantErr: context.Canceled, requireNoPlan: true},
+		{name: "provider-deadline", err: context.DeadlineExceeded, wantFallbackCalls: 0, wantErr: context.DeadlineExceeded, requireNoPlan: true},
+		{name: "provider-failed-with-wrapped-deadline", err: context.DeadlineExceeded, wantFallbackCalls: 0, wantErr: context.DeadlineExceeded, requireNoPlan: true},
+		{name: "provider-failed-triggers-fallback", err: errors.New("provider unavailable"), wantFallbackCalls: 1, wantErr: nil},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fallback := &countingPlanExpander{plan: fallbackPlan}
+			providerErr := test.err
+			if test.name == "provider-failed-with-wrapped-deadline" {
+				providerErr = fmt.Errorf("provider: %w", context.DeadlineExceeded)
+			}
+			expander := queryquality.NewStructuredPlanExpander(fakeProvider{err: providerErr}, fallback)
+			traced, ok := expander.(queryquality.TracedPlanExpander)
+			if !ok {
+				t.Fatal("structured plan expander should support tracing")
+			}
+
+			plan, info, err := traced.ExpandPlanWithTrace(context.Background(), "coffee", queryquality.DefaultCriterionPolicy, nil)
+			if !errors.Is(err, test.wantErr) {
+				t.Fatalf("ExpandPlanWithTrace() error = %v, want %v", err, test.wantErr)
+			}
+			if fallback.calls != test.wantFallbackCalls {
+				t.Fatalf("fallback calls = %d, want %d", fallback.calls, test.wantFallbackCalls)
+			}
+			if test.wantErr == nil {
+				if info.Source != "deterministic-fallback" {
+					t.Fatalf("fallback source = %q, want deterministic-fallback", info.Source)
+				}
+				return
+			}
+			if test.requireNoPlan && (plan.RawQuery != "" || len(plan.Required) != 0 || len(plan.Excluded) != 0 || len(plan.Preferred) != 0 || len(plan.Goals) != 0 || len(plan.SupportingDimensions) != 0 || len(plan.AcceptableAlternatives) != 0 || len(plan.Ambiguity) != 0 || plan.Fallback != false) {
+				t.Fatal("plan should be empty when provider cancellation propagates")
+			}
+		})
+	}
+}
+
+func TestStructuredPlanExpanderZeroValueUsesDefaultDecoderAndReturnsProviderNotConfigured(t *testing.T) {
+	var expander queryquality.StructuredPlanExpander
+	if _, err := expander.ExpandPlan(context.Background(), "coffee", queryquality.DefaultCriterionPolicy, nil); err == nil {
+		t.Fatal("ExpandPlan() error = nil, want provider_not_configured")
+	} else {
+		var expansionErr *queryquality.ExpansionError
+		if !errors.As(err, &expansionErr) || expansionErr.Reason != "provider_not_configured" {
+			t.Fatalf("ExpandPlan() err = %v, want ExpansionError reason provider_not_configured", err)
+		}
+	}
+}
+
 func TestProductionStructuredPlanPreservesLegacyExpandWireShape(t *testing.T) {
 	provider := fakeProvider{response: `{"raw_query":"coffee","required":[{"kind":"location","value":"Taipei","terms":["Taipei","coffee"],"proof":"lexical"}],"excluded":[{"kind":"avoid","value":"crowded","terms":["crowded","coffee"],"proof":"lexical"}],"preferred":[{"kind":"topic","value":"coffee","terms":["coffee","cafe"],"proof":"lexical"}],"goals":[],"supporting_dimensions":[],"acceptable_alternatives":[],"ambiguity":[],"fallback":false}`}
 	legacy := &countingExecutor{}
@@ -449,6 +513,16 @@ type fixedPlanExpander struct {
 
 func (f fixedPlanExpander) ExpandPlan(context.Context, string, queryquality.CriterionPolicy, []cache.Entry) (queryquality.QueryPlan, error) {
 	return f.plan, nil
+}
+
+type countingPlanExpander struct {
+	plan  queryquality.QueryPlan
+	calls int
+}
+
+func (e *countingPlanExpander) ExpandPlan(context.Context, string, queryquality.CriterionPolicy, []cache.Entry) (queryquality.QueryPlan, error) {
+	e.calls++
+	return e.plan, nil
 }
 
 func (p *promptProvider) Chat(_ context.Context, system, user string) (string, error) {
