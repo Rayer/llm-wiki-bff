@@ -56,6 +56,12 @@ func (s *Service) Execute(ctx context.Context, reader cache.Reader, request Requ
 
 	if s.expander != nil {
 		if result, err := s.expander.Expand(ctx, request.Query); err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return Result{}, ctxErr
+			}
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return Result{}, err
+			}
 			log.Printf("[expander] query expansion failed: %v — falling back to raw query", err)
 		} else if result != nil {
 			expandResult = result
@@ -95,6 +101,9 @@ func (s *Service) Synthesize(ctx context.Context, reader cache.Reader, request R
 }
 
 func (s *Service) SynthesizeWithError(ctx context.Context, reader cache.Reader, request Request, response Result) (Result, error) {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return response, ctxErr
+	}
 	if s.llm == nil || len(response.Results) == 0 {
 		return response, nil
 	}

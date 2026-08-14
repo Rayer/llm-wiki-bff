@@ -313,6 +313,29 @@ func TestServiceZeroResultsPreservesRankedResults(t *testing.T) {
 	}
 }
 
+func TestServiceSynthesisCancellationShortCircuitsZeroResultAndNoClient(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	result := Result{Query: "coffee", Mode: "wiki", Results: []search.Result{}}
+	service := NewService(cache.New(), nil, nil)
+	_, err := service.SynthesizeWithError(ctx, nil, Request{Query: "coffee"}, result)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("SynthesizeWithError() error = %v, want context.Canceled", err)
+	}
+}
+
+func TestServiceSynthesisStillSucceedsForZeroResultsWhenNotCanceled(t *testing.T) {
+	result := Result{Query: "coffee", Mode: "wiki", Results: []search.Result{}}
+	service := NewService(cache.New(), nil, nil)
+	got, err := service.SynthesizeWithError(context.Background(), nil, Request{Query: "coffee"}, result)
+	if err != nil {
+		t.Fatalf("SynthesizeWithError() error = %v", err)
+	}
+	if got.AISynth != "" || len(got.Results) != 0 {
+		t.Fatalf("SynthesizeWithError() = %#v, want zero-result pass-through", got)
+	}
+}
+
 func TestServiceExpansionFailureFallsBackToRawQuery(t *testing.T) {
 	baseTransport := http.DefaultTransport
 	http.DefaultTransport = roundTripFunc(func(*http.Request) (*http.Response, error) {
@@ -452,6 +475,39 @@ func TestServiceCancellationPropagatesToExpander(t *testing.T) {
 	}
 	select {
 	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("service did not return after cancellation")
+	}
+}
+
+func TestServiceCancellationShortCircuitsAfterExpanderError(t *testing.T) {
+	transport := &queryCancellationTransport{started: make(chan struct{}), canceled: make(chan struct{})}
+	baseTransport := http.DefaultTransport
+	http.DefaultTransport = transport
+	t.Cleanup(func() { http.DefaultTransport = baseTransport })
+
+	expander, err := llm.NewExpander(llm.NewClient("test"), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := NewService(cache.New(), expander, llm.NewClient("test"))
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		result, err := service.Execute(ctx, nil, Request{Query: "coffee", Mode: "wiki"})
+		if err == nil {
+			t.Logf("result=%#v", result)
+		}
+		done <- err
+	}()
+	<-transport.started
+	cancel()
+	<-transport.canceled
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Execute() error = %v, want context.Canceled", err)
+		}
 	case <-time.After(time.Second):
 		t.Fatal("service did not return after cancellation")
 	}

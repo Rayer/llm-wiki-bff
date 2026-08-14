@@ -50,6 +50,17 @@ func TestDeterministicFallbackIsGenericAndOptionalEvidenceDoesNotGate(t *testing
 	}
 }
 
+func TestDecodeStructuredPlanSupportsExtendedDimensionsInFixtureMode(t *testing.T) {
+	response := `{"raw_query":"coffee","required":[],"excluded":[],"preferred":[{"kind":"topic","value":"coffee","terms":["coffee"],"proof":"lexical"}],"goals":[],"supporting_dimensions":[{"kind":"mood","value":"quiet","terms":["quiet"],"proof":"lexical"}],"acceptable_alternatives":[{"kind":"topic","value":"tea","terms":["tea"],"proof":"lexical"}],"ambiguity":[],"fallback":false}`
+	plan, err := decodeStructuredPlan(response, "coffee")
+	if err != nil {
+		t.Fatalf("decodeStructuredPlan() error = %v, want generic acceptance", err)
+	}
+	if len(plan.SupportingDimensions) != 1 || len(plan.AcceptableAlternatives) != 1 {
+		t.Fatalf("plan=%#v, want fixture mode accepted extended dimensions", plan)
+	}
+}
+
 func TestSemanticCriteriaNeverBecomeLexicalEvidenceOrScore(t *testing.T) {
 	semantic := func(kind string) Criterion {
 		return Criterion{Kind: kind, Value: "private " + kind, Terms: []string{"private", kind}, Proof: "semantic"}

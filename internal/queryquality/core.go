@@ -144,8 +144,9 @@ type TracedPlanExpander interface {
 }
 
 type StructuredPlanExpander struct {
-	provider ChatProvider
-	fallback PlanExpander
+	provider   ChatProvider
+	fallback   PlanExpander
+	decodePlan func(string, string) (QueryPlan, error)
 }
 
 type ExpansionError struct {
@@ -163,7 +164,11 @@ func (e *ExpansionError) Error() string {
 func (e *ExpansionError) Unwrap() error { return e.Err }
 
 func NewStructuredPlanExpander(provider ChatProvider, fallback PlanExpander) PlanExpander {
-	return StructuredPlanExpander{provider: provider, fallback: fallback}
+	return StructuredPlanExpander{provider: provider, fallback: fallback, decodePlan: DecodePlan}
+}
+
+func NewMinimalStructuredPlanExpander(provider ChatProvider, fallback PlanExpander) PlanExpander {
+	return StructuredPlanExpander{provider: provider, fallback: fallback, decodePlan: DecodeMinimalV1Plan}
 }
 
 func (e StructuredPlanExpander) ExpandPlan(ctx context.Context, raw string, policy CriterionPolicy, entries []cache.Entry) (QueryPlan, error) {
@@ -172,10 +177,13 @@ func (e StructuredPlanExpander) ExpandPlan(ctx context.Context, raw string, poli
 }
 
 func (e StructuredPlanExpander) ExpandPlanWithTrace(ctx context.Context, raw string, policy CriterionPolicy, entries []cache.Entry) (QueryPlan, ExpansionInfo, error) {
+	if err := ctx.Err(); err != nil {
+		return QueryPlan{}, ExpansionInfo{}, err
+	}
 	if e.provider != nil {
 		response, err := e.provider.Chat(ctx, structuredPlanSystemPrompt, structuredPlanUserPrompt(raw, policy))
 		if err == nil {
-			if plan, decodeErr := DecodePlan(response, raw); decodeErr == nil {
+			if plan, decodeErr := e.decodePlan(response, raw); decodeErr == nil {
 				return plan, ExpansionInfo{Source: "structured-llm"}, nil
 			}
 			if e.fallback == nil {
@@ -243,13 +251,21 @@ func ValidateQueryPlan(plan QueryPlan) error {
 }
 
 func validateQueryPlan(plan QueryPlan, allowFallback bool) error {
+	return validateQueryPlanBase(plan, allowFallback, false)
+}
+
+func validateMinimalV1QueryPlan(plan QueryPlan, allowFallback bool) error {
+	return validateQueryPlanBase(plan, allowFallback, true)
+}
+
+func validateQueryPlanBase(plan QueryPlan, allowFallback bool, requireMinimal bool) error {
 	if strings.TrimSpace(plan.RawQuery) == "" {
 		return errors.New("plan raw query is empty")
 	}
 	if !allowFallback && plan.Fallback {
 		return errors.New("provider plan fallback must be false")
 	}
-	if len(plan.SupportingDimensions) != 0 || len(plan.AcceptableAlternatives) != 0 {
+	if requireMinimal && (len(plan.SupportingDimensions) != 0 || len(plan.AcceptableAlternatives) != 0) {
 		return errors.New("minimal-v1 does not support supporting dimensions or alternatives")
 	}
 	seenRequired := make(map[string]struct{})
@@ -358,10 +374,25 @@ func DecodePlan(response, raw string) (QueryPlan, error) {
 	if plan.RawQuery != raw {
 		return QueryPlan{}, errors.New("plan raw query does not match request")
 	}
-	if err := ValidateQueryPlan(plan); err != nil {
+	if err := validateQueryPlan(plan, false); err != nil {
 		return QueryPlan{}, err
 	}
 	return plan, nil
+}
+
+func DecodeMinimalV1Plan(response, raw string) (QueryPlan, error) {
+	plan, err := DecodePlan(response, raw)
+	if err != nil {
+		return QueryPlan{}, err
+	}
+	if err := ValidateMinimalV1Plan(plan); err != nil {
+		return QueryPlan{}, err
+	}
+	return plan, nil
+}
+
+func ValidateMinimalV1Plan(plan QueryPlan) error {
+	return validateMinimalV1QueryPlan(plan, false)
 }
 
 func decodeJSONString(raw json.RawMessage, field string) (string, error) {

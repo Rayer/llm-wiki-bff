@@ -25,7 +25,7 @@ func NewProductionExecutor(conceptCache *cache.Cache, provider ChatProvider, leg
 	if err != nil {
 		return nil, err
 	}
-	retriever := NewServiceWithOptions(NewStructuredPlanExpander(provider, nil), NewLexicalMatcher(nil), NewSelector(), options.SeedFor, options)
+	retriever := NewServiceWithOptions(NewMinimalStructuredPlanExpander(provider, nil), NewLexicalMatcher(nil), NewSelector(), options.SeedFor, options)
 	retriever.cache = conceptCache
 	return &ProductionExecutor{retriever: retriever, legacy: legacy, synthesizer: synthesizer}, nil
 }

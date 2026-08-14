@@ -78,9 +78,9 @@ func TestCorePlanEligibilityAndSelectionContracts(t *testing.T) {
 	}
 }
 
-func TestDecodePlanRequiresStrictMinimalV1Contract(t *testing.T) {
+func TestDecodeMinimalV1PlanRequiresStrictV1Contract(t *testing.T) {
 	valid := `{"raw_query":"Taipei cafe","required":[{"kind":"location","value":"Taipei","terms":["Taipei"],"proof":"lexical"}],"excluded":[],"preferred":[],"goals":[],"supporting_dimensions":[],"acceptable_alternatives":[],"ambiguity":[],"fallback":false}`
-	if _, err := queryquality.DecodePlan(valid, "Taipei cafe"); err != nil {
+	if _, err := queryquality.DecodeMinimalV1Plan(valid, "Taipei cafe"); err != nil {
 		t.Fatalf("valid minimal-v1 plan rejected: %v", err)
 	}
 	for _, test := range []struct {
@@ -99,10 +99,24 @@ func TestDecodePlanRequiresStrictMinimalV1Contract(t *testing.T) {
 		{name: "lexical criterion has no terms", response: strings.Replace(valid, `"terms":["Taipei"]`, `"terms":[]`, 1), raw: "Taipei cafe"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			if _, err := queryquality.DecodePlan(test.response, test.raw); err == nil {
+			if _, err := queryquality.DecodeMinimalV1Plan(test.response, test.raw); err == nil {
 				t.Fatal("DecodePlan() error = nil, want contract rejection")
 			}
 		})
+	}
+}
+
+func TestDecodePlanAllowsExtendedDimensionsAndAlternatives(t *testing.T) {
+	response := `{"raw_query":"Taipei cafe","required":[{"kind":"location","value":"Taipei","terms":["Taipei"],"proof":"lexical"}],"excluded":[],"preferred":[],"goals":[],"supporting_dimensions":[{"kind":"mood","value":"quiet","terms":["quiet"],"proof":"lexical"}],"acceptable_alternatives":[{"kind":"topic","value":"tea","terms":["tea"],"proof":"lexical"}],"ambiguity":["or"],"fallback":false}`
+	plan, err := queryquality.DecodePlan(response, "Taipei cafe")
+	if err != nil {
+		t.Fatalf("DecodePlan() error = %v, want generic acceptance", err)
+	}
+	if len(plan.SupportingDimensions) != 1 || len(plan.AcceptableAlternatives) != 1 {
+		t.Fatalf("plan=%#v, want one supporting dimension and one alternative", plan)
+	}
+	if _, err := queryquality.DecodeMinimalV1Plan(response, "Taipei cafe"); err == nil {
+		t.Fatal("DecodeMinimalV1Plan() error = nil, want extended plan rejection")
 	}
 }
 
@@ -340,6 +354,27 @@ func TestProductionExpansionCancellationDoesNotFallback(t *testing.T) {
 	}
 	if legacy.called {
 		t.Fatal("cancellation must not invoke legacy fallback")
+	}
+}
+
+func TestStructuredPlanExpanderPreservesCancellationBeforeFallbackWithoutProvider(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	expander := queryquality.NewStructuredPlanExpander(nil, nil)
+	traced, ok := expander.(queryquality.TracedPlanExpander)
+	if !ok {
+		t.Fatal("structured plan expander should support tracing")
+	}
+	if _, _, err := traced.ExpandPlanWithTrace(ctx, "coffee", queryquality.DefaultCriterionPolicy, nil); !errors.Is(err, context.Canceled) {
+		t.Fatalf("ExpandPlanWithTrace() error = %v, want context.Canceled", err)
+	}
+	traced, ok = queryquality.NewStructuredPlanExpander(&fakeProvider{response: "{}"}, nil).(queryquality.TracedPlanExpander)
+	if !ok {
+		t.Fatal("structured plan expander should support tracing")
+	}
+	_, _, err := traced.ExpandPlanWithTrace(context.Background(), "coffee", queryquality.DefaultCriterionPolicy, nil)
+	if err == nil {
+		t.Fatal("ExpandPlanWithTrace() error = nil, want plan decode failure")
 	}
 }
 
