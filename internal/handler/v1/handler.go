@@ -82,6 +82,10 @@ func New(wikiStore store.RootStore, fs *firestore.Client, idx *search.Index, cac
 	}
 }
 
+func (h *Handler) SetQueryExecutor(executor query.Executor) {
+	h.queryExecutor = executor
+}
+
 // SetRebuildIndexFunc overrides rebuild behavior for environments that do not
 // use Firestore locks, such as local filesystem development mode.
 func (h *Handler) SetRebuildIndexFunc(fn func(context.Context, string, string) (wikiindex.IDMap, error)) {

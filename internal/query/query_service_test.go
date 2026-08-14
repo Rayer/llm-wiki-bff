@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -22,6 +23,25 @@ import (
 	"github.com/rayer/llm-wiki-bff/internal/search"
 	"github.com/rayer/llm-wiki-bff/internal/storage"
 )
+
+func TestExecuteLogDoesNotSerializeResultBodiesOrSnippets(t *testing.T) {
+	service, reader := serviceFixture(t, `{"slug":"secret","title":"Secret Concept","body":"private concept body"}`+"\n")
+	previousWriter := log.Writer()
+	previousFlags := log.Flags()
+	var output strings.Builder
+	log.SetFlags(0)
+	log.SetOutput(&output)
+	defer func() {
+		log.SetOutput(previousWriter)
+		log.SetFlags(previousFlags)
+	}()
+	if _, err := service.Execute(context.Background(), reader, Request{Query: "private", Mode: "wiki"}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(output.String(), "Secret Concept") || strings.Contains(output.String(), "private concept body") {
+		t.Fatalf("log leaked result content: %q", output.String())
+	}
+}
 
 func TestServicePublicSeam(t *testing.T) {
 	var _ Executor = NewService(nil, nil, nil)

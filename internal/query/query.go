@@ -71,7 +71,7 @@ func (s *Service) Execute(ctx context.Context, reader cache.Reader, request Requ
 	if err != nil {
 		return Result{}, err
 	}
-	log.Printf("Search query: %s, results: %v\n", searchQuery, results)
+	log.Printf("Search query completed: terms=%d results=%d", len(strings.Fields(searchQuery)), len(results))
 
 	response := Result{
 		Query:   request.Query,
@@ -79,31 +79,35 @@ func (s *Service) Execute(ctx context.Context, reader cache.Reader, request Requ
 		Results: results,
 		Expand:  expandResult,
 	}
-	if s.llm == nil || len(results) == 0 {
-		return response, nil
+	return s.Synthesize(ctx, reader, request, response), nil
+}
+
+func (s *Service) Synthesize(ctx context.Context, reader cache.Reader, request Request, response Result) Result {
+	if s.llm == nil || len(response.Results) == 0 {
+		return response
 	}
 
-	authority, err := search.NewCitationAuthority(results)
+	authority, err := search.NewCitationAuthority(response.Results)
 	if err != nil {
 		log.Printf("citation capability issuance failed: %v", err)
-		return response, nil
+		return response
 	}
-	contexts := s.buildContexts(ctx, reader, results[:min(10, len(results))], authority)
+	contexts := s.buildContexts(ctx, reader, response.Results[:min(10, len(response.Results))], authority)
 	if len(contexts) == 0 {
-		return response, nil
+		return response
 	}
 
 	answer, err := s.llm.Chat(ctx, buildSystemPrompt(request.Mode), buildUserPrompt(request.Query, contexts))
 	if err != nil {
 		log.Printf("LLM synthesis failed: %v", err)
-		return response, nil
+		return response
 	}
 
 	answer, citations, filtered := authority.Resolve(answer)
 	response.AISynth = answer
 	response.Citations = citations
 	response.Results = filtered
-	return response, nil
+	return response
 }
 
 func (s *Service) buildContexts(ctx context.Context, reader cache.Reader, results []search.Result, authority *search.CitationAuthority) []string {

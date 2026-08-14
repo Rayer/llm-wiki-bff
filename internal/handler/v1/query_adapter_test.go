@@ -200,3 +200,14 @@ func TestQueryAdapterMappingIsExplicit(t *testing.T) {
 		t.Fatalf("mapQueryResult = %#v, want %#v", got, want)
 	}
 }
+
+func TestQueryResponseDoesNotExposeConceptSnippets(t *testing.T) {
+	result := query.Result{Query: "q", Results: []search.Result{{Slug: "s", Title: "Title", Snippet: "private concept body"}}}
+	data, err := json.Marshal(mapQueryResult(result))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "private concept body") {
+		t.Fatalf("wire response leaked concept snippet: %s", data)
+	}
+}

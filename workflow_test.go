@@ -652,6 +652,19 @@ func TestBFFDevWorkflowAllowsBothMigrationOrigins(t *testing.T) {
 	}
 }
 
+func TestBFFDevWorkflowSetsExpansionModelWithoutChangingSecretBinding(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
+	if !strings.Contains(contents, "QUERY_EXPANSION_MODEL: deepseek-v4-pro") {
+		t.Fatal("BFF DEV workflow must set the platform-owned expansion model")
+	}
+	if !strings.Contains(contents, "@QUERY_EXPANSION_MODEL=${{ env.QUERY_EXPANSION_MODEL }}") {
+		t.Fatal("BFF DEV deploy must pass the non-secret expansion model config")
+	}
+	if !strings.Contains(contents, "DEEPSEEK_API_KEY=deepseek-apikey:latest") {
+		t.Fatal("BFF DEV deploy must preserve the existing DeepSeek secret reference")
+	}
+}
+
 func TestAuthPreflightUsesNamedFirestoreDatabaseAndSourceReconciliationIdentity(t *testing.T) {
 	contents := readWorkflow(t, ".github/workflows/deploy-auth.yml")
 	preflight := workflowSection(t, contents, "      - name: Verify existing dev Auth prerequisites", "      - name: Resolve build identity")

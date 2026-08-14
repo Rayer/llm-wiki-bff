@@ -7,6 +7,16 @@ import (
 	"testing"
 )
 
+func TestLoadDefaultsQueryExpansionModel(t *testing.T) {
+	cfg, err := Load(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.QueryExpansionModel != "deepseek-v4-pro" {
+		t.Fatalf("QueryExpansionModel = %q, want deepseek-v4-pro", cfg.QueryExpansionModel)
+	}
+}
+
 func TestLoadAllowsEmptyJWTSecretInProduction(t *testing.T) {
 	t.Setenv("JWT_SECRET", "")
 	dir := writeConfig(t, "dev_jwt = false\n")
