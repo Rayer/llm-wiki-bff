@@ -15,6 +15,7 @@ import (
 	"unicode"
 
 	"github.com/rayer/llm-wiki-bff/internal/cache"
+	"github.com/rayer/llm-wiki-bff/internal/llm"
 	"github.com/rayer/llm-wiki-bff/internal/query"
 	"github.com/rayer/llm-wiki-bff/internal/search"
 )
@@ -182,6 +183,12 @@ func (e StructuredPlanExpander) ExpandPlanWithTrace(ctx context.Context, raw str
 			}
 			return e.fallbackPlan(ctx, raw, policy, entries, "invalid_plan")
 		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return QueryPlan{}, ExpansionInfo{}, ctxErr
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return QueryPlan{}, ExpansionInfo{}, err
+		}
 		if e.fallback == nil {
 			return QueryPlan{}, ExpansionInfo{}, &ExpansionError{Reason: "provider_error", Err: err}
 		}
@@ -194,40 +201,67 @@ func (e StructuredPlanExpander) ExpandPlanWithTrace(ctx context.Context, raw str
 }
 
 func (e StructuredPlanExpander) fallbackPlan(ctx context.Context, raw string, policy CriterionPolicy, entries []cache.Entry, reason string) (QueryPlan, ExpansionInfo, error) {
+	if err := ctx.Err(); err != nil {
+		return QueryPlan{}, ExpansionInfo{}, err
+	}
 	if e.fallback == nil {
 		return QueryPlan{}, ExpansionInfo{}, errors.New("fallback unavailable")
 	}
 	plan, err := e.fallback.ExpandPlan(ctx, raw, policy, entries)
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return QueryPlan{}, ExpansionInfo{}, ctxErr
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return QueryPlan{}, ExpansionInfo{}, err
+		}
 		return QueryPlan{}, ExpansionInfo{}, fmt.Errorf("fallback: %w", err)
 	}
 	plan.RawQuery = raw
 	plan.Fallback = true
-	if err := ValidateQueryPlan(plan); err != nil {
+	if err := validateDeterministicFallbackPlan(plan); err != nil {
 		return QueryPlan{}, ExpansionInfo{}, fmt.Errorf("fallback validation: %w", err)
 	}
 	return plan, ExpansionInfo{Source: "deterministic-fallback", FallbackReason: reason}, nil
 }
 
-const structuredPlanSystemPrompt = `Return one JSON query plan. Use only the fields raw_query, required, excluded, preferred, goals, supporting_dimensions, acceptable_alternatives, ambiguity, and fallback. Required and excluded criteria must be conservative: absence is not exclusion. Do not invent project ontology.`
+const (
+	StructuredPlanPromptID     = "minimal-v1"
+	structuredPlanSystemPrompt = `You produce a retrieval plan for a frozen Lifestyle concept corpus. Return exactly one JSON object and no markdown. The object fields and exact types are: raw_query string; required array of Criterion; excluded array of Criterion; preferred array of Criterion; goals array of Criterion; supporting_dimensions array of Criterion; acceptable_alternatives array of Criterion; ambiguity array of strings; fallback boolean. Every Criterion is exactly {kind:string,value:string,terms:array of strings,proof:"lexical" or "semantic"}. Every lexical Criterion needs at least one discovery term. Never output a string where an array or object is required. Be conservative: only explicit user constraints may be required or excluded; absent never means excluded. In this minimal variant, supporting_dimensions and acceptable_alternatives must be empty arrays and fallback must be false.`
+	structuredPlanUserTemplate = "Raw query: {{raw_query}}\nCriterion policy: {{criterion_policy}}\nInterpret the query into required, excluded, preferred and goals. Preserve the raw query exactly in raw_query. Return the single JSON object only."
+)
 
 func structuredPlanUserPrompt(raw string, policy CriterionPolicy) string {
-	return fmt.Sprintf("query=%q policy_required=%v policy_preferred=%v policy_goals=%v", raw, policy.RequiredWhenExplicit, policy.PreferredByDefault, policy.GoalsToExpand)
+	rawJSON, _ := json.Marshal(raw)
+	policyJSON, _ := json.Marshal(policy)
+	result := strings.ReplaceAll(structuredPlanUserTemplate, "{{raw_query}}", string(rawJSON))
+	return strings.ReplaceAll(result, "{{criterion_policy}}", string(policyJSON))
 }
 
 func ValidateQueryPlan(plan QueryPlan) error {
+	return validateQueryPlan(plan, false)
+}
+
+func validateQueryPlan(plan QueryPlan, allowFallback bool) error {
 	if strings.TrimSpace(plan.RawQuery) == "" {
 		return errors.New("plan raw query is empty")
 	}
+	if !allowFallback && plan.Fallback {
+		return errors.New("provider plan fallback must be false")
+	}
+	if len(plan.SupportingDimensions) != 0 || len(plan.AcceptableAlternatives) != 0 {
+		return errors.New("minimal-v1 does not support supporting dimensions or alternatives")
+	}
 	seenRequired := make(map[string]struct{})
+	criterionTotal := 0
 	groups := []struct {
 		name     string
 		criteria []Criterion
 	}{
-		{"required", plan.Required}, {"excluded", plan.Excluded}, {"preferred", plan.Preferred},
-		{"goals", plan.Goals}, {"supporting", plan.SupportingDimensions}, {"alternatives", plan.AcceptableAlternatives},
+		{"required", plan.Required}, {"excluded", plan.Excluded}, {"preferred", plan.Preferred}, {"goals", plan.Goals},
 	}
 	for _, group := range groups {
+		criterionTotal += len(group.criteria)
 		for _, criterion := range group.criteria {
 			if err := validateCriterion(criterion); err != nil {
 				return fmt.Errorf("%s criterion: %w", group.name, err)
@@ -243,6 +277,9 @@ func ValidateQueryPlan(plan QueryPlan) error {
 			}
 		}
 	}
+	if criterionTotal == 0 {
+		return errors.New("plan has no criteria")
+	}
 	return nil
 }
 
@@ -250,10 +287,10 @@ func validateCriterion(criterion Criterion) error {
 	if strings.TrimSpace(criterion.Kind) == "" || strings.TrimSpace(criterion.Value) == "" {
 		return errors.New("kind and value are required")
 	}
-	if criterion.Proof != "" && criterion.Proof != "lexical" && criterion.Proof != "semantic" {
+	if criterion.Proof != "lexical" && criterion.Proof != "semantic" {
 		return errors.New("unsupported proof")
 	}
-	if criterion.Proof != "semantic" && len(criterion.Terms) == 0 {
+	if criterion.Proof == "lexical" && len(criterion.Terms) == 0 {
 		return errors.New("lexical criterion requires terms")
 	}
 	return nil
@@ -261,9 +298,8 @@ func validateCriterion(criterion Criterion) error {
 
 func DecodePlan(response, raw string) (QueryPlan, error) {
 	decoder := json.NewDecoder(strings.NewReader(response))
-	decoder.DisallowUnknownFields()
-	var plan QueryPlan
-	if err := decoder.Decode(&plan); err != nil {
+	var object map[string]json.RawMessage
+	if err := decoder.Decode(&object); err != nil {
 		return QueryPlan{}, err
 	}
 	var extra interface{}
@@ -273,11 +309,163 @@ func DecodePlan(response, raw string) (QueryPlan, error) {
 		}
 		return QueryPlan{}, fmt.Errorf("trailing JSON: %w", err)
 	}
-	plan.RawQuery = raw
+	if object == nil {
+		return QueryPlan{}, errors.New("plan must be a JSON object")
+	}
+	allowed := map[string]struct{}{
+		"raw_query": {}, "required": {}, "excluded": {}, "preferred": {}, "goals": {},
+		"supporting_dimensions": {}, "acceptable_alternatives": {}, "ambiguity": {}, "fallback": {},
+	}
+	for name := range object {
+		if _, ok := allowed[name]; !ok {
+			return QueryPlan{}, fmt.Errorf("unknown plan field %q", name)
+		}
+	}
+	for _, name := range []string{"raw_query", "required", "excluded", "preferred", "goals", "supporting_dimensions", "acceptable_alternatives", "ambiguity", "fallback"} {
+		if _, ok := object[name]; !ok {
+			return QueryPlan{}, fmt.Errorf("missing plan field %q", name)
+		}
+	}
+	var plan QueryPlan
+	var err error
+	if plan.RawQuery, err = decodeJSONString(object["raw_query"], "raw_query"); err != nil {
+		return QueryPlan{}, err
+	}
+	for _, field := range []struct {
+		name string
+		into *[]Criterion
+	}{
+		{"required", &plan.Required}, {"excluded", &plan.Excluded}, {"preferred", &plan.Preferred}, {"goals", &plan.Goals},
+		{"supporting_dimensions", &plan.SupportingDimensions}, {"acceptable_alternatives", &plan.AcceptableAlternatives},
+	} {
+		if *field.into, err = decodeCriteria(object[field.name], field.name); err != nil {
+			return QueryPlan{}, err
+		}
+	}
+	if plan.Ambiguity, err = decodeStringArray(object["ambiguity"], "ambiguity"); err != nil {
+		return QueryPlan{}, err
+	}
+	if plan.Fallback, err = decodeJSONBool(object["fallback"], "fallback"); err != nil {
+		return QueryPlan{}, err
+	}
+	if plan.RawQuery != raw {
+		return QueryPlan{}, errors.New("plan raw query does not match request")
+	}
 	if err := ValidateQueryPlan(plan); err != nil {
 		return QueryPlan{}, err
 	}
 	return plan, nil
+}
+
+func decodeJSONString(raw json.RawMessage, field string) (string, error) {
+	if firstJSONByte(raw) != '"' {
+		return "", fmt.Errorf("%s must be a string", field)
+	}
+	var value string
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return "", fmt.Errorf("%s must be a string: %w", field, err)
+	}
+	return value, nil
+}
+
+func decodeJSONBool(raw json.RawMessage, field string) (bool, error) {
+	first := firstJSONByte(raw)
+	if first != 't' && first != 'f' {
+		return false, fmt.Errorf("%s must be a boolean", field)
+	}
+	var value bool
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return false, fmt.Errorf("%s must be a boolean: %w", field, err)
+	}
+	return value, nil
+}
+
+func decodeStringArray(raw json.RawMessage, field string) ([]string, error) {
+	if firstJSONByte(raw) != '[' {
+		return nil, fmt.Errorf("%s must be an array", field)
+	}
+	var values []json.RawMessage
+	if err := json.Unmarshal(raw, &values); err != nil {
+		return nil, fmt.Errorf("%s must be an array: %w", field, err)
+	}
+	result := make([]string, len(values))
+	for i, value := range values {
+		decoded, err := decodeJSONString(value, fmt.Sprintf("%s[%d]", field, i))
+		if err != nil {
+			return nil, err
+		}
+		result[i] = decoded
+	}
+	return result, nil
+}
+
+func decodeCriteria(raw json.RawMessage, field string) ([]Criterion, error) {
+	if firstJSONByte(raw) != '[' {
+		return nil, fmt.Errorf("%s must be an array", field)
+	}
+	var values []json.RawMessage
+	if err := json.Unmarshal(raw, &values); err != nil {
+		return nil, fmt.Errorf("%s must be an array: %w", field, err)
+	}
+	result := make([]Criterion, len(values))
+	for i, value := range values {
+		if firstJSONByte(value) != '{' {
+			return nil, fmt.Errorf("%s[%d] must be an object", field, i)
+		}
+		var object map[string]json.RawMessage
+		if err := json.Unmarshal(value, &object); err != nil {
+			return nil, fmt.Errorf("%s[%d] must be an object: %w", field, i, err)
+		}
+		for name := range object {
+			if name != "kind" && name != "value" && name != "terms" && name != "proof" {
+				return nil, fmt.Errorf("unknown %s[%d] criterion field %q", field, i, name)
+			}
+		}
+		for _, name := range []string{"kind", "value", "terms", "proof"} {
+			if _, ok := object[name]; !ok {
+				return nil, fmt.Errorf("missing %s[%d] criterion field %q", field, i, name)
+			}
+		}
+		kind, err := decodeJSONString(object["kind"], field+" criterion kind")
+		if err != nil {
+			return nil, err
+		}
+		valueText, err := decodeJSONString(object["value"], field+" criterion value")
+		if err != nil {
+			return nil, err
+		}
+		terms, err := decodeStringArray(object["terms"], field+" criterion terms")
+		if err != nil {
+			return nil, err
+		}
+		proof, err := decodeJSONString(object["proof"], field+" criterion proof")
+		if err != nil {
+			return nil, err
+		}
+		result[i] = Criterion{Kind: kind, Value: valueText, Terms: terms, Proof: proof}
+		if err := validateCriterion(result[i]); err != nil {
+			return nil, fmt.Errorf("%s criterion: %w", field, err)
+		}
+	}
+	return result, nil
+}
+
+func firstJSONByte(raw []byte) byte {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" {
+		return 0
+	}
+	return trimmed[0]
+}
+
+func validateDeterministicFallbackPlan(plan QueryPlan) error {
+	if !plan.Fallback {
+		return errors.New("deterministic fallback must set fallback true")
+	}
+	if len(plan.Required) != 0 || len(plan.Excluded) != 0 || len(plan.Goals) != 0 || len(plan.SupportingDimensions) != 0 || len(plan.AcceptableAlternatives) != 0 || len(plan.Preferred) != 1 {
+		return errors.New("deterministic fallback shape is invalid")
+	}
+	return validateQueryPlan(plan, true)
 }
 
 func queryTerms(value string) []string {
@@ -323,12 +511,13 @@ type CandidateSelector interface {
 }
 
 type Service struct {
-	cache    *cache.Cache
-	expander PlanExpander
-	matcher  EligibilityMatcher
-	selector CandidateSelector
-	seedFor  func(string) int64
-	options  Options
+	cache                      *cache.Cache
+	expander                   PlanExpander
+	matcher                    EligibilityMatcher
+	selector                   CandidateSelector
+	seedFor                    func(string) int64
+	options                    Options
+	allowDeterministicFallback bool
 }
 
 func NewService(expander PlanExpander, matcher EligibilityMatcher, selector CandidateSelector, seedFor func(string) int64) *Service {
@@ -356,23 +545,41 @@ func NewExperimentExecutor(conceptCache *cache.Cache, provider ChatProvider, opt
 	}
 	service := NewServiceWithOptions(NewStructuredPlanExpander(provider, NewDeterministicExpander()), NewLexicalMatcher(nil), NewSelector(), seedFor, options)
 	service.cache = conceptCache
+	service.allowDeterministicFallback = true
 	return service, nil
 }
 
 func (s *Service) Execute(ctx context.Context, reader cache.Reader, request query.Request) (query.Result, error) {
-	result, _, err := s.ExecuteWithTrace(ctx, reader, request)
-	return result, err
+	if err := s.validate(); err != nil {
+		return query.Result{}, err
+	}
+	return s.execute(ctx, reader, request, nil)
 }
 
 func (s *Service) ExecuteWithTrace(ctx context.Context, reader cache.Reader, request query.Request) (query.Result, *Trace, error) {
-	if s == nil || s.cache == nil || s.expander == nil || s.matcher == nil || s.selector == nil {
-		return query.Result{}, nil, errors.New("three-host service is incomplete")
-	}
-	entries, err := s.cache.All(ctx, reader)
-	if err != nil {
-		return query.Result{}, nil, errors.New("three-host corpus unavailable")
+	if err := s.validate(); err != nil {
+		return query.Result{}, nil, err
 	}
 	trace := &Trace{Variant: "three-host-v1"}
+	result, err := s.execute(ctx, reader, request, trace)
+	return result, trace, err
+}
+
+func (s *Service) validate() error {
+	if s == nil || s.cache == nil || s.expander == nil || s.matcher == nil || s.selector == nil {
+		return errors.New("three-host service is incomplete")
+	}
+	return nil
+}
+
+func (s *Service) execute(ctx context.Context, reader cache.Reader, request query.Request, trace *Trace) (query.Result, error) {
+	entries, err := s.cache.All(ctx, reader)
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return query.Result{}, err
+		}
+		return query.Result{}, fmt.Errorf("three-host corpus unavailable: %w", err)
+	}
 	started := time.Now()
 	var plan QueryPlan
 	info := ExpansionInfo{}
@@ -382,17 +589,21 @@ func (s *Service) ExecuteWithTrace(ctx context.Context, reader cache.Reader, req
 		plan, err = s.expander.ExpandPlan(ctx, request.Query, DefaultCriterionPolicy, entries)
 	}
 	if err != nil {
-		trace.Stages = append(trace.Stages, StageTrace{Name: "expansion", Outcome: "failure", ElapsedMS: elapsedSince(started), FallbackReason: "expansion_failure"})
-		return query.Result{}, trace, err
+		appendTraceStage(trace, StageTrace{Name: "expansion", Outcome: "failure", ElapsedMS: elapsedSince(started), FallbackReason: "expansion_failure"})
+		return query.Result{}, err
 	}
 	if strings.TrimSpace(plan.RawQuery) == "" {
 		plan.RawQuery = request.Query
 	}
-	if err := ValidateQueryPlan(plan); err != nil {
-		trace.Stages = append(trace.Stages, StageTrace{Name: "expansion", Outcome: "invalid", ElapsedMS: elapsedSince(started), FallbackReason: "invalid_plan"})
-		return query.Result{}, trace, errors.New("three-host expansion invalid")
+	validate := ValidateQueryPlan
+	if plan.Fallback && s.allowDeterministicFallback {
+		validate = validateDeterministicFallbackPlan
 	}
-	trace.Stages = append(trace.Stages, StageTrace{
+	if err := validate(plan); err != nil {
+		appendTraceStage(trace, StageTrace{Name: "expansion", Outcome: "invalid", ElapsedMS: elapsedSince(started), FallbackReason: "invalid_plan"})
+		return query.Result{}, errors.New("three-host expansion invalid")
+	}
+	appendTraceStage(trace, StageTrace{
 		Name: "expansion", Outcome: PlanOutcome(plan), Source: info.Source, FallbackReason: info.FallbackReason,
 		ElapsedMS: elapsedSince(started), InputCount: 1, OutputCount: CriterionCount(plan), Plan: &plan,
 	})
@@ -403,30 +614,75 @@ func (s *Service) ExecuteWithTrace(ctx context.Context, reader cache.Reader, req
 	} else if s.seedFor != nil {
 		seed = s.seedFor(request.Query)
 	}
-	trace.Seed = seed
+	if trace != nil {
+		trace.Seed = seed
+	}
 
 	started = time.Now()
 	eligible, err := s.matcher.Match(ctx, plan, entries)
 	if err != nil {
-		trace.Stages = append(trace.Stages, StageTrace{Name: "matching", Outcome: "failure", ElapsedMS: elapsedSince(started), InputCount: len(entries)})
-		return query.Result{}, trace, errors.New("three-host matching failed")
+		appendTraceStage(trace, StageTrace{Name: "matching", Outcome: "failure", ElapsedMS: elapsedSince(started), InputCount: len(entries)})
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return query.Result{}, ctxErr
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return query.Result{}, err
+		}
+		return query.Result{}, fmt.Errorf("three-host matching failed: %w", err)
 	}
-	trace.Stages = append(trace.Stages, StageTrace{Name: "matching", Outcome: "success", ElapsedMS: elapsedSince(started), InputCount: len(entries), OutputCount: EligibleCount(eligible.Candidates), TotalCount: len(eligible.Candidates), Candidates: eligible.Candidates})
+	appendTraceStage(trace, StageTrace{Name: "matching", Outcome: "success", ElapsedMS: elapsedSince(started), InputCount: len(entries), OutputCount: EligibleCount(eligible.Candidates), TotalCount: len(eligible.Candidates), Candidates: eligible.Candidates})
 
 	started = time.Now()
 	selected, err := s.selector.Select(ctx, SelectionInput{Candidates: eligible.Candidates, Limit: s.options.SelectionLimit, ExplorationSlots: s.options.ExplorationSlots, Seed: seed})
 	if err != nil {
-		trace.Stages = append(trace.Stages, StageTrace{Name: "selection", Outcome: "failure", ElapsedMS: elapsedSince(started), InputCount: len(eligible.Candidates)})
-		return query.Result{}, trace, errors.New("three-host selection failed")
+		appendTraceStage(trace, StageTrace{Name: "selection", Outcome: "failure", ElapsedMS: elapsedSince(started), InputCount: len(eligible.Candidates)})
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return query.Result{}, ctxErr
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return query.Result{}, err
+		}
+		return query.Result{}, fmt.Errorf("three-host selection failed: %w", err)
 	}
-	trace.Stages = append(trace.Stages, StageTrace{Name: "selection", Outcome: "success", ElapsedMS: elapsedSince(started), InputCount: len(eligible.Candidates), OutputCount: selectedCount(selected.Selected), TotalCount: len(selected.Selected), Decisions: selected.Selected})
+	appendTraceStage(trace, StageTrace{Name: "selection", Outcome: "success", ElapsedMS: elapsedSince(started), InputCount: len(eligible.Candidates), OutputCount: selectedCount(selected.Selected), TotalCount: len(selected.Selected), Decisions: selected.Selected})
 	results := make([]search.Result, 0, len(selected.Selected))
 	for _, candidate := range selected.Selected {
+		if err := ctx.Err(); err != nil {
+			return query.Result{}, err
+		}
 		if candidate.Selected {
 			results = append(results, search.Result{Slug: candidate.Slug, Title: candidate.Title, Type: "concept"})
 		}
 	}
-	return query.Result{Query: request.Query, Mode: request.Mode, Results: results}, trace, nil
+	return query.Result{Query: request.Query, Mode: request.Mode, Results: results, Expand: expandFromPlan(plan)}, nil
+}
+
+func appendTraceStage(trace *Trace, stage StageTrace) {
+	if trace != nil {
+		trace.Stages = append(trace.Stages, stage)
+	}
+}
+
+func expandFromPlan(plan QueryPlan) *llm.ExpandResult {
+	keywords := make([]string, 0)
+	seen := make(map[string]struct{})
+	for _, criteria := range [][]Criterion{plan.Required, plan.Excluded, plan.Preferred, plan.Goals, plan.SupportingDimensions, plan.AcceptableAlternatives} {
+		for _, criterion := range criteria {
+			for _, term := range criterion.Terms {
+				term = strings.TrimSpace(term)
+				key := strings.ToLower(term)
+				if term == "" {
+					continue
+				}
+				if _, ok := seen[key]; ok {
+					continue
+				}
+				seen[key] = struct{}{}
+				keywords = append(keywords, term)
+			}
+		}
+	}
+	return &llm.ExpandResult{Keywords: keywords}
 }
 
 type Trace struct {
@@ -503,7 +759,7 @@ func (deterministicExpander) ExpandPlan(_ context.Context, raw string, _ Criteri
 		return QueryPlan{}, errors.New("empty query")
 	}
 	plan := QueryPlan{RawQuery: raw, Fallback: true, Preferred: []Criterion{{Kind: "query", Value: query, Terms: queryTerms(query), Proof: "lexical"}}}
-	return plan, ValidateQueryPlan(plan)
+	return plan, validateDeterministicFallbackPlan(plan)
 }
 
 type SemanticDecision struct{ Outcome string }
@@ -521,6 +777,9 @@ func NewLexicalMatcher(semantic SemanticEvaluator) EligibilityMatcher {
 func (m lexicalMatcher) Match(ctx context.Context, plan QueryPlan, entries []cache.Entry) (EligibilityResult, error) {
 	candidates := make([]CandidateEvidence, 0, len(entries))
 	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			return EligibilityResult{}, err
+		}
 		candidate := CandidateEvidence{Slug: entry.Slug, Title: entry.Title, Eligible: true}
 		fields := searchableFields(entry)
 		for _, role := range []struct {
@@ -531,6 +790,9 @@ func (m lexicalMatcher) Match(ctx context.Context, plan QueryPlan, entries []cac
 			{"required", plan.Required, semanticRequiredFailClosed}, {"excluded", plan.Excluded, semanticExcludedFailClosed},
 			{"preferred", plan.Preferred, false}, {"goal", plan.Goals, false}, {"supporting", plan.SupportingDimensions, false}, {"alternative", plan.AcceptableAlternatives, false},
 		} {
+			if err := ctx.Err(); err != nil {
+				return EligibilityResult{}, err
+			}
 			groups, err := matchRole(ctx, role.name, role.criteria, fields, entry, m.semantic)
 			if err != nil {
 				return EligibilityResult{}, err
@@ -540,13 +802,17 @@ func (m lexicalMatcher) Match(ctx context.Context, plan QueryPlan, entries []cac
 				if group.SemanticOutcome == "unavailable" || group.SemanticOutcome == "unknown" {
 					candidate.SemanticOutcome = group.SemanticOutcome
 				}
-				if group.SemanticOutcome != "" && group.SemanticOutcome != "pass" && role.failClosed {
+				if role.name == "required" && group.SemanticOutcome != "" && group.SemanticOutcome != "pass" && role.failClosed {
 					candidate.Eligible = false
-					candidate.Rejection = "semantic_" + role.name + "_unavailable"
+					candidate.Rejection = "semantic_required_not_satisfied"
 				}
 				if role.name == "excluded" && group.SemanticOutcome == "pass" {
 					candidate.Eligible = false
 					candidate.Rejection = "excluded_criterion_matched"
+				}
+				if role.name == "excluded" && (group.SemanticOutcome == "unknown" || group.SemanticOutcome == "unavailable") {
+					candidate.Eligible = false
+					candidate.Rejection = "semantic_excluded_unavailable"
 				}
 			}
 		}
@@ -570,6 +836,9 @@ func (m lexicalMatcher) Match(ctx context.Context, plan QueryPlan, entries []cac
 func matchRole(ctx context.Context, role string, criteria []Criterion, fields map[string]string, entry cache.Entry, evaluator SemanticEvaluator) ([]GroupEvidence, error) {
 	groups := make([]GroupEvidence, 0, len(criteria))
 	for _, criterion := range criteria {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if criterion.Proof == "semantic" {
 			outcome := "unavailable"
 			if evaluator != nil {
@@ -582,7 +851,11 @@ func matchRole(ctx context.Context, role string, criteria []Criterion, fields ma
 			groups = append(groups, GroupEvidence{Role: role, Kind: criterion.Kind, Value: criterion.Value, SemanticOutcome: outcome})
 			continue
 		}
-		groups = append(groups, matchGroupsForRole([]Criterion{criterion}, role, fields)...)
+		matched, err := matchGroupsForRole(ctx, []Criterion{criterion}, role, fields)
+		if err != nil {
+			return nil, err
+		}
+		groups = append(groups, matched...)
 	}
 	return groups, nil
 }
@@ -602,20 +875,30 @@ func searchableFields(entry cache.Entry) map[string]string {
 }
 
 func matchGroups(criteria []Criterion, fields map[string]string) []GroupEvidence {
-	return matchGroupsForRole(criteria, "", fields)
+	groups, _ := matchGroupsForRole(context.Background(), criteria, "", fields)
+	return groups
 }
 
-func matchGroupsForRole(criteria []Criterion, role string, fields map[string]string) []GroupEvidence {
+func matchGroupsForRole(ctx context.Context, criteria []Criterion, role string, fields map[string]string) ([]GroupEvidence, error) {
 	groups := make([]GroupEvidence, 0, len(criteria))
 	for _, criterion := range criteria {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if criterion.Proof == "semantic" {
 			groups = append(groups, GroupEvidence{Role: role, Kind: criterion.Kind, Value: criterion.Value, SemanticOutcome: "unavailable"})
 			continue
 		}
 		group := GroupEvidence{Role: role, Kind: criterion.Kind, Value: criterion.Value}
 		for field, value := range fields {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			matched := make([]string, 0)
 			for _, term := range criterion.Terms {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
 				if strings.Contains(strings.ToLower(value), strings.ToLower(term)) && !ContainsString(matched, term) {
 					matched = append(matched, term)
 				}
@@ -628,7 +911,7 @@ func matchGroupsForRole(criteria []Criterion, role string, fields map[string]str
 			groups = append(groups, group)
 		}
 	}
-	return groups
+	return groups, nil
 }
 
 func hasMatchedGroup(groups []GroupEvidence, criterion Criterion) bool {
@@ -676,7 +959,10 @@ type randomSelector struct{}
 
 func NewSelector() CandidateSelector { return randomSelector{} }
 
-func (randomSelector) Select(_ context.Context, input SelectionInput) (SelectionResult, error) {
+func (randomSelector) Select(ctx context.Context, input SelectionInput) (SelectionResult, error) {
+	if err := ctx.Err(); err != nil {
+		return SelectionResult{}, err
+	}
 	limit := input.Limit
 	if limit <= 0 {
 		limit = DefaultSelectionLimit
@@ -690,24 +976,41 @@ func (randomSelector) Select(_ context.Context, input SelectionInput) (Selection
 	}
 	eligible := make([]CandidateEvidence, 0, len(input.Candidates))
 	for _, candidate := range input.Candidates {
+		if err := ctx.Err(); err != nil {
+			return SelectionResult{}, err
+		}
 		if candidate.Eligible {
 			eligible = append(eligible, candidate)
 		}
 	}
+	sortCanceled := false
 	sort.SliceStable(eligible, func(i, j int) bool {
+		if ctx.Err() != nil {
+			sortCanceled = true
+			return false
+		}
 		if eligible[i].Score != eligible[j].Score {
 			return eligible[i].Score > eligible[j].Score
 		}
 		return eligible[i].Slug < eligible[j].Slug
 	})
+	if sortCanceled {
+		return SelectionResult{}, ctx.Err()
+	}
 	selected := make(map[string]SelectedCandidate)
 	if len(eligible) <= limit {
 		for _, candidate := range eligible {
+			if err := ctx.Err(); err != nil {
+				return SelectionResult{}, err
+			}
 			selected[candidate.Slug] = selectionDecision(candidate, true, "selected", false)
 		}
 	} else {
 		exploitCount := limit - slots
 		for _, candidate := range eligible[:exploitCount] {
+			if err := ctx.Err(); err != nil {
+				return SelectionResult{}, err
+			}
 			selected[candidate.Slug] = selectionDecision(candidate, true, "selected", false)
 		}
 		remaining := eligible[exploitCount:]
@@ -719,6 +1022,9 @@ func (randomSelector) Select(_ context.Context, input SelectionInput) (Selection
 	}
 	decisions := make([]SelectedCandidate, 0, len(input.Candidates))
 	for _, candidate := range input.Candidates {
+		if err := ctx.Err(); err != nil {
+			return SelectionResult{}, err
+		}
 		if decision, ok := selected[candidate.Slug]; ok {
 			decisions = append(decisions, decision)
 			continue

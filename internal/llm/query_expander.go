@@ -72,7 +72,7 @@ func (e *QueryExpander) Expand(ctx context.Context, query string) (*ExpandResult
 
 	result, err := parseExpandResult(raw)
 	if err != nil {
-		log.Printf("[expander] parse failed for query %q: %v", query, err)
+		log.Printf("[expander] parse failed: %v", err)
 		return nil, fmt.Errorf("expander: parse: %w", err)
 	}
 

@@ -31,7 +31,7 @@ func NewProductionExecutor(conceptCache *cache.Cache, provider ChatProvider, leg
 }
 
 func (e *ProductionExecutor) Execute(ctx context.Context, reader cache.Reader, request query.Request) (query.Result, error) {
-	result, _, err := e.retriever.ExecuteWithTrace(ctx, reader, request)
+	result, err := e.retriever.Execute(ctx, reader, request)
 	if err != nil {
 		var expansionErr *ExpansionError
 		if errors.As(err, &expansionErr) && ctx.Err() == nil {

@@ -6,6 +6,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -163,22 +164,21 @@ func main() {
 }
 
 func newProductionQueryExecutor(cfg config.Config, conceptCache *conceptcache.Cache) (query.Executor, error) {
-	synthesisClient := llm.NewClient(cfg.DeepSeekAPIKey)
-	expansionModel := cfg.QueryExpansionModel
-	if expansionModel == "" {
-		expansionModel = config.DefaultQueryExpansionModel
+	if cfg.QueryExpansionModel != "" && cfg.QueryExpansionModel != config.DefaultQueryExpansionModel {
+		return nil, fmt.Errorf("query expansion model must be %s", config.DefaultQueryExpansionModel)
 	}
+	synthesisClient := llm.NewClient(cfg.DeepSeekAPIKey)
 	temperature := 0.0
-	expansionClient := llm.NewClientWithOptions(cfg.DeepSeekAPIKey, llm.ClientOptions{Model: expansionModel, Temperature: &temperature})
+	expansionClient := llm.NewClientWithOptions(cfg.DeepSeekAPIKey, llm.ClientOptions{Model: config.DefaultQueryExpansionModel, Temperature: &temperature})
 	var expansionProvider queryquality.ChatProvider
 	if expansionClient != nil {
 		expansionProvider = expansionClient
 	}
-	expander, err := llm.NewExpander(expansionClient, "lifestyle")
+	legacyExpander, err := llm.NewExpander(llm.NewClient(cfg.DeepSeekAPIKey), "lifestyle")
 	if err != nil {
 		return nil, err
 	}
-	legacy := query.NewService(conceptCache, expander, synthesisClient)
+	legacy := query.NewService(conceptCache, legacyExpander, synthesisClient)
 	return queryquality.NewProductionExecutor(conceptCache, expansionProvider, legacy, legacy, queryquality.DefaultOptions())
 }
 

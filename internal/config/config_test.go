@@ -8,12 +8,20 @@ import (
 )
 
 func TestLoadDefaultsQueryExpansionModel(t *testing.T) {
+	t.Setenv("QUERY_EXPANSION_MODEL", "")
 	cfg, err := Load(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
 	if cfg.QueryExpansionModel != "deepseek-v4-pro" {
 		t.Fatalf("QueryExpansionModel = %q, want deepseek-v4-pro", cfg.QueryExpansionModel)
+	}
+}
+
+func TestLoadRejectsNonBaselineQueryExpansionModel(t *testing.T) {
+	t.Setenv("QUERY_EXPANSION_MODEL", "deepseek-chat")
+	if _, err := Load(t.TempDir()); err == nil {
+		t.Fatal("Load() error = nil, want fixed baseline rejection")
 	}
 }
 

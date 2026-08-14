@@ -56,7 +56,7 @@ func (s *Service) Execute(ctx context.Context, reader cache.Reader, request Requ
 
 	if s.expander != nil {
 		if result, err := s.expander.Expand(ctx, request.Query); err != nil {
-			log.Printf("[expander] query expansion failed for %q: %v — falling back to raw query", request.Query, err)
+			log.Printf("[expander] query expansion failed: %v — falling back to raw query", err)
 		} else if result != nil {
 			expandResult = result
 			searchQuery = strings.Join(result.Keywords, " ")

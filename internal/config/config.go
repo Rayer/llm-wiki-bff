@@ -138,6 +138,9 @@ func Load(path string) (Config, error) {
 	if queryExpansionModel == "" {
 		queryExpansionModel = DefaultQueryExpansionModel
 	}
+	if queryExpansionModel != DefaultQueryExpansionModel {
+		return Config{}, fmt.Errorf("query_expansion_model must be %s", DefaultQueryExpansionModel)
+	}
 
 	cfg := Config{
 		GCPProject:              v.GetString("gcp_project"),

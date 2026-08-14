@@ -299,6 +299,36 @@ func TestServiceExpansionFailureFallsBackToRawQuery(t *testing.T) {
 	}
 }
 
+func TestServiceExpansionFailureLogOmitsRawQuery(t *testing.T) {
+	marker := "sensitive-query-marker-268"
+	baseTransport := http.DefaultTransport
+	http.DefaultTransport = roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return testHTTPResponse(http.StatusOK, `invalid`), nil
+	})
+	t.Cleanup(func() { http.DefaultTransport = baseTransport })
+	expander, err := llm.NewExpander(llm.NewClient("test"), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, reader := serviceFixture(t, `{"slug":"coffee","title":"Coffee","body":"coffee"}`+"\n")
+	service.expander = expander
+	previousWriter := log.Writer()
+	previousFlags := log.Flags()
+	var output strings.Builder
+	log.SetFlags(0)
+	log.SetOutput(&output)
+	t.Cleanup(func() {
+		log.SetOutput(previousWriter)
+		log.SetFlags(previousFlags)
+	})
+	if _, err := service.Execute(context.Background(), reader, Request{Query: marker, Mode: "wiki"}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(output.String(), marker) {
+		t.Fatalf("log leaked raw query: %q", output.String())
+	}
+}
+
 func TestServiceSearchFailurePropagatesError(t *testing.T) {
 	service := NewService(cache.New(), nil, nil)
 	_, err := service.Execute(context.Background(), &queryServiceFailReader{

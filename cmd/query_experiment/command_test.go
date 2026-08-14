@@ -92,13 +92,13 @@ func TestSemanticEvaluatorIsExplicitAndStillNeverScores(t *testing.T) {
 }
 
 func TestStructuredExpansionUsesOneCallAndSimpleFallback(t *testing.T) {
-	provider := &recordingChatProvider{responses: []string{`{"preferred":[{"kind":"topic","value":"coffee","terms":["coffee"]}]}`}}
+	provider := &recordingChatProvider{responses: []string{`{"raw_query":"coffee","required":[],"excluded":[],"preferred":[{"kind":"topic","value":"coffee","terms":["coffee"],"proof":"lexical"}],"goals":[],"supporting_dimensions":[],"acceptable_alternatives":[],"ambiguity":[],"fallback":false}`}}
 	expander := newStructuredPlanExpander(provider, newDeterministicExpander()).(structuredPlanExpander)
 	plan, info, err := expander.ExpandPlanWithTrace(context.Background(), "coffee", defaultCriterionPolicy, []cache.Entry{{Slug: "espresso", Title: "Espresso Guide"}})
 	if err != nil || plan.Fallback || info.source != "structured-llm" || len(provider.prompts) != 1 {
 		t.Fatalf("plan=%#v info=%#v calls=%d err=%v", plan, info, len(provider.prompts), err)
 	}
-	for _, response := range []string{`{"unknown":1}`, `{"preferred":[{"kind":"topic","value":"coffee","terms":["coffee"]}]} {}`} {
+	for _, response := range []string{`{"unknown":1}`, `{"raw_query":"coffee","required":[],"excluded":[],"preferred":[{"kind":"topic","value":"coffee","terms":["coffee"],"proof":"lexical"}],"goals":[],"supporting_dimensions":[],"acceptable_alternatives":[],"ambiguity":[],"fallback":false} {}`} {
 		provider := fixedChatProvider{response: response}
 		plan, info, err := newStructuredPlanExpander(provider, newDeterministicExpander()).(structuredPlanExpander).ExpandPlanWithTrace(context.Background(), "coffee", defaultCriterionPolicy, nil)
 		if err != nil || !plan.Fallback || info.source != "deterministic-fallback" || info.fallbackReason != "invalid_plan" {
@@ -162,7 +162,7 @@ func TestThreeHostServicePassesKnobsCausallyInOrderedStages(t *testing.T) {
 	var order []string
 	expander := fakePlanExpander{run: func() (QueryPlan, error) {
 		order = append(order, "expansion")
-		return QueryPlan{Preferred: []Criterion{{Kind: "topic", Value: "coffee", Terms: []string{"coffee"}}}}, nil
+		return QueryPlan{RawQuery: "coffee", Preferred: []Criterion{{Kind: "topic", Value: "coffee", Terms: []string{"coffee"}, Proof: "lexical"}}}, nil
 	}}
 	matcher := fakeMatcher{run: func(plan QueryPlan) (EligibilityResult, error) {
 		order = append(order, "matching")
