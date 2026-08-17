@@ -13,8 +13,11 @@ func TestLoadDefaultsQueryExpansionModel(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.QueryExpansionModel != "deepseek-v4-pro" {
-		t.Fatalf("QueryExpansionModel = %q, want deepseek-v4-pro", cfg.QueryExpansionModel)
+	if cfg.QueryExpansionModel != "deepseek-v4-flash" || cfg.QueryExpansionReasoning != "none" {
+		t.Fatalf("expansion config = %#v, want flash/none", cfg)
+	}
+	if cfg.AnswerSynthesisModel != "deepseek-v4-pro" || cfg.AnswerSynthesisReasoning != "none" {
+		t.Fatalf("synthesis config = %#v, want pro/none", cfg)
 	}
 }
 
@@ -22,6 +25,18 @@ func TestLoadRejectsNonBaselineQueryExpansionModel(t *testing.T) {
 	t.Setenv("QUERY_EXPANSION_MODEL", "deepseek-chat")
 	if _, err := Load(t.TempDir()); err == nil {
 		t.Fatal("Load() error = nil, want fixed baseline rejection")
+	}
+}
+
+func TestLoadRejectsEnabledExpansionAndInvalidSynthesisReasoning(t *testing.T) {
+	t.Setenv("QUERY_EXPANSION_REASONING", "low")
+	if _, err := Load(t.TempDir()); err == nil {
+		t.Fatal("Load() accepted enabled expansion reasoning")
+	}
+	t.Setenv("QUERY_EXPANSION_REASONING", "none")
+	t.Setenv("ANSWER_SYNTHESIS_REASONING", "medium")
+	if _, err := Load(t.TempDir()); err == nil {
+		t.Fatal("Load() accepted invalid synthesis reasoning")
 	}
 }
 

@@ -97,14 +97,17 @@ func TestProductionInvalidStructuredPlanUsesChatLegacyExpansion(t *testing.T) {
 	if len(result.Results) != 1 || result.Results[0].Slug != "coffee" {
 		t.Fatalf("result = %#v", result.Results)
 	}
-	if len(transport.requests) < 2 {
-		t.Fatalf("HTTP calls = %d, want structured plus legacy expansion", len(transport.requests))
+	if len(transport.requests) != 2 {
+		t.Fatalf("HTTP calls = %d, want expansion plus synthesis", len(transport.requests))
 	}
-	if transport.requests[0].Model != "deepseek-v4-pro" || transport.requests[0].Temperature == nil || *transport.requests[0].Temperature != 0 {
+	if transport.requests[0].Model != "deepseek-v4-flash" || transport.requests[0].Temperature == nil || *transport.requests[0].Temperature != 0 {
 		t.Fatalf("structured request = %#v", transport.requests[0])
 	}
-	if transport.requests[1].Model != "deepseek-chat" || transport.requests[1].Temperature != nil {
-		t.Fatalf("legacy request = %#v", transport.requests[1])
+	if transport.requests[1].Model != "deepseek-v4-pro" {
+		t.Fatalf("synthesis request = %#v", transport.requests[1])
+	}
+	if string(transport.requests[0].Thinking) != `{"type":"disabled"}` || transport.requests[0].ReasoningEffort != "" || string(transport.requests[1].Thinking) != `{"type":"disabled"}` || transport.requests[1].ReasoningEffort != "" {
+		t.Fatalf("thinking policies = %#v, want explicit disabled for both defaults", transport.requests)
 	}
 }
 
@@ -157,8 +160,10 @@ func (t productionCancellationTransport) RoundTrip(req *http.Request) (*http.Res
 }
 
 type productionRequest struct {
-	Model       string   `json:"model"`
-	Temperature *float64 `json:"temperature"`
+	Model           string          `json:"model"`
+	Temperature     *float64        `json:"temperature"`
+	Thinking        json.RawMessage `json:"thinking"`
+	ReasoningEffort string          `json:"reasoning_effort"`
 }
 
 type productionFallbackTransport struct{ requests []productionRequest }

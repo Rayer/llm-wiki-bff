@@ -665,8 +665,13 @@ func TestBFFDevWorkflowAllowsBothMigrationOrigins(t *testing.T) {
 
 func TestBFFDevWorkflowSetsExpansionModelWithoutChangingSecretBinding(t *testing.T) {
 	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
-	if !strings.Contains(contents, "QUERY_EXPANSION_MODEL: deepseek-v4-pro") {
+	if !strings.Contains(contents, "QUERY_EXPANSION_MODEL: deepseek-v4-flash") {
 		t.Fatal("BFF DEV workflow must set the platform-owned expansion model")
+	}
+	for _, want := range []string{"QUERY_EXPANSION_REASONING: none", "ANSWER_SYNTHESIS_MODEL: deepseek-v4-pro", "ANSWER_SYNTHESIS_REASONING: none", "@QUERY_EXPANSION_REASONING=${{ env.QUERY_EXPANSION_REASONING }}", "@ANSWER_SYNTHESIS_MODEL=${{ env.ANSWER_SYNTHESIS_MODEL }}", "@ANSWER_SYNTHESIS_REASONING=${{ env.ANSWER_SYNTHESIS_REASONING }}"} {
+		if !strings.Contains(contents, want) {
+			t.Fatalf("BFF DEV workflow missing %q", want)
+		}
 	}
 	if !strings.Contains(contents, "@QUERY_EXPANSION_MODEL=${{ env.QUERY_EXPANSION_MODEL }}") {
 		t.Fatal("BFF DEV deploy must pass the non-secret expansion model config")

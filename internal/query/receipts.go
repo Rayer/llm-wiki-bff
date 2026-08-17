@@ -1,0 +1,122 @@
+package query
+
+import (
+	"context"
+	"encoding/json"
+	"log"
+	"sync"
+	"time"
+
+	"github.com/rayer/llm-wiki-bff/internal/llm"
+)
+
+type Receipt struct {
+	QueryReceivedAt time.Time         `json:"query_received_at"`
+	RunStartedAt    time.Time         `json:"run_started_at"`
+	RunFinishedAt   time.Time         `json:"run_finished_at"`
+	ElapsedMS       int64             `json:"elapsed_ms"`
+	Stages          []StageReceipt    `json:"stages"`
+	HostCalls       []HostCallReceipt `json:"host_calls"`
+	runStartedMono  time.Time
+}
+type StageReceipt struct {
+	Name        string    `json:"name"`
+	StartedAt   time.Time `json:"started_at"`
+	FinishedAt  time.Time `json:"finished_at"`
+	ElapsedMS   int64     `json:"elapsed_ms"`
+	Provider    string    `json:"provider,omitempty"`
+	Model       string    `json:"model,omitempty"`
+	Reasoning   string    `json:"reasoning,omitempty"`
+	Outcome     string    `json:"outcome"`
+	startedMono time.Time
+}
+type HostCallReceipt struct {
+	Sequence    int       `json:"sequence"`
+	Stage       string    `json:"stage"`
+	Scheme      string    `json:"scheme"`
+	Host        string    `json:"host"`
+	StartedAt   time.Time `json:"started_at"`
+	FinishedAt  time.Time `json:"finished_at"`
+	ElapsedMS   int64     `json:"elapsed_ms"`
+	Provider    string    `json:"provider"`
+	Model       string    `json:"model"`
+	Reasoning   string    `json:"reasoning"`
+	Outcome     string    `json:"outcome"`
+	startedMono time.Time
+}
+
+type receiptKey struct{}
+type stageContextKey struct{}
+type ReceiptRecorder struct {
+	mu         sync.Mutex
+	receipt    Receipt
+	stageIndex map[string]int
+	callSeq    int
+}
+
+func WithReceipt(ctx context.Context) (context.Context, *ReceiptRecorder) {
+	now := time.Now()
+	r := &ReceiptRecorder{stageIndex: make(map[string]int), receipt: Receipt{QueryReceivedAt: now, RunStartedAt: now}}
+	r.receipt.runStartedMono = now
+	return context.WithValue(llm.WithCallRecorder(ctx, r), receiptKey{}, r), r
+}
+func ReceiptRecorderFromContext(ctx context.Context) *ReceiptRecorder {
+	r, _ := ctx.Value(receiptKey{}).(*ReceiptRecorder)
+	return r
+}
+func (r *ReceiptRecorder) StartStage(ctx context.Context, name, provider, model, reasoning string) context.Context {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	now := time.Now()
+	r.receipt.Stages = append(r.receipt.Stages, StageReceipt{Name: name, StartedAt: now.UTC(), startedMono: now, Provider: provider, Model: model, Reasoning: reasoning})
+	return context.WithValue(llm.WithCallStage(ctx, name), stageContextKey{}, stageKey{name: name, index: len(r.receipt.Stages) - 1})
+}
+
+type stageKey struct {
+	name  string
+	index int
+}
+
+func FinishStage(ctx context.Context, outcome string) {
+	r, ok := ctx.Value(receiptKey{}).(*ReceiptRecorder)
+	if !ok {
+		return
+	}
+	key, ok := ctx.Value(stageContextKey{}).(stageKey)
+	if !ok {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	s := &r.receipt.Stages[key.index]
+	now := time.Now()
+	s.FinishedAt = now.UTC()
+	s.ElapsedMS = now.Sub(s.startedMono).Milliseconds()
+	s.Outcome = outcome
+}
+func (r *ReceiptRecorder) StartCall(stageName, model, reasoning string) func(string) {
+	r.mu.Lock()
+	r.callSeq++
+	seq := r.callSeq
+	started := time.Now()
+	r.mu.Unlock()
+	return func(outcome string) {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		finished := time.Now()
+		r.receipt.HostCalls = append(r.receipt.HostCalls, HostCallReceipt{Sequence: seq, Stage: stageName, Scheme: "https", Host: "api.deepseek.com", StartedAt: started.UTC(), FinishedAt: finished.UTC(), startedMono: started, ElapsedMS: finished.Sub(started).Milliseconds(), Provider: "deepseek", Model: model, Reasoning: reasoning, Outcome: outcome})
+	}
+}
+func FinishReceipt(r *ReceiptRecorder) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	now := time.Now()
+	r.receipt.RunFinishedAt = now.UTC()
+	r.receipt.ElapsedMS = now.Sub(r.receipt.runStartedMono).Milliseconds()
+	data, _ := json.Marshal(r.receipt)
+	log.Printf("query receipt: %s", data)
+}
+func (r *ReceiptRecorder) Receipt() Receipt { r.mu.Lock(); defer r.mu.Unlock(); return r.receipt }

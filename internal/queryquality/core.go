@@ -639,12 +639,17 @@ func (s *QueryRetrievalPipeline) execute(ctx context.Context, reader cache.Reade
 	var plan QueryPlan
 	info := ExpansionInfo{}
 	requestWithPolicy := ExpansionRequest{Query: request.Query, CriterionPolicy: DefaultCriterionPolicy}
+	stageCtx := ctx
+	if recorder := query.ReceiptRecorderFromContext(ctx); recorder != nil {
+		stageCtx = recorder.StartStage(ctx, "query_expansion", "deepseek", "deepseek-v4-flash", "none")
+	}
 	if traced, ok := s.queryExpander.(TracedQueryExpander); ok {
-		plan, info, err = traced.ExpandWithTrace(ctx, requestWithPolicy)
+		plan, info, err = traced.ExpandWithTrace(stageCtx, requestWithPolicy)
 	} else {
-		plan, err = s.queryExpander.Expand(ctx, requestWithPolicy)
+		plan, err = s.queryExpander.Expand(stageCtx, requestWithPolicy)
 	}
 	if err != nil {
+		query.FinishStage(stageCtx, "failure")
 		appendTraceStage(trace, StageTrace{Name: "expansion", Outcome: "failure", ElapsedMS: elapsedSince(started), FallbackReason: "expansion_failure"})
 		return query.Result{}, err
 	}
@@ -656,6 +661,7 @@ func (s *QueryRetrievalPipeline) execute(ctx context.Context, reader cache.Reade
 		validate = validateDeterministicFallbackPlan
 	}
 	if err := validate(plan); err != nil {
+		query.FinishStage(stageCtx, "failure")
 		appendTraceStage(trace, StageTrace{Name: "expansion", Outcome: "invalid", ElapsedMS: elapsedSince(started), FallbackReason: "invalid_plan"})
 		return query.Result{}, errors.New("query-retrieval expansion invalid")
 	}
@@ -663,6 +669,7 @@ func (s *QueryRetrievalPipeline) execute(ctx context.Context, reader cache.Reade
 		Name: "expansion", Outcome: PlanOutcome(plan), Source: info.Source, FallbackReason: info.FallbackReason,
 		ElapsedMS: elapsedSince(started), InputCount: 1, OutputCount: CriterionCount(plan), Plan: &plan,
 	})
+	query.FinishStage(stageCtx, map[bool]string{true: "fallback", false: "success"}[plan.Fallback])
 
 	seed := ReproducibleSeed(request.Query)
 	if s.options.Seed != nil {
@@ -675,9 +682,14 @@ func (s *QueryRetrievalPipeline) execute(ctx context.Context, reader cache.Reade
 	}
 
 	started = time.Now()
+	matchCtx := ctx
+	if recorder := query.ReceiptRecorderFromContext(ctx); recorder != nil {
+		matchCtx = recorder.StartStage(ctx, "candidate_matching", "", "", "")
+	}
 	matchReq := MatchRequest{Plan: plan, CorpusEntries: entries}
-	eligible, err := s.candidateMatcher.Match(ctx, matchReq)
+	eligible, err := s.candidateMatcher.Match(matchCtx, matchReq)
 	if err != nil {
+		query.FinishStage(matchCtx, "failure")
 		appendTraceStage(trace, StageTrace{Name: "matching", Outcome: "failure", ElapsedMS: elapsedSince(started), InputCount: len(entries)})
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return query.Result{}, ctxErr
@@ -688,10 +700,16 @@ func (s *QueryRetrievalPipeline) execute(ctx context.Context, reader cache.Reade
 		return query.Result{}, fmt.Errorf("query-retrieval matching failed: %w", err)
 	}
 	appendTraceStage(trace, StageTrace{Name: "matching", Outcome: "success", ElapsedMS: elapsedSince(started), InputCount: len(entries), OutputCount: EligibleCount(eligible.Candidates), TotalCount: len(eligible.Candidates), Candidates: eligible.Candidates})
+	query.FinishStage(matchCtx, "success")
 
 	started = time.Now()
-	selected, err := s.resultSelector.Select(ctx, SelectionInput{Candidates: eligible.Candidates, Limit: s.options.SelectionLimit, ExplorationSlots: s.options.ExplorationSlots, Seed: seed})
+	selectionCtx := ctx
+	if recorder := query.ReceiptRecorderFromContext(ctx); recorder != nil {
+		selectionCtx = recorder.StartStage(ctx, "result_selection", "", "", "")
+	}
+	selected, err := s.resultSelector.Select(selectionCtx, SelectionInput{Candidates: eligible.Candidates, Limit: s.options.SelectionLimit, ExplorationSlots: s.options.ExplorationSlots, Seed: seed})
 	if err != nil {
+		query.FinishStage(selectionCtx, "failure")
 		appendTraceStage(trace, StageTrace{Name: "selection", Outcome: "failure", ElapsedMS: elapsedSince(started), InputCount: len(eligible.Candidates)})
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return query.Result{}, ctxErr
@@ -702,6 +720,7 @@ func (s *QueryRetrievalPipeline) execute(ctx context.Context, reader cache.Reade
 		return query.Result{}, fmt.Errorf("query-retrieval selection failed: %w", err)
 	}
 	appendTraceStage(trace, StageTrace{Name: "selection", Outcome: "success", ElapsedMS: elapsedSince(started), InputCount: len(eligible.Candidates), OutputCount: selectedCount(selected.Selected), TotalCount: len(selected.Selected), Decisions: selected.Selected})
+	query.FinishStage(selectionCtx, "success")
 	results := make([]search.Result, 0, len(selected.Selected))
 	for _, candidate := range selected.Selected {
 		if err := ctx.Err(); err != nil {

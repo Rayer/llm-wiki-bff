@@ -121,7 +121,19 @@ func (s *Service) SynthesizeWithError(ctx context.Context, reader cache.Reader, 
 		return response, nil
 	}
 
-	answer, err := s.llm.Chat(ctx, buildSystemPrompt(request.Mode), buildUserPrompt(request.Query, contexts))
+	synthesisCtx := ctx
+	if recorder := ReceiptRecorderFromContext(ctx); recorder != nil {
+		synthesisCtx = recorder.StartStage(ctx, "answer_synthesis", "deepseek", s.llm.Model(), s.llm.Reasoning())
+	}
+	answer, err := s.llm.Chat(synthesisCtx, buildSystemPrompt(request.Mode), buildUserPrompt(request.Query, contexts))
+	outcome := "success"
+	if err != nil {
+		outcome = "degraded"
+		if ctx.Err() != nil {
+			outcome = "failure"
+		}
+	}
+	FinishStage(synthesisCtx, outcome)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return response, ctxErr

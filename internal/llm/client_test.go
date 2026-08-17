@@ -48,6 +48,57 @@ func TestExpansionAndSynthesisClientOptionsAreIsolated(t *testing.T) {
 	}
 }
 
+func TestChatSendsExplicitThinkingPolicy(t *testing.T) {
+	var got struct {
+		Model           string          `json:"model"`
+		Temperature     *float64        `json:"temperature"`
+		Thinking        json.RawMessage `json:"thinking"`
+		ReasoningEffort string          `json:"reasoning_effort"`
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Fatal(err)
+		}
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
+	}))
+	defer server.Close()
+	temperature := 0.0
+	client := NewClientWithOptions("test-key", ClientOptions{Model: "deepseek-v4-flash", Temperature: &temperature, Reasoning: "none"})
+	client.baseURL = server.URL
+	if _, err := client.Chat(context.Background(), "system", "user"); err != nil {
+		t.Fatal(err)
+	}
+	if got.Model != "deepseek-v4-flash" || got.Temperature == nil || *got.Temperature != 0 || string(got.Thinking) != `{"type":"disabled"}` || got.ReasoningEffort != "" {
+		t.Fatalf("request = %#v, want flash/0/disabled/no effort", got)
+	}
+}
+
+func TestChatSendsConfiguredSynthesisReasoning(t *testing.T) {
+	for _, reasoning := range []string{"low", "high", "max"} {
+		t.Run(reasoning, func(t *testing.T) {
+			var got struct {
+				Thinking json.RawMessage `json:"thinking"`
+				Effort   string          `json:"reasoning_effort"`
+			}
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+					t.Fatal(err)
+				}
+				_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
+			}))
+			defer server.Close()
+			client := NewClientWithOptions("key", ClientOptions{Model: "deepseek-v4-pro", Reasoning: reasoning})
+			client.baseURL = server.URL
+			if _, err := client.Chat(context.Background(), "s", "u"); err != nil {
+				t.Fatal(err)
+			}
+			if string(got.Thinking) != `{"type":"enabled"}` || got.Effort != reasoning {
+				t.Fatalf("thinking=%s effort=%q", got.Thinking, got.Effort)
+			}
+		})
+	}
+}
+
 func TestChatErrorDoesNotExposeResponseBodyOrAPIKey(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadGateway)
