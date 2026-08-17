@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -164,17 +165,29 @@ func main() {
 }
 
 func newProductionQueryExecutor(cfg config.Config, conceptCache *conceptcache.Cache) (query.Executor, error) {
+	if cfg.QueryExpansionModel == "" {
+		cfg.QueryExpansionModel = config.DefaultQueryExpansionModel
+	}
+	if cfg.AnswerSynthesisModel == "" {
+		cfg.AnswerSynthesisModel = config.DefaultAnswerSynthesisModel
+	}
+	if cfg.AnswerSynthesisReasoning == "" {
+		cfg.AnswerSynthesisReasoning = config.DefaultAnswerSynthesisReasoning
+	}
 	if cfg.QueryExpansionModel != "" && cfg.QueryExpansionModel != config.DefaultQueryExpansionModel {
 		return nil, fmt.Errorf("query expansion model must be %s", config.DefaultQueryExpansionModel)
 	}
-	synthesisClient := llm.NewClient(cfg.DeepSeekAPIKey)
+	synthesisClient := llm.NewClientWithOptions(cfg.DeepSeekAPIKey, llm.ClientOptions{Model: cfg.AnswerSynthesisModel, Reasoning: cfg.AnswerSynthesisReasoning})
+	if cfg.DeepSeekAPIKey != "" && synthesisClient == nil {
+		return nil, errors.New("invalid answer synthesis client configuration")
+	}
 	temperature := 0.0
-	expansionClient := llm.NewClientWithOptions(cfg.DeepSeekAPIKey, llm.ClientOptions{Model: config.DefaultQueryExpansionModel, Temperature: &temperature})
+	expansionClient := llm.NewClientWithOptions(cfg.DeepSeekAPIKey, llm.ClientOptions{Model: cfg.QueryExpansionModel, Temperature: &temperature, Reasoning: config.DefaultQueryExpansionReasoning})
 	var expansionProvider queryquality.ChatProvider
 	if expansionClient != nil {
 		expansionProvider = expansionClient
 	}
-	legacyExpander, err := llm.NewExpander(llm.NewClient(cfg.DeepSeekAPIKey), "lifestyle")
+	legacyExpander, err := llm.NewExpander(nil, "lifestyle")
 	if err != nil {
 		return nil, err
 	}

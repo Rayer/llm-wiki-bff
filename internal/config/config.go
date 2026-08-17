@@ -6,17 +6,21 @@ import (
 	"net/url"
 	"strings"
 
+	"github.com/rayer/llm-wiki-bff/internal/llm"
 	"github.com/spf13/viper"
 )
 
 // Default pipeline quota limits (LWC-138).
 const (
-	DefaultPipelineDailyLimit      = 2
-	DefaultPipelineCooldownSeconds = 3600
-	DefaultPipelineMinNewRaw       = 1
-	DefaultPipelineJobURL          = "https://run.googleapis.com/v2/projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline:run"
-	DefaultAuthServiceURL          = "https://auth.dev.rayer.idv.tw"
-	DefaultQueryExpansionModel     = "deepseek-v4-pro"
+	DefaultPipelineDailyLimit                     = 2
+	DefaultPipelineCooldownSeconds                = 3600
+	DefaultPipelineMinNewRaw                      = 1
+	DefaultPipelineJobURL                         = "https://run.googleapis.com/v2/projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline:run"
+	DefaultAuthServiceURL                         = "https://auth.dev.rayer.idv.tw"
+	DefaultQueryExpansionModel                    = "deepseek-v4-flash"
+	DefaultAnswerSynthesisModel                   = "deepseek-v4-pro"
+	DefaultQueryExpansionReasoning  llm.Reasoning = llm.ReasoningNone
+	DefaultAnswerSynthesisReasoning llm.Reasoning = llm.ReasoningNone
 )
 
 var defaultAllowedOrigins = []string{
@@ -27,21 +31,24 @@ var defaultAllowedOrigins = []string{
 
 // Config holds application configuration loaded from config.toml.
 type Config struct {
-	GCPProject          string
-	Bucket              string
-	FirestoreDatabaseID string
-	UserID              string
-	ProjectID           string
-	Port                string
-	DeepSeekAPIKey      string
-	QueryExpansionModel string
-	JWTSecret           string
-	DevJWT              bool
-	LocalDataDir        string
-	PipelineJobURL      string
-	AllowedOrigins      []string
-	AllowedHosts        []string
-	Users               []UserConfig
+	GCPProject               string
+	Bucket                   string
+	FirestoreDatabaseID      string
+	UserID                   string
+	ProjectID                string
+	Port                     string
+	DeepSeekAPIKey           string
+	QueryExpansionModel      string
+	QueryExpansionReasoning  llm.Reasoning
+	AnswerSynthesisModel     string
+	AnswerSynthesisReasoning llm.Reasoning
+	JWTSecret                string
+	DevJWT                   bool
+	LocalDataDir             string
+	PipelineJobURL           string
+	AllowedOrigins           []string
+	AllowedHosts             []string
+	Users                    []UserConfig
 
 	// Pipeline quota (LWC-138). Env: PIPELINE_DAILY_LIMIT, PIPELINE_COOLDOWN_SECONDS,
 	// PIPELINE_MIN_NEW_RAW, PIPELINE_DEMO_USER_IDS (comma-separated).
@@ -78,6 +85,9 @@ func Load(path string) (Config, error) {
 	v.SetDefault("pipeline_min_new_raw", DefaultPipelineMinNewRaw)
 	v.SetDefault("pipeline_job_url", DefaultPipelineJobURL)
 	v.SetDefault("query_expansion_model", DefaultQueryExpansionModel)
+	v.SetDefault("query_expansion_reasoning", DefaultQueryExpansionReasoning)
+	v.SetDefault("answer_synthesis_model", DefaultAnswerSynthesisModel)
+	v.SetDefault("answer_synthesis_reasoning", DefaultAnswerSynthesisReasoning)
 	v.AutomaticEnv()
 	v.BindEnv("deepseek_api_key")
 	v.BindEnv("firestore_database_id", "FIRESTORE_DATABASE_ID")
@@ -91,6 +101,9 @@ func Load(path string) (Config, error) {
 	v.BindEnv("registration_enabled", "REGISTRATION_ENABLED")
 	v.BindEnv("auth_service_url", "AUTH_SERVICE_URL")
 	v.BindEnv("query_expansion_model", "QUERY_EXPANSION_MODEL")
+	v.BindEnv("query_expansion_reasoning", "QUERY_EXPANSION_REASONING")
+	v.BindEnv("answer_synthesis_model", "ANSWER_SYNTHESIS_MODEL")
+	v.BindEnv("answer_synthesis_reasoning", "ANSWER_SYNTHESIS_REASONING")
 
 	if err := v.ReadInConfig(); err != nil {
 		var notFound viper.ConfigFileNotFoundError
@@ -141,28 +154,43 @@ func Load(path string) (Config, error) {
 	if queryExpansionModel != DefaultQueryExpansionModel {
 		return Config{}, fmt.Errorf("query_expansion_model must be %s", DefaultQueryExpansionModel)
 	}
+	queryExpansionReasoning := llm.Reasoning(strings.TrimSpace(v.GetString("query_expansion_reasoning")))
+	answerSynthesisModel := strings.TrimSpace(v.GetString("answer_synthesis_model"))
+	answerSynthesisReasoning := llm.Reasoning(strings.TrimSpace(v.GetString("answer_synthesis_reasoning")))
+	if queryExpansionReasoning != DefaultQueryExpansionReasoning {
+		return Config{}, fmt.Errorf("query_expansion_reasoning must be none")
+	}
+	if answerSynthesisModel != DefaultAnswerSynthesisModel {
+		return Config{}, fmt.Errorf("answer_synthesis_model must be %s", DefaultAnswerSynthesisModel)
+	}
+	if !answerSynthesisReasoning.Valid() {
+		return Config{}, fmt.Errorf("answer_synthesis_reasoning must be none, low, high, or max")
+	}
 
 	cfg := Config{
-		GCPProject:              v.GetString("gcp_project"),
-		Bucket:                  v.GetString("bucket"),
-		FirestoreDatabaseID:     strings.TrimSpace(v.GetString("firestore_database_id")),
-		UserID:                  v.GetString("user_id"),
-		ProjectID:               v.GetString("project_id"),
-		Port:                    v.GetString("port"),
-		DeepSeekAPIKey:          v.GetString("deepseek_api_key"),
-		QueryExpansionModel:     queryExpansionModel,
-		JWTSecret:               v.GetString("jwt_secret"),
-		DevJWT:                  v.GetBool("dev_jwt"),
-		LocalDataDir:            v.GetString("local_data_dir"),
-		PipelineJobURL:          pipelineJobURL,
-		AllowedOrigins:          parseAllowedOrigins(v.GetString("allowed_origins")),
-		AllowedHosts:            allowedHosts,
-		PipelineDailyLimit:      dailyLimit,
-		PipelineCooldownSeconds: cooldownSeconds,
-		PipelineMinNewRaw:       minNewRaw,
-		PipelineDemoUserIDs:     splitCommaList(v.GetString("pipeline_demo_user_ids")),
-		RegistrationEnabled:     registrationEnabled,
-		AuthServiceURL:          authServiceURL,
+		GCPProject:               v.GetString("gcp_project"),
+		Bucket:                   v.GetString("bucket"),
+		FirestoreDatabaseID:      strings.TrimSpace(v.GetString("firestore_database_id")),
+		UserID:                   v.GetString("user_id"),
+		ProjectID:                v.GetString("project_id"),
+		Port:                     v.GetString("port"),
+		DeepSeekAPIKey:           v.GetString("deepseek_api_key"),
+		QueryExpansionModel:      queryExpansionModel,
+		QueryExpansionReasoning:  queryExpansionReasoning,
+		AnswerSynthesisModel:     answerSynthesisModel,
+		AnswerSynthesisReasoning: answerSynthesisReasoning,
+		JWTSecret:                v.GetString("jwt_secret"),
+		DevJWT:                   v.GetBool("dev_jwt"),
+		LocalDataDir:             v.GetString("local_data_dir"),
+		PipelineJobURL:           pipelineJobURL,
+		AllowedOrigins:           parseAllowedOrigins(v.GetString("allowed_origins")),
+		AllowedHosts:             allowedHosts,
+		PipelineDailyLimit:       dailyLimit,
+		PipelineCooldownSeconds:  cooldownSeconds,
+		PipelineMinNewRaw:        minNewRaw,
+		PipelineDemoUserIDs:      splitCommaList(v.GetString("pipeline_demo_user_ids")),
+		RegistrationEnabled:      registrationEnabled,
+		AuthServiceURL:           authServiceURL,
 	}
 	return cfg, nil
 }

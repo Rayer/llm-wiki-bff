@@ -21,7 +21,6 @@ import (
 	"github.com/rayer/llm-wiki-bff/internal/llm"
 	"github.com/rayer/llm-wiki-bff/internal/query"
 	"github.com/rayer/llm-wiki-bff/internal/queryquality"
-	"github.com/rayer/llm-wiki-bff/internal/search"
 )
 
 func TestCorePlanEligibilityAndSelectionContracts(t *testing.T) {
@@ -368,7 +367,7 @@ func TestSelectorDeterministicReplayAndContextCancellation(t *testing.T) {
 	}
 }
 
-func TestProductionExpansionFailureAndInvalidJSONUseLegacyBoundedFallback(t *testing.T) {
+func TestProductionExpansionFailureAndInvalidJSONUseDeterministicFallback(t *testing.T) {
 	for _, test := range []struct {
 		name     string
 		provider queryquality.ChatProvider
@@ -378,7 +377,7 @@ func TestProductionExpansionFailureAndInvalidJSONUseLegacyBoundedFallback(t *tes
 		{name: "invalid JSON", provider: fakeProvider{response: "not-json"}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			legacy := fakeExecutor{result: query.Result{Query: "q", Mode: "wiki", Results: []search.Result{{Slug: "legacy-hit"}}}}
+			legacy := fakeExecutor{}
 			executor, err := queryquality.NewProductionExecutor(cache.New(), test.provider, legacy, nil, queryquality.DefaultOptions())
 			if err != nil {
 				t.Fatal(err)
@@ -387,8 +386,8 @@ func TestProductionExpansionFailureAndInvalidJSONUseLegacyBoundedFallback(t *tes
 			if err != nil {
 				t.Fatal(err)
 			}
-			if len(got.Results) != 1 || got.Results[0].Slug != "legacy-hit" {
-				t.Fatalf("fallback result = %#v, want legacy bounded result", got.Results)
+			if len(got.Results) != 1 || got.Results[0].Slug != "all-candidate" {
+				t.Fatalf("fallback result = %#v, want deterministic raw-query result", got.Results)
 			}
 		})
 	}
