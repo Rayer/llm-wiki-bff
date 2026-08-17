@@ -38,7 +38,7 @@ func TestReceiptRecordsDistinctStagesCallsAndRedactsSensitiveValues(t *testing.T
 }
 
 func TestReceiptTimesAreRFC3339NanoUTCAndHostIdentityIsNormalized(t *testing.T) {
-	ctx, recorder := WithReceipt(context.Background())
+	_, recorder := WithReceipt(context.Background())
 	finish := recorder.StartCallAt("answer_synthesis", "configured-model", "low", "http://127.0.0.1:8080/path?q=x")
 	finish("success")
 	FinishReceipt(recorder)
@@ -46,14 +46,30 @@ func TestReceiptTimesAreRFC3339NanoUTCAndHostIdentityIsNormalized(t *testing.T) 
 	if got.QueryReceivedAt.Location() != time.UTC || got.RunStartedAt.Location() != time.UTC || got.RunFinishedAt.Location() != time.UTC {
 		t.Fatalf("run timestamps are not UTC: %#v", got)
 	}
-	if got.HostCalls[0].Scheme != "http" || got.HostCalls[0].Host != "127.0.0.1" || got.HostCalls[0].Model != "configured-model" {
-		t.Fatalf("host identity = %#v", got.HostCalls[0])
+	if len(got.HostCalls) != 0 {
+		t.Fatalf("IP host was persisted: %#v", got.HostCalls)
 	}
 	data, _ := json.Marshal(got)
-	for _, field := range []string{"query_received_at", "run_started_at", "started_at", "finished_at"} {
+	for _, field := range []string{"query_received_at", "run_started_at", "run_finished_at"} {
 		if !strings.Contains(string(data), `"`+field+`":"`) || !strings.Contains(string(data), "Z") {
 			t.Fatalf("timestamp %s is not RFC3339 UTC: %s", field, data)
 		}
 	}
-	_ = ctx
+	for _, forbidden := range []string{"127.0.0.1", "::1", "/path", "q=x", "configured-credential"} {
+		if strings.Contains(string(data), forbidden) {
+			t.Fatalf("receipt leaked %q: %s", forbidden, data)
+		}
+	}
+}
+
+func TestTimedHostReceiptEndsAtNetworkBoundary(t *testing.T) {
+	_, recorder := WithReceipt(context.Background())
+	started := time.Now()
+	finish := recorder.StartCallAtTimed("answer_synthesis", "configured-model", "low", "https://api.deepseek.com/chat/completions")
+	networkFinished := started.Add(10 * time.Millisecond)
+	finish("decode_error", networkFinished)
+	got := recorder.Receipt()
+	if len(got.HostCalls) != 1 || got.HostCalls[0].Outcome != "decode_error" || !got.HostCalls[0].FinishedAt.Equal(networkFinished.UTC()) {
+		t.Fatalf("timed host receipt = %#v", got.HostCalls)
+	}
 }

@@ -22,6 +22,9 @@ func startGCSCall(ctx context.Context) func(string) {
 }
 
 func finishGCSCall(ctx context.Context, err error) string {
+	if err == nil {
+		return "success"
+	}
 	if errors.Is(err, context.Canceled) {
 		return "canceled"
 	}
@@ -79,9 +82,7 @@ func (c *Client) readObject(ctx context.Context, name string, generation, limit 
 		return backendObject{}, errors.New("object exceeds input limit")
 	}
 	if c.backend != nil {
-		finish := startGCSCall(ctx)
 		object, err := c.backend.Read(ctx, name, generation, limit)
-		finish(finishGCSCall(ctx, err))
 		if err != nil || object.Size < 0 || object.Size > limit || int64(len(object.Data)) != object.Size || int64(len(object.Data)) > limit {
 			if err != nil {
 				return backendObject{}, err
@@ -111,6 +112,7 @@ func (c *Client) readObject(ctx context.Context, name string, generation, limit 
 	}
 	defer r.Close()
 	if r.Attrs.Size < 0 || r.Attrs.Size > limit {
+		finishOnce(nil)
 		return backendObject{}, errors.New("object size does not match attributes")
 	}
 	data, err := io.ReadAll(io.LimitReader(r, limit+1))
@@ -119,6 +121,7 @@ func (c *Client) readObject(ctx context.Context, name string, generation, limit 
 		return backendObject{}, err
 	}
 	if int64(len(data)) != r.Attrs.Size || int64(len(data)) > limit {
+		finishOnce(nil)
 		return backendObject{}, errors.New("object exceeds input limit")
 	}
 	return backendObject{Name: name, Data: data, Generation: r.Attrs.Generation, Size: r.Attrs.Size}, nil
@@ -126,10 +129,7 @@ func (c *Client) readObject(ctx context.Context, name string, generation, limit 
 
 func (c *Client) objectAttrs(ctx context.Context, name string, generation int64) (backendObject, error) {
 	if c.backend != nil {
-		finish := startGCSCall(ctx)
-		object, err := c.backend.Attrs(ctx, name, generation)
-		finish(finishGCSCall(ctx, err))
-		return object, err
+		return c.backend.Attrs(ctx, name, generation)
 	}
 	obj := c.bucket.Object(name)
 	if generation > 0 {
@@ -184,10 +184,7 @@ func (c *Client) visitObjectsWithBudget(ctx context.Context, prefix string, dire
 
 func (c *Client) visitObjectsRaw(ctx context.Context, prefix string, directOnly bool, visit func(backendObject) error) error {
 	if c.backend != nil {
-		finish := startGCSCall(ctx)
-		err := c.backend.List(ctx, prefix, directOnly, visit)
-		finish(finishGCSCall(ctx, err))
-		return err
+		return c.backend.List(ctx, prefix, directOnly, visit)
 	}
 	query := &storage.Query{Prefix: prefix}
 	if directOnly {

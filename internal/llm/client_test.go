@@ -24,13 +24,24 @@ type testCallRecorder struct {
 	starts   atomic.Int32
 	finishes atomic.Int32
 	url      string
+	outcomes []string
+	finished []time.Time
 }
 
 func (r *testCallRecorder) StartCall(string, string, string) func(string) { return func(string) {} }
 func (r *testCallRecorder) StartCallAt(_, _, _, rawURL string) func(string) {
 	r.starts.Add(1)
 	r.url = rawURL
-	return func(string) { r.finishes.Add(1) }
+	return func(outcome string) { r.finishes.Add(1); r.outcomes = append(r.outcomes, outcome) }
+}
+func (r *testCallRecorder) StartCallAtTimed(_, _, _, rawURL string) func(string, time.Time) {
+	r.starts.Add(1)
+	r.url = rawURL
+	return func(outcome string, finished time.Time) {
+		r.finishes.Add(1)
+		r.outcomes = append(r.outcomes, outcome)
+		r.finished = append(r.finished, finished)
+	}
 }
 
 func TestChatPreCanceledContextMakesNoAttemptOrReceipt(t *testing.T) {
@@ -71,7 +82,7 @@ func TestChatReceiptUsesActualRequestURL(t *testing.T) {
 	}
 }
 
-func TestExpansionAndSynthesisClientOptionsAreIsolated(t *testing.T) {
+func TestFlashExpansionAndSynthesisClientOptionsAreIsolated(t *testing.T) {
 	type request struct {
 		Model       string   `json:"model"`
 		Temperature *float64 `json:"temperature"`
@@ -88,7 +99,7 @@ func TestExpansionAndSynthesisClientOptionsAreIsolated(t *testing.T) {
 	defer server.Close()
 
 	temperature := 0.0
-	expansion := NewClientWithOptions("test-key", ClientOptions{Model: "deepseek-v4-pro", Temperature: &temperature})
+	expansion := NewClientWithOptions("test-key", ClientOptions{Model: "deepseek-v4-flash", Temperature: &temperature})
 	expansion.baseURL = server.URL
 	synthesis := NewClient("test-key")
 	synthesis.baseURL = server.URL
@@ -101,8 +112,8 @@ func TestExpansionAndSynthesisClientOptionsAreIsolated(t *testing.T) {
 
 	gotExpansion := <-requests
 	gotSynthesis := <-requests
-	if gotExpansion.Model != "deepseek-v4-pro" || gotExpansion.Temperature == nil || *gotExpansion.Temperature != 0 {
-		t.Fatalf("expansion request = %#v, want deepseek-v4-pro and temperature 0", gotExpansion)
+	if gotExpansion.Model != "deepseek-v4-flash" || gotExpansion.Temperature == nil || *gotExpansion.Temperature != 0 {
+		t.Fatalf("expansion request = %#v, want deepseek-v4-flash and temperature 0", gotExpansion)
 	}
 	if gotSynthesis.Model != "deepseek-chat" || gotSynthesis.Temperature != nil {
 		t.Fatalf("synthesis request = %#v, want deepseek-chat without temperature", gotSynthesis)
@@ -206,3 +217,53 @@ func TestChatCancellationInterruptsHTTPCall(t *testing.T) {
 		t.Fatal("Chat() waited for the fixed HTTP timeout after context cancellation")
 	}
 }
+
+func TestChatActualAttemptsCloseExactlyOnceWithBoundedOutcomes(t *testing.T) {
+	for _, test := range []struct {
+		name, mode, want string
+	}{
+		{name: "success", mode: "success", want: "success"},
+		{name: "provider error", mode: "provider", want: "provider_error"},
+		{name: "malformed JSON", mode: "decode", want: "decode_error"},
+		{name: "cancellation", mode: "canceled", want: "canceled"},
+		{name: "deadline timeout", mode: "timeout", want: "timeout"},
+		{name: "response body cancellation", mode: "body-canceled", want: "canceled"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client := NewClient("key")
+			client.client = &http.Client{Transport: outcomeRoundTripper{mode: test.mode}}
+			recorder := &testCallRecorder{}
+			_, _ = client.Chat(WithCallRecorder(context.Background(), recorder), "s", "u")
+			if recorder.starts.Load() != 1 || recorder.finishes.Load() != 1 || len(recorder.outcomes) != 1 || recorder.outcomes[0] != test.want {
+				t.Fatalf("attempt receipt starts=%d finishes=%d outcomes=%v, want one %q", recorder.starts.Load(), recorder.finishes.Load(), recorder.outcomes, test.want)
+			}
+			if len(recorder.finished) != 1 || recorder.finished[0].IsZero() {
+				t.Fatalf("network endpoint time = %v", recorder.finished)
+			}
+		})
+	}
+}
+
+type outcomeRoundTripper struct{ mode string }
+
+func (t outcomeRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	switch t.mode {
+	case "provider":
+		return &http.Response{StatusCode: http.StatusBadGateway, Body: io.NopCloser(bytes.NewReader(nil)), Header: make(http.Header)}, nil
+	case "decode":
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(bytes.NewReader([]byte("bad"))), Header: make(http.Header)}, nil
+	case "canceled":
+		return nil, context.Canceled
+	case "timeout":
+		return nil, context.DeadlineExceeded
+	case "body-canceled":
+		return &http.Response{StatusCode: http.StatusOK, Body: errorReadCloser{err: context.Canceled}, Header: make(http.Header)}, nil
+	default:
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(bytes.NewReader([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))), Header: make(http.Header)}, nil
+	}
+}
+
+type errorReadCloser struct{ err error }
+
+func (r errorReadCloser) Read([]byte) (int, error) { return 0, r.err }
+func (r errorReadCloser) Close() error             { return nil }

@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"log"
+	"net"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -108,20 +110,40 @@ func (r *ReceiptRecorder) StartCallAt(stageName, model, reasoning, rawURL string
 	return r.startHostCall(stageName, u.Scheme, u.Hostname(), "deepseek", model, reasoning)
 }
 
+func (r *ReceiptRecorder) StartCallAtTimed(stageName, model, reasoning, rawURL string) func(string, time.Time) {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Scheme == "" || u.Hostname() == "" {
+		return func(string, time.Time) {}
+	}
+	return r.startHostCallTimed(stageName, u.Scheme, u.Hostname(), "deepseek", model, reasoning)
+}
+
 func (r *ReceiptRecorder) StartHostCall(stage, scheme, host string) func(string) {
 	return r.startHostCall(stage, scheme, host, "gcs", "", "")
 }
 
 func (r *ReceiptRecorder) startHostCall(stageName, scheme, host, provider, model, reasoning string) func(string) {
+	finish := r.startHostCallTimed(stageName, scheme, host, provider, model, reasoning)
+	return func(outcome string) { finish(outcome, time.Time{}) }
+}
+
+func (r *ReceiptRecorder) startHostCallTimed(stageName, scheme, host, provider, model, reasoning string) func(string, time.Time) {
+	if net.ParseIP(host) != nil {
+		return func(string, time.Time) {}
+	}
+	host = strings.ToLower(strings.TrimSuffix(host, "."))
 	r.mu.Lock()
 	r.callSeq++
 	seq := r.callSeq
 	started := time.Now()
 	r.mu.Unlock()
-	return func(outcome string) {
+	return func(outcome string, finishedAt time.Time) {
 		r.mu.Lock()
 		defer r.mu.Unlock()
-		finished := time.Now()
+		finished := finishedAt
+		if finished.IsZero() {
+			finished = time.Now()
+		}
 		r.receipt.HostCalls = append(r.receipt.HostCalls, HostCallReceipt{Sequence: seq, Stage: stageName, Scheme: scheme, Host: host, StartedAt: started.UTC(), FinishedAt: finished.UTC(), startedMono: started, ElapsedMS: finished.Sub(started).Milliseconds(), Provider: provider, Model: model, Reasoning: reasoning, Outcome: outcome})
 	}
 }

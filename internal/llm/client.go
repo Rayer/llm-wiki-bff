@@ -23,6 +23,10 @@ type callURLRecorder interface {
 	StartCallAt(stage, model, reasoning, rawURL string) func(string)
 }
 
+type timedCallRecorder interface {
+	StartCallAtTimed(stage, model, reasoning, rawURL string) func(string, time.Time)
+}
+
 type recorderKey struct{}
 type stageKey struct{}
 type hostRecorderKey struct{}
@@ -149,7 +153,14 @@ func NewClientWithOptions(apiKey string, options ClientOptions) *Client {
 // Chat sends a system + user message and returns the assistant's reply.
 func (c *Client) Chat(ctx context.Context, systemPrompt, userMessage string) (string, error) {
 	var closeCall func(string)
+	var closeCallAt func(string, time.Time)
 	finish := func(outcome string) {
+		if closeCallAt != nil {
+			f := closeCallAt
+			closeCallAt = nil
+			f(outcome, time.Now())
+			return
+		}
 		if closeCall != nil {
 			f := closeCall
 			closeCall = nil
@@ -192,7 +203,9 @@ func (c *Client) Chat(ctx context.Context, systemPrompt, userMessage string) (st
 	}
 	if recorder, ok := ctx.Value(recorderKey{}).(CallRecorder); ok {
 		stage := CallStage(ctx)
-		if withURL, ok := recorder.(callURLRecorder); ok {
+		if timed, ok := recorder.(timedCallRecorder); ok {
+			closeCallAt = timed.StartCallAtTimed(stage, c.model, string(c.reasoning), req.URL.String())
+		} else if withURL, ok := recorder.(callURLRecorder); ok {
 			closeCall = withURL.StartCallAt(stage, c.model, string(c.reasoning), req.URL.String())
 		} else {
 			closeCall = recorder.StartCall(stage, c.model, string(c.reasoning))
@@ -206,28 +219,66 @@ func (c *Client) Chat(ctx context.Context, systemPrompt, userMessage string) (st
 	defer resp.Body.Close()
 
 	respData, err := io.ReadAll(io.LimitReader(resp.Body, maxChatResponseBytes+1))
+	networkFinished := time.Now()
 	if err != nil {
-		finish(callOutcome(ctx, err))
+		if closeCallAt != nil {
+			f := closeCallAt
+			closeCallAt = nil
+			f(callOutcome(ctx, err), networkFinished)
+		} else {
+			finish(callOutcome(ctx, err))
+		}
 		return "", fmt.Errorf("read response: %w", err)
 	}
 	if len(respData) > maxChatResponseBytes {
-		finish("decode_error")
+		if closeCallAt != nil {
+			f := closeCallAt
+			closeCallAt = nil
+			f("decode_error", networkFinished)
+		} else {
+			finish("decode_error")
+		}
 		return "", fmt.Errorf("response exceeds %d-byte limit", maxChatResponseBytes)
 	}
 
 	if resp.StatusCode != 200 {
-		finish("provider_error")
+		if closeCallAt != nil {
+			f := closeCallAt
+			closeCallAt = nil
+			f("provider_error", networkFinished)
+		} else {
+			finish("provider_error")
+		}
 		return "", fmt.Errorf("api error %d", resp.StatusCode)
 	}
 
 	var cr chatResponse
 	if err := json.Unmarshal(respData, &cr); err != nil {
-		finish("decode_error")
+		if closeCallAt != nil {
+			f := closeCallAt
+			closeCallAt = nil
+			f("decode_error", networkFinished)
+		} else {
+			finish("decode_error")
+		}
 		return "", fmt.Errorf("unmarshal: %w", err)
 	}
 	if len(cr.Choices) == 0 {
-		finish("decode_error")
+		if closeCallAt != nil {
+			f := closeCallAt
+			closeCallAt = nil
+			f("decode_error", networkFinished)
+		} else {
+			finish("decode_error")
+		}
 		return "", fmt.Errorf("no choices in response")
+	}
+	if closeCallAt != nil {
+		f := closeCallAt
+		closeCallAt = nil
+		f("success", networkFinished)
+	} else {
+		finish("success")
 	}
 
 	return cr.Choices[0].Message.Content, nil

@@ -27,7 +27,7 @@ func (r *gcsHostReceipt) StartHostCall(stage, scheme, host string) func(string) 
 	return func(string) { r.finished++ }
 }
 
-func TestProductionReaderRecordsBoundedGCSAttemptAtActualStorageBoundary(t *testing.T) {
+func TestMemoryReaderDoesNotFabricateGCSAttempt(t *testing.T) {
 	client, backend := newMemoryClient()
 	backend.put("users/user/projects/project/raw/concepts.jsonl", []byte(`{"slug":"coffee","title":"Coffee","frontmatter":{}}`+"\n"), 1, nil)
 	receipt := &gcsHostReceipt{}
@@ -35,8 +35,8 @@ func TestProductionReaderRecordsBoundedGCSAttemptAtActualStorageBoundary(t *test
 	if _, err := client.ReadRaw(ctx, "concepts.jsonl"); err != nil {
 		t.Fatal(err)
 	}
-	if receipt.stage != "cache_load" || receipt.scheme != "https" || receipt.host != "storage.googleapis.com" || receipt.finished != 1 {
-		t.Fatalf("GCS receipt = %#v, want one bounded storage attempt", receipt)
+	if receipt.finished != 0 || receipt.host != "" {
+		t.Fatalf("memory backend receipt = %#v, want no host attempt", receipt)
 	}
 }
 
