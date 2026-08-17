@@ -113,17 +113,18 @@ func (s *Service) SynthesizeWithError(ctx context.Context, reader cache.Reader, 
 		log.Printf("citation capability issuance failed: %v", err)
 		return response, nil
 	}
-	contexts, err := s.buildContexts(ctx, reader, response.Results[:min(10, len(response.Results))], authority)
+	synthesisCtx := ctx
+	if recorder := ReceiptRecorderFromContext(ctx); recorder != nil {
+		synthesisCtx = recorder.StartStage(ctx, "answer_synthesis", "deepseek", s.llm.Model(), string(s.llm.Reasoning()))
+	}
+	contexts, err := s.buildContexts(synthesisCtx, reader, response.Results[:min(10, len(response.Results))], authority)
 	if err != nil {
+		FinishStage(synthesisCtx, "failure")
 		return response, err
 	}
 	if len(contexts) == 0 {
+		FinishStage(synthesisCtx, "success")
 		return response, nil
-	}
-
-	synthesisCtx := ctx
-	if recorder := ReceiptRecorderFromContext(ctx); recorder != nil {
-		synthesisCtx = recorder.StartStage(ctx, "answer_synthesis", "deepseek", s.llm.Model(), s.llm.Reasoning())
 	}
 	answer, err := s.llm.Chat(synthesisCtx, buildSystemPrompt(request.Mode), buildUserPrompt(request.Query, contexts))
 	outcome := "success"
@@ -133,8 +134,8 @@ func (s *Service) SynthesizeWithError(ctx context.Context, reader cache.Reader, 
 			outcome = "failure"
 		}
 	}
-	FinishStage(synthesisCtx, outcome)
 	if err != nil {
+		FinishStage(synthesisCtx, outcome)
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return response, ctxErr
 		}
@@ -146,6 +147,7 @@ func (s *Service) SynthesizeWithError(ctx context.Context, reader cache.Reader, 
 	}
 
 	answer, citations, filtered := authority.Resolve(answer)
+	FinishStage(synthesisCtx, outcome)
 	response.AISynth = answer
 	response.Citations = citations
 	response.Results = filtered

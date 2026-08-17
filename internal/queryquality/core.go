@@ -195,6 +195,9 @@ func (e StructuredPlanExpander) ExpandWithTrace(ctx context.Context, request Exp
 		decodePlan = DecodePlan
 	}
 	if e.provider != nil {
+		if client, ok := e.provider.(*llm.Client); ok && client.Reasoning() != llm.ReasoningNone {
+			return QueryPlan{}, ExpansionInfo{}, errors.New("query expansion reasoning must be none")
+		}
 		response, err := e.provider.Chat(ctx, structuredPlanSystemPrompt, structuredPlanUserPrompt(request.Query, request.CriterionPolicy))
 		if err == nil {
 			if plan, decodeErr := decodePlan(response, request.Query); decodeErr == nil {
@@ -628,7 +631,12 @@ func (s *QueryRetrievalPipeline) validate() error {
 }
 
 func (s *QueryRetrievalPipeline) execute(ctx context.Context, reader cache.Reader, request query.Request, trace *Trace) (query.Result, error) {
-	entries, err := s.cache.All(ctx, reader)
+	cacheCtx := ctx
+	if recorder := query.ReceiptRecorderFromContext(ctx); recorder != nil {
+		cacheCtx = recorder.StartStage(ctx, "cache_load", "", "", "")
+	}
+	entries, err := s.cache.All(cacheCtx, reader)
+	query.FinishStage(cacheCtx, map[bool]string{true: "failure", false: "success"}[err != nil])
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return query.Result{}, err
@@ -641,7 +649,8 @@ func (s *QueryRetrievalPipeline) execute(ctx context.Context, reader cache.Reade
 	requestWithPolicy := ExpansionRequest{Query: request.Query, CriterionPolicy: DefaultCriterionPolicy}
 	stageCtx := ctx
 	if recorder := query.ReceiptRecorderFromContext(ctx); recorder != nil {
-		stageCtx = recorder.StartStage(ctx, "query_expansion", "deepseek", "deepseek-v4-flash", "none")
+		provider, model, reasoning := providerIdentity(s.queryExpander)
+		stageCtx = recorder.StartStage(ctx, "query_expansion", provider, model, reasoning)
 	}
 	if traced, ok := s.queryExpander.(TracedQueryExpander); ok {
 		plan, info, err = traced.ExpandWithTrace(stageCtx, requestWithPolicy)
@@ -731,6 +740,15 @@ func (s *QueryRetrievalPipeline) execute(ctx context.Context, reader cache.Reade
 		}
 	}
 	return query.Result{Query: request.Query, Mode: request.Mode, Results: results, Expand: expandFromPlan(plan)}, nil
+}
+
+func providerIdentity(expander QueryExpander) (string, string, string) {
+	if structured, ok := expander.(StructuredPlanExpander); ok {
+		if client, ok := structured.provider.(*llm.Client); ok {
+			return "deepseek", client.Model(), string(client.Reasoning())
+		}
+	}
+	return "", "", ""
 }
 
 func appendTraceStage(trace *Trace, stage StageTrace) {

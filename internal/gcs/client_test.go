@@ -10,11 +10,35 @@ import (
 
 	cloudstorage "cloud.google.com/go/storage"
 	"github.com/rayer/llm-wiki-bff/internal/generation"
+	"github.com/rayer/llm-wiki-bff/internal/llm"
 	store "github.com/rayer/llm-wiki-bff/internal/storage"
 	"google.golang.org/api/googleapi"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
+
+type gcsHostReceipt struct {
+	stage, scheme, host string
+	finished            int
+}
+
+func (r *gcsHostReceipt) StartHostCall(stage, scheme, host string) func(string) {
+	r.stage, r.scheme, r.host = stage, scheme, host
+	return func(string) { r.finished++ }
+}
+
+func TestProductionReaderRecordsBoundedGCSAttemptAtActualStorageBoundary(t *testing.T) {
+	client, backend := newMemoryClient()
+	backend.put("users/user/projects/project/raw/concepts.jsonl", []byte(`{"slug":"coffee","title":"Coffee","frontmatter":{}}`+"\n"), 1, nil)
+	receipt := &gcsHostReceipt{}
+	ctx := llm.WithCallStage(llm.WithHostCallRecorder(context.Background(), receipt), "cache_load")
+	if _, err := client.ReadRaw(ctx, "concepts.jsonl"); err != nil {
+		t.Fatal(err)
+	}
+	if receipt.stage != "cache_load" || receipt.scheme != "https" || receipt.host != "storage.googleapis.com" || receipt.finished != 1 {
+		t.Fatalf("GCS receipt = %#v, want one bounded storage attempt", receipt)
+	}
+}
 
 func TestStatFileUsesScopedMetadataOnly(t *testing.T) {
 	client, backend := newMemoryClient()

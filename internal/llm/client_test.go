@@ -1,14 +1,75 @@
 package llm
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 )
+
+type countingRoundTripper struct{ calls atomic.Int32 }
+
+func (r *countingRoundTripper) RoundTrip(*http.Request) (*http.Response, error) {
+	r.calls.Add(1)
+	return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(bytes.NewReader([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))), Header: make(http.Header)}, nil
+}
+
+type testCallRecorder struct {
+	starts   atomic.Int32
+	finishes atomic.Int32
+	url      string
+}
+
+func (r *testCallRecorder) StartCall(string, string, string) func(string) { return func(string) {} }
+func (r *testCallRecorder) StartCallAt(_, _, _, rawURL string) func(string) {
+	r.starts.Add(1)
+	r.url = rawURL
+	return func(string) { r.finishes.Add(1) }
+}
+
+func TestChatPreCanceledContextMakesNoAttemptOrReceipt(t *testing.T) {
+	transport := &countingRoundTripper{}
+	client := NewClient("key")
+	client.client = &http.Client{Transport: transport}
+	recorder := &testCallRecorder{}
+	ctx, cancel := context.WithCancel(WithCallRecorder(context.Background(), recorder))
+	cancel()
+	if _, err := client.Chat(ctx, "s", "u"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Chat() error = %v, want cancellation", err)
+	}
+	if transport.calls.Load() != 0 || recorder.starts.Load() != 0 {
+		t.Fatalf("attempts=%d receipts=%d, want zero", transport.calls.Load(), recorder.starts.Load())
+	}
+}
+
+func TestNewClientRejectsInvalidReasoning(t *testing.T) {
+	if client := NewClientWithOptions("key", ClientOptions{Reasoning: Reasoning("arbitrary")}); client != nil {
+		t.Fatal("invalid reasoning constructed a client")
+	}
+}
+
+func TestChatReceiptUsesActualRequestURL(t *testing.T) {
+	transport := &countingRoundTripper{}
+	client := NewClient("key")
+	client.baseURL = "http://127.0.0.1:4321/override?q=query"
+	client.client = &http.Client{Transport: transport}
+	recorder := &testCallRecorder{}
+	if _, err := client.Chat(WithCallRecorder(context.Background(), recorder), "s", "u"); err != nil {
+		t.Fatal(err)
+	}
+	if recorder.url != "http://127.0.0.1:4321/override?q=query/chat/completions" {
+		t.Fatalf("recorded URL = %q", recorder.url)
+	}
+	if recorder.finishes.Load() != 1 {
+		t.Fatalf("finished receipts = %d, want one", recorder.finishes.Load())
+	}
+}
 
 func TestExpansionAndSynthesisClientOptionsAreIsolated(t *testing.T) {
 	type request struct {
@@ -74,8 +135,8 @@ func TestChatSendsExplicitThinkingPolicy(t *testing.T) {
 }
 
 func TestChatSendsConfiguredSynthesisReasoning(t *testing.T) {
-	for _, reasoning := range []string{"low", "high", "max"} {
-		t.Run(reasoning, func(t *testing.T) {
+	for _, reasoning := range []Reasoning{ReasoningLow, ReasoningHigh, ReasoningMax} {
+		t.Run(string(reasoning), func(t *testing.T) {
 			var got struct {
 				Thinking json.RawMessage `json:"thinking"`
 				Effort   string          `json:"reasoning_effort"`
@@ -92,7 +153,7 @@ func TestChatSendsConfiguredSynthesisReasoning(t *testing.T) {
 			if _, err := client.Chat(context.Background(), "s", "u"); err != nil {
 				t.Fatal(err)
 			}
-			if string(got.Thinking) != `{"type":"enabled"}` || got.Effort != reasoning {
+			if string(got.Thinking) != `{"type":"enabled"}` || got.Effort != string(reasoning) {
 				t.Fatalf("thinking=%s effort=%q", got.Thinking, got.Effort)
 			}
 		})

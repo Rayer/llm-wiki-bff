@@ -6,20 +6,21 @@ import (
 	"net/url"
 	"strings"
 
+	"github.com/rayer/llm-wiki-bff/internal/llm"
 	"github.com/spf13/viper"
 )
 
 // Default pipeline quota limits (LWC-138).
 const (
-	DefaultPipelineDailyLimit       = 2
-	DefaultPipelineCooldownSeconds  = 3600
-	DefaultPipelineMinNewRaw        = 1
-	DefaultPipelineJobURL           = "https://run.googleapis.com/v2/projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline:run"
-	DefaultAuthServiceURL           = "https://auth.dev.rayer.idv.tw"
-	DefaultQueryExpansionModel      = "deepseek-v4-flash"
-	DefaultAnswerSynthesisModel     = "deepseek-v4-pro"
-	DefaultQueryExpansionReasoning  = "none"
-	DefaultAnswerSynthesisReasoning = "none"
+	DefaultPipelineDailyLimit                     = 2
+	DefaultPipelineCooldownSeconds                = 3600
+	DefaultPipelineMinNewRaw                      = 1
+	DefaultPipelineJobURL                         = "https://run.googleapis.com/v2/projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline:run"
+	DefaultAuthServiceURL                         = "https://auth.dev.rayer.idv.tw"
+	DefaultQueryExpansionModel                    = "deepseek-v4-flash"
+	DefaultAnswerSynthesisModel                   = "deepseek-v4-pro"
+	DefaultQueryExpansionReasoning  llm.Reasoning = llm.ReasoningNone
+	DefaultAnswerSynthesisReasoning llm.Reasoning = llm.ReasoningNone
 )
 
 var defaultAllowedOrigins = []string{
@@ -38,9 +39,9 @@ type Config struct {
 	Port                     string
 	DeepSeekAPIKey           string
 	QueryExpansionModel      string
-	QueryExpansionReasoning  string
+	QueryExpansionReasoning  llm.Reasoning
 	AnswerSynthesisModel     string
-	AnswerSynthesisReasoning string
+	AnswerSynthesisReasoning llm.Reasoning
 	JWTSecret                string
 	DevJWT                   bool
 	LocalDataDir             string
@@ -153,16 +154,16 @@ func Load(path string) (Config, error) {
 	if queryExpansionModel != DefaultQueryExpansionModel {
 		return Config{}, fmt.Errorf("query_expansion_model must be %s", DefaultQueryExpansionModel)
 	}
-	queryExpansionReasoning := strings.TrimSpace(v.GetString("query_expansion_reasoning"))
+	queryExpansionReasoning := llm.Reasoning(strings.TrimSpace(v.GetString("query_expansion_reasoning")))
 	answerSynthesisModel := strings.TrimSpace(v.GetString("answer_synthesis_model"))
-	answerSynthesisReasoning := strings.TrimSpace(v.GetString("answer_synthesis_reasoning"))
+	answerSynthesisReasoning := llm.Reasoning(strings.TrimSpace(v.GetString("answer_synthesis_reasoning")))
 	if queryExpansionReasoning != DefaultQueryExpansionReasoning {
 		return Config{}, fmt.Errorf("query_expansion_reasoning must be none")
 	}
 	if answerSynthesisModel != DefaultAnswerSynthesisModel {
 		return Config{}, fmt.Errorf("answer_synthesis_model must be %s", DefaultAnswerSynthesisModel)
 	}
-	if !validReasoning(answerSynthesisReasoning) {
+	if !answerSynthesisReasoning.Valid() {
 		return Config{}, fmt.Errorf("answer_synthesis_reasoning must be none, low, high, or max")
 	}
 
@@ -192,15 +193,6 @@ func Load(path string) (Config, error) {
 		AuthServiceURL:           authServiceURL,
 	}
 	return cfg, nil
-}
-
-func validReasoning(value string) bool {
-	switch value {
-	case "none", "low", "high", "max":
-		return true
-	default:
-		return false
-	}
 }
 
 func validatePipelineJobURL(rawURL string) error {

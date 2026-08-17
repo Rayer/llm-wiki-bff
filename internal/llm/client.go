@@ -15,15 +15,38 @@ type CallRecorder interface {
 	StartCall(stage, model, reasoning string) func(outcome string)
 }
 
+type HostCallRecorder interface {
+	StartHostCall(stage, scheme, host string) func(string)
+}
+
+type callURLRecorder interface {
+	StartCallAt(stage, model, reasoning, rawURL string) func(string)
+}
+
 type recorderKey struct{}
 type stageKey struct{}
+type hostRecorderKey struct{}
 
 func WithCallRecorder(ctx context.Context, recorder CallRecorder) context.Context {
 	return context.WithValue(ctx, recorderKey{}, recorder)
 }
 
+func WithHostCallRecorder(ctx context.Context, recorder HostCallRecorder) context.Context {
+	return context.WithValue(ctx, hostRecorderKey{}, recorder)
+}
+
+func HostCallRecorderFromContext(ctx context.Context) HostCallRecorder {
+	recorder, _ := ctx.Value(hostRecorderKey{}).(HostCallRecorder)
+	return recorder
+}
+
 func WithCallStage(ctx context.Context, stage string) context.Context {
 	return context.WithValue(ctx, stageKey{}, stage)
+}
+
+func CallStage(ctx context.Context) string {
+	stage, _ := ctx.Value(stageKey{}).(string)
+	return stage
 }
 
 // Client calls the DeepSeek API (OpenAI-compatible endpoint).
@@ -33,7 +56,7 @@ type Client struct {
 	client      *http.Client
 	model       string
 	temperature *float64
-	reasoning   string
+	reasoning   Reasoning
 }
 
 func (c *Client) Model() string {
@@ -42,7 +65,7 @@ func (c *Client) Model() string {
 	}
 	return c.model
 }
-func (c *Client) Reasoning() string {
+func (c *Client) Reasoning() Reasoning {
 	if c == nil {
 		return ""
 	}
@@ -71,7 +94,20 @@ type thinking struct {
 type ClientOptions struct {
 	Model       string
 	Temperature *float64
-	Reasoning   string
+	Reasoning   Reasoning
+}
+
+type Reasoning string
+
+const (
+	ReasoningNone Reasoning = "none"
+	ReasoningLow  Reasoning = "low"
+	ReasoningHigh Reasoning = "high"
+	ReasoningMax  Reasoning = "max"
+)
+
+func (r Reasoning) Valid() bool {
+	return r == ReasoningNone || r == ReasoningLow || r == ReasoningHigh || r == ReasoningMax
 }
 
 type chatChoice struct {
@@ -95,7 +131,10 @@ func NewClientWithOptions(apiKey string, options ClientOptions) *Client {
 		options.Model = "deepseek-chat"
 	}
 	if options.Reasoning == "" {
-		options.Reasoning = "none"
+		options.Reasoning = ReasoningNone
+	}
+	if !options.Reasoning.Valid() {
+		return nil
 	}
 	return &Client{
 		apiKey:      apiKey,
@@ -110,10 +149,6 @@ func NewClientWithOptions(apiKey string, options ClientOptions) *Client {
 // Chat sends a system + user message and returns the assistant's reply.
 func (c *Client) Chat(ctx context.Context, systemPrompt, userMessage string) (string, error) {
 	var closeCall func(string)
-	if recorder, ok := ctx.Value(recorderKey{}).(CallRecorder); ok {
-		stage, _ := ctx.Value(stageKey{}).(string)
-		closeCall = recorder.StartCall(stage, c.model, c.reasoning)
-	}
 	finish := func(outcome string) {
 		if closeCall != nil {
 			f := closeCall
@@ -130,14 +165,14 @@ func (c *Client) Chat(ctx context.Context, systemPrompt, userMessage string) (st
 		},
 		Temperature: c.temperature,
 		Thinking: thinking{Type: func() string {
-			if c.reasoning == "none" {
+			if c.reasoning == ReasoningNone {
 				return "disabled"
 			}
 			return "enabled"
 		}()},
 	}
-	if c.reasoning != "" && c.reasoning != "none" {
-		body.ReasoningEffort = c.reasoning
+	if c.reasoning != ReasoningNone {
+		body.ReasoningEffort = string(c.reasoning)
 	}
 
 	data, err := json.Marshal(body)
@@ -152,6 +187,17 @@ func (c *Client) Chat(ctx context.Context, systemPrompt, userMessage string) (st
 	req.Header.Set("Authorization", "Bearer "+c.apiKey)
 	req.Header.Set("Content-Type", "application/json")
 
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if recorder, ok := ctx.Value(recorderKey{}).(CallRecorder); ok {
+		stage := CallStage(ctx)
+		if withURL, ok := recorder.(callURLRecorder); ok {
+			closeCall = withURL.StartCallAt(stage, c.model, string(c.reasoning), req.URL.String())
+		} else {
+			closeCall = recorder.StartCall(stage, c.model, string(c.reasoning))
+		}
+	}
 	resp, err := c.client.Do(req)
 	if err != nil {
 		finish(callOutcome(ctx, err))
@@ -161,7 +207,7 @@ func (c *Client) Chat(ctx context.Context, systemPrompt, userMessage string) (st
 
 	respData, err := io.ReadAll(io.LimitReader(resp.Body, maxChatResponseBytes+1))
 	if err != nil {
-		finish("decode_error")
+		finish(callOutcome(ctx, err))
 		return "", fmt.Errorf("read response: %w", err)
 	}
 	if len(respData) > maxChatResponseBytes {

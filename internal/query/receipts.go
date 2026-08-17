@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"log"
+	"net/url"
 	"sync"
 	"time"
 
@@ -55,10 +56,11 @@ type ReceiptRecorder struct {
 }
 
 func WithReceipt(ctx context.Context) (context.Context, *ReceiptRecorder) {
-	now := time.Now()
+	mono := time.Now()
+	now := mono.UTC()
 	r := &ReceiptRecorder{stageIndex: make(map[string]int), receipt: Receipt{QueryReceivedAt: now, RunStartedAt: now}}
-	r.receipt.runStartedMono = now
-	return context.WithValue(llm.WithCallRecorder(ctx, r), receiptKey{}, r), r
+	r.receipt.runStartedMono = mono
+	return context.WithValue(llm.WithHostCallRecorder(llm.WithCallRecorder(ctx, r), r), receiptKey{}, r), r
 }
 func ReceiptRecorderFromContext(ctx context.Context) *ReceiptRecorder {
 	r, _ := ctx.Value(receiptKey{}).(*ReceiptRecorder)
@@ -95,6 +97,22 @@ func FinishStage(ctx context.Context, outcome string) {
 	s.Outcome = outcome
 }
 func (r *ReceiptRecorder) StartCall(stageName, model, reasoning string) func(string) {
+	return r.StartCallAt(stageName, model, reasoning, "https://api.deepseek.com")
+}
+
+func (r *ReceiptRecorder) StartCallAt(stageName, model, reasoning, rawURL string) func(string) {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Scheme == "" || u.Hostname() == "" {
+		return func(string) {}
+	}
+	return r.startHostCall(stageName, u.Scheme, u.Hostname(), "deepseek", model, reasoning)
+}
+
+func (r *ReceiptRecorder) StartHostCall(stage, scheme, host string) func(string) {
+	return r.startHostCall(stage, scheme, host, "gcs", "", "")
+}
+
+func (r *ReceiptRecorder) startHostCall(stageName, scheme, host, provider, model, reasoning string) func(string) {
 	r.mu.Lock()
 	r.callSeq++
 	seq := r.callSeq
@@ -104,7 +122,7 @@ func (r *ReceiptRecorder) StartCall(stageName, model, reasoning string) func(str
 		r.mu.Lock()
 		defer r.mu.Unlock()
 		finished := time.Now()
-		r.receipt.HostCalls = append(r.receipt.HostCalls, HostCallReceipt{Sequence: seq, Stage: stageName, Scheme: "https", Host: "api.deepseek.com", StartedAt: started.UTC(), FinishedAt: finished.UTC(), startedMono: started, ElapsedMS: finished.Sub(started).Milliseconds(), Provider: "deepseek", Model: model, Reasoning: reasoning, Outcome: outcome})
+		r.receipt.HostCalls = append(r.receipt.HostCalls, HostCallReceipt{Sequence: seq, Stage: stageName, Scheme: scheme, Host: host, StartedAt: started.UTC(), FinishedAt: finished.UTC(), startedMono: started, ElapsedMS: finished.Sub(started).Milliseconds(), Provider: provider, Model: model, Reasoning: reasoning, Outcome: outcome})
 	}
 }
 func FinishReceipt(r *ReceiptRecorder) {

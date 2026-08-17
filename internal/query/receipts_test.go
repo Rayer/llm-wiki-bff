@@ -36,3 +36,24 @@ func TestReceiptRecordsDistinctStagesCallsAndRedactsSensitiveValues(t *testing.T
 		}
 	}
 }
+
+func TestReceiptTimesAreRFC3339NanoUTCAndHostIdentityIsNormalized(t *testing.T) {
+	ctx, recorder := WithReceipt(context.Background())
+	finish := recorder.StartCallAt("answer_synthesis", "configured-model", "low", "http://127.0.0.1:8080/path?q=x")
+	finish("success")
+	FinishReceipt(recorder)
+	got := recorder.Receipt()
+	if got.QueryReceivedAt.Location() != time.UTC || got.RunStartedAt.Location() != time.UTC || got.RunFinishedAt.Location() != time.UTC {
+		t.Fatalf("run timestamps are not UTC: %#v", got)
+	}
+	if got.HostCalls[0].Scheme != "http" || got.HostCalls[0].Host != "127.0.0.1" || got.HostCalls[0].Model != "configured-model" {
+		t.Fatalf("host identity = %#v", got.HostCalls[0])
+	}
+	data, _ := json.Marshal(got)
+	for _, field := range []string{"query_received_at", "run_started_at", "started_at", "finished_at"} {
+		if !strings.Contains(string(data), `"`+field+`":"`) || !strings.Contains(string(data), "Z") {
+			t.Fatalf("timestamp %s is not RFC3339 UTC: %s", field, data)
+		}
+	}
+	_ = ctx
+}
