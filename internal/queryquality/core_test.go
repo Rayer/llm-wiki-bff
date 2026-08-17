@@ -5,7 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"net/http"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -29,7 +35,7 @@ func TestCorePlanEligibilityAndSelectionContracts(t *testing.T) {
 		{Slug: "required-miss", Title: "Kaohsiung cafe", Body: "cafe for work"},
 		{Slug: "excluded", Title: "Taipei smoking cafe", Body: "Taipei cafe smoking"},
 	}
-	matched, err := queryquality.NewLexicalMatcher(nil).Match(context.Background(), plan, entries)
+	matched, err := queryquality.NewLexicalMatcher(nil).Match(context.Background(), queryquality.MatchRequest{Plan: plan, CorpusEntries: entries})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -45,7 +51,7 @@ func TestCorePlanEligibilityAndSelectionContracts(t *testing.T) {
 	}
 
 	semanticPlan := queryquality.QueryPlan{RawQuery: "semantic", Required: []queryquality.Criterion{{Kind: "activity", Value: "skiing", Terms: []string{"skiing"}, Proof: "semantic"}}}
-	semanticMatched, err := queryquality.NewLexicalMatcher(nil).Match(context.Background(), semanticPlan, []cache.Entry{{Slug: "lexical", Title: "Lexical", Body: "skiing"}})
+	semanticMatched, err := queryquality.NewLexicalMatcher(nil).Match(context.Background(), queryquality.MatchRequest{Plan: semanticPlan, CorpusEntries: []cache.Entry{{Slug: "lexical", Title: "Lexical", Body: "skiing"}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -54,7 +60,7 @@ func TestCorePlanEligibilityAndSelectionContracts(t *testing.T) {
 	}
 
 	candidates := append(matched.Candidates, queryquality.CandidateEvidence{Slug: "ineligible-high-score", Title: "bad", Eligible: false, Score: 99})
-	selector := queryquality.NewSelector()
+	selector := queryquality.NewResultSelector()
 	input := queryquality.SelectionInput{Candidates: candidates, Limit: 2, ExplorationSlots: 1, Seed: 42}
 	first, err := selector.Select(context.Background(), input)
 	if err != nil {
@@ -76,6 +82,69 @@ func TestCorePlanEligibilityAndSelectionContracts(t *testing.T) {
 	}
 	if !containsSelected(first.Selected, "positive") {
 		t.Fatal("known-positive fixture was not selected")
+	}
+}
+
+func TestNoGenericConstructorAliases(t *testing.T) {
+	_, caller, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller(0) failed")
+	}
+	corePath := filepath.Join(filepath.Dir(caller), "core.go")
+	source, err := os.ReadFile(corePath)
+	if err != nil {
+		t.Fatalf("read core.go = %v", err)
+	}
+	file, err := parser.ParseFile(token.NewFileSet(), corePath, source, parser.AllErrors)
+	if err != nil {
+		t.Fatalf("parse core.go = %v", err)
+	}
+	for _, decl := range file.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok {
+			continue
+		}
+		if fn.Name.Name == "NewService" || fn.Name.Name == "NewServiceWithOptions" {
+			t.Fatalf("found forbidden queryquality constructor alias %q", fn.Name.Name)
+		}
+	}
+}
+
+func TestQueryRetrievalPipelineBoundaryContracts(t *testing.T) {
+	entries := []cache.Entry{
+		{Slug: "coffee", Title: "Coffee", Body: "coffee"},
+		{Slug: "tea", Title: "Tea", Body: "tea"},
+	}
+	expander := &trackingQueryExpander{}
+	matcher := &recordingCandidateMatcher{}
+	selector := &trackingResultSelector{}
+	service := queryquality.NewQueryRetrievalPipeline(
+		expander,
+		matcher,
+		selector,
+		nil,
+	)
+	if _, err := service.Execute(context.Background(), &jsonlReader{data: []byte(`{"slug":"coffee","title":"Coffee","body":"coffee"}` + "\n" + `{"slug":"tea","title":"Tea","body":"tea"}` + "\n")}, query.Request{Query: "coffee", Mode: "wiki"}); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if got := expander.lastQuery; got != "coffee" {
+		t.Fatalf("expander query = %q, want %q", got, "coffee")
+	}
+	if len(expander.lastPolicy.RequiredWhenExplicit) != len(queryquality.DefaultCriterionPolicy.RequiredWhenExplicit) {
+		t.Fatalf("expander policy = %#v, want %v", expander.lastPolicy, queryquality.DefaultCriterionPolicy)
+	}
+	if len(matcher.lastCorpusEntries) != len(entries) {
+		t.Fatalf("matcher corpus entries = %d, want %d", len(matcher.lastCorpusEntries), len(entries))
+	}
+	if matcher.lastPlan.RawQuery != "coffee" {
+		t.Fatalf("matcher plan = %#v, want raw query coffee", matcher.lastPlan)
+	}
+	defaultOptions := queryquality.DefaultOptions()
+	if selector.lastSelectionInput.Candidates == nil || selector.lastSelectionInput.Limit != defaultOptions.SelectionLimit || selector.lastSelectionInput.ExplorationSlots != defaultOptions.ExplorationSlots {
+		t.Fatalf("selector input = %#v", selector.lastSelectionInput)
+	}
+	if matcher.lastCorpusEntries[0].Slug != "coffee" || matcher.lastCorpusEntries[1].Slug != "tea" {
+		t.Fatalf("matcher corpus entries changed: %#v", matcher.lastCorpusEntries)
 	}
 }
 
@@ -130,10 +199,10 @@ func TestQueryPlanValidationRejectsWhitespaceTermsAndCannotMatchAllCandidates(t 
 		t.Fatal("ValidateQueryPlan() error = nil, want lexical term rejection")
 	}
 
-	service := queryquality.NewService(
-		fixedPlanExpander{plan: plan},
+	service := queryquality.NewQueryRetrievalPipeline(
+		fixedQueryExpander{plan: plan},
 		queryquality.NewLexicalMatcher(nil),
-		queryquality.NewSelector(),
+		queryquality.NewResultSelector(),
 		nil,
 	)
 	if _, err := service.Execute(context.Background(), &jsonlReader{data: []byte(`{"slug":"x","title":"coffee shop","body":"coffee here"}\n`)}, query.Request{Query: "coffee"}); err == nil {
@@ -157,7 +226,7 @@ func TestDefaultCriterionPolicyIsPlatformOwnedLifestyleV1(t *testing.T) {
 func TestStructuredPlanPromptIsMinimalV1(t *testing.T) {
 	provider := &promptProvider{response: `{"raw_query":"coffee","required":[],"excluded":[],"preferred":[{"kind":"topic","value":"coffee","terms":["coffee"],"proof":"lexical"}],"goals":[],"supporting_dimensions":[],"acceptable_alternatives":[],"ambiguity":[],"fallback":false}`}
 	expander := queryquality.NewStructuredPlanExpander(provider, nil)
-	if _, err := expander.ExpandPlan(context.Background(), "coffee", queryquality.DefaultCriterionPolicy, nil); err != nil {
+	if _, err := expander.Expand(context.Background(), queryquality.ExpansionRequest{Query: "coffee", CriterionPolicy: queryquality.DefaultCriterionPolicy}); err != nil {
 		t.Fatal(err)
 	}
 	wantSystem := `You produce a retrieval plan for a frozen Lifestyle concept corpus. Return exactly one JSON object and no markdown. The object fields and exact types are: raw_query string; required array of Criterion; excluded array of Criterion; preferred array of Criterion; goals array of Criterion; supporting_dimensions array of Criterion; acceptable_alternatives array of Criterion; ambiguity array of strings; fallback boolean. Every Criterion is exactly {kind:string,value:string,terms:array of strings,proof:"lexical" or "semantic"}. Every lexical Criterion needs at least one discovery term. Never output a string where an array or object is required. Be conservative: only explicit user constraints may be required or excluded; absent never means excluded. In this minimal variant, supporting_dimensions and acceptable_alternatives must be empty arrays and fallback must be false.`
@@ -197,7 +266,7 @@ func TestSemanticRequiredAndExcludedFailClosedRoles(t *testing.T) {
 			} else {
 				plan.Excluded = []queryquality.Criterion{criterion}
 			}
-			matched, err := queryquality.NewLexicalMatcher(fixedSemanticEvaluator{outcome: test.outcome}).Match(context.Background(), plan, []cache.Entry{{Slug: "candidate", Title: "Candidate"}})
+			matched, err := queryquality.NewLexicalMatcher(fixedSemanticEvaluator{outcome: test.outcome}).Match(context.Background(), queryquality.MatchRequest{Plan: plan, CorpusEntries: []cache.Entry{{Slug: "candidate", Title: "Candidate"}}})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -209,9 +278,9 @@ func TestSemanticRequiredAndExcludedFailClosedRoles(t *testing.T) {
 }
 
 func TestServicePreservesCanceledCorpusRead(t *testing.T) {
-	service := queryquality.NewService(
-		testPlanExpander{},
-		queryquality.NewLexicalMatcher(nil), queryquality.NewSelector(), nil,
+	service := queryquality.NewQueryRetrievalPipeline(
+		queryQualityTestQueryExpander{},
+		queryquality.NewLexicalMatcher(nil), queryquality.NewResultSelector(), nil,
 	)
 	_, err := service.Execute(context.Background(), &jsonlReader{readErr: context.Canceled}, query.Request{Query: "coffee"})
 	if !errors.Is(err, context.Canceled) {
@@ -223,10 +292,10 @@ func TestMatchingAndSelectionPreserveCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	plan := queryquality.QueryPlan{Preferred: []queryquality.Criterion{{Kind: "topic", Value: "coffee", Terms: []string{"coffee"}, Proof: "lexical"}}}
-	if _, err := queryquality.NewLexicalMatcher(nil).Match(ctx, plan, []cache.Entry{{Slug: "coffee"}}); !errors.Is(err, context.Canceled) {
+	if _, err := queryquality.NewLexicalMatcher(nil).Match(ctx, queryquality.MatchRequest{Plan: plan, CorpusEntries: []cache.Entry{{Slug: "coffee"}}}); !errors.Is(err, context.Canceled) {
 		t.Fatalf("Match() error = %v, want context.Canceled", err)
 	}
-	if _, err := queryquality.NewSelector().Select(ctx, queryquality.SelectionInput{Candidates: []queryquality.CandidateEvidence{{Slug: "coffee", Eligible: true}}, Limit: 1}); !errors.Is(err, context.Canceled) {
+	if _, err := queryquality.NewResultSelector().Select(ctx, queryquality.SelectionInput{Candidates: []queryquality.CandidateEvidence{{Slug: "coffee", Eligible: true}}, Limit: 1}); !errors.Is(err, context.Canceled) {
 		t.Fatalf("Select() error = %v, want context.Canceled", err)
 	}
 }
@@ -276,11 +345,11 @@ func TestSelectorDeterministicReplayAndContextCancellation(t *testing.T) {
 		ExplorationSlots: 2,
 		Seed:             7,
 	}
-	first, err := queryquality.NewSelector().Select(context.Background(), input)
+	first, err := queryquality.NewResultSelector().Select(context.Background(), input)
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := queryquality.NewSelector().Select(context.Background(), input)
+	second, err := queryquality.NewResultSelector().Select(context.Background(), input)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -294,7 +363,7 @@ func TestSelectorDeterministicReplayAndContextCancellation(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := queryquality.NewSelector().Select(ctx, input); !errors.Is(err, context.Canceled) {
+	if _, err := queryquality.NewResultSelector().Select(ctx, input); !errors.Is(err, context.Canceled) {
 		t.Fatalf("Select() error = %v, want context.Canceled", err)
 	}
 }
@@ -362,18 +431,18 @@ func TestStructuredPlanExpanderPreservesCancellationBeforeFallbackWithoutProvide
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	expander := queryquality.NewStructuredPlanExpander(nil, nil)
-	traced, ok := expander.(queryquality.TracedPlanExpander)
+	traced, ok := expander.(queryquality.TracedQueryExpander)
 	if !ok {
 		t.Fatal("structured plan expander should support tracing")
 	}
-	if _, _, err := traced.ExpandPlanWithTrace(ctx, "coffee", queryquality.DefaultCriterionPolicy, nil); !errors.Is(err, context.Canceled) {
+	if _, _, err := traced.ExpandWithTrace(ctx, queryquality.ExpansionRequest{Query: "coffee", CriterionPolicy: queryquality.DefaultCriterionPolicy}); !errors.Is(err, context.Canceled) {
 		t.Fatalf("ExpandPlanWithTrace() error = %v, want context.Canceled", err)
 	}
-	traced, ok = queryquality.NewStructuredPlanExpander(&fakeProvider{response: "{}"}, nil).(queryquality.TracedPlanExpander)
+	traced, ok = queryquality.NewStructuredPlanExpander(&fakeProvider{response: "{}"}, nil).(queryquality.TracedQueryExpander)
 	if !ok {
 		t.Fatal("structured plan expander should support tracing")
 	}
-	_, _, err := traced.ExpandPlanWithTrace(context.Background(), "coffee", queryquality.DefaultCriterionPolicy, nil)
+	_, _, err := traced.ExpandWithTrace(context.Background(), queryquality.ExpansionRequest{Query: "coffee", CriterionPolicy: queryquality.DefaultCriterionPolicy})
 	if err == nil {
 		t.Fatal("ExpandPlanWithTrace() error = nil, want plan decode failure")
 	}
@@ -386,11 +455,11 @@ func TestStructuredPlanExpanderCancellationFallbackPolicy(t *testing.T) {
 		},
 	}
 	tests := []struct {
-		name                 string
-		err                  error
-		wantFallbackCalls    int
-		wantErr              error
-		requireNoPlan         bool
+		name              string
+		err               error
+		wantFallbackCalls int
+		wantErr           error
+		requireNoPlan     bool
 	}{
 		{name: "provider-cancelled", err: context.Canceled, wantFallbackCalls: 0, wantErr: context.Canceled, requireNoPlan: true},
 		{name: "provider-deadline", err: context.DeadlineExceeded, wantFallbackCalls: 0, wantErr: context.DeadlineExceeded, requireNoPlan: true},
@@ -399,18 +468,18 @@ func TestStructuredPlanExpanderCancellationFallbackPolicy(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			fallback := &countingPlanExpander{plan: fallbackPlan}
+			fallback := &countingQueryExpander{plan: fallbackPlan}
 			providerErr := test.err
 			if test.name == "provider-failed-with-wrapped-deadline" {
 				providerErr = fmt.Errorf("provider: %w", context.DeadlineExceeded)
 			}
 			expander := queryquality.NewStructuredPlanExpander(fakeProvider{err: providerErr}, fallback)
-			traced, ok := expander.(queryquality.TracedPlanExpander)
+			traced, ok := expander.(queryquality.TracedQueryExpander)
 			if !ok {
 				t.Fatal("structured plan expander should support tracing")
 			}
 
-			plan, info, err := traced.ExpandPlanWithTrace(context.Background(), "coffee", queryquality.DefaultCriterionPolicy, nil)
+			plan, info, err := traced.ExpandWithTrace(context.Background(), queryquality.ExpansionRequest{Query: "coffee", CriterionPolicy: queryquality.DefaultCriterionPolicy})
 			if !errors.Is(err, test.wantErr) {
 				t.Fatalf("ExpandPlanWithTrace() error = %v, want %v", err, test.wantErr)
 			}
@@ -432,7 +501,7 @@ func TestStructuredPlanExpanderCancellationFallbackPolicy(t *testing.T) {
 
 func TestStructuredPlanExpanderZeroValueUsesDefaultDecoderAndReturnsProviderNotConfigured(t *testing.T) {
 	var expander queryquality.StructuredPlanExpander
-	if _, err := expander.ExpandPlan(context.Background(), "coffee", queryquality.DefaultCriterionPolicy, nil); err == nil {
+	if _, err := expander.Expand(context.Background(), queryquality.ExpansionRequest{Query: "coffee", CriterionPolicy: queryquality.DefaultCriterionPolicy}); err == nil {
 		t.Fatal("ExpandPlan() error = nil, want provider_not_configured")
 	} else {
 		var expansionErr *queryquality.ExpansionError
@@ -501,26 +570,66 @@ func (e fixedSemanticEvaluator) Evaluate(context.Context, queryquality.Criterion
 	return queryquality.SemanticDecision{Outcome: e.outcome}, nil
 }
 
-type testPlanExpander struct{}
+type trackingQueryExpander struct {
+	lastQuery  string
+	lastPolicy queryquality.CriterionPolicy
+}
 
-func (testPlanExpander) ExpandPlan(context.Context, string, queryquality.CriterionPolicy, []cache.Entry) (queryquality.QueryPlan, error) {
+func (e *trackingQueryExpander) Expand(ctx context.Context, request queryquality.ExpansionRequest) (queryquality.QueryPlan, error) {
+	e.lastQuery = request.Query
+	e.lastPolicy = request.CriterionPolicy
+	query := strings.Join(strings.Fields(request.Query), " ")
+	if query == "" {
+		return queryquality.QueryPlan{}, errors.New("empty query")
+	}
+	return queryquality.QueryPlan{
+		RawQuery: request.Query,
+		Preferred: []queryquality.Criterion{
+			{Kind: "query", Value: query, Terms: []string{query}, Proof: "lexical"},
+		},
+	}, nil
+}
+
+type recordingCandidateMatcher struct {
+	lastPlan          queryquality.QueryPlan
+	lastCorpusEntries []cache.Entry
+}
+
+func (m *recordingCandidateMatcher) Match(_ context.Context, request queryquality.MatchRequest) (queryquality.EligibilityResult, error) {
+	m.lastPlan = request.Plan
+	m.lastCorpusEntries = request.CorpusEntries
+	return queryquality.EligibilityResult{Candidates: []queryquality.CandidateEvidence{{Slug: "coffee", Title: "Coffee", Eligible: true}}}, nil
+}
+
+type trackingResultSelector struct {
+	lastSelectionInput queryquality.SelectionInput
+}
+
+func (s *trackingResultSelector) Select(_ context.Context, input queryquality.SelectionInput) (queryquality.SelectionResult, error) {
+	s.lastSelectionInput = input
+	return queryquality.SelectionResult{Selected: []queryquality.SelectedCandidate{{Slug: "coffee", Selected: true, Score: 1}}}, nil
+}
+
+type queryQualityTestQueryExpander struct{}
+
+func (queryQualityTestQueryExpander) Expand(context.Context, queryquality.ExpansionRequest) (queryquality.QueryPlan, error) {
 	return queryquality.QueryPlan{}, nil
 }
 
-type fixedPlanExpander struct {
+type fixedQueryExpander struct {
 	plan queryquality.QueryPlan
 }
 
-func (f fixedPlanExpander) ExpandPlan(context.Context, string, queryquality.CriterionPolicy, []cache.Entry) (queryquality.QueryPlan, error) {
+func (f fixedQueryExpander) Expand(context.Context, queryquality.ExpansionRequest) (queryquality.QueryPlan, error) {
 	return f.plan, nil
 }
 
-type countingPlanExpander struct {
+type countingQueryExpander struct {
 	plan  queryquality.QueryPlan
 	calls int
 }
 
-func (e *countingPlanExpander) ExpandPlan(context.Context, string, queryquality.CriterionPolicy, []cache.Entry) (queryquality.QueryPlan, error) {
+func (e *countingQueryExpander) Expand(context.Context, queryquality.ExpansionRequest) (queryquality.QueryPlan, error) {
 	e.calls++
 	return e.plan, nil
 }

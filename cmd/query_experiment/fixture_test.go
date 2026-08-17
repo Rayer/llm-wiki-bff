@@ -124,7 +124,7 @@ func TestFixtureRunWritesEightReceiptsAndSummaryWithoutKey(t *testing.T) {
 	summaryPath := filepath.Join(dir, "summary.json")
 	var output strings.Builder
 	err := runExperiment(context.Background(), experimentOptions{
-		snapshotPath: root, casesPath: casesPath, runs: 1, service: serviceThreeHost,
+		snapshotPath: root, casesPath: casesPath, runs: 1, service: serviceQueryRetrievalLegacy,
 		selectionLimit: 1, explorationSlots: 0, explorationSlotsSet: true, seed: int64Ptr(7),
 		modelFixturePath: modelPath, profileFixturePath: profilePath, promptFixturePath: promptPath,
 		artifactsDir: artifacts, summaryPath: summaryPath,
@@ -163,6 +163,61 @@ func TestFixtureRunWritesEightReceiptsAndSummaryWithoutKey(t *testing.T) {
 	}
 	if strings.Contains(string(data), "fixture-secret") || strings.Contains(string(data), "api_key") {
 		t.Fatalf("summary leaked credentials: %s", data)
+	}
+}
+
+func TestFixtureAttemptWritesTimingFieldsInRecordAndFinalReceipt(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write([]byte(`{"choices":[{"message":{"content":"{\"preferred\":[{\"kind\":\"topic\",\"value\":\"coffee\",\"terms\":[\"coffee\"]}]}}],"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5}}`))
+	}))
+	defer server.Close()
+	root := filepath.Join(t.TempDir(), "snapshot")
+	writeTestFile(t, filepath.Join(root, "cache", "concepts.jsonl"), `{"slug":"coffee","title":"Coffee","body":"coffee"}`+"\n")
+	dir := t.TempDir()
+	modelPath := writeFixture(t, dir, "models.json", `{"models":[{"id":"m","provider":"fake","base_url":"`+server.URL+`","model":"selected","api_key":"fixture-secret"}]}`)
+	profilePath := writeFixture(t, dir, "profiles.json", `{"profiles":[{"id":"profile","required_when_explicit":[],"preferred_by_default":["topic"],"goals_to_expand":[]}]}`)
+	promptPath := writeFixture(t, dir, "prompts.json", `{"prompts":[{"id":"prompt","system_template":"system {{raw_query}}","user_template":"user {{criterion_policy}} {{raw_query}}"}]}`)
+	casesPath := writeFixture(t, dir, "cases.jsonl", `{"id":"case","query":"coffee","mode":"wiki"}`+"\n")
+	artifacts := filepath.Join(dir, "artifacts")
+	var output strings.Builder
+	received := time.Date(2026, 8, 17, 11, 0, 0, 0, time.UTC)
+	runCompleted := received.Add(600 * time.Millisecond)
+	next := scriptedNow(
+		received,
+		received.Add(20*time.Millisecond),
+		received.Add(120*time.Millisecond),
+		received.Add(130*time.Millisecond),
+		received.Add(180*time.Millisecond),
+		runCompleted,
+	)
+	err := runExperiment(context.Background(), experimentOptions{
+		snapshotPath: root, casesPath: casesPath, runs: 1, service: serviceQueryRetrievalLegacy,
+		selectionLimit: 1, explorationSlots: 0, explorationSlotsSet: true, seed: int64Ptr(7),
+		modelFixturePath: modelPath, profileFixturePath: profilePath, promptFixturePath: promptPath,
+		artifactsDir: artifacts,
+	}, dependencies{now: next, stdout: &output})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var record resultRecord
+	if err := json.Unmarshal([]byte(strings.TrimSpace(output.String())), &record); err != nil {
+		t.Fatal(err)
+	}
+	if record.QueryReceivedAt != received.Format(time.RFC3339Nano) || record.RunCompletedAt != runCompleted.Format(time.RFC3339Nano) || record.DurationMS != 600 {
+		t.Fatalf("record timings=%#v", record)
+	}
+	variantDir := filepath.Join(artifacts, record.VariantID, "case", "run-1")
+	finalReceiptContents, err := os.ReadFile(filepath.Join(variantDir, "final.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var final fixtureFinalReceipt
+	if err := json.Unmarshal(finalReceiptContents, &final); err != nil {
+		t.Fatal(err)
+	}
+	if final.QueryReceivedAt != received.Format(time.RFC3339Nano) || final.RunCompletedAt != runCompleted.Format(time.RFC3339Nano) || final.DurationMS != 600 {
+		t.Fatalf("final receipt timings=%#v", final)
 	}
 }
 

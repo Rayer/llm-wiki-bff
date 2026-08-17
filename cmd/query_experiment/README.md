@@ -8,15 +8,15 @@ go run ./cmd/query_experiment --snapshot ./frozen-project --cases ./cases.jsonl 
 
 The default `--service production` path is the actual baseline/control. It uses
 the existing production query service and its existing output contract. The
-three-host service is a trusted-local experiment only:
+`query-retrieval` service is a trusted-local experiment only:
 
 ```sh
-go run ./cmd/query_experiment --service three-host \
+go run ./cmd/query_experiment --service query-retrieval \
   --selection-limit 10 --exploration-slots 1 --seed -7 \
   --snapshot ./frozen-project --cases ./cases.jsonl
 ```
 
-Three-host knobs are ignored by production. `--selection-limit` defaults to 10
+query-retrieval knobs are ignored by production. `--selection-limit` defaults to 10
 and accepts 1..1000. `--exploration-slots` defaults to 1 and accepts 0 through
 the selection limit. `--seed` accepts a signed 64-bit integer; when omitted,
 the seed is derived reproducibly from the query. Selection is therefore causal
@@ -39,32 +39,35 @@ Cases are strict JSONL, one object per line:
 {"id":"full-coffee","query":"coffee shops","mode":"full"}
 ```
 
-The no-key three-host path uses `deterministic-fallback`: one normalized raw
-query as one preferred lexical criterion. This fallback is only a three-host
+The no-key query-retrieval path uses `deterministic-fallback`: one normalized raw
+query as one preferred lexical criterion. This fallback is only a query-retrieval
 wiring smoke; it is not the baseline, ranking evidence, semantic evidence, or
 quality evidence. A configured provider may make one structured expansion call;
 provider failure falls back with a short trace reason. No project ontology or
 semantic profile is loaded.
 
-The three-host trace preserves the ordered `expansion`, `matching`, and
+The query-retrieval trace preserves the ordered `expansion`, `matching`, and
 `selection` stages. It may include plan criteria, lexical field/term evidence,
 eligibility reasons, selection reasons, exploration markers, and seed metadata,
 but never concept bodies/snippets, prompts, credentials, or raw provider
 responses. Semantic criteria are never treated as lexical proof; required or
 excluded semantic criteria are explicitly unavailable without an evaluator.
 
-Three-host returns selected identities only. It does not produce production
+query-retrieval returns selected identities only. It does not produce production
 synthesis or citation resolution. The honest remaining limit is that this
 trusted-local variant is an experiment, not a quality claim about production.
 
 ## Local fixture matrix
 
-The trusted-local fixture runner is enabled only for `--service three-host` when
+The trusted-local fixture runner is enabled only for `--service query-retrieval` when
 all three fixture files and `--artifacts-dir` are supplied. Production ignores
-these flags, and the existing no-fixture three-host smoke remains unchanged.
+these flags, and the existing no-fixture query-retrieval smoke remains unchanged.
+
+The service also accepts the legacy value `--service three-host` for backward
+compatibility.
 
 ```sh
-go run ./cmd/query_experiment --service three-host \
+go run ./cmd/query_experiment --service query-retrieval \
   --snapshot ./frozen-project --cases ./cases.jsonl --runs 3 \
   --model-fixture ./models.json --models deepseek-v4-flash,deepseek-v4-pro,grok-4.6 \
   --profile-fixture ./profiles.json --profiles narrow \

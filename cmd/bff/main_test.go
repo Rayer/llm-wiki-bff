@@ -29,7 +29,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-func TestDefaultProductionQueryCompositionUsesThreeHostExecutor(t *testing.T) {
+func TestDefaultProductionQueryCompositionUsesProductionExecutor(t *testing.T) {
 	executor, err := newProductionQueryExecutor(config.Config{}, conceptcache.New())
 	if err != nil {
 		t.Fatal(err)

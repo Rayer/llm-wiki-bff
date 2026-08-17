@@ -59,13 +59,13 @@ type caseInput struct {
 }
 
 type dependencies struct {
-	loadConfig           func(string) (config.Config, error)
-	newExecutor          func(*cache.Cache, config.Config) (query.Executor, error)
-	newThreeHostExecutor func(*cache.Cache, config.Config, threeHostOptions) (query.Executor, error)
-	now                  func() time.Time
-	stdout               io.Writer
-	openOutput           func(string, io.Writer) (recordSink, error)
-	threeHostSeed        func(string) int64
+	loadConfig                func(string) (config.Config, error)
+	newExecutor               func(*cache.Cache, config.Config) (query.Executor, error)
+	newQueryRetrievalExecutor func(*cache.Cache, config.Config, queryRetrievalOptions) (query.Executor, error)
+	now                       func() time.Time
+	stdout                    io.Writer
+	openOutput                func(string, io.Writer) (recordSink, error)
+	queryRetrievalSeed        func(string) int64
 }
 
 type preparedSnapshot struct {
@@ -82,28 +82,31 @@ type resultIdentity struct {
 }
 
 type resultRecord struct {
-	SchemaVersion  int               `json:"schema_version"`
-	CaseID         string            `json:"case_id"`
-	RunIndex       int               `json:"run_index"`
-	Snapshot       string            `json:"snapshot_identity"`
-	CorpusSHA256   string            `json:"corpus_sha256"`
-	Query          string            `json:"query"`
-	Mode           string            `json:"mode"`
-	Expansion      *llm.ExpandResult `json:"expansion,omitempty"`
-	Results        []resultIdentity  `json:"results"`
-	Citations      []search.Citation `json:"citations"`
-	Synthesis      string            `json:"synthesis"`
-	Outcome        string            `json:"outcome"`
-	ErrorStage     string            `json:"error_stage,omitempty"`
-	ErrorMessage   string            `json:"error_message,omitempty"`
-	ElapsedMS      int64             `json:"elapsed_ms"`
-	SourceRevision string            `json:"source_revision"`
-	Provider       string            `json:"provider,omitempty"`
-	Model          string            `json:"model,omitempty"`
-	VariantID      string            `json:"variant_id,omitempty"`
-	ProfileID      string            `json:"profile_id,omitempty"`
-	PromptID       string            `json:"prompt_id,omitempty"`
-	ThreeHostTrace *threeHostTrace   `json:"three_host_trace,omitempty"`
+	SchemaVersion       int                  `json:"schema_version"`
+	CaseID              string               `json:"case_id"`
+	RunIndex            int                  `json:"run_index"`
+	Snapshot            string               `json:"snapshot_identity"`
+	CorpusSHA256        string               `json:"corpus_sha256"`
+	Query               string               `json:"query"`
+	Mode                string               `json:"mode"`
+	Expansion           *llm.ExpandResult    `json:"expansion,omitempty"`
+	Results             []resultIdentity     `json:"results"`
+	Citations           []search.Citation    `json:"citations"`
+	Synthesis           string               `json:"synthesis"`
+	Outcome             string               `json:"outcome"`
+	ErrorStage          string               `json:"error_stage,omitempty"`
+	ErrorMessage        string               `json:"error_message,omitempty"`
+	ElapsedMS           int64                `json:"elapsed_ms"`
+	QueryReceivedAt     string               `json:"query_received_at"`
+	RunCompletedAt      string               `json:"run_completed_at"`
+	DurationMS          int64                `json:"duration_ms"`
+	SourceRevision      string               `json:"source_revision"`
+	Provider            string               `json:"provider,omitempty"`
+	Model               string               `json:"model,omitempty"`
+	VariantID           string               `json:"variant_id,omitempty"`
+	ProfileID           string               `json:"profile_id,omitempty"`
+	PromptID            string               `json:"prompt_id,omitempty"`
+	QueryRetrievalTrace *queryRetrievalTrace `json:"three_host_trace,omitempty"`
 }
 
 type recordSink interface {
@@ -354,8 +357,11 @@ func runExperiment(ctx context.Context, options experimentOptions, deps dependen
 	if options.service == "" {
 		options.service = serviceProduction
 	}
-	if options.service != serviceProduction && options.service != serviceThreeHost {
+	if options.service != serviceProduction && options.service != serviceQueryRetrieval && options.service != serviceQueryRetrievalLegacy {
 		return fmt.Errorf("unsupported service %q", options.service)
+	}
+	if options.service == serviceQueryRetrievalLegacy {
+		options.service = serviceQueryRetrieval
 	}
 	if err := validateOutputPath(options.outputPath); err != nil {
 		return err
@@ -368,13 +374,13 @@ func runExperiment(ctx context.Context, options experimentOptions, deps dependen
 	if err != nil {
 		return err
 	}
-	if options.service == serviceThreeHost && options.fixtureFlagsSet() {
+	if options.service == serviceQueryRetrieval && options.fixtureFlagsSet() {
 		if err := options.validateFixtureFlags(); err != nil {
 			return err
 		}
 		return runFixtureExperiment(ctx, options, prepared, cases, deps)
 	}
-	if deps.loadConfig == nil || (options.service == serviceProduction && deps.newExecutor == nil) || (options.service == serviceThreeHost && deps.newThreeHostExecutor == nil) {
+	if deps.loadConfig == nil || (options.service == serviceProduction && deps.newExecutor == nil) || (options.service == serviceQueryRetrieval && deps.newQueryRetrievalExecutor == nil) {
 		return errors.New("experiment dependencies are incomplete")
 	}
 	configDir := options.configDir
@@ -386,15 +392,15 @@ func runExperiment(ctx context.Context, options experimentOptions, deps dependen
 		return fmt.Errorf("load config: %w", err)
 	}
 	var executor query.Executor
-	if options.service == serviceThreeHost {
-		threeHostOptions := defaultThreeHostOptions()
-		threeHostOptions.selectionLimit = options.selectionLimit
+	if options.service == serviceQueryRetrieval {
+		queryRetrievalOptions := defaultQueryRetrievalOptions()
+		queryRetrievalOptions.selectionLimit = options.selectionLimit
 		if options.explorationSlotsSet {
-			threeHostOptions.explorationSlots = options.explorationSlots
+			queryRetrievalOptions.explorationSlots = options.explorationSlots
 		}
-		threeHostOptions.seed = options.seed
-		threeHostOptions.seedFor = deps.threeHostSeed
-		executor, err = deps.newThreeHostExecutor(prepared.cache, cfg, threeHostOptions)
+		queryRetrievalOptions.seed = options.seed
+		queryRetrievalOptions.seedFor = deps.queryRetrievalSeed
+		executor, err = deps.newQueryRetrievalExecutor(prepared.cache, cfg, queryRetrievalOptions)
 	} else {
 		executor, err = deps.newExecutor(prepared.cache, cfg)
 	}
@@ -426,13 +432,12 @@ func runExperiment(ctx context.Context, options experimentOptions, deps dependen
 	metadata := buildRecordMetadata(cfg)
 	for _, input := range cases {
 		for runIndex := 1; runIndex <= options.runs; runIndex++ {
-			started := now()
+			queryReceivedAt := now()
 			result, trace, executeErr := executeExperiment(executor, ctx, prepared.reader, query.Request{Query: input.Query, Mode: input.Mode})
-			elapsed := now().Sub(started).Milliseconds()
-			if elapsed < 0 {
-				elapsed = 0
-			}
+			runCompletedAt := now()
+			elapsed := elapsedBetween(runCompletedAt, queryReceivedAt)
 			record := makeResultRecordWithTrace(input, runIndex, prepared, result, executeErr, elapsed, metadata, trace)
+			record.QueryReceivedAt, record.RunCompletedAt, record.DurationMS = attemptTiming(queryReceivedAt, runCompletedAt)
 			if err := sink.WriteRecord(record); err != nil {
 				return fmt.Errorf("write result %d/%d for %q: %w", runIndex, options.runs, input.ID, err)
 			}
@@ -445,11 +450,15 @@ func runExperiment(ctx context.Context, options experimentOptions, deps dependen
 	return nil
 }
 
-type tracedExecutor interface {
-	ExecuteWithTrace(context.Context, cache.Reader, query.Request) (query.Result, *threeHostTrace, error)
+func attemptTiming(receivedAt, completedAt time.Time) (string, string, int64) {
+	return receivedAt.UTC().Format(time.RFC3339Nano), completedAt.UTC().Format(time.RFC3339Nano), elapsedBetween(completedAt, receivedAt)
 }
 
-func executeExperiment(executor query.Executor, ctx context.Context, reader cache.Reader, request query.Request) (query.Result, *threeHostTrace, error) {
+type tracedExecutor interface {
+	ExecuteWithTrace(context.Context, cache.Reader, query.Request) (query.Result, *queryRetrievalTrace, error)
+}
+
+func executeExperiment(executor query.Executor, ctx context.Context, reader cache.Reader, request query.Request) (query.Result, *queryRetrievalTrace, error) {
 	if traced, ok := executor.(tracedExecutor); ok {
 		return traced.ExecuteWithTrace(ctx, reader, request)
 	}
@@ -478,7 +487,7 @@ func makeResultRecord(input caseInput, runIndex int, snapshot preparedSnapshot, 
 	return makeResultRecordWithTrace(input, runIndex, snapshot, result, executeErr, elapsed, metadata, nil)
 }
 
-func makeResultRecordWithTrace(input caseInput, runIndex int, snapshot preparedSnapshot, result query.Result, executeErr error, elapsed int64, metadata recordMetadata, trace *threeHostTrace) resultRecord {
+func makeResultRecordWithTrace(input caseInput, runIndex int, snapshot preparedSnapshot, result query.Result, executeErr error, elapsed int64, metadata recordMetadata, trace *queryRetrievalTrace) resultRecord {
 	outcome := "success"
 	if executeErr != nil {
 		outcome = "execution_failure"
@@ -497,23 +506,23 @@ func makeResultRecordWithTrace(input caseInput, runIndex int, snapshot preparedS
 		citations = []search.Citation{}
 	}
 	record := resultRecord{
-		SchemaVersion:  1,
-		CaseID:         input.ID,
-		RunIndex:       runIndex,
-		Snapshot:       snapshot.label,
-		CorpusSHA256:   snapshot.digest,
-		Query:          input.Query,
-		Mode:           input.Mode,
-		Expansion:      result.Expand,
-		Results:        identities,
-		Citations:      citations,
-		Synthesis:      result.AISynth,
-		Outcome:        outcome,
-		ElapsedMS:      elapsed,
-		SourceRevision: metadata.sourceRevision,
-		Provider:       metadata.provider,
-		Model:          metadata.model,
-		ThreeHostTrace: trace,
+		SchemaVersion:       1,
+		CaseID:              input.ID,
+		RunIndex:            runIndex,
+		Snapshot:            snapshot.label,
+		CorpusSHA256:        snapshot.digest,
+		Query:               input.Query,
+		Mode:                input.Mode,
+		Expansion:           result.Expand,
+		Results:             identities,
+		Citations:           citations,
+		Synthesis:           result.AISynth,
+		Outcome:             outcome,
+		ElapsedMS:           elapsed,
+		SourceRevision:      metadata.sourceRevision,
+		Provider:            metadata.provider,
+		Model:               metadata.model,
+		QueryRetrievalTrace: trace,
 	}
 	if executeErr != nil {
 		record.ErrorStage = "execute"

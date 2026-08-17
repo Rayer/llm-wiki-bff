@@ -107,6 +107,16 @@ type CandidateEvidence struct {
 
 type EligibilityResult struct{ Candidates []CandidateEvidence }
 
+type ExpansionRequest struct {
+	Query           string
+	CriterionPolicy CriterionPolicy
+}
+
+type MatchRequest struct {
+	Plan          QueryPlan
+	CorpusEntries []cache.Entry
+}
+
 type SelectionInput struct {
 	Candidates       []CandidateEvidence
 	Limit            int
@@ -126,8 +136,8 @@ type SelectedCandidate struct {
 
 type SelectionResult struct{ Selected []SelectedCandidate }
 
-type PlanExpander interface {
-	ExpandPlan(context.Context, string, CriterionPolicy, []cache.Entry) (QueryPlan, error)
+type QueryExpander interface {
+	Expand(context.Context, ExpansionRequest) (QueryPlan, error)
 }
 
 type ChatProvider interface {
@@ -139,13 +149,13 @@ type ExpansionInfo struct {
 	FallbackReason string
 }
 
-type TracedPlanExpander interface {
-	ExpandPlanWithTrace(context.Context, string, CriterionPolicy, []cache.Entry) (QueryPlan, ExpansionInfo, error)
+type TracedQueryExpander interface {
+	ExpandWithTrace(context.Context, ExpansionRequest) (QueryPlan, ExpansionInfo, error)
 }
 
 type StructuredPlanExpander struct {
 	provider   ChatProvider
-	fallback   PlanExpander
+	fallback   QueryExpander
 	decodePlan func(string, string) (QueryPlan, error)
 }
 
@@ -163,20 +173,20 @@ func (e *ExpansionError) Error() string {
 
 func (e *ExpansionError) Unwrap() error { return e.Err }
 
-func NewStructuredPlanExpander(provider ChatProvider, fallback PlanExpander) PlanExpander {
+func NewStructuredPlanExpander(provider ChatProvider, fallback QueryExpander) QueryExpander {
 	return StructuredPlanExpander{provider: provider, fallback: fallback, decodePlan: DecodePlan}
 }
 
-func NewMinimalStructuredPlanExpander(provider ChatProvider, fallback PlanExpander) PlanExpander {
+func NewMinimalStructuredPlanExpander(provider ChatProvider, fallback QueryExpander) QueryExpander {
 	return StructuredPlanExpander{provider: provider, fallback: fallback, decodePlan: DecodeMinimalV1Plan}
 }
 
-func (e StructuredPlanExpander) ExpandPlan(ctx context.Context, raw string, policy CriterionPolicy, entries []cache.Entry) (QueryPlan, error) {
-	plan, _, err := e.ExpandPlanWithTrace(ctx, raw, policy, entries)
+func (e StructuredPlanExpander) Expand(ctx context.Context, request ExpansionRequest) (QueryPlan, error) {
+	plan, _, err := e.ExpandWithTrace(ctx, request)
 	return plan, err
 }
 
-func (e StructuredPlanExpander) ExpandPlanWithTrace(ctx context.Context, raw string, policy CriterionPolicy, entries []cache.Entry) (QueryPlan, ExpansionInfo, error) {
+func (e StructuredPlanExpander) ExpandWithTrace(ctx context.Context, request ExpansionRequest) (QueryPlan, ExpansionInfo, error) {
 	if err := ctx.Err(); err != nil {
 		return QueryPlan{}, ExpansionInfo{}, err
 	}
@@ -185,15 +195,15 @@ func (e StructuredPlanExpander) ExpandPlanWithTrace(ctx context.Context, raw str
 		decodePlan = DecodePlan
 	}
 	if e.provider != nil {
-		response, err := e.provider.Chat(ctx, structuredPlanSystemPrompt, structuredPlanUserPrompt(raw, policy))
+		response, err := e.provider.Chat(ctx, structuredPlanSystemPrompt, structuredPlanUserPrompt(request.Query, request.CriterionPolicy))
 		if err == nil {
-			if plan, decodeErr := decodePlan(response, raw); decodeErr == nil {
+			if plan, decodeErr := decodePlan(response, request.Query); decodeErr == nil {
 				return plan, ExpansionInfo{Source: "structured-llm"}, nil
 			}
 			if e.fallback == nil {
 				return QueryPlan{}, ExpansionInfo{}, &ExpansionError{Reason: "invalid_plan"}
 			}
-			return e.fallbackPlan(ctx, raw, policy, entries, "invalid_plan")
+			return e.fallbackPlan(ctx, request, "invalid_plan")
 		}
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return QueryPlan{}, ExpansionInfo{}, ctxErr
@@ -204,22 +214,22 @@ func (e StructuredPlanExpander) ExpandPlanWithTrace(ctx context.Context, raw str
 		if e.fallback == nil {
 			return QueryPlan{}, ExpansionInfo{}, &ExpansionError{Reason: "provider_error", Err: err}
 		}
-		return e.fallbackPlan(ctx, raw, policy, entries, "provider_error")
+		return e.fallbackPlan(ctx, request, "provider_error")
 	}
 	if e.fallback == nil {
 		return QueryPlan{}, ExpansionInfo{}, &ExpansionError{Reason: "provider_not_configured"}
 	}
-	return e.fallbackPlan(ctx, raw, policy, entries, "provider_not_configured")
+	return e.fallbackPlan(ctx, request, "provider_not_configured")
 }
 
-func (e StructuredPlanExpander) fallbackPlan(ctx context.Context, raw string, policy CriterionPolicy, entries []cache.Entry, reason string) (QueryPlan, ExpansionInfo, error) {
+func (e StructuredPlanExpander) fallbackPlan(ctx context.Context, request ExpansionRequest, reason string) (QueryPlan, ExpansionInfo, error) {
 	if err := ctx.Err(); err != nil {
 		return QueryPlan{}, ExpansionInfo{}, err
 	}
 	if e.fallback == nil {
 		return QueryPlan{}, ExpansionInfo{}, errors.New("fallback unavailable")
 	}
-	plan, err := e.fallback.ExpandPlan(ctx, raw, policy, entries)
+	plan, err := e.fallback.Expand(ctx, request)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return QueryPlan{}, ExpansionInfo{}, ctxErr
@@ -229,7 +239,7 @@ func (e StructuredPlanExpander) fallbackPlan(ctx context.Context, raw string, po
 		}
 		return QueryPlan{}, ExpansionInfo{}, fmt.Errorf("fallback: %w", err)
 	}
-	plan.RawQuery = raw
+	plan.RawQuery = request.Query
 	plan.Fallback = true
 	if err := validateDeterministicFallbackPlan(plan); err != nil {
 		return QueryPlan{}, ExpansionInfo{}, fmt.Errorf("fallback validation: %w", err)
@@ -544,38 +554,41 @@ func criterionKey(criterion Criterion) string {
 	return strings.ToLower(strings.TrimSpace(criterion.Kind) + "\x00" + strings.TrimSpace(criterion.Value))
 }
 
-type EligibilityMatcher interface {
-	Match(context.Context, QueryPlan, []cache.Entry) (EligibilityResult, error)
+type CandidateMatcher interface {
+	Match(context.Context, MatchRequest) (EligibilityResult, error)
 }
 
-type CandidateSelector interface {
+type ResultSelector interface {
 	Select(context.Context, SelectionInput) (SelectionResult, error)
 }
 
-type Service struct {
+type QueryRetrievalPipeline struct {
 	cache                      *cache.Cache
-	expander                   PlanExpander
-	matcher                    EligibilityMatcher
-	selector                   CandidateSelector
+	queryExpander              QueryExpander
+	candidateMatcher           CandidateMatcher
+	resultSelector             ResultSelector
 	seedFor                    func(string) int64
 	options                    Options
 	allowDeterministicFallback bool
 }
 
-func NewService(expander PlanExpander, matcher EligibilityMatcher, selector CandidateSelector, seedFor func(string) int64) *Service {
-	return NewServiceWithOptions(expander, matcher, selector, seedFor, DefaultOptions())
-}
-
-func NewServiceWithOptions(expander PlanExpander, matcher EligibilityMatcher, selector CandidateSelector, seedFor func(string) int64, options Options) *Service {
+func NewQueryRetrievalPipeline(queryExpander QueryExpander, candidateMatcher CandidateMatcher, resultSelector ResultSelector, seedFor func(string) int64) *QueryRetrievalPipeline {
 	if seedFor == nil {
 		seedFor = ReproducibleSeed
 	}
-	return &Service{cache: cache.New(), expander: expander, matcher: matcher, selector: selector, seedFor: seedFor, options: options}
+	return &QueryRetrievalPipeline{cache: cache.New(), queryExpander: queryExpander, candidateMatcher: candidateMatcher, resultSelector: resultSelector, seedFor: seedFor, options: DefaultOptions()}
+}
+
+func NewQueryRetrievalPipelineWithOptions(queryExpander QueryExpander, candidateMatcher CandidateMatcher, resultSelector ResultSelector, seedFor func(string) int64, options Options) *QueryRetrievalPipeline {
+	if seedFor == nil {
+		seedFor = ReproducibleSeed
+	}
+	return &QueryRetrievalPipeline{cache: cache.New(), queryExpander: queryExpander, candidateMatcher: candidateMatcher, resultSelector: resultSelector, seedFor: seedFor, options: options}
 }
 
 func NewExperimentExecutor(conceptCache *cache.Cache, provider ChatProvider, options Options) (query.Executor, error) {
 	if conceptCache == nil {
-		return nil, errors.New("three-host cache is nil")
+		return nil, errors.New("query-retrieval cache is nil")
 	}
 	options, err := NormalizeOptions(options)
 	if err != nil {
@@ -585,50 +598,51 @@ func NewExperimentExecutor(conceptCache *cache.Cache, provider ChatProvider, opt
 	if seedFor == nil {
 		seedFor = ReproducibleSeed
 	}
-	service := NewServiceWithOptions(NewStructuredPlanExpander(provider, NewDeterministicExpander()), NewLexicalMatcher(nil), NewSelector(), seedFor, options)
+	service := NewQueryRetrievalPipelineWithOptions(NewStructuredPlanExpander(provider, NewDeterministicExpander()), NewLexicalMatcher(nil), NewResultSelector(), seedFor, options)
 	service.cache = conceptCache
 	service.allowDeterministicFallback = true
 	return service, nil
 }
 
-func (s *Service) Execute(ctx context.Context, reader cache.Reader, request query.Request) (query.Result, error) {
+func (s *QueryRetrievalPipeline) Execute(ctx context.Context, reader cache.Reader, request query.Request) (query.Result, error) {
 	if err := s.validate(); err != nil {
 		return query.Result{}, err
 	}
 	return s.execute(ctx, reader, request, nil)
 }
 
-func (s *Service) ExecuteWithTrace(ctx context.Context, reader cache.Reader, request query.Request) (query.Result, *Trace, error) {
+func (s *QueryRetrievalPipeline) ExecuteWithTrace(ctx context.Context, reader cache.Reader, request query.Request) (query.Result, *Trace, error) {
 	if err := s.validate(); err != nil {
 		return query.Result{}, nil, err
 	}
-	trace := &Trace{Variant: "three-host-v1"}
+	trace := &Trace{Variant: "query-retrieval-v1"}
 	result, err := s.execute(ctx, reader, request, trace)
 	return result, trace, err
 }
 
-func (s *Service) validate() error {
-	if s == nil || s.cache == nil || s.expander == nil || s.matcher == nil || s.selector == nil {
-		return errors.New("three-host service is incomplete")
+func (s *QueryRetrievalPipeline) validate() error {
+	if s == nil || s.cache == nil || s.queryExpander == nil || s.candidateMatcher == nil || s.resultSelector == nil {
+		return errors.New("query-retrieval pipeline is incomplete")
 	}
 	return nil
 }
 
-func (s *Service) execute(ctx context.Context, reader cache.Reader, request query.Request, trace *Trace) (query.Result, error) {
+func (s *QueryRetrievalPipeline) execute(ctx context.Context, reader cache.Reader, request query.Request, trace *Trace) (query.Result, error) {
 	entries, err := s.cache.All(ctx, reader)
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return query.Result{}, err
 		}
-		return query.Result{}, fmt.Errorf("three-host corpus unavailable: %w", err)
+		return query.Result{}, fmt.Errorf("query-retrieval corpus unavailable: %w", err)
 	}
 	started := time.Now()
 	var plan QueryPlan
 	info := ExpansionInfo{}
-	if traced, ok := s.expander.(TracedPlanExpander); ok {
-		plan, info, err = traced.ExpandPlanWithTrace(ctx, request.Query, DefaultCriterionPolicy, entries)
+	requestWithPolicy := ExpansionRequest{Query: request.Query, CriterionPolicy: DefaultCriterionPolicy}
+	if traced, ok := s.queryExpander.(TracedQueryExpander); ok {
+		plan, info, err = traced.ExpandWithTrace(ctx, requestWithPolicy)
 	} else {
-		plan, err = s.expander.ExpandPlan(ctx, request.Query, DefaultCriterionPolicy, entries)
+		plan, err = s.queryExpander.Expand(ctx, requestWithPolicy)
 	}
 	if err != nil {
 		appendTraceStage(trace, StageTrace{Name: "expansion", Outcome: "failure", ElapsedMS: elapsedSince(started), FallbackReason: "expansion_failure"})
@@ -643,7 +657,7 @@ func (s *Service) execute(ctx context.Context, reader cache.Reader, request quer
 	}
 	if err := validate(plan); err != nil {
 		appendTraceStage(trace, StageTrace{Name: "expansion", Outcome: "invalid", ElapsedMS: elapsedSince(started), FallbackReason: "invalid_plan"})
-		return query.Result{}, errors.New("three-host expansion invalid")
+		return query.Result{}, errors.New("query-retrieval expansion invalid")
 	}
 	appendTraceStage(trace, StageTrace{
 		Name: "expansion", Outcome: PlanOutcome(plan), Source: info.Source, FallbackReason: info.FallbackReason,
@@ -661,7 +675,8 @@ func (s *Service) execute(ctx context.Context, reader cache.Reader, request quer
 	}
 
 	started = time.Now()
-	eligible, err := s.matcher.Match(ctx, plan, entries)
+	matchReq := MatchRequest{Plan: plan, CorpusEntries: entries}
+	eligible, err := s.candidateMatcher.Match(ctx, matchReq)
 	if err != nil {
 		appendTraceStage(trace, StageTrace{Name: "matching", Outcome: "failure", ElapsedMS: elapsedSince(started), InputCount: len(entries)})
 		if ctxErr := ctx.Err(); ctxErr != nil {
@@ -670,12 +685,12 @@ func (s *Service) execute(ctx context.Context, reader cache.Reader, request quer
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return query.Result{}, err
 		}
-		return query.Result{}, fmt.Errorf("three-host matching failed: %w", err)
+		return query.Result{}, fmt.Errorf("query-retrieval matching failed: %w", err)
 	}
 	appendTraceStage(trace, StageTrace{Name: "matching", Outcome: "success", ElapsedMS: elapsedSince(started), InputCount: len(entries), OutputCount: EligibleCount(eligible.Candidates), TotalCount: len(eligible.Candidates), Candidates: eligible.Candidates})
 
 	started = time.Now()
-	selected, err := s.selector.Select(ctx, SelectionInput{Candidates: eligible.Candidates, Limit: s.options.SelectionLimit, ExplorationSlots: s.options.ExplorationSlots, Seed: seed})
+	selected, err := s.resultSelector.Select(ctx, SelectionInput{Candidates: eligible.Candidates, Limit: s.options.SelectionLimit, ExplorationSlots: s.options.ExplorationSlots, Seed: seed})
 	if err != nil {
 		appendTraceStage(trace, StageTrace{Name: "selection", Outcome: "failure", ElapsedMS: elapsedSince(started), InputCount: len(eligible.Candidates)})
 		if ctxErr := ctx.Err(); ctxErr != nil {
@@ -684,7 +699,7 @@ func (s *Service) execute(ctx context.Context, reader cache.Reader, request quer
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return query.Result{}, err
 		}
-		return query.Result{}, fmt.Errorf("three-host selection failed: %w", err)
+		return query.Result{}, fmt.Errorf("query-retrieval selection failed: %w", err)
 	}
 	appendTraceStage(trace, StageTrace{Name: "selection", Outcome: "success", ElapsedMS: elapsedSince(started), InputCount: len(eligible.Candidates), OutputCount: selectedCount(selected.Selected), TotalCount: len(selected.Selected), Decisions: selected.Selected})
 	results := make([]search.Result, 0, len(selected.Selected))
@@ -793,9 +808,10 @@ func ReproducibleSeed(query string) int64 {
 
 type deterministicExpander struct{}
 
-func NewDeterministicExpander() PlanExpander { return deterministicExpander{} }
+func NewDeterministicExpander() QueryExpander { return deterministicExpander{} }
 
-func (deterministicExpander) ExpandPlan(_ context.Context, raw string, _ CriterionPolicy, _ []cache.Entry) (QueryPlan, error) {
+func (deterministicExpander) Expand(_ context.Context, request ExpansionRequest) (QueryPlan, error) {
+	raw := request.Query
 	query := strings.Join(strings.Fields(raw), " ")
 	if query == "" {
 		return QueryPlan{}, errors.New("empty query")
@@ -812,13 +828,13 @@ type SemanticEvaluator interface {
 
 type lexicalMatcher struct{ semantic SemanticEvaluator }
 
-func NewLexicalMatcher(semantic SemanticEvaluator) EligibilityMatcher {
+func NewLexicalMatcher(semantic SemanticEvaluator) CandidateMatcher {
 	return lexicalMatcher{semantic: semantic}
 }
 
-func (m lexicalMatcher) Match(ctx context.Context, plan QueryPlan, entries []cache.Entry) (EligibilityResult, error) {
-	candidates := make([]CandidateEvidence, 0, len(entries))
-	for _, entry := range entries {
+func (m lexicalMatcher) Match(ctx context.Context, request MatchRequest) (EligibilityResult, error) {
+	candidates := make([]CandidateEvidence, 0, len(request.CorpusEntries))
+	for _, entry := range request.CorpusEntries {
 		if err := ctx.Err(); err != nil {
 			return EligibilityResult{}, err
 		}
@@ -829,8 +845,8 @@ func (m lexicalMatcher) Match(ctx context.Context, plan QueryPlan, entries []cac
 			criteria   []Criterion
 			failClosed bool
 		}{
-			{"required", plan.Required, semanticRequiredFailClosed}, {"excluded", plan.Excluded, semanticExcludedFailClosed},
-			{"preferred", plan.Preferred, false}, {"goal", plan.Goals, false}, {"supporting", plan.SupportingDimensions, false}, {"alternative", plan.AcceptableAlternatives, false},
+			{"required", request.Plan.Required, semanticRequiredFailClosed}, {"excluded", request.Plan.Excluded, semanticExcludedFailClosed},
+			{"preferred", request.Plan.Preferred, false}, {"goal", request.Plan.Goals, false}, {"supporting", request.Plan.SupportingDimensions, false}, {"alternative", request.Plan.AcceptableAlternatives, false},
 		} {
 			if err := ctx.Err(); err != nil {
 				return EligibilityResult{}, err
@@ -858,18 +874,18 @@ func (m lexicalMatcher) Match(ctx context.Context, plan QueryPlan, entries []cac
 				}
 			}
 		}
-		for _, criterion := range plan.Required {
+		for _, criterion := range request.Plan.Required {
 			if criterion.Proof != "semantic" && !hasMatchedGroup(candidate.Groups, criterion) {
 				candidate.Eligible = false
 				candidate.Rejection = "required_" + criterion.Kind + "_not_matched"
 				break
 			}
 		}
-		if candidate.Eligible && hasAnyMatchedGroup(candidate.Groups, plan.Excluded) {
+		if candidate.Eligible && hasAnyMatchedGroup(candidate.Groups, request.Plan.Excluded) {
 			candidate.Eligible = false
 			candidate.Rejection = "excluded_criterion_matched"
 		}
-		candidate.Score = independentDimensionScore(plan, candidate.Groups)
+		candidate.Score = independentDimensionScore(request.Plan, candidate.Groups)
 		candidates = append(candidates, candidate)
 	}
 	return EligibilityResult{Candidates: candidates}, nil
@@ -999,7 +1015,7 @@ func ContainsString(values []string, want string) bool {
 
 type randomSelector struct{}
 
-func NewSelector() CandidateSelector { return randomSelector{} }
+func NewResultSelector() ResultSelector { return randomSelector{} }
 
 func (randomSelector) Select(ctx context.Context, input SelectionInput) (SelectionResult, error) {
 	if err := ctx.Err(); err != nil {
