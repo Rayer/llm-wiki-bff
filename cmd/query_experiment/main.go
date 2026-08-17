@@ -20,13 +20,13 @@ func main() {
 	flag.IntVar(&options.runs, "runs", 0, "positive number of runs per case (maximum 100)")
 	flag.StringVar(&options.outputPath, "output", "", "JSONL output file; stdout when omitted")
 	flag.StringVar(&options.configDir, "config-dir", ".", "directory for optional config.toml")
-	flag.StringVar(&options.service, "service", serviceProduction, "query service: production or three-host")
-	flag.IntVar(&options.selectionLimit, "selection-limit", defaultLimit, "three-host maximum selected concepts")
-	flag.IntVar(&options.explorationSlots, "exploration-slots", 1, "three-host selected concepts reserved for exploration")
+	flag.StringVar(&options.service, "service", serviceProduction, "query service: production or query-retrieval")
+	flag.IntVar(&options.selectionLimit, "selection-limit", defaultLimit, "query-retrieval maximum selected concepts")
+	flag.IntVar(&options.explorationSlots, "exploration-slots", 1, "query-retrieval selected concepts reserved for exploration")
 	options.explorationSlotsSet = true
 	var seed int64
 	var seedSet bool
-	flag.Func("seed", "three-host signed selection seed; query-derived when omitted", func(value string) error {
+	flag.Func("seed", "query-retrieval signed selection seed; query-derived when omitted", func(value string) error {
 		parsed, err := strconv.ParseInt(value, 10, 64)
 		if err != nil {
 			return err
@@ -50,11 +50,11 @@ func main() {
 	log.SetOutput(io.Discard)
 
 	if err := runExperiment(context.Background(), options, dependencies{
-		loadConfig:           config.Load,
-		newExecutor:          newProductionExecutor,
-		newThreeHostExecutor: newThreeHostExecutor,
-		now:                  time.Now,
-		stdout:               os.Stdout,
+		loadConfig:                config.Load,
+		newExecutor:               newProductionExecutor,
+		newQueryRetrievalExecutor: newQueryRetrievalExecutor,
+		now:                       time.Now,
+		stdout:                    os.Stdout,
 	}); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)

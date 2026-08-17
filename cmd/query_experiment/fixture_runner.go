@@ -18,6 +18,7 @@ import (
 	"github.com/rayer/llm-wiki-bff/internal/cache"
 	"github.com/rayer/llm-wiki-bff/internal/config"
 	"github.com/rayer/llm-wiki-bff/internal/query"
+	"github.com/rayer/llm-wiki-bff/internal/queryquality"
 	"github.com/rayer/llm-wiki-bff/internal/search"
 )
 
@@ -29,10 +30,10 @@ func (options experimentOptions) fixtureFlagsSet() bool {
 
 func (options experimentOptions) validateFixtureFlags() error {
 	if options.modelFixturePath == "" || options.profileFixturePath == "" || options.promptFixturePath == "" {
-		return errors.New("three-host fixture mode requires --model-fixture, --profile-fixture, and --prompt-fixture")
+		return errors.New("query-retrieval fixture mode requires --model-fixture, --profile-fixture, and --prompt-fixture")
 	}
 	if strings.TrimSpace(options.artifactsDir) == "" {
-		return errors.New("three-host fixture mode requires --artifacts-dir")
+		return errors.New("query-retrieval fixture mode requires --artifacts-dir")
 	}
 	return validateOutputPath(options.summaryPath)
 }
@@ -110,6 +111,9 @@ type fixtureFinalReceipt struct {
 	Outcome         string            `json:"outcome"`
 	FinalIdentities []resultIdentity  `json:"final_identities"`
 	Receipts        map[string]string `json:"receipts"`
+	QueryReceivedAt string            `json:"query_received_at"`
+	RunCompletedAt  string            `json:"run_completed_at"`
+	DurationMS      int64             `json:"duration_ms"`
 	Error           string            `json:"error,omitempty"`
 }
 
@@ -142,18 +146,18 @@ func runFixtureExperiment(ctx context.Context, options experimentOptions, prepar
 	if err != nil {
 		return err
 	}
-	hostOptions := defaultThreeHostOptions()
-	hostOptions.selectionLimit = options.selectionLimit
+	retrievalOptions := defaultQueryRetrievalOptions()
+	retrievalOptions.selectionLimit = options.selectionLimit
 	if options.explorationSlotsSet {
-		hostOptions.explorationSlots = options.explorationSlots
+		retrievalOptions.explorationSlots = options.explorationSlots
 	}
-	hostOptions.seed = options.seed
-	hostOptions, err = normalizeThreeHostOptions(hostOptions)
+	retrievalOptions.seed = options.seed
+	retrievalOptions, err = normalizeQueryRetrievalOptions(retrievalOptions)
 	if err != nil {
 		return err
 	}
-	options.selectionLimit = hostOptions.selectionLimit
-	options.explorationSlots = hostOptions.explorationSlots
+	options.selectionLimit = retrievalOptions.selectionLimit
+	options.explorationSlots = retrievalOptions.explorationSlots
 	if err := os.MkdirAll(filepath.Clean(options.artifactsDir), 0o755); err != nil {
 		return fmt.Errorf("create artifacts directory: %w", err)
 	}
@@ -191,7 +195,7 @@ func runFixtureExperiment(ctx context.Context, options experimentOptions, prepar
 		variants[i].VariantID = fixtureVariantID(variants[i].VariantID, options, prepared)
 		for _, input := range cases {
 			for runIndex := 1; runIndex <= options.runs; runIndex++ {
-				attempt, err := runFixtureAttempt(ctx, options, hostOptions, variants[i], input, runIndex, prepared, entries, now, metadata)
+				attempt, err := runFixtureAttempt(ctx, options, retrievalOptions, variants[i], input, runIndex, prepared, entries, now, metadata)
 				if err != nil {
 					return err
 				}
@@ -222,10 +226,11 @@ func fixtureVariantID(base string, options experimentOptions, prepared preparedS
 	return fmt.Sprintf("%s__limit=%d__exploration=%d__seed=%s__corpus=%s", base, options.selectionLimit, options.explorationSlots, seed, prepared.digest)
 }
 
-func runFixtureAttempt(ctx context.Context, options experimentOptions, hostOptions threeHostOptions, variant fixtureVariant, input caseInput, runIndex int, prepared preparedSnapshot, entries []cache.Entry, now func() time.Time, metadata recordMetadata) (fixtureAttempt, error) {
+func runFixtureAttempt(ctx context.Context, options experimentOptions, retrievalOptions queryRetrievalOptions, variant fixtureVariant, input caseInput, runIndex int, prepared preparedSnapshot, entries []cache.Entry, now func() time.Time, metadata recordMetadata) (fixtureAttempt, error) {
 	attemptID := fmt.Sprintf("%s__case=%s__run=%d", variant.VariantID, input.ID, runIndex)
 	meta := fixtureReceiptMeta{AttemptID: attemptID, VariantID: variant.VariantID, ProfileID: variant.Profile.ID, PromptID: variant.Prompt.ID, Provider: variant.Model.Provider, Model: variant.Model.Model, CaseID: input.ID, RunIndex: runIndex}
 	dir := filepath.Join(filepath.Clean(options.artifactsDir), variant.VariantID, receiptSegment(input.ID), fmt.Sprintf("run-%d", runIndex))
+	queryReceivedAt := now()
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fixtureAttempt{}, fmt.Errorf("create attempt artifacts: %w", err)
 	}
@@ -234,12 +239,12 @@ func runFixtureAttempt(ctx context.Context, options experimentOptions, hostOptio
 	}
 	seed := reproducibleSeed(input.Query)
 	seedMode := "query-derived"
-	if hostOptions.seed != nil {
-		seed = *hostOptions.seed
+	if retrievalOptions.seed != nil {
+		seed = *retrievalOptions.seed
 		seedMode = "explicit"
 	}
 	publicModel := publicModelFixture{ID: variant.Model.ID, Provider: variant.Model.Provider, BaseURL: variant.Model.BaseURL, Model: variant.Model.Model, Temperature: variant.Model.Temperature, Reasoning: variant.Model.Reasoning}
-	if err := write("request.json", fixtureRequestReceipt{Query: input.Query, Mode: input.Mode, SnapshotIdentity: prepared.label, CorpusSHA256: prepared.digest, SelectionLimit: hostOptions.selectionLimit, ExplorationSlots: hostOptions.explorationSlots, SeedMode: seedMode, Model: publicModel}); err != nil {
+	if err := write("request.json", fixtureRequestReceipt{Query: input.Query, Mode: input.Mode, SnapshotIdentity: prepared.label, CorpusSHA256: prepared.digest, SelectionLimit: retrievalOptions.selectionLimit, ExplorationSlots: retrievalOptions.explorationSlots, SeedMode: seedMode, Model: publicModel}); err != nil {
 		return fixtureAttempt{}, err
 	}
 	policy := CriterionPolicy{RequiredWhenExplicit: append([]string(nil), variant.Profile.RequiredWhenExplicit...), PreferredByDefault: append([]string(nil), variant.Profile.PreferredByDefault...), GoalsToExpand: append([]string(nil), variant.Profile.GoalsToExpand...)}
@@ -267,7 +272,7 @@ func runFixtureAttempt(ctx context.Context, options experimentOptions, hostOptio
 	}
 	if expansionErr != nil {
 		validation = "fallback"
-		plan, expansionErr = newDeterministicExpander().ExpandPlan(ctx, input.Query, policy, entries)
+		plan, expansionErr = newDeterministicExpander().Expand(ctx, queryquality.ExpansionRequest{Query: input.Query, CriterionPolicy: policy})
 		if expansionErr != nil {
 			return fixtureAttempt{}, fmt.Errorf("fixture fallback: %w", expansionErr)
 		}
@@ -277,12 +282,13 @@ func runFixtureAttempt(ctx context.Context, options experimentOptions, hostOptio
 	if err := write("expansion.output.json", fixtureExpansionOutput{RawModelResponse: scrubSecret(call.RawResponse, variant.Model.APIKey), ParsedPlan: plan, Source: info.source, Validation: validation, Fallback: plan.Fallback, FallbackReason: info.fallbackReason, Error: scrubSecret(errorString(callErr), variant.Model.APIKey), LatencyMS: call.LatencyMS, Usage: call.Usage}); err != nil {
 		return fixtureAttempt{}, err
 	}
-	trace := &threeHostTrace{Variant: variant.VariantID, Seed: seed, Stages: []stageTrace{{Name: "expansion", Outcome: planOutcome(plan), Source: info.source, FallbackReason: info.fallbackReason, ElapsedMS: call.LatencyMS, InputCount: 1, OutputCount: criterionCount(plan), Plan: &plan}}}
+	trace := &queryRetrievalTrace{Variant: variant.VariantID, Seed: seed, Stages: []stageTrace{{Name: "expansion", Outcome: planOutcome(plan), Source: info.source, FallbackReason: info.fallbackReason, ElapsedMS: call.LatencyMS, InputCount: 1, OutputCount: criterionCount(plan), Plan: &plan}}}
 	if err := write("matching.input.json", fixtureMatchingInput{Plan: plan, SnapshotIdentity: prepared.label, CorpusSHA256: prepared.digest, Parameters: map[string]any{"semantic_required_fail_closed": semanticRequiredFailClosed, "semantic_excluded_fail_closed": semanticExcludedFailClosed}}); err != nil {
 		return fixtureAttempt{}, err
 	}
 	matchingStarted := now()
-	eligible, err := newLexicalMatcher(nil).Match(ctx, plan, entries)
+	matchReq := queryquality.MatchRequest{Plan: plan, CorpusEntries: entries}
+	eligible, err := newLexicalMatcher(nil).Match(ctx, matchReq)
 	matchingElapsed := elapsedBetween(now(), matchingStarted)
 	if err != nil {
 		return fixtureAttempt{}, err
@@ -295,12 +301,12 @@ func runFixtureAttempt(ctx context.Context, options experimentOptions, hostOptio
 	if err := write("matching.output.json", fixtureMatchingOutput{CandidateIdentities: identities, Candidates: eligible.Candidates}); err != nil {
 		return fixtureAttempt{}, err
 	}
-	selectionInput := fixtureSelectionInput{Candidates: eligible.Candidates, Limit: hostOptions.selectionLimit, ExplorationSlots: hostOptions.explorationSlots, EffectiveSeed: seed}
+	selectionInput := fixtureSelectionInput{Candidates: eligible.Candidates, Limit: retrievalOptions.selectionLimit, ExplorationSlots: retrievalOptions.explorationSlots, EffectiveSeed: seed}
 	if err := write("selection.input.json", selectionInput); err != nil {
 		return fixtureAttempt{}, err
 	}
 	selectionStarted := now()
-	selected, err := newRandomSelector().Select(ctx, SelectionInput{Candidates: eligible.Candidates, Limit: hostOptions.selectionLimit, ExplorationSlots: hostOptions.explorationSlots, Seed: seed})
+	selected, err := newRandomSelector().Select(ctx, SelectionInput{Candidates: eligible.Candidates, Limit: retrievalOptions.selectionLimit, ExplorationSlots: retrievalOptions.explorationSlots, Seed: seed})
 	selectionElapsed := elapsedBetween(now(), selectionStarted)
 	if err != nil {
 		return fixtureAttempt{}, err
@@ -317,11 +323,13 @@ func runFixtureAttempt(ctx context.Context, options experimentOptions, hostOptio
 	if err := write("selection.output.json", fixtureSelectionOutput{Decisions: selected.Selected, FinalOrder: finalOrder}); err != nil {
 		return fixtureAttempt{}, err
 	}
+	runCompletedAt := now()
 	outcome := "success"
 	if len(resultIdentities) == 0 {
 		outcome = "retrieval_miss"
 	}
-	if err := write("final.json", fixtureFinalReceipt{Outcome: outcome, FinalIdentities: resultIdentities, Receipts: map[string]string{"request": "request.json", "expansion_input": "expansion.input.json", "expansion_output": "expansion.output.json", "matching_input": "matching.input.json", "matching_output": "matching.output.json", "selection_input": "selection.input.json", "selection_output": "selection.output.json", "final": "final.json"}}); err != nil {
+	queryReceivedAtStr, runCompletedAtStr, durationMS := attemptTiming(queryReceivedAt, runCompletedAt)
+	if err := write("final.json", fixtureFinalReceipt{Outcome: outcome, FinalIdentities: resultIdentities, Receipts: map[string]string{"request": "request.json", "expansion_input": "expansion.input.json", "expansion_output": "expansion.output.json", "matching_input": "matching.input.json", "matching_output": "matching.output.json", "selection_input": "selection.input.json", "selection_output": "selection.output.json", "final": "final.json"}, QueryReceivedAt: queryReceivedAtStr, RunCompletedAt: runCompletedAtStr, DurationMS: durationMS}); err != nil {
 		return fixtureAttempt{}, err
 	}
 	result := query.Result{Query: input.Query, Mode: input.Mode}
@@ -329,6 +337,7 @@ func runFixtureAttempt(ctx context.Context, options experimentOptions, hostOptio
 		result.Results = append(result.Results, search.Result{Slug: identity.Slug, Title: identity.Title, Type: identity.Type})
 	}
 	record := makeResultRecordWithTrace(input, runIndex, prepared, result, nil, call.LatencyMS+matchingElapsed+selectionElapsed, metadata, trace)
+	record.QueryReceivedAt, record.RunCompletedAt, record.DurationMS = queryReceivedAtStr, runCompletedAtStr, durationMS
 	record.VariantID, record.ProfileID, record.PromptID, record.Provider, record.Model = variant.VariantID, variant.Profile.ID, variant.Prompt.ID, variant.Model.Provider, variant.Model.Model
 	selectionDigest := digestJSON(selectionInput)
 	return fixtureAttempt{Record: record, Case: input, Candidates: eligible.Candidates, Decisions: selected.Selected, EffectiveSeed: seed, SelectionInputDigest: selectionDigest, Fallback: plan.Fallback, LatencyMS: call.LatencyMS, Usage: call.Usage}, nil

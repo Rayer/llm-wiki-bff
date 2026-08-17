@@ -17,12 +17,13 @@ import (
 	"github.com/rayer/llm-wiki-bff/internal/config"
 	"github.com/rayer/llm-wiki-bff/internal/llm"
 	"github.com/rayer/llm-wiki-bff/internal/query"
+	"github.com/rayer/llm-wiki-bff/internal/queryquality"
 	"github.com/rayer/llm-wiki-bff/internal/search"
 )
 
 func TestDeterministicFallbackIsGenericAndOptionalEvidenceDoesNotGate(t *testing.T) {
 	for _, raw := range []string{"台北適合工作的咖啡廳", "小孩想玩水，有什麼室外戲水景點嗎", "unrelated astronomy query"} {
-		plan, err := newDeterministicExpander().ExpandPlan(context.Background(), raw, defaultCriterionPolicy, nil)
+		plan, err := newDeterministicExpander().Expand(context.Background(), queryquality.ExpansionRequest{Query: raw, CriterionPolicy: defaultCriterionPolicy})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -41,7 +42,7 @@ func TestDeterministicFallbackIsGenericAndOptionalEvidenceDoesNotGate(t *testing
 		SupportingDimensions:   []Criterion{{Kind: "supporting", Value: "work", Terms: []string{"work"}}},
 		AcceptableAlternatives: []Criterion{{Kind: "alternative", Value: "tea", Terms: []string{"tea"}}},
 	}
-	got, err := newLexicalMatcher(nil).Match(context.Background(), plan, []cache.Entry{{Slug: "taipei", Title: "Taipei", Body: ""}})
+	got, err := newLexicalMatcher(nil).Match(context.Background(), queryquality.MatchRequest{Plan: plan, CorpusEntries: []cache.Entry{{Slug: "taipei", Title: "Taipei", Body: ""}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,7 +70,7 @@ func TestSemanticCriteriaNeverBecomeLexicalEvidenceOrScore(t *testing.T) {
 		Required: []Criterion{semantic("required")}, Excluded: []Criterion{semantic("excluded")}, Preferred: []Criterion{semantic("preferred")},
 		Goals: []Criterion{semantic("goal")}, SupportingDimensions: []Criterion{semantic("supporting")}, AcceptableAlternatives: []Criterion{semantic("alternative")},
 	}
-	got, err := newLexicalMatcher(nil).Match(context.Background(), plan, []cache.Entry{{Slug: "candidate", Title: "candidate", Body: "private required private excluded private preferred private goal private supporting private alternative"}})
+	got, err := newLexicalMatcher(nil).Match(context.Background(), queryquality.MatchRequest{Plan: plan, CorpusEntries: []cache.Entry{{Slug: "candidate", Title: "candidate", Body: "private required private excluded private preferred private goal private supporting private alternative"}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,7 +92,7 @@ func TestSemanticEvaluatorIsExplicitAndStillNeverScores(t *testing.T) {
 		Preferred: []Criterion{{Kind: "preferred", Value: "preferred", Proof: "semantic"}}, Goals: []Criterion{{Kind: "goal", Value: "goal", Proof: "semantic"}},
 		SupportingDimensions: []Criterion{{Kind: "supporting", Value: "supporting", Proof: "semantic"}}, AcceptableAlternatives: []Criterion{{Kind: "alternative", Value: "alternative", Proof: "semantic"}},
 	}
-	got, err := newLexicalMatcher(evaluator).Match(context.Background(), plan, []cache.Entry{{Slug: "candidate", Title: "candidate"}})
+	got, err := newLexicalMatcher(evaluator).Match(context.Background(), queryquality.MatchRequest{Plan: plan, CorpusEntries: []cache.Entry{{Slug: "candidate", Title: "candidate"}}})
 	if err != nil || got.Candidates[0].Eligible || got.Candidates[0].Score != 0 || len(evaluator.calls) != 6 {
 		t.Fatalf("candidate=%#v calls=%v err=%v", got.Candidates[0], evaluator.calls, err)
 	}
@@ -104,14 +105,14 @@ func TestSemanticEvaluatorIsExplicitAndStillNeverScores(t *testing.T) {
 
 func TestStructuredExpansionUsesOneCallAndSimpleFallback(t *testing.T) {
 	provider := &recordingChatProvider{responses: []string{`{"raw_query":"coffee","required":[],"excluded":[],"preferred":[{"kind":"topic","value":"coffee","terms":["coffee"],"proof":"lexical"}],"goals":[],"supporting_dimensions":[],"acceptable_alternatives":[],"ambiguity":[],"fallback":false}`}}
-	expander := newStructuredPlanExpander(provider, newDeterministicExpander()).(structuredPlanExpander)
-	plan, info, err := expander.ExpandPlanWithTrace(context.Background(), "coffee", defaultCriterionPolicy, []cache.Entry{{Slug: "espresso", Title: "Espresso Guide"}})
+	expander := newQueryPlanExpander(provider, newDeterministicExpander()).(queryPlanAdapter)
+	plan, info, err := expander.ExpandWithTrace(context.Background(), queryquality.ExpansionRequest{Query: "coffee", CriterionPolicy: defaultCriterionPolicy})
 	if err != nil || plan.Fallback || info.source != "structured-llm" || len(provider.prompts) != 1 {
 		t.Fatalf("plan=%#v info=%#v calls=%d err=%v", plan, info, len(provider.prompts), err)
 	}
 	for _, response := range []string{`{"unknown":1}`, `{"raw_query":"coffee","required":[],"excluded":[],"preferred":[{"kind":"topic","value":"coffee","terms":["coffee"],"proof":"lexical"}],"goals":[],"supporting_dimensions":[],"acceptable_alternatives":[],"ambiguity":[],"fallback":false} {}`} {
 		provider := fixedChatProvider{response: response}
-		plan, info, err := newStructuredPlanExpander(provider, newDeterministicExpander()).(structuredPlanExpander).ExpandPlanWithTrace(context.Background(), "coffee", defaultCriterionPolicy, nil)
+		plan, info, err := newQueryPlanExpander(provider, newDeterministicExpander()).(queryPlanAdapter).ExpandWithTrace(context.Background(), queryquality.ExpansionRequest{Query: "coffee", CriterionPolicy: defaultCriterionPolicy})
 		if err != nil || !plan.Fallback || info.source != "deterministic-fallback" || info.fallbackReason != "invalid_plan" {
 			t.Fatalf("response=%q plan=%#v info=%#v err=%v", response, plan, info, err)
 		}
@@ -155,12 +156,12 @@ func TestSelectionReplaysSeedAndHonorsZeroOneAndMultipleExplorationSlots(t *test
 	}
 }
 
-func TestThreeHostOptionBoundsAndQueryDerivedSeed(t *testing.T) {
-	if got, err := normalizeThreeHostOptions(threeHostOptions{}); err != nil || got.selectionLimit != defaultLimit || got.explorationSlots != 0 {
+func TestQueryRetrievalOptionBoundsAndQueryDerivedSeed(t *testing.T) {
+	if got, err := normalizeQueryRetrievalOptions(queryRetrievalOptions{}); err != nil || got.selectionLimit != defaultLimit || got.explorationSlots != 0 {
 		t.Fatalf("zero options = %#v err=%v, want default limit and valid zero slots", got, err)
 	}
-	for _, options := range []threeHostOptions{{selectionLimit: -1}, {selectionLimit: maxSelectionLimit + 1}, {selectionLimit: 3, explorationSlots: -1}, {selectionLimit: 3, explorationSlots: 4}} {
-		if _, err := normalizeThreeHostOptions(options); err == nil {
+	for _, options := range []queryRetrievalOptions{{selectionLimit: -1}, {selectionLimit: maxSelectionLimit + 1}, {selectionLimit: 3, explorationSlots: -1}, {selectionLimit: 3, explorationSlots: 4}} {
+		if _, err := normalizeQueryRetrievalOptions(options); err == nil {
 			t.Fatalf("options=%#v accepted, want validation error", options)
 		}
 	}
@@ -169,14 +170,17 @@ func TestThreeHostOptionBoundsAndQueryDerivedSeed(t *testing.T) {
 	}
 }
 
-func TestThreeHostServicePassesKnobsCausallyInOrderedStages(t *testing.T) {
+func TestQueryRetrievalServicePassesKnobsCausallyInOrderedStages(t *testing.T) {
 	var order []string
-	expander := fakePlanExpander{run: func() (QueryPlan, error) {
+	expander := fakeQueryExpander{run: func() (QueryPlan, error) {
 		order = append(order, "expansion")
 		return QueryPlan{RawQuery: "coffee", Preferred: []Criterion{{Kind: "topic", Value: "coffee", Terms: []string{"coffee"}, Proof: "lexical"}}}, nil
 	}}
-	matcher := fakeMatcher{run: func(plan QueryPlan) (EligibilityResult, error) {
+	matcher := fakeMatcher{run: func(request queryquality.MatchRequest) (EligibilityResult, error) {
 		order = append(order, "matching")
+		if request.Plan.RawQuery != "coffee" || len(request.CorpusEntries) != 1 {
+			t.Fatalf("match request=%#v", request)
+		}
 		return EligibilityResult{Candidates: []CandidateEvidence{{Slug: "coffee", Title: "Coffee", Eligible: true, Score: 1}}}, nil
 	}}
 	selector := fakeSelector{run: func(input SelectionInput) (SelectionResult, error) {
@@ -187,7 +191,7 @@ func TestThreeHostServicePassesKnobsCausallyInOrderedStages(t *testing.T) {
 		return SelectionResult{Selected: []SelectedCandidate{{Slug: "coffee", Title: "Coffee", Selected: true, Reason: "selected", Score: 1}}}, nil
 	}}
 	seed := int64(17)
-	service := newThreeHostServiceWithOptions(expander, matcher, selector, nil, threeHostOptions{selectionLimit: 3, explorationSlots: 2, seed: &seed})
+	service := newQueryRetrievalPipelineWithOptions(expander, matcher, selector, nil, queryRetrievalOptions{selectionLimit: 3, explorationSlots: 2, seed: &seed})
 	root := t.TempDir()
 	writeTestFile(t, filepath.Join(root, "cache", "concepts.jsonl"), `{"slug":"coffee","title":"Coffee","body":"coffee"}`+"\n")
 	result, trace, err := service.ExecuteWithTrace(context.Background(), newSnapshotReader(root), query.Request{Query: "coffee", Mode: "wiki"})
@@ -196,51 +200,103 @@ func TestThreeHostServicePassesKnobsCausallyInOrderedStages(t *testing.T) {
 	}
 }
 
-func TestProductionIgnoresThreeHostKnobsAndKeepsOutputContract(t *testing.T) {
+func TestProductionIgnoresQueryRetrievalKnobsAndKeepsOutputContract(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "snapshot")
 	writeTestFile(t, filepath.Join(root, "cache", "concepts.jsonl"), `{"slug":"coffee","title":"Coffee","body":"coffee"}`+"\n")
 	casesPath := filepath.Join(t.TempDir(), "cases.jsonl")
 	writeTestFile(t, casesPath, `{"id":"a","query":"coffee","mode":"wiki"}`+"\n")
 	var output bytes.Buffer
-	threeHostCalled := false
+	queryRetrievalExecutorCalled := false
 	err := runExperiment(context.Background(), experimentOptions{snapshotPath: root, casesPath: casesPath, runs: 1, selectionLimit: -1, explorationSlots: -1, explorationSlotsSet: true, seed: int64Ptr(-7)}, dependencies{
 		loadConfig:  func(string) (config.Config, error) { return config.Config{}, nil },
 		newExecutor: func(*cache.Cache, config.Config) (query.Executor, error) { return &recordingExecutor{}, nil },
-		newThreeHostExecutor: func(*cache.Cache, config.Config, threeHostOptions) (query.Executor, error) {
-			threeHostCalled = true
+		newQueryRetrievalExecutor: func(*cache.Cache, config.Config, queryRetrievalOptions) (query.Executor, error) {
+			queryRetrievalExecutorCalled = true
 			return nil, nil
 		},
 		now: time.Now, stdout: &output,
 	})
-	if err != nil || threeHostCalled || strings.Contains(output.String(), "three_host_trace") {
-		t.Fatalf("production err=%v three_host_called=%v output=%s", err, threeHostCalled, output.String())
+	if err != nil || queryRetrievalExecutorCalled || strings.Contains(output.String(), "three_host_trace") {
+		t.Fatalf("production err=%v query_retrieval_executor_called=%v output=%s", err, queryRetrievalExecutorCalled, output.String())
 	}
 }
 
-func TestThreeHostTraceIsOrderedAndPrivate(t *testing.T) {
+func TestQueryRetrievalTraceIsOrderedAndPrivate(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "frozen-project")
 	writeTestFile(t, filepath.Join(root, "cache", "concepts.jsonl"), `{"slug":"secret","title":"Safe Title","body":"private body secret"}`+"\n")
 	casesPath := filepath.Join(t.TempDir(), "cases.jsonl")
 	writeTestFile(t, casesPath, `{"id":"one","query":"secret","mode":"wiki"}`+"\n")
 	var output bytes.Buffer
-	if err := runExperiment(context.Background(), experimentOptions{snapshotPath: root, casesPath: casesPath, runs: 1, service: serviceThreeHost, selectionLimit: 1, explorationSlots: 0, explorationSlotsSet: true, seed: int64Ptr(42)}, dependencies{
-		loadConfig: func(string) (config.Config, error) { return config.Config{}, nil }, newThreeHostExecutor: newThreeHostExecutor, now: time.Now, stdout: &output,
+	if err := runExperiment(context.Background(), experimentOptions{snapshotPath: root, casesPath: casesPath, runs: 1, service: serviceQueryRetrieval, selectionLimit: 1, explorationSlots: 0, explorationSlotsSet: true, seed: int64Ptr(42)}, dependencies{
+		loadConfig: func(string) (config.Config, error) { return config.Config{}, nil }, newQueryRetrievalExecutor: newQueryRetrievalExecutor, now: time.Now, stdout: &output,
 	}); err != nil {
 		t.Fatal(err)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(bytes.TrimSpace(output.Bytes()), &raw); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := raw["three_host_trace"]; !ok {
+		t.Fatalf("raw trace key absent, record=%s", output.String())
+	}
+	if _, ok := raw["query_retrieval_trace"]; ok {
+		t.Fatalf("unexpected query_retrieval_trace key in output record=%s", output.String())
 	}
 	var record resultRecord
 	if err := json.Unmarshal(bytes.TrimSpace(output.Bytes()), &record); err != nil {
 		t.Fatal(err)
 	}
-	if record.ThreeHostTrace == nil || len(record.ThreeHostTrace.Stages) != 3 || record.ThreeHostTrace.Seed != 42 {
-		t.Fatalf("trace=%#v, want three ordered stages and explicit seed", record.ThreeHostTrace)
+	if record.QueryRetrievalTrace == nil || len(record.QueryRetrievalTrace.Stages) != 3 || record.QueryRetrievalTrace.Seed != 42 {
+		t.Fatalf("trace=%#v, want three ordered stages and explicit seed", record.QueryRetrievalTrace)
 	}
-	got := []string{record.ThreeHostTrace.Stages[0].Name, record.ThreeHostTrace.Stages[1].Name, record.ThreeHostTrace.Stages[2].Name}
-	if !equalStrings(got, []string{"expansion", "matching", "selection"}) || record.ThreeHostTrace.Stages[0].Source != "deterministic-fallback" {
-		t.Fatalf("stage order/source=%v/%q", got, record.ThreeHostTrace.Stages[0].Source)
+	got := []string{record.QueryRetrievalTrace.Stages[0].Name, record.QueryRetrievalTrace.Stages[1].Name, record.QueryRetrievalTrace.Stages[2].Name}
+	if !equalStrings(got, []string{"expansion", "matching", "selection"}) || record.QueryRetrievalTrace.Stages[0].Source != "deterministic-fallback" {
+		t.Fatalf("stage order/source=%v/%q", got, record.QueryRetrievalTrace.Stages[0].Source)
 	}
 	if strings.Contains(output.String(), "private body") || strings.Contains(output.String(), root) || strings.Contains(output.String(), "{bad") {
 		t.Fatalf("trace leaked private/provider data: %s", output.String())
+	}
+}
+
+func TestQueryExperimentRunsRecordsAttemptTimings(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "snapshot")
+	writeTestFile(t, filepath.Join(root, "cache", "concepts.jsonl"), `{"slug":"coffee","title":"Coffee","body":"coffee"}`+"\n")
+	casesPath := filepath.Join(t.TempDir(), "cases.jsonl")
+	writeTestFile(t, casesPath, `{"id":"a","query":"coffee","mode":"wiki"}`+"\n")
+	run := func(executor query.Executor, received, completed time.Time) resultRecord {
+		var output bytes.Buffer
+		clock := scriptedNow(received, completed)
+		if err := runExperiment(context.Background(), experimentOptions{snapshotPath: root, casesPath: casesPath, runs: 1, selectionLimit: 1}, dependencies{
+			loadConfig:  func(string) (config.Config, error) { return config.Config{}, nil },
+			newExecutor: func(*cache.Cache, config.Config) (query.Executor, error) { return executor, nil },
+			now:         clock, stdout: &output,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		var record resultRecord
+		if err := json.Unmarshal(bytes.TrimSpace(output.Bytes()), &record); err != nil {
+			t.Fatal(err)
+		}
+		return record
+	}
+	received := time.Date(2026, 8, 17, 10, 0, 0, 0, time.UTC)
+	completed := received.Add(321 * time.Millisecond)
+	record := run(&recordingExecutor{}, received, completed)
+	if got, want := record.QueryReceivedAt, received.Format(time.RFC3339Nano); got != want {
+		t.Fatalf("query_received_at=%q want=%q", got, want)
+	}
+	if got, want := record.RunCompletedAt, completed.Format(time.RFC3339Nano); got != want {
+		t.Fatalf("run_completed_at=%q want=%q", got, want)
+	}
+	if record.DurationMS != 321 {
+		t.Fatalf("duration_ms=%d want=%d", record.DurationMS, 321)
+	}
+	if _, err := time.Parse(time.RFC3339Nano, record.QueryReceivedAt); err != nil {
+		t.Fatalf("query_received_at parse=%v", err)
+	}
+	record = run(&recordingExecutorWithError{err: errors.New("boom")}, received, completed.Add(100*time.Millisecond))
+	if record.ErrorStage != "execute" || record.DurationMS == 0 {
+		t.Fatalf("record=%#v", record)
 	}
 }
 
@@ -299,18 +355,18 @@ func (p *recordingChatProvider) Chat(_ context.Context, _, user string) (string,
 	return response, nil
 }
 
-type fakePlanExpander struct{ run func() (QueryPlan, error) }
+type fakeQueryExpander struct{ run func() (QueryPlan, error) }
 
-func (f fakePlanExpander) ExpandPlan(context.Context, string, CriterionPolicy, []cache.Entry) (QueryPlan, error) {
+func (f fakeQueryExpander) Expand(context.Context, queryquality.ExpansionRequest) (QueryPlan, error) {
 	return f.run()
 }
 
 type fakeMatcher struct {
-	run func(QueryPlan) (EligibilityResult, error)
+	run func(queryquality.MatchRequest) (EligibilityResult, error)
 }
 
-func (f fakeMatcher) Match(_ context.Context, plan QueryPlan, _ []cache.Entry) (EligibilityResult, error) {
-	return f.run(plan)
+func (f fakeMatcher) Match(_ context.Context, request queryquality.MatchRequest) (EligibilityResult, error) {
+	return f.run(request)
 }
 
 type fakeSelector struct {
@@ -326,6 +382,12 @@ type recordingExecutor struct{ calls []string }
 func (e *recordingExecutor) Execute(_ context.Context, _ cache.Reader, request query.Request) (query.Result, error) {
 	e.calls = append(e.calls, request.Query+":"+request.Mode)
 	return query.Result{Query: request.Query, Mode: request.Mode, Results: []search.Result{{Slug: "coffee", Title: "Coffee", Type: "concept", Snippet: "private body"}}, Expand: &llm.ExpandResult{Keywords: []string{"coffee"}}}, nil
+}
+
+type recordingExecutorWithError struct{ err error }
+
+func (e *recordingExecutorWithError) Execute(_ context.Context, _ cache.Reader, _ query.Request) (query.Result, error) {
+	return query.Result{}, e.err
 }
 
 func int64Ptr(value int64) *int64 { return &value }
@@ -349,5 +411,17 @@ func writeTestFile(t *testing.T, path, contents string) {
 	}
 	if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func scriptedNow(times ...time.Time) func() time.Time {
+	index := 0
+	return func() time.Time {
+		if index >= len(times) {
+			return times[len(times)-1]
+		}
+		t := times[index]
+		index++
+		return t
 	}
 }
