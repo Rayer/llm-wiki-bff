@@ -16,11 +16,15 @@ env:
   REGION: asia-east1
   AR_REPO: asia-east1-docker.pkg.dev/llm-wiki-cloud/cloud-run-images
 
+concurrency:
+  group: deploy-bff-dev
+  cancel-in-progress: false
+
 jobs:
   test-and-deploy:
     name: Test & Deploy
     runs-on: ubuntu-latest
-    timeout-minutes: 80
+    timeout-minutes: 120
 
     permissions:
       contents: read
@@ -178,8 +182,83 @@ jobs:
           GIT_SHA: ${{ steps.identity.outputs.git_sha }}
           GIT_BRANCH: ${{ steps.identity.outputs.git_branch }}
           GIT_TAG: ${{ steps.identity.outputs.git_tag }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          echo "previous_revision=" >> "$GITHUB_OUTPUT"
+          echo "new_revision=" >> "$GITHUB_OUTPUT"
+          echo "traffic_mutated=false" >> "$GITHUB_OUTPUT"
+
+          validate_exact_traffic() {
+            local revision="$1"
+            local service_json="$2"
+            jq -e --arg revision "$revision" '
+              .status.traffic as $status
+              | .spec.traffic as $spec
+              | ((($status | type) == "array") and (($status | length) == 1)
+                and (($spec | type) == "array") and (($spec | length) == 1)
+                and (($status[0].percent // 0) == 100)
+                and (($spec[0].percent // 0) == 100)
+                and (($status[0].latestRevision // false) == false)
+                and (($spec[0].latestRevision // false) == false)
+                and (($status[0].revisionName // "") == $revision)
+                and (($spec[0].revisionName // "") == $revision)
+                and (($status[0].revisionName // "") == ($spec[0].revisionName // ""))
+                and (($status[0].tag // "") == "")
+                and (($spec[0].tag // "") == ""))' <<<"$service_json"
+          }
+
+          verify_revision() {
+            local revision="$1"
+            local image_reference="$2"
+            local revision_json="${3:-}"
+            if [[ -z "$revision_json" ]]; then
+              if ! revision_json=$(gcloud run revisions describe "$revision" \
+                --region "${{ env.REGION }}" \
+                --project "${{ env.PROJECT_ID }}" \
+                --format=json \
+                --quiet); then
+                echo "Unable to read revision $revision; refusing to deploy."
+                return 1
+              fi
+            fi
+            if ! jq -e --arg image "$image_reference" '
+              (.status.imageDigest // "") == $image and
+              (.status.conditions | type) == "array" and
+              any(.status.conditions[]?; .type == "Ready" and .status == "True") and
+              any(.status.conditions[]?; .type == "ContainerReady" and .status == "True")
+            ' <<<"$revision_json"; then
+              echo "Revision $revision is not running immutable image $image_reference with ready container state."
+              return 1
+            fi
+          }
+
+          rollback_traffic() {
+            local target_revision="$1"
+            local deadline=$((SECONDS + 240))
+            set +e
+            gcloud run services update-traffic "${{ env.SERVICE_NAME }}" \
+              --to-revisions "${target_revision}=100" \
+              --region "${{ env.REGION }}" \
+              --project "${{ env.PROJECT_ID }}" \
+              --quiet
+            ROLLBACK_EXIT=$?
+            set -e
+
+            while (( SECONDS < deadline )); do
+              if SERVICE_JSON=$(gcloud run services describe "${{ env.SERVICE_NAME }}" \
+                --region "${{ env.REGION }}" \
+                --project "${{ env.PROJECT_ID }}" \
+                --format=json \
+                --quiet) && validate_exact_traffic "$target_revision" "$SERVICE_JSON"; then
+                return 0
+              fi
+              sleep 5
+            done
+            echo "Traffic restore to $target_revision did not become authoritative within timeout (update exit $ROLLBACK_EXIT)."
+            return 1
+          }
+
           IMAGE="${{ env.AR_REPO }}/llm-wiki-bff:$GIT_SHA"
           echo "Building ${IMAGE}…"
           BUILD_ID=$(gcloud builds submit \
@@ -254,13 +333,74 @@ jobs:
             exit 1
           fi
           IMMUTABLE_IMAGE="${{ env.AR_REPO }}/llm-wiki-bff@$DIGEST"
-          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
-          echo "immutable_image=$IMMUTABLE_IMAGE" >> "$GITHUB_OUTPUT"
+
+          if ! SERVICE_JSON=$(gcloud run services describe "${{ env.SERVICE_NAME }}" \
+            --region "${{ env.REGION }}" \
+            --project "${{ env.PROJECT_ID }}" \
+            --format=json \
+            --quiet); then
+            echo "Unable to read ${{ env.SERVICE_NAME }} before mutation; refusing to deploy."
+            exit 1
+          fi
+
+          if ! PREVIOUS_ROLLBACK_REVISION=$(jq -er '.status.traffic[0].revisionName // empty' <<<"$SERVICE_JSON"); then
+            echo "Cloud Run service did not have a rollback revision in status traffic."
+            exit 1
+          fi
+          if ! validate_exact_traffic "$PREVIOUS_ROLLBACK_REVISION" "$SERVICE_JSON"; then
+            echo "Cloud Run service did not have exactly one explicit non-tagged 100% serving revision in both spec and status before deploy."
+            exit 1
+          fi
+          if ! PREVIOUS_ROLLBACK_REVISION_JSON=$(gcloud run revisions describe "$PREVIOUS_ROLLBACK_REVISION" \
+            --region "${{ env.REGION }}" \
+            --project "${{ env.PROJECT_ID }}" \
+            --format=json \
+            --quiet); then
+            echo "Unable to read previous rollback revision $PREVIOUS_ROLLBACK_REVISION."
+            exit 1
+          fi
+          if ! PREVIOUS_ROLLBACK_IMAGE=$(jq -er '.status.imageDigest // empty' <<<"$PREVIOUS_ROLLBACK_REVISION_JSON"); then
+            echo "Unable to read image digest for previous rollback revision $PREVIOUS_ROLLBACK_REVISION."
+            exit 1
+          fi
+          EXPECTED_IMAGE_PREFIX="${{ env.AR_REPO }}/llm-wiki-bff@"
+          if [[ "$PREVIOUS_ROLLBACK_IMAGE" != "$EXPECTED_IMAGE_PREFIX"* ]]; then
+            echo "Previous rollback revision $PREVIOUS_ROLLBACK_REVISION is not immutable."
+            exit 1
+          fi
+          PREVIOUS_ROLLBACK_DIGEST="${PREVIOUS_ROLLBACK_IMAGE#"$EXPECTED_IMAGE_PREFIX"}"
+          if [[ ! "$PREVIOUS_ROLLBACK_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "Previous rollback revision $PREVIOUS_ROLLBACK_REVISION is not immutable."
+            exit 1
+          fi
+          if ! verify_revision "$PREVIOUS_ROLLBACK_REVISION" "$PREVIOUS_ROLLBACK_IMAGE" "$PREVIOUS_ROLLBACK_REVISION_JSON"; then
+            echo "Previous rollback revision $PREVIOUS_ROLLBACK_REVISION was not ready."
+            exit 1
+          fi
+
+          if ! PREVIOUS_CREATED_REVISION=$(jq -r '.status.latestCreatedRevisionName // empty' <<<"$SERVICE_JSON"); then
+            echo "Cloud Run did not return latest created revision information; refusing to deploy."
+            exit 1
+          fi
+
+          if ! REMOTE_SHA=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${GITHUB_REF_NAME}" --jq .object.sha); then
+            echo "Unable to read remote ${GITHUB_REF_NAME}; refusing to deploy."
+            exit 1
+          fi
+          if [[ ! "$REMOTE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Remote ${GITHUB_REF_NAME} returned an invalid commit SHA; refusing to deploy."
+            exit 1
+          fi
+          if [[ "$REMOTE_SHA" != "$GIT_SHA" ]]; then
+            echo "Remote ${GITHUB_REF_NAME} no longer matches the deployment commit; refusing to deploy."
+            exit 1
+          fi
 
           echo "Deploying ${IMMUTABLE_IMAGE}…"
-          gcloud run deploy ${{ env.SERVICE_NAME }} \
+          gcloud run deploy "${{ env.SERVICE_NAME }}" \
             --image "$IMMUTABLE_IMAGE" \
-            --region ${{ env.REGION }} \
+            --no-traffic \
+            --region "${{ env.REGION }}" \
             --service-account "${{ env.RUNTIME_SERVICE_ACCOUNT }}" \
             --network default --subnet default \
             --vpc-egress private-ranges-only \
@@ -268,24 +408,94 @@ jobs:
             --update-secrets "JWT_SECRET=${{ env.JWT_SECRET_NAME }}:latest,DEEPSEEK_API_KEY=deepseek-apikey:latest" \
             --update-env-vars "^@^GCP_PROJECT=${{ env.PROJECT_ID }}@BUCKET=${{ env.BUCKET }}@FIRESTORE_DATABASE_ID=${{ env.FIRESTORE_DATABASE_ID }}@PIPELINE_JOB_URL=https://run.googleapis.com/v2/projects/${{ env.PROJECT_ID }}/locations/${{ env.REGION }}/jobs/${{ env.PIPELINE_JOB_NAME }}:run@ALLOWED_ORIGINS=${{ env.ALLOWED_ORIGINS }}@AUTH_SERVICE_URL=https://auth.dev.rayer.idv.tw@QUERY_EXPANSION_MODEL=${{ env.QUERY_EXPANSION_MODEL }}@DEV_JWT=false" \
             --quiet
-          echo "✅ Deployed ${{ env.SERVICE_NAME }} ($GIT_SHA)"
 
-          LATEST_READY_REVISION=$(gcloud run services describe ${{ env.SERVICE_NAME }} \
-            --region ${{ env.REGION }} \
-            --format='value(status.latestReadyRevisionName)' \
-            --quiet)
-          if [[ -z "$LATEST_READY_REVISION" ]]; then
-            echo "Cloud Run did not report a latest ready revision; refusing to publish provenance."
+          CREATED_REVISION=""
+          CREATED_REVISION_DEADLINE=$((SECONDS + 600))
+          while ((SECONDS < CREATED_REVISION_DEADLINE)); do
+            if ! SERVICE_JSON=$(gcloud run services describe "${{ env.SERVICE_NAME }}" \
+              --region "${{ env.REGION }}" \
+              --project "${{ env.PROJECT_ID }}" \
+              --format=json \
+              --quiet); then
+              echo "Unable to read service after deploy."
+              exit 1
+            fi
+            CREATED_REVISION=$(jq -r '.status.latestCreatedRevisionName // empty' <<<"$SERVICE_JSON")
+            if [[ -n "$CREATED_REVISION" && "$CREATED_REVISION" != "$PREVIOUS_CREATED_REVISION" ]]; then
+              break
+            fi
+            sleep 10
+          done
+          if [[ -z "$CREATED_REVISION" || "$CREATED_REVISION" == "$PREVIOUS_CREATED_REVISION" ]]; then
+            echo "Cloud Run did not report a new latest created revision; refusing to deploy."
             exit 1
           fi
-          DEPLOYED_IMAGE_DIGEST=$(gcloud run revisions describe "$LATEST_READY_REVISION" \
-            --region ${{ env.REGION }} \
-            --format='value(status.imageDigest)' \
-            --quiet)
-          if [[ "$DEPLOYED_IMAGE_DIGEST" != "$IMMUTABLE_IMAGE" ]]; then
-            echo "Latest ready revision $LATEST_READY_REVISION image digest does not match the deployed build result; refusing to publish provenance."
+          if ! verify_revision "$CREATED_REVISION" "$IMMUTABLE_IMAGE"; then
+            echo "Cloud Run did not create a ready revision with the expected immutable image."
             exit 1
           fi
+
+          if ! SERVICE_JSON=$(gcloud run services describe "${{ env.SERVICE_NAME }}" \
+            --region "${{ env.REGION }}" \
+            --project "${{ env.PROJECT_ID }}" \
+            --format=json \
+            --quiet); then
+            echo "Unable to re-read ${{ env.SERVICE_NAME }} before cutover; refusing to deploy."
+            exit 1
+          fi
+          if ! validate_exact_traffic "$PREVIOUS_ROLLBACK_REVISION" "$SERVICE_JSON"; then
+            echo "Cloud Run traffic changed before cutover; refusing to mutate traffic."
+            exit 1
+          fi
+
+          echo "previous_revision=$PREVIOUS_ROLLBACK_REVISION" >> "$GITHUB_OUTPUT"
+          echo "new_revision=$CREATED_REVISION" >> "$GITHUB_OUTPUT"
+          echo "traffic_mutated=true" >> "$GITHUB_OUTPUT"
+
+          CUTOVER_VERIFIED=0
+          set +e
+          gcloud run services update-traffic "${{ env.SERVICE_NAME }}" \
+            --to-revisions "${CREATED_REVISION}=100" \
+            --region "${{ env.REGION }}" \
+            --project "${{ env.PROJECT_ID }}" \
+            --quiet
+          CUTOVER_EXIT=$?
+          if (( CUTOVER_EXIT == 0 )); then
+            VERIFY_DEADLINE=$((SECONDS + 600))
+            while ((SECONDS < VERIFY_DEADLINE)); do
+              if SERVICE_JSON=$(gcloud run services describe "${{ env.SERVICE_NAME }}" \
+                --region "${{ env.REGION }}" \
+                --project "${{ env.PROJECT_ID }}" \
+                --format=json \
+                --quiet) \
+                && validate_exact_traffic "$CREATED_REVISION" "$SERVICE_JSON" \
+                && jq -e --arg revision "$CREATED_REVISION" \
+                  '(.status.latestReadyRevisionName // "") == $revision' \
+                  <<<"$SERVICE_JSON" \
+                && verify_revision "$CREATED_REVISION" "$IMMUTABLE_IMAGE"; then
+                CUTOVER_VERIFIED=1
+                break
+              fi
+              sleep 10
+            done
+          fi
+          set -e
+
+          if (( CUTOVER_EXIT != 0 || CUTOVER_VERIFIED != 1 )); then
+            echo "Cutover failed; attempting bounded rollback to $PREVIOUS_ROLLBACK_REVISION."
+            if ! rollback_traffic "$PREVIOUS_ROLLBACK_REVISION"; then
+              echo "Rollback to $PREVIOUS_ROLLBACK_REVISION failed; refusing to continue."
+              exit 1
+            else
+              echo "traffic_mutated=false" >> "$GITHUB_OUTPUT"
+              echo "Rollback to $PREVIOUS_ROLLBACK_REVISION succeeded."
+            fi
+            exit 1
+          fi
+
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          echo "immutable_image=$IMMUTABLE_IMAGE" >> "$GITHUB_OUTPUT"
+          echo "✅ Deployed ${{ env.SERVICE_NAME }} ($GIT_SHA) to $CREATED_REVISION"
 
       - name: Persist build image digest
         id: image_digest
@@ -332,3 +542,75 @@ jobs:
           gcloud run services describe ${{ env.SERVICE_NAME }} \
             --region ${{ env.REGION }} \
             --format="value(status.url)"
+
+      - name: Restore BFF traffic on post-cutover failure
+        if: ${{ always() && failure() && steps.build.outputs.traffic_mutated == 'true' }}
+        run: |
+          set -euo pipefail
+          PREVIOUS_REVISION="${{ steps.build.outputs.previous_revision }}"
+          NEW_REVISION="${{ steps.build.outputs.new_revision }}"
+          if [[ -z "$PREVIOUS_REVISION" || -z "$NEW_REVISION" ]]; then
+            echo "Cannot restore BFF traffic without validated rollback context."
+            exit 1
+          fi
+          echo "Rolling back traffic from $NEW_REVISION to $PREVIOUS_REVISION."
+
+          validate_exact_traffic() {
+            local revision="$1"
+            local service_json="$2"
+            jq -e --arg revision "$revision" '
+              .status.traffic as $status
+              | .spec.traffic as $spec
+              | ((($status | type) == "array") and (($status | length) == 1)
+                and (($spec | type) == "array") and (($spec | length) == 1)
+                and (($status[0].percent // 0) == 100)
+                and (($spec[0].percent // 0) == 100)
+                and (($status[0].latestRevision // false) == false)
+                and (($spec[0].latestRevision // false) == false)
+                and (($status[0].revisionName // "") == $revision)
+                and (($spec[0].revisionName // "") == $revision)
+                and (($status[0].revisionName // "") == ($spec[0].revisionName // ""))
+                and (($status[0].tag // "") == "")
+                and (($spec[0].tag // "") == ""))' <<<"$service_json"
+          }
+
+          if ! SERVICE_JSON=$(gcloud run services describe "${{ env.SERVICE_NAME }}" \
+            --region "${{ env.REGION }}" \
+            --project "${{ env.PROJECT_ID }}" \
+            --format=json \
+            --quiet); then
+            echo "Unable to read service before cleanup; refusing to mutate traffic."
+            exit 1
+          fi
+          if validate_exact_traffic "$PREVIOUS_REVISION" "$SERVICE_JSON"; then
+            echo "BFF traffic is already on $PREVIOUS_REVISION; cleanup is a no-op."
+            exit 0
+          fi
+          if ! validate_exact_traffic "$NEW_REVISION" "$SERVICE_JSON"; then
+            echo "BFF traffic is neither on $PREVIOUS_REVISION nor $NEW_REVISION; refusing to mutate traffic."
+            exit 1
+          fi
+
+          set +e
+          gcloud run services update-traffic "${{ env.SERVICE_NAME }}" \
+            --to-revisions "${PREVIOUS_REVISION}=100" \
+            --region "${{ env.REGION }}" \
+            --project "${{ env.PROJECT_ID }}" \
+            --quiet
+          ROLLBACK_EXIT=$?
+          set -e
+
+          DEADLINE=$((SECONDS + 240))
+          while ((SECONDS < DEADLINE)); do
+            if SERVICE_JSON=$(gcloud run services describe "${{ env.SERVICE_NAME }}" \
+              --region "${{ env.REGION }}" \
+              --project "${{ env.PROJECT_ID }}" \
+              --format=json \
+              --quiet) && validate_exact_traffic "$PREVIOUS_REVISION" "$SERVICE_JSON"; then
+              echo "Rolled back BFF traffic to $PREVIOUS_REVISION with exact serving traffic."
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "Traffic rollback to $PREVIOUS_REVISION did not become authoritative within timeout (update exit $ROLLBACK_EXIT)."
+          exit 1

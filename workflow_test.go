@@ -468,6 +468,17 @@ func TestBFFDevWorkflowPushesMainOnlyAndSupportsManualDispatch(t *testing.T) {
 	}
 }
 
+func TestBFFDevWorkflowHasRollbackTimeoutBudget(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
+	m := regexp.MustCompile(`(?m)^    timeout-minutes: (\d+)$`).FindStringSubmatch(contents)
+	if len(m) != 2 {
+		t.Fatal("BFF dev workflow is missing the job timeout")
+	}
+	if m[1] != "120" {
+		t.Fatalf("BFF dev workflow timeout-minutes = %q, want exactly 120", m[1])
+	}
+}
+
 func TestAuthDevWorkflowUsesCanonicalSourceAndExistingPrerequisites(t *testing.T) {
 	contents := readWorkflow(t, ".github/workflows/deploy-auth.yml")
 	if strings.Contains(contents, "  push:") {
@@ -1087,7 +1098,9 @@ func TestDeployWorkflowUsesImmutableCloudBuildResultDigest(t *testing.T) {
 		"latestReadyRevisionName",
 		"gcloud run revisions describe",
 		"status.imageDigest",
-		`[[ "$DEPLOYED_IMAGE_DIGEST" != "$IMMUTABLE_IMAGE" ]]`,
+		`verify_revision "$CREATED_REVISION" "$IMMUTABLE_IMAGE"`,
+		`(.status.imageDigest // "") == $image`,
+		`validate_exact_traffic "$CREATED_REVISION" "$SERVICE_JSON"`,
 	} {
 		if !strings.Contains(contents, want) {
 			t.Errorf("deploy workflow is missing immutable build provenance contract %q", want)
@@ -1104,6 +1117,186 @@ func TestDeployWorkflowUsesImmutableCloudBuildResultDigest(t *testing.T) {
 	}
 	if strings.Index(contents, "latestReadyRevisionName") > strings.Index(contents, "Upload image digest artifact") {
 		t.Fatal("deploy workflow must verify the latest ready revision before uploading the digest artifact")
+	}
+}
+
+func TestBFFDevWorkflowUsesCanonicalRevisionTransaction(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
+	build := workflowSection(t, contents, "      - name: Build and deploy to Cloud Run", "      - name: Persist build image digest")
+	for _, want := range []string{
+		"concurrency:\n  group: deploy-bff-dev\n  cancel-in-progress: false",
+		"validate_exact_traffic() {",
+		".status.traffic as $status",
+		".spec.traffic as $spec",
+		"latestRevision // false",
+		"(($status[0].revisionName // \"\") == ($spec[0].revisionName // \"\"))",
+		"PREVIOUS_ROLLBACK_REVISION_JSON=$(gcloud run revisions describe \"$PREVIOUS_ROLLBACK_REVISION\"",
+		"PREVIOUS_ROLLBACK_IMAGE=$(jq -er '.status.imageDigest // empty' <<<\"$PREVIOUS_ROLLBACK_REVISION_JSON\")",
+		"EXPECTED_IMAGE_PREFIX=\"${{ env.AR_REPO }}/llm-wiki-bff@\"",
+		"PREVIOUS_ROLLBACK_DIGEST=\"${PREVIOUS_ROLLBACK_IMAGE#\"$EXPECTED_IMAGE_PREFIX\"}\"",
+		"^sha256:[0-9a-f]{64}$",
+		".type == \"Ready\" and .status == \"True\"",
+		".type == \"ContainerReady\" and .status == \"True\"",
+		"gcloud run deploy \"${{ env.SERVICE_NAME }}\"",
+		"--no-traffic",
+		"gcloud run services update-traffic \"${{ env.SERVICE_NAME }}\"",
+		"--to-revisions \"${CREATED_REVISION}=100\"",
+		"CUTOVER_EXIT=$?",
+		"CUTOVER_VERIFIED=1",
+		"CUTOVER_EXIT != 0 || CUTOVER_VERIFIED != 1",
+		"rollback_traffic \"$PREVIOUS_ROLLBACK_REVISION\"",
+		"echo \"previous_revision=$PREVIOUS_ROLLBACK_REVISION\" >> \"$GITHUB_OUTPUT\"",
+		"echo \"new_revision=$CREATED_REVISION\" >> \"$GITHUB_OUTPUT\"",
+		"echo \"traffic_mutated=true\" >> \"$GITHUB_OUTPUT\"",
+		"GH_TOKEN: ${{ github.token }}",
+		`gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${GITHUB_REF_NAME}" --jq .object.sha`,
+		`REMOTE_SHA=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${GITHUB_REF_NAME}" --jq .object.sha)`,
+		`[[ ! "$REMOTE_SHA" =~ ^[0-9a-f]{40}$ ]]`,
+		"Cloud Run traffic changed before cutover; refusing to mutate traffic.",
+	} {
+		if !strings.Contains(contents, want) {
+			t.Errorf("BFF workflow missing contract %q", want)
+		}
+	}
+
+	previousCreatedAt := strings.Index(build, `PREVIOUS_CREATED_REVISION=$(jq -r '.status.latestCreatedRevisionName // empty'`)
+	deployAt := strings.Index(build, `gcloud run deploy "${{ env.SERVICE_NAME }}"`)
+	newCreatedAt := strings.Index(build, "\n            CREATED_REVISION=$(jq -r '.status.latestCreatedRevisionName // empty'")
+	contextAt := strings.Index(build, `echo "previous_revision=$PREVIOUS_ROLLBACK_REVISION" >> "$GITHUB_OUTPUT"`)
+	newRevisionOutputAt := strings.Index(build, `echo "new_revision=$CREATED_REVISION" >> "$GITHUB_OUTPUT"`)
+	markerAt := strings.Index(build, `echo "traffic_mutated=true" >> "$GITHUB_OUTPUT"`)
+	cutoverAt := strings.Index(build, "gcloud run services update-traffic \"${{ env.SERVICE_NAME }}\" \\\n            --to-revisions \"${CREATED_REVISION}=100\"")
+	latestReadyAt := strings.Index(build, "latestReadyRevisionName")
+	verifyNewAt := strings.Index(build, `if ! verify_revision "$CREATED_REVISION" "$IMMUTABLE_IMAGE"; then`)
+	if previousCreatedAt < 0 || deployAt < 0 || newCreatedAt < 0 || contextAt < 0 || newRevisionOutputAt < 0 || markerAt < 0 || cutoverAt < 0 || latestReadyAt < 0 || verifyNewAt < 0 {
+		t.Fatal("BFF workflow is missing revision identity or cutover anchors")
+	}
+	if !(previousCreatedAt < deployAt && deployAt < newCreatedAt && newCreatedAt < verifyNewAt && verifyNewAt < contextAt && contextAt < newRevisionOutputAt && newRevisionOutputAt < markerAt && markerAt < cutoverAt && cutoverAt < latestReadyAt) {
+		t.Fatal("BFF workflow must identify and verify the new revision, persist rollback context, then cut over and verify latestReady")
+	}
+	ghTokenAt := strings.Index(build, "GH_TOKEN: ${{ github.token }}")
+	remoteCheckAt := strings.Index(build, `REMOTE_SHA=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${GITHUB_REF_NAME}" --jq .object.sha)`)
+	if ghTokenAt < 0 || remoteCheckAt < 0 || !(ghTokenAt < remoteCheckAt && remoteCheckAt < deployAt) {
+		t.Fatal("BFF workflow must use GH_TOKEN and revalidate the exact remote ref immediately before deploy")
+	}
+	if strings.Contains(build, "git fetch") {
+		t.Fatal("BFF workflow must not fetch the remote late in the deploy step")
+	}
+	preCutoverReadAt := strings.LastIndex(build[:cutoverAt], `SERVICE_JSON=$(gcloud run services describe "${{ env.SERVICE_NAME }}"`)
+	preCutoverCheckAt := strings.LastIndex(build[:cutoverAt], `validate_exact_traffic "$PREVIOUS_ROLLBACK_REVISION" "$SERVICE_JSON"`)
+	if preCutoverReadAt < 0 || preCutoverCheckAt < 0 || !(preCutoverReadAt < preCutoverCheckAt && preCutoverCheckAt < contextAt) {
+		t.Fatal("BFF workflow must revalidate OLD traffic immediately before arming rollback and cutting over")
+	}
+	failureAt := strings.Index(build, "if (( CUTOVER_EXIT != 0 || CUTOVER_VERIFIED != 1 )); then")
+	if failureAt < 0 {
+		t.Fatal("BFF workflow is missing cutover failure branch")
+	}
+	successAt := strings.Index(build[failureAt:], `echo "✅ Deployed`)
+	if successAt < 0 {
+		t.Fatal("BFF workflow is missing successful deployment marker")
+	}
+	failureBranch := build[failureAt : failureAt+successAt]
+	cutoverFlow := build[cutoverAt:latestReadyAt]
+	verificationAt := strings.Index(cutoverFlow, "VERIFY_DEADLINE=$((SECONDS + 600))")
+	if verificationAt < 0 || !strings.Contains(cutoverFlow[:verificationAt], "if (( CUTOVER_EXIT == 0 )); then") {
+		t.Fatal("nonzero cutover command must roll back before the 600-second verification loop")
+	}
+	rollbackAt := strings.Index(failureBranch, `rollback_traffic "$PREVIOUS_ROLLBACK_REVISION"`)
+	if rollbackAt < 0 || strings.Count(failureBranch, `rollback_traffic "$PREVIOUS_ROLLBACK_REVISION"`) != 1 {
+		t.Fatal("BFF cutover failure must attempt exactly one rollback")
+	}
+	markerResetAt := strings.Index(failureBranch, `echo "traffic_mutated=false" >> "$GITHUB_OUTPUT"`)
+	if markerResetAt < 0 {
+		t.Fatal("BFF cutover failure should clear traffic_mutated on successful self-rollback path")
+	}
+	elseAt := strings.Index(failureBranch, "else")
+	if elseAt < 0 {
+		t.Fatal("BFF cutover failure branch must contain a successful self-rollback else path")
+	}
+	failedBranch := failureBranch[:elseAt]
+	failedBranchExitAt := strings.Index(failedBranch, "exit 1")
+	if failedBranchExitAt < 0 {
+		t.Fatal("BFF failed self-rollback path should exit 1")
+	}
+	if markerResetAt <= failedBranchExitAt {
+		t.Fatal("BFF cutover failure marker reset for failed self-rollback must not appear before exit")
+	}
+	successfulRollbackPath := failureBranch[elseAt:]
+	successfulRollbackMarkerAt := strings.Index(successfulRollbackPath, `echo "traffic_mutated=false" >> "$GITHUB_OUTPUT"`)
+	if successfulRollbackMarkerAt < 0 {
+		t.Fatal("BFF cutover successful self-rollback path must reset traffic_mutated")
+	}
+	successfulRollbackExitAt := strings.Index(successfulRollbackPath, "exit 1")
+	if successfulRollbackExitAt < 0 {
+		t.Fatal("BFF cutover successful self-rollback path must exit after reset attempt")
+	}
+	if !(successfulRollbackMarkerAt < successfulRollbackExitAt) {
+		t.Fatal("BFF successful self-rollback should reset marker before final exit")
+	}
+	if strings.Count(build, "latestReadyRevisionName") != 1 {
+		t.Fatal("latestReadyRevisionName must only be used for post-cutover verification")
+	}
+	if strings.Contains(build, "\n            CREATED_REVISION=$(jq -er '.status.latestCreatedRevisionName // empty'") {
+		t.Fatal("latestCreated polling must tolerate missing latestCreatedRevisionName")
+	}
+	if !strings.Contains(build, "PREVIOUS_CREATED_REVISION=$(jq -r '.status.latestCreatedRevisionName // empty'") {
+		t.Fatal("pre-deploy previous created revision capture must use jq -r")
+	}
+	if strings.Contains(build, "PREVIOUS_CREATED_REVISION=$(jq -er '.status.latestCreatedRevisionName // empty'") {
+		t.Fatal("pre-deploy previous created revision capture must not use jq -er")
+	}
+	digestOutputAt := strings.Index(build, `echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"`)
+	if digestOutputAt < 0 || digestOutputAt < failureAt {
+		t.Fatal("digest outputs must be written only after successful cutover")
+	}
+	if strings.Contains(build[:cutoverAt], "--to-latest") || strings.Contains(build[:cutoverAt], "latestReadyRevisionName") {
+		t.Fatal("BFF workflow must not use latestReady as created revision identity or use to-latest traffic")
+	}
+
+	preAt := strings.Index(contents, "      - name: Verify existing dev IAM prerequisites")
+	stepDeployAt := strings.Index(contents, "      - name: Build and deploy to Cloud Run")
+	persistAt := strings.Index(contents, "      - name: Persist build image digest")
+	uploadAt := strings.Index(contents, "      - name: Upload image digest artifact")
+	tagAt := strings.Index(contents, "      - name: Tag deployed dev image (fail-closed)")
+	showAt := strings.Index(contents, "      - name: Show deployment info")
+	cleanupAt := strings.Index(contents, "      - name: Restore BFF traffic on post-cutover failure")
+	if preAt < 0 || stepDeployAt < 0 || persistAt < 0 || uploadAt < 0 || tagAt < 0 || showAt < 0 || cleanupAt < 0 {
+		t.Fatalf("BFF workflow is missing required step anchors")
+	}
+	if !(preAt < stepDeployAt && stepDeployAt < persistAt && persistAt < uploadAt && uploadAt < tagAt && tagAt < showAt && showAt < cleanupAt) {
+		t.Fatalf("BFF traffic safety flow must run: IAM preflight < deploy < persist < upload < tag < show < cleanup")
+	}
+
+	cleanup := contents[cleanupAt:]
+	for _, want := range []string{
+		"if: ${{ always() && failure() && steps.build.outputs.traffic_mutated == 'true' }}",
+		"PREVIOUS_REVISION=\"${{ steps.build.outputs.previous_revision }}\"",
+		"NEW_REVISION=\"${{ steps.build.outputs.new_revision }}\"",
+		"gcloud run services update-traffic \"${{ env.SERVICE_NAME }}\"",
+		"--to-revisions \"${PREVIOUS_REVISION}=100\"",
+		"validate_exact_traffic() {",
+		".status.traffic as $status",
+		`SERVICE_JSON=$(gcloud run services describe "${{ env.SERVICE_NAME }}"`,
+		`validate_exact_traffic "$PREVIOUS_REVISION" "$SERVICE_JSON"`,
+		`validate_exact_traffic "$NEW_REVISION" "$SERVICE_JSON"`,
+	} {
+		if !strings.Contains(cleanup, want) {
+			t.Errorf("BFF cleanup step missing contract %q", want)
+		}
+	}
+	cleanupReadAt := strings.Index(cleanup, `SERVICE_JSON=$(gcloud run services describe "${{ env.SERVICE_NAME }}"`)
+	oldCheckAt := strings.Index(cleanup, `validate_exact_traffic "$PREVIOUS_REVISION" "$SERVICE_JSON"`)
+	newCheckAt := strings.Index(cleanup, `validate_exact_traffic "$NEW_REVISION" "$SERVICE_JSON"`)
+	cleanupMutationAt := strings.Index(cleanup, "gcloud run services update-traffic")
+	if cleanupReadAt < 0 || oldCheckAt < 0 || newCheckAt < 0 || cleanupMutationAt < 0 || !(cleanupReadAt < oldCheckAt && oldCheckAt < newCheckAt && newCheckAt < cleanupMutationAt) {
+		t.Fatal("BFF cleanup must read and validate OLD/NEW traffic before mutation")
+	}
+	if strings.Contains(cleanup, "latestReadyRevisionName") {
+		t.Fatal("BFF cleanup should validate exact serving traffic without requiring latestReadyRevisionName")
+	}
+
+	if strings.Contains(contents, "add-iam-policy-binding") || strings.Contains(contents, "set-iam-policy") || strings.Contains(contents, "remove-iam-policy-binding") || strings.Contains(contents, "--allow-unauthenticated") {
+		t.Fatal("BFF dev workflow must not mutate IAM")
 	}
 }
 
