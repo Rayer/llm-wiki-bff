@@ -342,8 +342,8 @@ func runFixtureAttempt(ctx context.Context, options experimentOptions, retrieval
 	}
 	runCompletedAt := now()
 	outcome := "success"
-	resultStatus := ""
-	resultReason := ""
+	resultStatus := "ok"
+	resultReason := "qualified_evidence"
 	if len(resultIdentities) == 0 {
 		outcome = "retrieval_miss"
 		resultStatus = "insufficient_evidence"

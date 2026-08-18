@@ -280,7 +280,7 @@ func TestFixtureZeroQualifiedAttemptWritesStatusReasonInResultsAndFinalReceipt(t
 	}
 }
 
-func TestFixtureNonemptyAttemptPreservesEmptyStatusReasonInReceipts(t *testing.T) {
+func TestFixtureNonemptyAttemptWritesOkAndQualifiedEvidenceInReceipts(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
 		_, _ = writer.Write([]byte(`{"choices":[{"message":{"content":"{\"preferred\":[{\"kind\":\"topic\",\"value\":\"coffee\",\"terms\":[\"coffee\"]}]}"}}],"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5}}`))
@@ -307,11 +307,11 @@ func TestFixtureNonemptyAttemptPreservesEmptyStatusReasonInReceipts(t *testing.T
 	if err := json.Unmarshal([]byte(strings.TrimSpace(output.String())), &record); err != nil {
 		t.Fatal(err)
 	}
-	if got, want := record["status"], ""; got != want {
-		t.Fatalf("results status=%q want empty", got)
+	if got, want := record["status"], "ok"; got != want {
+		t.Fatalf("results status=%q want=%q", got, want)
 	}
-	if got, want := record["reason"], ""; got != want {
-		t.Fatalf("results reason=%q want empty", got)
+	if got, want := record["reason"], "qualified_evidence"; got != want {
+		t.Fatalf("results reason=%q want=%q", got, want)
 	}
 	if got, want := record["outcome"], "success"; got != want {
 		t.Fatalf("outcome=%v want=%q", got, want)
@@ -325,11 +325,11 @@ func TestFixtureNonemptyAttemptPreservesEmptyStatusReasonInReceipts(t *testing.T
 	if err := json.Unmarshal(finalReceiptContents, &final); err != nil {
 		t.Fatal(err)
 	}
-	if got, want := final["status"], ""; got != want {
-		t.Fatalf("final status=%q want empty", got)
+	if got, want := final["status"], "ok"; got != want {
+		t.Fatalf("final status=%q want=%q", got, want)
 	}
-	if got, want := final["reason"], ""; got != want {
-		t.Fatalf("final reason=%q want empty", got)
+	if got, want := final["reason"], "qualified_evidence"; got != want {
+		t.Fatalf("final reason=%q want=%q", got, want)
 	}
 }
 
