@@ -76,7 +76,7 @@ func TestParallelExpansionAggregationIsStableAcrossCompletionOrder(t *testing.T)
 	if !reflect.DeepEqual(left, right) {
 		t.Fatalf("completion order changed aggregate: left=%#v right=%#v", left, right)
 	}
-	if len(left.KeywordSupport) != 2 || left.KeywordSupport[0].SupportCount != 2 || left.KeywordSupport[1].SupportCount != 1 {
+	if len(left.KeywordSupport) != 1 || left.KeywordSupport[0].SupportCount != 2 || len(left.KeywordSupport[0].SurfaceForms) != 2 {
 		t.Fatalf("keyword support = %#v", left.KeywordSupport)
 	}
 }

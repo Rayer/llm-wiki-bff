@@ -7,3 +7,5 @@ The DEV limitations are intentional and accepted for this slice:
 - The semantic evaluator is unavailable; lexical hits never count as semantic proof.
 - Unsupported or no-evidence queries may still fill irrelevant candidates.
 - Equal-score tie quality remains unresolved.
+
+Lexical matching uses deterministic title, allowlisted frontmatter values, and body fields. Keyword support is one vote per normalized role/kind/value concept per attempt; normalized surface forms are retained for auditable local evidence, while production receipts retain only their digests.

@@ -99,3 +99,13 @@ func TestReceiptRecordsResolvedExpansionConfigAndSupport(t *testing.T) {
 		t.Fatalf("receipt lost auditable sanitized support: %s", encoded)
 	}
 }
+
+func TestReceiptDigestsSurfaceFormsWithoutPersistingThem(t *testing.T) {
+	_, recorder := WithReceipt(context.Background())
+	recorder.SetExpansionConfig(1, 1, 0, 1, 2, 1, 2, []KeywordSupportReceipt{{Role: "preferred", Kind: "concept", Value: "value", Keyword: "alias", SurfaceForms: []string{"surface-form"}, SupportCount: 1, AttemptIndexes: []int{1}}})
+	data, _ := json.Marshal(recorder.Receipt())
+	encoded := string(data)
+	if strings.Contains(encoded, "surface-form") || !strings.Contains(encoded, "surface_form_digests") {
+		t.Fatalf("surface form was not sanitized: %s", encoded)
+	}
+}

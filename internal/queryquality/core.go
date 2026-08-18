@@ -131,11 +131,17 @@ type QueryPlan struct {
 }
 
 type KeywordSupport struct {
-	Role           string `json:"role"`
-	Kind           string `json:"kind"`
+	Role           string        `json:"role"`
+	Kind           string        `json:"kind"`
+	Value          string        `json:"value"`
+	Keyword        string        `json:"keyword"`
+	SupportCount   int           `json:"support_count"`
+	AttemptIndexes []int         `json:"attempt_indexes"`
+	SurfaceForms   []SurfaceForm `json:"surface_forms,omitempty"`
+}
+
+type SurfaceForm struct {
 	Value          string `json:"value"`
-	Keyword        string `json:"keyword"`
-	SupportCount   int    `json:"support_count"`
 	AttemptIndexes []int  `json:"attempt_indexes"`
 }
 
@@ -173,14 +179,15 @@ type CandidateEvidence struct {
 }
 
 type KeywordEvidence struct {
-	Role              string   `json:"role"`
-	Kind              string   `json:"kind"`
-	Value             string   `json:"value"`
-	Keyword           string   `json:"keyword"`
-	SupportCount      int      `json:"support_count"`
-	AttemptIndexes    []int    `json:"attempt_indexes"`
-	DocumentFrequency int      `json:"document_frequency"`
-	MatchedFields     []string `json:"matched_fields"`
+	Role              string        `json:"role"`
+	Kind              string        `json:"kind"`
+	Value             string        `json:"value"`
+	Keyword           string        `json:"keyword"`
+	SurfaceForms      []SurfaceForm `json:"surface_forms,omitempty"`
+	SupportCount      int           `json:"support_count"`
+	AttemptIndexes    []int         `json:"attempt_indexes"`
+	DocumentFrequency int           `json:"document_frequency"`
+	MatchedFields     []string      `json:"matched_fields"`
 }
 
 type EligibilityResult struct{ Candidates []CandidateEvidence }
@@ -586,11 +593,13 @@ func mergeCriteria(existing, additions []Criterion) []Criterion {
 }
 
 func keywordSupport(attempts []indexedPlan) []KeywordSupport {
-	type key struct{ role, kind, value, keyword string }
-	counts := make(map[key]*KeywordSupport)
-	order := make([]key, 0)
+	type conceptKey struct{ role, kind, value string }
+	counts := make(map[conceptKey]*KeywordSupport)
+	forms := make(map[conceptKey]map[string]map[int]struct{})
+	order := make([]conceptKey, 0)
 	for _, attempt := range attempts {
-		seen := make(map[key]struct{})
+		attemptForms := make(map[conceptKey]map[string]struct{})
+		attemptOrder := make([]conceptKey, 0)
 		for _, role := range []struct {
 			name     string
 			criteria []Criterion
@@ -601,26 +610,49 @@ func keywordSupport(attempts []indexedPlan) []KeywordSupport {
 					if keyword == "" {
 						continue
 					}
-					itemKey := key{normalizeIdentity(role.name), normalizeIdentity(criterion.Kind), normalizeIdentity(criterion.Value), keyword}
-					if _, exists := seen[itemKey]; exists {
-						continue
+					concept := conceptKey{normalizeIdentity(role.name), normalizeIdentity(criterion.Kind), normalizeIdentity(criterion.Value)}
+					if _, exists := attemptForms[concept]; !exists {
+						attemptForms[concept] = make(map[string]struct{})
+						attemptOrder = append(attemptOrder, concept)
 					}
-					seen[itemKey] = struct{}{}
-					item, exists := counts[itemKey]
-					if !exists {
-						item = &KeywordSupport{Role: normalizeIdentity(role.name), Kind: normalizeIdentity(criterion.Kind), Value: normalizeIdentity(criterion.Value), Keyword: keyword}
-						counts[itemKey] = item
-						order = append(order, itemKey)
-					}
-					item.SupportCount++
-					item.AttemptIndexes = append(item.AttemptIndexes, attempt.index)
+					attemptForms[concept][keyword] = struct{}{}
 				}
+			}
+		}
+		for _, concept := range attemptOrder {
+			item, exists := counts[concept]
+			if !exists {
+				item = &KeywordSupport{Role: concept.role, Kind: concept.kind, Value: concept.value}
+				counts[concept] = item
+				forms[concept] = make(map[string]map[int]struct{})
+				order = append(order, concept)
+			}
+			item.SupportCount++
+			item.AttemptIndexes = append(item.AttemptIndexes, attempt.index)
+			for surface := range attemptForms[concept] {
+				if _, exists := forms[concept][surface]; !exists {
+					forms[concept][surface] = make(map[int]struct{})
+				}
+				forms[concept][surface][attempt.index] = struct{}{}
 			}
 		}
 	}
 	result := make([]KeywordSupport, 0, len(order))
-	for _, itemKey := range order {
-		result = append(result, *counts[itemKey])
+	for _, concept := range order {
+		item := *counts[concept]
+		for surface, attempts := range forms[concept] {
+			indexes := make([]int, 0, len(attempts))
+			for index := range attempts {
+				indexes = append(indexes, index)
+			}
+			sort.Ints(indexes)
+			item.SurfaceForms = append(item.SurfaceForms, SurfaceForm{Value: surface, AttemptIndexes: indexes})
+		}
+		sort.Slice(item.SurfaceForms, func(i, j int) bool { return item.SurfaceForms[i].Value < item.SurfaceForms[j].Value })
+		if len(item.SurfaceForms) > 0 {
+			item.Keyword = item.SurfaceForms[0].Value
+		}
+		result = append(result, item)
 	}
 	return result
 }
@@ -1096,7 +1128,11 @@ func (s *QueryRetrievalPipeline) execute(ctx context.Context, reader cache.Reade
 	if recorder := query.ReceiptRecorderFromContext(ctx); recorder != nil {
 		support := make([]query.KeywordSupportReceipt, 0, len(plan.KeywordSupport))
 		for _, item := range plan.KeywordSupport {
-			support = append(support, query.KeywordSupportReceipt{Role: item.Role, Kind: item.Kind, Value: item.Value, Keyword: item.Keyword, SupportCount: item.SupportCount, AttemptIndexes: append([]int(nil), item.AttemptIndexes...)})
+			surfaces := make([]string, 0, len(item.SurfaceForms))
+			for _, surface := range item.SurfaceForms {
+				surfaces = append(surfaces, surface.Value)
+			}
+			support = append(support, query.KeywordSupportReceipt{Role: item.Role, Kind: item.Kind, Value: item.Value, Keyword: item.Keyword, SurfaceForms: surfaces, SupportCount: item.SupportCount, AttemptIndexes: append([]int(nil), item.AttemptIndexes...)})
 		}
 		recorder.SetExpansionConfig(info.RequestedAttempts, info.SuccessfulAttempts, info.ProviderFailedAttempts, info.KeywordsPerAttempt, resolvedEvidenceThreshold(s.options), s.options.RareDocumentFrequency, MinimumKeywordConsensusSupport, support)
 		outcomes := make([]query.ExpansionAttemptReceipt, 0, len(info.AttemptOutcomes))
@@ -1355,13 +1391,18 @@ func (m lexicalMatcher) Match(ctx context.Context, request MatchRequest) (Eligib
 	if rareDocumentFrequency < 1 || rareDocumentFrequency > maxRareDocumentFrequency {
 		return EligibilityResult{}, fmt.Errorf("rare document frequency must be between 1 and %d", maxRareDocumentFrequency)
 	}
+	searchCorpus := make([]searchableEntry, len(request.CorpusEntries))
+	for index, entry := range request.CorpusEntries {
+		searchCorpus[index] = prepareSearchableEntry(entry)
+	}
+	documentFrequencies := precomputeDocumentFrequencies(request.Plan.KeywordSupport, searchCorpus)
 	candidates := make([]CandidateEvidence, 0, len(request.CorpusEntries))
-	for _, entry := range request.CorpusEntries {
+	for index, entry := range request.CorpusEntries {
 		if err := ctx.Err(); err != nil {
 			return EligibilityResult{}, err
 		}
 		candidate := CandidateEvidence{Slug: entry.Slug, Title: entry.Title, Eligible: true, EvidenceThreshold: threshold}
-		fields := searchableFields(entry)
+		fields := searchCorpus[index].Fields
 		for _, role := range []struct {
 			name       string
 			criteria   []Criterion
@@ -1402,18 +1443,18 @@ func (m lexicalMatcher) Match(ctx context.Context, request MatchRequest) (Eligib
 		}
 		candidate.SemanticResolution = semanticResolution(candidate.Groups)
 		candidate.SemanticOutcome = candidate.SemanticResolution
-		candidate.ExactIdentityEvidence = hasExactRequiredIdentity(request.Plan, candidate.Groups)
+		candidate.ExactIdentityEvidence = hasExactRequiredIdentity(request.Plan, searchCorpus[index], candidate.Groups)
 		candidate.PositiveEvidenceDimensions = positiveEvidenceDimensions(request.Plan, candidate.Groups)
 		candidate.PositiveEvidenceCount = len(candidate.PositiveEvidenceDimensions)
 		candidate.Score = independentDimensionScore(request.Plan, candidate.Groups)
-		candidate.KeywordEvidence, candidate.MatchedFields = keywordEvidence(request.Plan, candidate.Groups, request.CorpusEntries, entry)
+		candidate.KeywordEvidence, candidate.MatchedFields = keywordEvidence(request.Plan, candidate.Groups, searchCorpus, index, documentFrequencies)
 		candidate.Qualified, candidate.QualificationReason, candidate.QualificationPath = qualifyCandidate(candidate, threshold, request.Plan.RawQuery, rareDocumentFrequency, request.Plan.Fallback && request.FallbackQualificationAllowed)
 		candidates = append(candidates, candidate)
 	}
 	return EligibilityResult{Candidates: candidates}, nil
 }
 
-func matchRole(ctx context.Context, role string, criteria []Criterion, fields map[string]string, entry cache.Entry, evaluator SemanticEvaluator) ([]GroupEvidence, error) {
+func matchRole(ctx context.Context, role string, criteria []Criterion, fields []searchableField, entry cache.Entry, evaluator SemanticEvaluator) ([]GroupEvidence, error) {
 	groups := make([]GroupEvidence, 0, len(criteria))
 	for _, criterion := range criteria {
 		if err := ctx.Err(); err != nil {
@@ -1453,17 +1494,67 @@ func safeSemanticOutcome(outcome string) string {
 	}
 }
 
-func searchableFields(entry cache.Entry) map[string]string {
-	frontmatter, _ := json.Marshal(entry.Frontmatter)
-	return map[string]string{"title": entry.Title, "body": entry.Body, "frontmatter": string(frontmatter)}
+type searchableField struct {
+	Name  string
+	Value string
 }
 
-func matchGroups(criteria []Criterion, fields map[string]string) []GroupEvidence {
+type searchableEntry struct {
+	Fields     []searchableField
+	Identities []string
+}
+
+var searchableFrontmatterKeys = []string{"title", "name", "aliases", "tags", "keywords", "category", "categories", "type", "location"}
+
+func prepareSearchableEntry(entry cache.Entry) searchableEntry {
+	values := make([]string, 0)
+	for _, key := range searchableFrontmatterKeys {
+		values = appendSearchableValues(values, entry.Frontmatter[key])
+	}
+	identities := make([]string, 0, 1+len(values))
+	if normalizeIdentity(entry.Title) != "" {
+		identities = append(identities, entry.Title)
+	}
+	identities = append(identities, frontmatterIdentityAliases(entry.Frontmatter)...)
+	return searchableEntry{Fields: []searchableField{{Name: "title", Value: entry.Title}, {Name: "frontmatter", Value: strings.Join(values, " ")}, {Name: "body", Value: entry.Body}}, Identities: identities}
+}
+
+func appendSearchableValues(values []string, value interface{}) []string {
+	switch value := value.(type) {
+	case string:
+		if strings.TrimSpace(value) != "" {
+			return append(values, value)
+		}
+	case []string:
+		for _, item := range value {
+			values = appendSearchableValues(values, item)
+		}
+	case []interface{}:
+		for _, item := range value {
+			if text, ok := item.(string); ok {
+				values = appendSearchableValues(values, text)
+			}
+		}
+	case json.Number:
+		return append(values, string(value))
+	case bool:
+		return append(values, fmt.Sprint(value))
+	case float64, float32, int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
+		return append(values, fmt.Sprint(value))
+	}
+	return values
+}
+
+func frontmatterIdentityAliases(frontmatter map[string]interface{}) []string {
+	return appendSearchableValues(nil, frontmatter["aliases"])
+}
+
+func matchGroups(criteria []Criterion, fields []searchableField) []GroupEvidence {
 	groups, _ := matchGroupsForRole(context.Background(), criteria, "", fields)
 	return groups
 }
 
-func matchGroupsForRole(ctx context.Context, criteria []Criterion, role string, fields map[string]string) ([]GroupEvidence, error) {
+func matchGroupsForRole(ctx context.Context, criteria []Criterion, role string, fields []searchableField) ([]GroupEvidence, error) {
 	groups := make([]GroupEvidence, 0, len(criteria))
 	for _, criterion := range criteria {
 		if err := ctx.Err(); err != nil {
@@ -1474,7 +1565,7 @@ func matchGroupsForRole(ctx context.Context, criteria []Criterion, role string, 
 			continue
 		}
 		group := GroupEvidence{Role: role, Kind: criterion.Kind, Value: criterion.Value}
-		for field, value := range fields {
+		for _, field := range fields {
 			if err := ctx.Err(); err != nil {
 				return nil, err
 			}
@@ -1483,12 +1574,13 @@ func matchGroupsForRole(ctx context.Context, criteria []Criterion, role string, 
 				if err := ctx.Err(); err != nil {
 					return nil, err
 				}
-				if strings.Contains(strings.ToLower(value), strings.ToLower(term)) && !ContainsString(matched, term) {
-					matched = append(matched, term)
+				keyword := normalizeKeyword(term)
+				if containsNormalizedPhrase(field.Value, keyword) && !ContainsString(matched, keyword) {
+					matched = append(matched, keyword)
 				}
 			}
 			if len(matched) > 0 {
-				group.Matches = append(group.Matches, FieldEvidence{Field: field, Terms: matched})
+				group.Matches = append(group.Matches, FieldEvidence{Field: field.Name, Terms: matched})
 			}
 		}
 		if len(group.Matches) > 0 {
@@ -1506,7 +1598,7 @@ func hasMatchedGroup(groups []GroupEvidence, role string, criterion Criterion) b
 		for _, match := range group.Matches {
 			for _, matchedTerm := range match.Terms {
 				for _, term := range criterion.Terms {
-					if strings.EqualFold(matchedTerm, term) {
+					if normalizeKeyword(matchedTerm) == normalizeKeyword(term) {
 						return true
 					}
 				}
@@ -1542,7 +1634,11 @@ func exactIdentityKind(kind string) bool {
 	}
 }
 
-func hasExactRequiredIdentity(plan QueryPlan, groups []GroupEvidence) bool {
+func hasExactRequiredIdentity(plan QueryPlan, candidate searchableEntry, groups []GroupEvidence) bool {
+	rawQuery := normalizeIdentity(plan.RawQuery)
+	if rawQuery == "" {
+		return false
+	}
 	for _, criterion := range plan.Required {
 		if exactIdentityKind(criterion.Kind) && criterion.Proof != "semantic" && hasMatchedGroup(groups, "required", criterion) {
 			for _, group := range groups {
@@ -1550,11 +1646,29 @@ func hasExactRequiredIdentity(plan QueryPlan, groups []GroupEvidence) bool {
 					continue
 				}
 				for _, match := range group.Matches {
-					if match.Field == "title" && len(match.Terms) > 0 {
-						return true
+					if match.Field != "title" && match.Field != "frontmatter" {
+						continue
+					}
+					for _, identity := range candidate.Identities {
+						canonical := normalizeIdentity(identity)
+						if canonical == "" || !containsNormalizedPhrase(rawQuery, canonical) {
+							continue
+						}
+						if canonical == normalizeIdentity(criterion.Value) || containsNormalizedString(criterion.Terms, canonical) {
+							return true
+						}
 					}
 				}
 			}
+		}
+	}
+	return false
+}
+
+func containsNormalizedString(values []string, want string) bool {
+	for _, value := range values {
+		if normalizeIdentity(value) == want {
+			return true
 		}
 	}
 	return false
@@ -1605,14 +1719,132 @@ func semanticResolution(groups []GroupEvidence) string {
 	return seen
 }
 
-func keywordEvidence(plan QueryPlan, groups []GroupEvidence, entries []cache.Entry, entry cache.Entry) ([]KeywordEvidence, []string) {
-	fields := searchableFields(entry)
+type keywordConceptKey struct{ role, kind, value string }
+
+func keywordConcept(support KeywordSupport) keywordConceptKey {
+	return keywordConceptKey{normalizeIdentity(support.Role), normalizeIdentity(support.Kind), normalizeIdentity(support.Value)}
+}
+
+func supportSurfaceForms(support KeywordSupport) []SurfaceForm {
+	forms := make(map[string]map[int]struct{})
+	for _, form := range support.SurfaceForms {
+		value := normalizeKeyword(form.Value)
+		if value == "" {
+			continue
+		}
+		if _, exists := forms[value]; !exists {
+			forms[value] = make(map[int]struct{})
+		}
+		for _, index := range form.AttemptIndexes {
+			forms[value][index] = struct{}{}
+		}
+	}
+	if keyword := normalizeKeyword(support.Keyword); keyword != "" {
+		if _, exists := forms[keyword]; !exists {
+			forms[keyword] = make(map[int]struct{})
+		}
+	}
+	result := make([]SurfaceForm, 0, len(forms))
+	for value, indexes := range forms {
+		attempts := make([]int, 0, len(indexes))
+		for index := range indexes {
+			attempts = append(attempts, index)
+		}
+		sort.Ints(attempts)
+		result = append(result, SurfaceForm{Value: value, AttemptIndexes: attempts})
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].Value < result[j].Value })
+	return result
+}
+
+func mergeKeywordSupports(supports []KeywordSupport) []KeywordSupport {
+	merged := make(map[keywordConceptKey]*KeywordSupport)
+	order := make([]keywordConceptKey, 0, len(supports))
+	for _, support := range supports {
+		key := keywordConcept(support)
+		item, exists := merged[key]
+		if !exists {
+			copy := support
+			copy.SurfaceForms = nil
+			copy.AttemptIndexes = append([]int(nil), support.AttemptIndexes...)
+			item = &copy
+			merged[key] = item
+			order = append(order, key)
+		}
+		if !exists {
+			item.SurfaceForms = append(item.SurfaceForms, supportSurfaceForms(support)...)
+			continue
+		}
+		attempts := make(map[int]struct{}, len(item.AttemptIndexes)+len(support.AttemptIndexes))
+		for _, index := range item.AttemptIndexes {
+			attempts[index] = struct{}{}
+		}
+		for _, index := range support.AttemptIndexes {
+			attempts[index] = struct{}{}
+		}
+		item.AttemptIndexes = item.AttemptIndexes[:0]
+		for index := range attempts {
+			item.AttemptIndexes = append(item.AttemptIndexes, index)
+		}
+		sort.Ints(item.AttemptIndexes)
+		if len(item.AttemptIndexes) > 0 {
+			item.SupportCount = len(item.AttemptIndexes)
+		} else if support.SupportCount > item.SupportCount {
+			item.SupportCount = support.SupportCount
+		}
+		item.SurfaceForms = append(item.SurfaceForms, supportSurfaceForms(support)...)
+		if item.Keyword == "" {
+			item.Keyword = support.Keyword
+		}
+	}
+	for _, key := range order {
+		item := merged[key]
+		item.SurfaceForms = supportSurfaceForms(*item)
+		if len(item.SurfaceForms) > 0 {
+			item.Keyword = item.SurfaceForms[0].Value
+		}
+	}
+	result := make([]KeywordSupport, 0, len(order))
+	for _, key := range order {
+		result = append(result, *merged[key])
+	}
+	return result
+}
+
+func precomputeDocumentFrequencies(supports []KeywordSupport, corpus []searchableEntry) map[keywordConceptKey]int {
+	frequencies := make(map[keywordConceptKey]int)
+	for _, support := range mergeKeywordSupports(supports) {
+		key := keywordConcept(support)
+		forms := supportSurfaceForms(support)
+		for _, entry := range corpus {
+			matched := false
+			for _, field := range entry.Fields {
+				for _, form := range forms {
+					if containsNormalizedPhrase(field.Value, form.Value) {
+						matched = true
+						break
+					}
+				}
+				if matched {
+					break
+				}
+			}
+			if matched {
+				frequencies[key]++
+			}
+		}
+	}
+	return frequencies
+}
+
+func keywordEvidence(plan QueryPlan, groups []GroupEvidence, corpus []searchableEntry, candidateIndex int, documentFrequencies map[keywordConceptKey]int) ([]KeywordEvidence, []string) {
 	matchedFields := make([]string, 0)
 	result := make([]KeywordEvidence, 0)
-	for _, support := range plan.KeywordSupport {
+	for _, support := range mergeKeywordSupports(plan.KeywordSupport) {
 		if support.Role != "preferred" && support.Role != "goal" {
 			continue
 		}
+		forms := supportSurfaceForms(support)
 		matched := false
 		for _, group := range groups {
 			if normalizeIdentity(group.Role) != normalizeIdentity(support.Role) || normalizeKind(group.Kind) != normalizeKind(support.Kind) || normalizeIdentity(group.Value) != normalizeIdentity(support.Value) {
@@ -1620,9 +1852,13 @@ func keywordEvidence(plan QueryPlan, groups []GroupEvidence, entries []cache.Ent
 			}
 			for _, field := range group.Matches {
 				for _, term := range field.Terms {
-					if normalizeKeyword(term) == support.Keyword {
+					for _, form := range forms {
+						if normalizeKeyword(term) != form.Value {
+							continue
+						}
 						matched = true
 						matchedFields = appendUnique(matchedFields, field.Field)
+						break
 					}
 				}
 			}
@@ -1630,29 +1866,26 @@ func keywordEvidence(plan QueryPlan, groups []GroupEvidence, entries []cache.Ent
 		if !matched {
 			continue
 		}
-		frequency := 0
-		for _, corpusEntry := range entries {
-			for _, value := range searchableFields(corpusEntry) {
-				if containsNormalizedPhrase(value, support.Keyword) {
-					frequency++
+		fieldsForKeyword := make([]string, 0, len(corpus[candidateIndex].Fields))
+		for _, field := range corpus[candidateIndex].Fields {
+			for _, form := range forms {
+				if containsNormalizedPhrase(field.Value, form.Value) {
+					fieldsForKeyword = appendUnique(fieldsForKeyword, field.Name)
 					break
 				}
 			}
 		}
-		fieldsForKeyword := make([]string, 0, len(fields))
-		for field, value := range fields {
-			if containsNormalizedPhrase(value, support.Keyword) {
-				fieldsForKeyword = appendUnique(fieldsForKeyword, field)
-			}
-		}
 		sort.Strings(fieldsForKeyword)
-		result = append(result, KeywordEvidence{Role: support.Role, Kind: support.Kind, Value: support.Value, Keyword: support.Keyword, SupportCount: support.SupportCount, AttemptIndexes: append([]int(nil), support.AttemptIndexes...), DocumentFrequency: frequency, MatchedFields: fieldsForKeyword})
+		result = append(result, KeywordEvidence{Role: support.Role, Kind: support.Kind, Value: support.Value, Keyword: support.Keyword, SurfaceForms: append([]SurfaceForm(nil), forms...), SupportCount: support.SupportCount, AttemptIndexes: append([]int(nil), support.AttemptIndexes...), DocumentFrequency: documentFrequencies[keywordConcept(support)], MatchedFields: fieldsForKeyword})
 	}
 	sort.SliceStable(result, func(i, j int) bool {
 		if result[i].Role != result[j].Role {
 			return result[i].Role < result[j].Role
 		}
-		return result[i].Keyword < result[j].Keyword
+		if result[i].Kind != result[j].Kind {
+			return result[i].Kind < result[j].Kind
+		}
+		return result[i].Value < result[j].Value
 	})
 	sort.Strings(matchedFields)
 	return result, matchedFields
@@ -1685,7 +1918,17 @@ func qualifyCandidate(candidate CandidateEvidence, threshold int, rawQuery strin
 		}
 		raw := normalizeKeyword(rawQuery)
 		for _, evidence := range candidate.KeywordEvidence {
-			if evidence.SupportCount != 1 || evidence.DocumentFrequency > rareDocumentFrequency || !containsNormalizedPhrase(raw, evidence.Keyword) {
+			grounded := false
+			for _, form := range evidence.SurfaceForms {
+				if containsNormalizedPhrase(raw, form.Value) {
+					grounded = true
+					break
+				}
+			}
+			if !grounded {
+				grounded = containsNormalizedPhrase(raw, evidence.Keyword)
+			}
+			if evidence.SupportCount != 1 || evidence.DocumentFrequency > rareDocumentFrequency || !grounded {
 				continue
 			}
 			if containsString(evidence.MatchedFields, "title") || containsString(evidence.MatchedFields, "frontmatter") {
@@ -1707,31 +1950,31 @@ func qualifyCandidate(candidate CandidateEvidence, threshold int, rawQuery strin
 }
 
 func containsNormalizedPhrase(value, phrase string) bool {
-	value, phrase = normalizeIdentity(value), normalizeIdentity(phrase)
-	if value == "" || phrase == "" {
+	valueRunes := []rune(normalizeIdentity(value))
+	phraseRunes := []rune(normalizeIdentity(phrase))
+	if len(valueRunes) == 0 || len(phraseRunes) == 0 || len(phraseRunes) > len(valueRunes) {
 		return false
 	}
-	if containsCJK(phrase) {
-		return strings.Contains(value, phrase)
-	}
-	start := 0
-	for {
-		index := strings.Index(value[start:], phrase)
-		if index < 0 {
-			return false
+	if containsCJK(string(phraseRunes)) {
+		for start := 0; start+len(phraseRunes) <= len(valueRunes); start++ {
+			if string(valueRunes[start:start+len(phraseRunes)]) == string(phraseRunes) {
+				return true
+			}
 		}
-		index += start
-		end := index + len(phrase)
-		beforeOK := index == 0 || !unicode.IsLetter(rune(value[index-1])) && !unicode.IsDigit(rune(value[index-1]))
-		afterOK := end == len(value) || !unicode.IsLetter(rune(value[end])) && !unicode.IsDigit(rune(value[end]))
+		return false
+	}
+	for index := 0; index+len(phraseRunes) <= len(valueRunes); index++ {
+		if string(valueRunes[index:index+len(phraseRunes)]) != string(phraseRunes) {
+			continue
+		}
+		end := index + len(phraseRunes)
+		beforeOK := index == 0 || !unicode.IsLetter(valueRunes[index-1]) && !unicode.IsDigit(valueRunes[index-1])
+		afterOK := end == len(valueRunes) || !unicode.IsLetter(valueRunes[end]) && !unicode.IsDigit(valueRunes[end])
 		if beforeOK && afterOK {
 			return true
 		}
-		start = index + 1
-		if start >= len(value) {
-			return false
-		}
 	}
+	return false
 }
 
 func containsCJK(value string) bool {

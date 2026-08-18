@@ -149,9 +149,9 @@ func TestEvidenceThresholdQualificationAndSelection(t *testing.T) {
 func TestExactRequiredEntityQualifiesWithoutLegacyScore(t *testing.T) {
 	for _, kind := range []string{"entity", "name", "entity_name", "entity-name", "venue_name", "venue-name"} {
 		t.Run(kind, func(t *testing.T) {
-			plan := queryquality.QueryPlan{Required: []queryquality.Criterion{{Kind: kind, Value: "Boven", Terms: []string{"Boven"}, Proof: "lexical"}}}
+			plan := queryquality.QueryPlan{RawQuery: "Boven", Required: []queryquality.Criterion{{Kind: kind, Value: "Boven", Terms: []string{"Boven"}, Proof: "lexical"}}}
 			matched, err := queryquality.NewLexicalMatcher(nil).Match(context.Background(), queryquality.MatchRequest{
-				Plan: plan, CorpusEntries: []cache.Entry{{Slug: "boven", Title: "Boven 雜誌圖書館"}}, EvidenceThreshold: 3, EvidenceThresholdSet: true,
+				Plan: plan, CorpusEntries: []cache.Entry{{Slug: "boven", Title: "Boven"}}, EvidenceThreshold: 3, EvidenceThresholdSet: true,
 			})
 			if err != nil {
 				t.Fatal(err)
@@ -163,7 +163,7 @@ func TestExactRequiredEntityQualifiesWithoutLegacyScore(t *testing.T) {
 		})
 	}
 	matched, err := queryquality.NewLexicalMatcher(nil).Match(context.Background(), queryquality.MatchRequest{
-		Plan:          queryquality.QueryPlan{Required: []queryquality.Criterion{{Kind: "entity", Value: "Boven", Terms: []string{"Boven"}, Proof: "lexical"}}},
+		Plan:          queryquality.QueryPlan{RawQuery: "Boven", Required: []queryquality.Criterion{{Kind: "entity", Value: "Boven", Terms: []string{"Boven"}, Proof: "lexical"}}},
 		CorpusEntries: []cache.Entry{{Slug: "body-only", Title: "雜誌圖書館", Body: "Boven"}}, EvidenceThreshold: 1, EvidenceThresholdSet: true,
 	})
 	if err != nil {

@@ -39,15 +39,17 @@ type Receipt struct {
 }
 
 type KeywordSupportReceipt struct {
-	Role           string `json:"role"`
-	Kind           string `json:"-"`
-	Value          string `json:"-"`
-	Keyword        string `json:"-"`
-	KindDigest     string `json:"kind_digest,omitempty"`
-	ValueDigest    string `json:"value_digest,omitempty"`
-	KeywordDigest  string `json:"keyword_digest,omitempty"`
-	SupportCount   int    `json:"support_count"`
-	AttemptIndexes []int  `json:"attempt_indexes"`
+	Role               string   `json:"role"`
+	Kind               string   `json:"-"`
+	Value              string   `json:"-"`
+	Keyword            string   `json:"-"`
+	SurfaceForms       []string `json:"-"`
+	KindDigest         string   `json:"kind_digest,omitempty"`
+	ValueDigest        string   `json:"value_digest,omitempty"`
+	KeywordDigest      string   `json:"keyword_digest,omitempty"`
+	SurfaceFormDigests []string `json:"surface_form_digests,omitempty"`
+	SupportCount       int      `json:"support_count"`
+	AttemptIndexes     []int    `json:"attempt_indexes"`
 }
 
 type ExpansionAttemptReceipt struct {
@@ -78,7 +80,11 @@ func (r *ReceiptRecorder) SetExpansionConfig(attempts, successful, providerFaile
 		item.KindDigest = receiptDigest(item.Kind)
 		item.ValueDigest = receiptDigest(item.Value)
 		item.KeywordDigest = receiptDigest(item.Keyword)
-		item.Kind, item.Value, item.Keyword = "", "", ""
+		item.SurfaceFormDigests = make([]string, 0, len(item.SurfaceForms))
+		for _, surface := range item.SurfaceForms {
+			item.SurfaceFormDigests = append(item.SurfaceFormDigests, receiptDigest(surface))
+		}
+		item.Kind, item.Value, item.Keyword, item.SurfaceForms = "", "", "", nil
 		r.receipt.KeywordSupport = append(r.receipt.KeywordSupport, item)
 	}
 }
