@@ -956,13 +956,13 @@ func (m lexicalMatcher) Match(ctx context.Context, request MatchRequest) (Eligib
 			}
 		}
 		for _, criterion := range request.Plan.Required {
-			if criterion.Proof != "semantic" && !hasMatchedGroup(candidate.Groups, criterion) {
+			if criterion.Proof != "semantic" && !hasMatchedGroup(candidate.Groups, "required", criterion) {
 				candidate.Eligible = false
 				candidate.Rejection = "required_" + criterion.Kind + "_not_matched"
 				break
 			}
 		}
-		if candidate.Eligible && hasAnyMatchedGroup(candidate.Groups, request.Plan.Excluded) {
+		if candidate.Eligible && hasAnyMatchedGroup(candidate.Groups, "excluded", request.Plan.Excluded) {
 			candidate.Eligible = false
 			candidate.Rejection = "excluded_criterion_matched"
 		}
@@ -1063,18 +1063,27 @@ func matchGroupsForRole(ctx context.Context, criteria []Criterion, role string, 
 	return groups, nil
 }
 
-func hasMatchedGroup(groups []GroupEvidence, criterion Criterion) bool {
+func hasMatchedGroup(groups []GroupEvidence, role string, criterion Criterion) bool {
 	for _, group := range groups {
-		if normalizeKind(group.Kind) == normalizeKind(criterion.Kind) && group.Value == criterion.Value && len(group.Matches) > 0 {
-			return true
+		if group.Role != role || normalizeKind(group.Kind) != normalizeKind(criterion.Kind) || group.Value != criterion.Value {
+			continue
+		}
+		for _, match := range group.Matches {
+			for _, matchedTerm := range match.Terms {
+				for _, term := range criterion.Terms {
+					if strings.EqualFold(matchedTerm, term) {
+						return true
+					}
+				}
+			}
 		}
 	}
 	return false
 }
 
-func hasAnyMatchedGroup(groups []GroupEvidence, criteria []Criterion) bool {
+func hasAnyMatchedGroup(groups []GroupEvidence, role string, criteria []Criterion) bool {
 	for _, criterion := range criteria {
-		if hasMatchedGroup(groups, criterion) {
+		if hasMatchedGroup(groups, role, criterion) {
 			return true
 		}
 	}
@@ -1091,7 +1100,7 @@ func normalizeKind(kind string) string {
 
 func exactIdentityKind(kind string) bool {
 	switch normalizeKind(kind) {
-	case "entity", "name", "venue-name":
+	case "entity", "name", "entity-name", "venue-name":
 		return true
 	default:
 		return false
@@ -1100,8 +1109,17 @@ func exactIdentityKind(kind string) bool {
 
 func hasExactRequiredIdentity(plan QueryPlan, groups []GroupEvidence) bool {
 	for _, criterion := range plan.Required {
-		if exactIdentityKind(criterion.Kind) && criterion.Proof != "semantic" && hasMatchedGroup(groups, criterion) {
-			return true
+		if exactIdentityKind(criterion.Kind) && criterion.Proof != "semantic" && hasMatchedGroup(groups, "required", criterion) {
+			for _, group := range groups {
+				if group.Role != "required" || normalizeKind(group.Kind) != normalizeKind(criterion.Kind) || group.Value != criterion.Value {
+					continue
+				}
+				for _, match := range group.Matches {
+					if match.Field == "title" && len(match.Terms) > 0 {
+						return true
+					}
+				}
+			}
 		}
 	}
 	return false
@@ -1115,7 +1133,7 @@ func positiveEvidenceDimensions(plan QueryPlan, groups []GroupEvidence) []string
 	seen := make(map[string]struct{})
 	dimensions := make([]string, 0, len(criteria))
 	for _, criterion := range criteria {
-		if criterion.Proof == "semantic" || !hasMatchedGroup(groups, criterion) {
+		if criterion.Proof == "semantic" || !hasMatchedGroup(groups, "preferred", criterion) && !hasMatchedGroup(groups, "supporting", criterion) && !hasMatchedGroup(groups, "goal", criterion) && !hasMatchedGroup(groups, "alternative", criterion) {
 			continue
 		}
 		kind := normalizeKind(criterion.Kind)
@@ -1248,7 +1266,10 @@ func (randomSelector) Select(ctx context.Context, input SelectionInput) (Selecti
 		}
 		reason := "selection_omission"
 		if !candidate.Eligible {
-			reason = "ineligible"
+			reason = candidate.Rejection
+			if reason == "" {
+				reason = "ineligible"
+			}
 		} else if !candidate.Qualified {
 			reason = candidate.QualificationReason
 		}

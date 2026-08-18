@@ -130,26 +130,88 @@ func TestEvidenceThresholdQualificationAndSelection(t *testing.T) {
 }
 
 func TestExactRequiredEntityQualifiesWithoutLegacyScore(t *testing.T) {
-	plan := queryquality.QueryPlan{
-		Required:  []queryquality.Criterion{{Kind: "venue-name", Value: "Boven", Terms: []string{"Boven"}, Proof: "lexical"}},
-		Preferred: []queryquality.Criterion{{Kind: "venue_type", Value: "libraries", Terms: []string{"libraries"}, Proof: "lexical"}},
+	for _, kind := range []string{"entity", "name", "entity_name", "entity-name", "venue_name", "venue-name"} {
+		t.Run(kind, func(t *testing.T) {
+			plan := queryquality.QueryPlan{Required: []queryquality.Criterion{{Kind: kind, Value: "Boven", Terms: []string{"Boven"}, Proof: "lexical"}}}
+			matched, err := queryquality.NewLexicalMatcher(nil).Match(context.Background(), queryquality.MatchRequest{
+				Plan: plan, CorpusEntries: []cache.Entry{{Slug: "boven", Title: "Boven 雜誌圖書館"}}, EvidenceThreshold: 3, EvidenceThresholdSet: true,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			candidate := matched.Candidates[0]
+			if !candidate.ExactIdentityEvidence || !candidate.Qualified || candidate.Score != 0 {
+				t.Fatalf("candidate = %#v, want exact qualified score zero", candidate)
+			}
+		})
 	}
 	matched, err := queryquality.NewLexicalMatcher(nil).Match(context.Background(), queryquality.MatchRequest{
-		Plan: plan,
-		CorpusEntries: []cache.Entry{
-			{Slug: "boven", Title: "Boven", Body: ""},
-			{Slug: "generic", Title: "Libraries and cafes", Body: "libraries cafes"},
-		},
-		EvidenceThreshold: 3, EvidenceThresholdSet: true,
+		Plan:          queryquality.QueryPlan{Required: []queryquality.Criterion{{Kind: "entity", Value: "Boven", Terms: []string{"Boven"}, Proof: "lexical"}}},
+		CorpusEntries: []cache.Entry{{Slug: "body-only", Title: "雜誌圖書館", Body: "Boven"}}, EvidenceThreshold: 1, EvidenceThresholdSet: true,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !matched.Candidates[0].ExactIdentityEvidence || !matched.Candidates[0].Qualified || matched.Candidates[0].Score != 0 {
-		t.Fatalf("Boven candidate = %#v, want exact qualified score zero", matched.Candidates[0])
+	candidate := matched.Candidates[0]
+	if candidate.ExactIdentityEvidence || candidate.Qualified || candidate.Score != 0 {
+		t.Fatalf("body-only candidate = %#v, want no exact identity and score-zero rejection", candidate)
 	}
-	if matched.Candidates[1].Qualified {
-		t.Fatalf("generic candidate = %#v, want unqualified", matched.Candidates[1])
+}
+
+func TestCriterionEvidenceIsRoleAndTermLocal(t *testing.T) {
+	plan := queryquality.QueryPlan{
+		Required:  []queryquality.Criterion{{Kind: "topic", Value: "coffee", Terms: []string{"coffee shop"}, Proof: "lexical"}},
+		Preferred: []queryquality.Criterion{{Kind: "topic", Value: "coffee", Terms: []string{"coffee"}, Proof: "lexical"}},
+		Excluded:  []queryquality.Criterion{{Kind: "topic", Value: "coffee", Terms: []string{"tea"}, Proof: "lexical"}},
+	}
+	matched, err := queryquality.NewLexicalMatcher(nil).Match(context.Background(), queryquality.MatchRequest{
+		Plan: plan, CorpusEntries: []cache.Entry{{Slug: "preferred-only", Title: "Coffee"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate := matched.Candidates[0]
+	if candidate.Eligible || candidate.Rejection != "required_topic_not_matched" {
+		t.Fatalf("candidate = %#v, want required miss despite preferred match", candidate)
+	}
+
+	plan = queryquality.QueryPlan{
+		Required:  []queryquality.Criterion{{Kind: "entity", Value: "Boven", Terms: []string{"Boven"}, Proof: "lexical"}},
+		Preferred: []queryquality.Criterion{{Kind: "entity", Value: "Boven", Terms: []string{"Boven"}, Proof: "lexical"}},
+	}
+	matched, err = queryquality.NewLexicalMatcher(nil).Match(context.Background(), queryquality.MatchRequest{Plan: plan, CorpusEntries: []cache.Entry{{Slug: "body-only", Title: "Other", Body: "Boven"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if matched.Candidates[0].ExactIdentityEvidence {
+		t.Fatal("preferred/body evidence must not establish required exact identity")
+	}
+
+	plan = queryquality.QueryPlan{
+		Preferred: []queryquality.Criterion{{Kind: "topic", Value: "coffee", Terms: []string{"coffee"}, Proof: "lexical"}},
+		Excluded:  []queryquality.Criterion{{Kind: "topic", Value: "coffee", Terms: []string{"coffee"}, Proof: "lexical"}},
+	}
+	matched, err = queryquality.NewLexicalMatcher(nil).Match(context.Background(), queryquality.MatchRequest{Plan: plan, CorpusEntries: []cache.Entry{{Slug: "excluded", Title: "Coffee"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if matched.Candidates[0].Eligible || matched.Candidates[0].Rejection != "excluded_criterion_matched" {
+		t.Fatalf("candidate = %#v, want excluded role to reject independently", matched.Candidates[0])
+	}
+}
+
+func TestSelectorPreservesHardIneligibilityRejection(t *testing.T) {
+	result, err := queryquality.NewResultSelector().Select(context.Background(), queryquality.SelectionInput{Candidates: []queryquality.CandidateEvidence{
+		{Slug: "required-miss", Eligible: false, Rejection: "required_location_not_matched"},
+		{Slug: "excluded", Eligible: false, Rejection: "excluded_criterion_matched"},
+	}, Limit: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, decision := range result.Selected {
+		if decision.Reason != map[string]string{"required-miss": "required_location_not_matched", "excluded": "excluded_criterion_matched"}[decision.Slug] {
+			t.Fatalf("decision = %#v, want preserved rejection", decision)
+		}
 	}
 }
 
