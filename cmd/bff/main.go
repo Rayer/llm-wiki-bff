@@ -174,6 +174,7 @@ func newProductionQueryExecutor(cfg config.Config, conceptCache *conceptcache.Ca
 		explorationSlots = config.DefaultQuerySelectionExplorationSlots
 	}
 	evidenceThreshold := cfg.QuerySelectionEvidenceThreshold
+	evidenceThresholdSet := cfg.QuerySelectionEvidenceThreshold != 0
 	if evidenceThreshold == 0 {
 		evidenceThreshold = config.DefaultQuerySelectionEvidenceThreshold
 	}
@@ -206,7 +207,10 @@ func newProductionQueryExecutor(cfg config.Config, conceptCache *conceptcache.Ca
 	legacy := query.NewService(conceptCache, legacyExpander, synthesisClient)
 	return queryquality.NewProductionExecutor(conceptCache, expansionProvider, legacy, legacy, queryquality.Options{
 		SelectionLimit: selectionLimit, ExplorationSlots: explorationSlots,
-		EvidenceThreshold: evidenceThreshold, EvidenceThresholdSet: true,
+		EvidenceThreshold: evidenceThreshold, EvidenceThresholdSet: evidenceThresholdSet,
+		KeywordsPerAttempt:    cfg.QueryExpansionKeywordsPerAttempt,
+		ExpansionAttempts:     cfg.QueryExpansionAttempts,
+		RareDocumentFrequency: cfg.QueryMatchingRareKeywordMaxDocumentFrequency,
 	})
 }
 

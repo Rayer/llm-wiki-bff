@@ -25,7 +25,11 @@ func NewProductionExecutor(conceptCache *cache.Cache, provider ChatProvider, leg
 	if err != nil {
 		return nil, err
 	}
-	queryRetrievalPipeline := NewQueryRetrievalPipelineWithOptions(NewMinimalStructuredPlanExpander(provider, NewDeterministicExpander()), NewLexicalMatcher(nil), NewResultSelector(), options.SeedFor, options)
+	expander, err := NewParallelMinimalStructuredPlanExpander(provider, NewDeterministicExpander(), options)
+	if err != nil {
+		return nil, err
+	}
+	queryRetrievalPipeline := NewQueryRetrievalPipelineWithOptions(expander, NewLexicalMatcher(nil), NewResultSelector(), options.SeedFor, options)
 	queryRetrievalPipeline.cache = conceptCache
 	queryRetrievalPipeline.allowDeterministicFallback = true
 	return &ProductionExecutor{queryRetrievalPipeline: queryRetrievalPipeline, legacy: legacy, synthesizer: synthesizer}, nil

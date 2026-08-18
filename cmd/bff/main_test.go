@@ -10,6 +10,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -97,16 +98,16 @@ func TestProductionInvalidStructuredPlanUsesChatLegacyExpansion(t *testing.T) {
 	if len(result.Results) != 1 || result.Results[0].Slug != "coffee" {
 		t.Fatalf("result = %#v", result.Results)
 	}
-	if len(transport.requests) != 2 {
-		t.Fatalf("HTTP calls = %d, want expansion plus synthesis", len(transport.requests))
+	if len(transport.requests) != 4 {
+		t.Fatalf("HTTP calls = %d, want three parallel expansions plus synthesis", len(transport.requests))
 	}
 	if transport.requests[0].Model != "deepseek-v4-flash" || transport.requests[0].Temperature == nil || *transport.requests[0].Temperature != 0 {
 		t.Fatalf("structured request = %#v", transport.requests[0])
 	}
-	if transport.requests[1].Model != "deepseek-v4-pro" {
-		t.Fatalf("synthesis request = %#v", transport.requests[1])
+	if transport.requests[3].Model != "deepseek-v4-pro" {
+		t.Fatalf("synthesis request = %#v", transport.requests[3])
 	}
-	if string(transport.requests[0].Thinking) != `{"type":"disabled"}` || transport.requests[0].ReasoningEffort != "" || string(transport.requests[1].Thinking) != `{"type":"disabled"}` || transport.requests[1].ReasoningEffort != "" {
+	if string(transport.requests[0].Thinking) != `{"type":"disabled"}` || transport.requests[0].ReasoningEffort != "" || string(transport.requests[3].Thinking) != `{"type":"disabled"}` || transport.requests[3].ReasoningEffort != "" {
 		t.Fatalf("thinking policies = %#v, want explicit disabled for both defaults", transport.requests)
 	}
 }
@@ -118,7 +119,7 @@ func TestDefaultProductionQueryCompositionPreservesRequestCancellation(t *testin
 	}
 	started := make(chan struct{})
 	previousTransport := http.DefaultTransport
-	http.DefaultTransport = productionCancellationTransport{started: started}
+	http.DefaultTransport = productionCancellationTransport{started: started, startedOnce: &sync.Once{}}
 	defer func() { http.DefaultTransport = previousTransport }()
 	executor, err := newProductionQueryExecutor(config.Config{DeepSeekAPIKey: "test-key"}, conceptcache.New())
 	if err != nil {
@@ -170,10 +171,13 @@ func TestProductionQueryReportsInsufficientEvidenceWithoutConcepts(t *testing.T)
 	}
 }
 
-type productionCancellationTransport struct{ started chan struct{} }
+type productionCancellationTransport struct {
+	started     chan struct{}
+	startedOnce *sync.Once
+}
 
 func (t productionCancellationTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	close(t.started)
+	t.startedOnce.Do(func() { close(t.started) })
 	<-req.Context().Done()
 	return nil, req.Context().Err()
 }
@@ -185,7 +189,10 @@ type productionRequest struct {
 	ReasoningEffort string          `json:"reasoning_effort"`
 }
 
-type productionFallbackTransport struct{ requests []productionRequest }
+type productionFallbackTransport struct {
+	mu       sync.Mutex
+	requests []productionRequest
+}
 
 func (t *productionFallbackTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	body, err := io.ReadAll(req.Body)
@@ -196,9 +203,12 @@ func (t *productionFallbackTransport) RoundTrip(req *http.Request) (*http.Respon
 	if err := json.Unmarshal(body, &captured); err != nil {
 		return nil, err
 	}
+	t.mu.Lock()
 	t.requests = append(t.requests, captured)
+	requestCount := len(t.requests)
+	t.mu.Unlock()
 	content := "not-json"
-	if len(t.requests) == 2 {
+	if requestCount == 2 {
 		content = `{"keywords":["coffee"]}`
 	}
 	response := `{"choices":[{"message":{"content":` + strconv.Quote(content) + `}}]}`

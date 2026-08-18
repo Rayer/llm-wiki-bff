@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -472,7 +473,7 @@ func TestStructuredPlanPromptIsMinimalV1(t *testing.T) {
 	}
 	wantSystem := `You produce a retrieval plan for a frozen Lifestyle concept corpus. Return exactly one JSON object and no markdown. The object fields and exact types are: raw_query string; required array of Criterion; excluded array of Criterion; preferred array of Criterion; goals array of Criterion; supporting_dimensions array of Criterion; acceptable_alternatives array of Criterion; ambiguity array of strings; fallback boolean. Every Criterion is exactly {kind:string,value:string,terms:array of strings,proof:"lexical" or "semantic"}. Every lexical Criterion needs at least one discovery term. Never output a string where an array or object is required. Be conservative: only explicit user constraints may be required or excluded; absent never means excluded. In this minimal variant, supporting_dimensions and acceptable_alternatives must be empty arrays and fallback must be false.`
 	wantUser := `Raw query: "coffee"` + "\n" + `Criterion policy: {"required_when_explicit":["location","explicit_exclusion"],"preferred_by_default":["venue_type","activity","audience","setting"],"goals_to_expand":["suitability","recommendation","discovery"]}` + "\nInterpret the query into required, excluded, preferred and goals. Preserve the raw query exactly in raw_query. Return the single JSON object only."
-	if provider.system != wantSystem || provider.user != wantUser {
+	if provider.system != wantSystem || !strings.HasPrefix(provider.user, wantUser) || !strings.Contains(provider.user, "Maximum normalized positive discovery keywords for this attempt: 24.") {
 		t.Fatalf("prompt mismatch:\nsystem=%q\nuser=%q", provider.system, provider.user)
 	}
 	if queryquality.StructuredPlanPromptID != "minimal-v1" {
@@ -637,7 +638,7 @@ func TestProductionExpansionFailureAndInvalidJSONUseDeterministicFallback(t *tes
 
 func TestProductionExpansionCancellationDoesNotFallback(t *testing.T) {
 	started := make(chan struct{})
-	provider := blockingProvider{started: started}
+	provider := blockingProvider{started: started, startedOnce: &sync.Once{}}
 	legacy := &countingExecutor{}
 	executor, err := queryquality.NewProductionExecutor(cache.New(), provider, legacy, nil, queryquality.DefaultOptions())
 	if err != nil {
@@ -893,10 +894,13 @@ func (e *countingExecutor) Execute(context.Context, cache.Reader, query.Request)
 	return query.Result{}, nil
 }
 
-type blockingProvider struct{ started chan struct{} }
+type blockingProvider struct {
+	started     chan struct{}
+	startedOnce *sync.Once
+}
 
 func (p blockingProvider) Chat(ctx context.Context, _, _ string) (string, error) {
-	close(p.started)
+	p.startedOnce.Do(func() { close(p.started) })
 	<-ctx.Done()
 	return "", ctx.Err()
 }

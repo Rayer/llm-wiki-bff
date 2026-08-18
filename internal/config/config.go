@@ -13,19 +13,26 @@ import (
 
 // Default pipeline quota limits (LWC-138).
 const (
-	DefaultPipelineDailyLimit                            = 2
-	DefaultPipelineCooldownSeconds                       = 3600
-	DefaultPipelineMinNewRaw                             = 1
-	DefaultPipelineJobURL                                = "https://run.googleapis.com/v2/projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline:run"
-	DefaultAuthServiceURL                                = "https://auth.dev.rayer.idv.tw"
-	DefaultQueryExpansionModel                           = "deepseek-v4-flash"
-	DefaultAnswerSynthesisModel                          = "deepseek-v4-pro"
-	DefaultQueryExpansionReasoning         llm.Reasoning = llm.ReasoningNone
-	DefaultAnswerSynthesisReasoning        llm.Reasoning = llm.ReasoningNone
-	DefaultQuerySelectionLimit                           = 10
-	DefaultQuerySelectionExplorationSlots                = 1
-	DefaultQuerySelectionEvidenceThreshold               = 1
-	MaxQuerySelectionLimit                               = 1000
+	DefaultPipelineDailyLimit                                         = 2
+	DefaultPipelineCooldownSeconds                                    = 3600
+	DefaultPipelineMinNewRaw                                          = 1
+	DefaultPipelineJobURL                                             = "https://run.googleapis.com/v2/projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline:run"
+	DefaultAuthServiceURL                                             = "https://auth.dev.rayer.idv.tw"
+	DefaultQueryExpansionModel                                        = "deepseek-v4-flash"
+	DefaultAnswerSynthesisModel                                       = "deepseek-v4-pro"
+	DefaultQueryExpansionReasoning                      llm.Reasoning = llm.ReasoningNone
+	DefaultAnswerSynthesisReasoning                     llm.Reasoning = llm.ReasoningNone
+	DefaultQuerySelectionLimit                                        = 10
+	DefaultQuerySelectionExplorationSlots                             = 1
+	DefaultQuerySelectionEvidenceThreshold                            = 2
+	DefaultQueryExpansionKeywordsPerAttempt                           = 24
+	DefaultQueryExpansionAttempts                                     = 3
+	DefaultQueryMatchingRareKeywordMaxDocumentFrequency               = 1
+	MaxQuerySelectionLimit                                            = 1000
+	MaxQueryExpansionKeywordsPerAttempt                               = 100
+	MaxQueryExpansionAttempts                                         = 10
+	MaxQuerySelectionEvidenceThreshold                                = 100
+	MaxQueryMatchingRareKeywordDocumentFrequency                      = 1000
 )
 
 var defaultAllowedOrigins = []string{
@@ -70,11 +77,16 @@ type Config struct {
 	// Env: AUTH_SERVICE_URL. Default: https://auth.dev.rayer.idv.tw
 	AuthServiceURL string
 
-	// Query retrieval selection contract. Env: QUERY_SELECTION_LIMIT,
-	// QUERY_SELECTION_EXPLORATION_SLOTS, QUERY_SELECTION_EVIDENCE_THRESHOLD.
-	QuerySelectionLimit             int
-	QuerySelectionExplorationSlots  int
-	QuerySelectionEvidenceThreshold int
+	// Query retrieval contract. Env: QUERY_SELECTION_LIMIT,
+	// QUERY_SELECTION_EXPLORATION_SLOTS, QUERY_SELECTION_EVIDENCE_THRESHOLD,
+	// QUERY_EXPANSION_KEYWORDS_PER_ATTEMPT, QUERY_EXPANSION_ATTEMPTS,
+	// QUERY_MATCHING_RARE_KEYWORD_MAX_DOCUMENT_FREQUENCY.
+	QuerySelectionLimit                          int
+	QuerySelectionExplorationSlots               int
+	QuerySelectionEvidenceThreshold              int
+	QueryExpansionKeywordsPerAttempt             int
+	QueryExpansionAttempts                       int
+	QueryMatchingRareKeywordMaxDocumentFrequency int
 }
 
 // UserConfig holds a hardcoded user for authentication.
@@ -102,6 +114,9 @@ func Load(path string) (Config, error) {
 	v.SetDefault("query_selection_limit", DefaultQuerySelectionLimit)
 	v.SetDefault("query_selection_exploration_slots", DefaultQuerySelectionExplorationSlots)
 	v.SetDefault("query_selection_evidence_threshold", DefaultQuerySelectionEvidenceThreshold)
+	v.SetDefault("query_expansion_keywords_per_attempt", DefaultQueryExpansionKeywordsPerAttempt)
+	v.SetDefault("query_expansion_attempts", DefaultQueryExpansionAttempts)
+	v.SetDefault("query_matching_rare_keyword_max_document_frequency", DefaultQueryMatchingRareKeywordMaxDocumentFrequency)
 	v.AutomaticEnv()
 	v.BindEnv("deepseek_api_key")
 	v.BindEnv("firestore_database_id", "FIRESTORE_DATABASE_ID")
@@ -121,12 +136,18 @@ func Load(path string) (Config, error) {
 	v.BindEnv("query_selection_limit", "QUERY_SELECTION_LIMIT")
 	v.BindEnv("query_selection_exploration_slots", "QUERY_SELECTION_EXPLORATION_SLOTS")
 	v.BindEnv("query_selection_evidence_threshold", "QUERY_SELECTION_EVIDENCE_THRESHOLD")
+	v.BindEnv("query_expansion_keywords_per_attempt", "QUERY_EXPANSION_KEYWORDS_PER_ATTEMPT")
+	v.BindEnv("query_expansion_attempts", "QUERY_EXPANSION_ATTEMPTS")
+	v.BindEnv("query_matching_rare_keyword_max_document_frequency", "QUERY_MATCHING_RARE_KEYWORD_MAX_DOCUMENT_FREQUENCY")
 
 	if err := v.ReadInConfig(); err != nil {
 		var notFound viper.ConfigFileNotFoundError
 		if !errors.As(err, &notFound) {
 			return Config{}, err
 		}
+	}
+	if err := validateKnownQuerySettings(v); err != nil {
+		return Config{}, err
 	}
 
 	dailyLimit := v.GetInt("pipeline_daily_limit")
@@ -195,36 +216,71 @@ func Load(path string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	if evidenceThreshold > MaxQuerySelectionEvidenceThreshold {
+		return Config{}, fmt.Errorf("invalid query_selection_evidence_threshold: must be at most %d", MaxQuerySelectionEvidenceThreshold)
+	}
+	keywordsPerAttempt, err := configuredInt(v, "query_expansion_keywords_per_attempt", DefaultQueryExpansionKeywordsPerAttempt, 1, MaxQueryExpansionKeywordsPerAttempt)
+	if err != nil {
+		return Config{}, err
+	}
+	attempts, err := configuredInt(v, "query_expansion_attempts", DefaultQueryExpansionAttempts, 1, MaxQueryExpansionAttempts)
+	if err != nil {
+		return Config{}, err
+	}
+	rareKeywordMaxDocumentFrequency, err := configuredInt(v, "query_matching_rare_keyword_max_document_frequency", DefaultQueryMatchingRareKeywordMaxDocumentFrequency, 1, MaxQueryMatchingRareKeywordDocumentFrequency)
+	if err != nil {
+		return Config{}, err
+	}
 
 	cfg := Config{
-		GCPProject:                      v.GetString("gcp_project"),
-		Bucket:                          v.GetString("bucket"),
-		FirestoreDatabaseID:             strings.TrimSpace(v.GetString("firestore_database_id")),
-		UserID:                          v.GetString("user_id"),
-		ProjectID:                       v.GetString("project_id"),
-		Port:                            v.GetString("port"),
-		DeepSeekAPIKey:                  v.GetString("deepseek_api_key"),
-		QueryExpansionModel:             queryExpansionModel,
-		QueryExpansionReasoning:         queryExpansionReasoning,
-		AnswerSynthesisModel:            answerSynthesisModel,
-		AnswerSynthesisReasoning:        answerSynthesisReasoning,
-		JWTSecret:                       v.GetString("jwt_secret"),
-		DevJWT:                          v.GetBool("dev_jwt"),
-		LocalDataDir:                    v.GetString("local_data_dir"),
-		PipelineJobURL:                  pipelineJobURL,
-		AllowedOrigins:                  parseAllowedOrigins(v.GetString("allowed_origins")),
-		AllowedHosts:                    allowedHosts,
-		PipelineDailyLimit:              dailyLimit,
-		PipelineCooldownSeconds:         cooldownSeconds,
-		PipelineMinNewRaw:               minNewRaw,
-		PipelineDemoUserIDs:             splitCommaList(v.GetString("pipeline_demo_user_ids")),
-		RegistrationEnabled:             registrationEnabled,
-		AuthServiceURL:                  authServiceURL,
-		QuerySelectionLimit:             selectionLimit,
-		QuerySelectionExplorationSlots:  explorationSlots,
-		QuerySelectionEvidenceThreshold: evidenceThreshold,
+		GCPProject:                       v.GetString("gcp_project"),
+		Bucket:                           v.GetString("bucket"),
+		FirestoreDatabaseID:              strings.TrimSpace(v.GetString("firestore_database_id")),
+		UserID:                           v.GetString("user_id"),
+		ProjectID:                        v.GetString("project_id"),
+		Port:                             v.GetString("port"),
+		DeepSeekAPIKey:                   v.GetString("deepseek_api_key"),
+		QueryExpansionModel:              queryExpansionModel,
+		QueryExpansionReasoning:          queryExpansionReasoning,
+		AnswerSynthesisModel:             answerSynthesisModel,
+		AnswerSynthesisReasoning:         answerSynthesisReasoning,
+		JWTSecret:                        v.GetString("jwt_secret"),
+		DevJWT:                           v.GetBool("dev_jwt"),
+		LocalDataDir:                     v.GetString("local_data_dir"),
+		PipelineJobURL:                   pipelineJobURL,
+		AllowedOrigins:                   parseAllowedOrigins(v.GetString("allowed_origins")),
+		AllowedHosts:                     allowedHosts,
+		PipelineDailyLimit:               dailyLimit,
+		PipelineCooldownSeconds:          cooldownSeconds,
+		PipelineMinNewRaw:                minNewRaw,
+		PipelineDemoUserIDs:              splitCommaList(v.GetString("pipeline_demo_user_ids")),
+		RegistrationEnabled:              registrationEnabled,
+		AuthServiceURL:                   authServiceURL,
+		QuerySelectionLimit:              selectionLimit,
+		QuerySelectionExplorationSlots:   explorationSlots,
+		QuerySelectionEvidenceThreshold:  evidenceThreshold,
+		QueryExpansionKeywordsPerAttempt: keywordsPerAttempt,
+		QueryExpansionAttempts:           attempts,
+		QueryMatchingRareKeywordMaxDocumentFrequency: rareKeywordMaxDocumentFrequency,
 	}
 	return cfg, nil
+}
+
+func validateKnownQuerySettings(v *viper.Viper) error {
+	known := map[string]struct{}{
+		"query_expansion_model": {}, "query_expansion_reasoning": {}, "query_expansion_keywords_per_attempt": {}, "query_expansion_attempts": {},
+		"query_selection_limit": {}, "query_selection_exploration_slots": {}, "query_selection_evidence_threshold": {},
+		"query_matching_rare_keyword_max_document_frequency": {},
+	}
+	for key := range v.AllSettings() {
+		if !strings.HasPrefix(key, "query_expansion_") && !strings.HasPrefix(key, "query_selection_") && !strings.HasPrefix(key, "query_matching_") {
+			continue
+		}
+		if _, ok := known[key]; !ok {
+			return fmt.Errorf("unknown query configuration %q", key)
+		}
+	}
+	return nil
 }
 
 func configuredInt(v *viper.Viper, key string, fallback, minimum, maximum int) (int, error) {

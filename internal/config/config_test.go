@@ -22,6 +22,68 @@ func TestLoadDefaultsQueryExpansionModel(t *testing.T) {
 	}
 }
 
+func TestLoadDefaultsAndEnvForParallelQueryExpansion(t *testing.T) {
+	for _, name := range []string{
+		"QUERY_EXPANSION_KEYWORDS_PER_ATTEMPT",
+		"QUERY_EXPANSION_ATTEMPTS",
+		"QUERY_SELECTION_EVIDENCE_THRESHOLD",
+		"QUERY_MATCHING_RARE_KEYWORD_MAX_DOCUMENT_FREQUENCY",
+	} {
+		t.Setenv(name, "")
+	}
+	cfg, err := Load(writeConfig(t, "dev_jwt = true\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.QueryExpansionKeywordsPerAttempt != 24 || cfg.QueryExpansionAttempts != 3 || cfg.QuerySelectionEvidenceThreshold != 2 || cfg.QueryMatchingRareKeywordMaxDocumentFrequency != 1 {
+		t.Fatalf("parallel expansion defaults = %#v", cfg)
+	}
+
+	t.Setenv("QUERY_EXPANSION_KEYWORDS_PER_ATTEMPT", "12")
+	t.Setenv("QUERY_EXPANSION_ATTEMPTS", "2")
+	t.Setenv("QUERY_SELECTION_EVIDENCE_THRESHOLD", "3")
+	t.Setenv("QUERY_MATCHING_RARE_KEYWORD_MAX_DOCUMENT_FREQUENCY", "4")
+	cfg, err = Load(writeConfig(t, "dev_jwt = true\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.QueryExpansionKeywordsPerAttempt != 12 || cfg.QueryExpansionAttempts != 2 || cfg.QuerySelectionEvidenceThreshold != 3 || cfg.QueryMatchingRareKeywordMaxDocumentFrequency != 4 {
+		t.Fatalf("parallel expansion env = %#v", cfg)
+	}
+}
+
+func TestLoadRejectsUnsafeParallelQueryExpansionConfig(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		env  map[string]string
+	}{
+		{name: "keywords zero", env: map[string]string{"QUERY_EXPANSION_KEYWORDS_PER_ATTEMPT": "0"}},
+		{name: "attempts negative", env: map[string]string{"QUERY_EXPANSION_ATTEMPTS": "-1"}},
+		{name: "attempts excessive", env: map[string]string{"QUERY_EXPANSION_ATTEMPTS": "11"}},
+		{name: "keywords malformed", env: map[string]string{"QUERY_EXPANSION_KEYWORDS_PER_ATTEMPT": "nope"}},
+		{name: "rare frequency negative", env: map[string]string{"QUERY_MATCHING_RARE_KEYWORD_MAX_DOCUMENT_FREQUENCY": "-1"}},
+		{name: "threshold malformed", env: map[string]string{"QUERY_SELECTION_EVIDENCE_THRESHOLD": "nope"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			for _, name := range []string{"QUERY_EXPANSION_KEYWORDS_PER_ATTEMPT", "QUERY_EXPANSION_ATTEMPTS", "QUERY_SELECTION_EVIDENCE_THRESHOLD", "QUERY_MATCHING_RARE_KEYWORD_MAX_DOCUMENT_FREQUENCY"} {
+				t.Setenv(name, "")
+			}
+			for name, value := range test.env {
+				t.Setenv(name, value)
+			}
+			if _, err := Load(writeConfig(t, "dev_jwt = true\n")); err == nil {
+				t.Fatal("Load() accepted unsafe parallel expansion configuration")
+			}
+		})
+	}
+}
+
+func TestLoadRejectsUnknownQueryConfiguration(t *testing.T) {
+	if _, err := Load(writeConfig(t, "dev_jwt = true\nquery_expansion_attempts_typo = 3\n")); err == nil {
+		t.Fatal("Load() accepted unknown query configuration")
+	}
+}
+
 func TestLoadQuerySelectionDefaultsAndTypedEnv(t *testing.T) {
 	t.Setenv("QUERY_SELECTION_LIMIT", "")
 	t.Setenv("QUERY_SELECTION_EXPLORATION_SLOTS", "")
