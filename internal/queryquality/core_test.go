@@ -200,6 +200,33 @@ func TestCriterionEvidenceIsRoleAndTermLocal(t *testing.T) {
 	}
 }
 
+func TestPositiveEvidenceDimensionsCountPrefersRoleLocalMatches(t *testing.T) {
+	plan := queryquality.QueryPlan{
+		Preferred:              []queryquality.Criterion{{Kind: "topic", Value: "coffee", Terms: []string{"cafe"}, Proof: "lexical"}},
+		SupportingDimensions:   []queryquality.Criterion{{Kind: "topic", Value: "coffee", Terms: []string{"coffee"}, Proof: "lexical"}},
+		Goals:                  []queryquality.Criterion{{Kind: "topic", Value: "coffee", Terms: []string{"espresso"}, Proof: "lexical"}},
+		AcceptableAlternatives: []queryquality.Criterion{{Kind: "topic", Value: "tea", Terms: []string{"tea"}, Proof: "lexical"}},
+	}
+	matched, err := queryquality.NewLexicalMatcher(nil).Match(context.Background(), queryquality.MatchRequest{
+		Plan:              plan,
+		CorpusEntries:     []cache.Entry{{Slug: "coffee", Title: "Coffee", Body: "coffee"}},
+		EvidenceThreshold: 1, EvidenceThresholdSet: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate := matched.Candidates[0]
+	if candidate.PositiveEvidenceCount != 1 {
+		t.Fatalf("candidate = %#v, want positive-evidence-count 1", candidate)
+	}
+	if len(candidate.PositiveEvidenceDimensions) != 1 || candidate.PositiveEvidenceDimensions[0] != "topic" {
+		t.Fatalf("candidate = %#v, want one normalized topic dimension", candidate)
+	}
+	if !candidate.Qualified {
+		t.Fatalf("candidate = %#v, want threshold to qualify", candidate)
+	}
+}
+
 func TestSelectorPreservesHardIneligibilityRejection(t *testing.T) {
 	result, err := queryquality.NewResultSelector().Select(context.Background(), queryquality.SelectionInput{Candidates: []queryquality.CandidateEvidence{
 		{Slug: "required-miss", Eligible: false, Rejection: "required_location_not_matched"},

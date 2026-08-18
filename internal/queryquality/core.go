@@ -1126,22 +1126,29 @@ func hasExactRequiredIdentity(plan QueryPlan, groups []GroupEvidence) bool {
 }
 
 func positiveEvidenceDimensions(plan QueryPlan, groups []GroupEvidence) []string {
-	criteria := append([]Criterion{}, plan.Preferred...)
-	criteria = append(criteria, plan.SupportingDimensions...)
-	criteria = append(criteria, plan.Goals...)
-	criteria = append(criteria, plan.AcceptableAlternatives...)
+	roleCriteria := []struct {
+		role     string
+		criteria []Criterion
+	}{
+		{"preferred", plan.Preferred},
+		{"supporting", plan.SupportingDimensions},
+		{"goal", plan.Goals},
+		{"alternative", plan.AcceptableAlternatives},
+	}
 	seen := make(map[string]struct{})
-	dimensions := make([]string, 0, len(criteria))
-	for _, criterion := range criteria {
-		if criterion.Proof == "semantic" || !hasMatchedGroup(groups, "preferred", criterion) && !hasMatchedGroup(groups, "supporting", criterion) && !hasMatchedGroup(groups, "goal", criterion) && !hasMatchedGroup(groups, "alternative", criterion) {
-			continue
+	dimensions := make([]string, 0, len(plan.Preferred)+len(plan.SupportingDimensions)+len(plan.Goals)+len(plan.AcceptableAlternatives))
+	for _, rc := range roleCriteria {
+		for _, criterion := range rc.criteria {
+			if criterion.Proof == "semantic" || !hasMatchedGroup(groups, rc.role, criterion) {
+				continue
+			}
+			kind := normalizeKind(criterion.Kind)
+			if _, exists := seen[kind]; exists {
+				continue
+			}
+			seen[kind] = struct{}{}
+			dimensions = append(dimensions, kind)
 		}
-		kind := normalizeKind(criterion.Kind)
-		if _, exists := seen[kind]; exists {
-			continue
-		}
-		seen[kind] = struct{}{}
-		dimensions = append(dimensions, kind)
 	}
 	return dimensions
 }
