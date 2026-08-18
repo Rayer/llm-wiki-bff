@@ -84,6 +84,22 @@ func TestCorePlanEligibilityAndSelectionContracts(t *testing.T) {
 	}
 }
 
+func TestResultStatus(t *testing.T) {
+	for _, test := range []struct {
+		count      int
+		wantStatus string
+		wantReason string
+	}{
+		{count: 0, wantStatus: "insufficient_evidence", wantReason: "no_qualified_evidence"},
+		{count: 1, wantStatus: "ok", wantReason: "qualified_evidence"},
+	} {
+		status, reason := queryquality.ResultStatus(test.count)
+		if status != test.wantStatus || reason != test.wantReason {
+			t.Errorf("ResultStatus(%d) = %q, %q; want %q, %q", test.count, status, reason, test.wantStatus, test.wantReason)
+		}
+	}
+}
+
 func TestEvidenceThresholdQualificationAndSelection(t *testing.T) {
 	plan := queryquality.QueryPlan{Preferred: []queryquality.Criterion{{Kind: "venue_type", Value: "cafe", Terms: []string{"cafe"}, Proof: "lexical"}}}
 	entries := []cache.Entry{

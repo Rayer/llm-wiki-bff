@@ -28,6 +28,14 @@ const (
 	semanticExcludedFailClosed = true
 )
 
+// ResultStatus returns the canonical status and reason for the selected result count.
+func ResultStatus(count int) (string, string) {
+	if count == 0 {
+		return "insufficient_evidence", "no_qualified_evidence"
+	}
+	return "ok", "qualified_evidence"
+}
+
 type Options struct {
 	SelectionLimit       int
 	ExplorationSlots     int
@@ -760,10 +768,7 @@ func (s *QueryRetrievalPipeline) execute(ctx context.Context, reader cache.Reade
 			results = append(results, search.Result{Slug: candidate.Slug, Title: candidate.Title, Type: "concept"})
 		}
 	}
-	status, reason := "ok", "qualified_evidence"
-	if len(results) == 0 {
-		status, reason = "insufficient_evidence", "no_qualified_evidence"
-	}
+	status, reason := ResultStatus(len(results))
 	return query.Result{Query: request.Query, Mode: request.Mode, Results: results, Expand: expandFromPlan(plan), Status: status, Reason: reason}, nil
 }
 

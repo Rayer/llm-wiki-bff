@@ -342,12 +342,9 @@ func runFixtureAttempt(ctx context.Context, options experimentOptions, retrieval
 	}
 	runCompletedAt := now()
 	outcome := "success"
-	resultStatus := "ok"
-	resultReason := "qualified_evidence"
-	if len(resultIdentities) == 0 {
+	resultStatus, resultReason := queryquality.ResultStatus(len(resultIdentities))
+	if resultStatus != "ok" {
 		outcome = "retrieval_miss"
-		resultStatus = "insufficient_evidence"
-		resultReason = "no_qualified_evidence"
 	}
 	queryReceivedAtStr, runCompletedAtStr, durationMS := attemptTiming(queryReceivedAt, runCompletedAt)
 	if err := write("final.json", fixtureFinalReceipt{Outcome: outcome, Status: resultStatus, Reason: resultReason, FinalIdentities: resultIdentities, Receipts: map[string]string{"request": "request.json", "expansion_input": "expansion.input.json", "expansion_output": "expansion.output.json", "matching_input": "matching.input.json", "matching_output": "matching.output.json", "selection_input": "selection.input.json", "selection_output": "selection.output.json", "final": "final.json"}, QueryReceivedAt: queryReceivedAtStr, RunCompletedAt: runCompletedAtStr, DurationMS: durationMS}); err != nil {
