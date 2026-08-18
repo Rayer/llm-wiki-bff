@@ -19,6 +19,7 @@ import (
 	"github.com/rayer/llm-wiki-bff/internal/llm"
 	"github.com/rayer/llm-wiki-bff/internal/query"
 	"github.com/rayer/llm-wiki-bff/internal/search"
+	"golang.org/x/text/unicode/norm"
 )
 
 const (
@@ -34,6 +35,8 @@ const (
 	semanticRequiredFailClosed   = true
 	semanticExcludedFailClosed   = true
 )
+
+const MinimumKeywordConsensusSupport int = 2
 
 // ResultStatus returns the canonical status and reason for the selected result count.
 func ResultStatus(count int) (string, string) {
@@ -395,7 +398,20 @@ func normalizePositiveCriteriaWithLimit(preferred, goals []Criterion, limit int)
 }
 
 func normalizeKeyword(value string) string {
-	return strings.ToLower(strings.Join(strings.Fields(strings.TrimSpace(value)), " "))
+	return normalizeIdentity(value)
+}
+
+func normalizeIdentity(value string) string {
+	value = norm.NFKC.String(value)
+	var normalized strings.Builder
+	for _, r := range strings.ToLower(value) {
+		if unicode.IsPunct(r) {
+			normalized.WriteByte(' ')
+		} else {
+			normalized.WriteRune(r)
+		}
+	}
+	return strings.Join(strings.Fields(normalized.String()), " ")
 }
 
 // NewParallelQueryExpander runs bounded attempts concurrently and aggregates
@@ -484,6 +500,22 @@ func (e parallelQueryExpander) ExpandWithTrace(ctx context.Context, request Expa
 		info.FallbackReason = "all_provider_attempts_failed"
 		return plan, info, nil
 	}
+	if hasConflictingHardCriteria(successes) {
+		if e.fallback == nil {
+			return QueryPlan{}, info, &ExpansionError{Reason: "conflicting_hard_constraints"}
+		}
+		plan, err := e.fallback.Expand(ctx, ExpansionRequest{Query: request.Query, CriterionPolicy: request.CriterionPolicy, KeywordsPerAttempt: e.options.KeywordsPerAttempt})
+		if err != nil {
+			return QueryPlan{}, info, err
+		}
+		plan.RawQuery = request.Query
+		plan.Fallback = true
+		plan.KeywordSupport = nil
+		info.FallbackCount = 1
+		info.Source = "deterministic-fallback"
+		info.FallbackReason = "conflicting_hard_constraints"
+		return plan, info, nil
+	}
 	plan := aggregatePlans(request.Query, successes)
 	info.Source = "parallel-structured-llm"
 	return plan, info, nil
@@ -562,14 +594,14 @@ func keywordSupport(attempts []indexedPlan) []KeywordSupport {
 					if keyword == "" {
 						continue
 					}
-					itemKey := key{role.name, normalizeKind(criterion.Kind), criterion.Value, keyword}
+					itemKey := key{normalizeIdentity(role.name), normalizeIdentity(criterion.Kind), normalizeIdentity(criterion.Value), keyword}
 					if _, exists := seen[itemKey]; exists {
 						continue
 					}
 					seen[itemKey] = struct{}{}
 					item, exists := counts[itemKey]
 					if !exists {
-						item = &KeywordSupport{Role: role.name, Kind: criterion.Kind, Value: criterion.Value, Keyword: keyword}
+						item = &KeywordSupport{Role: normalizeIdentity(role.name), Kind: normalizeIdentity(criterion.Kind), Value: normalizeIdentity(criterion.Value), Keyword: keyword}
 						counts[itemKey] = item
 						order = append(order, itemKey)
 					}
@@ -584,6 +616,24 @@ func keywordSupport(attempts []indexedPlan) []KeywordSupport {
 		result = append(result, *counts[itemKey])
 	}
 	return result
+}
+
+func hasConflictingHardCriteria(attempts []indexedPlan) bool {
+	required, excluded := map[string]struct{}{}, map[string]struct{}{}
+	for _, attempt := range attempts {
+		for _, criterion := range attempt.plan.Required {
+			required[normalizeIdentity(criterion.Kind)+"\x00"+normalizeIdentity(criterion.Value)] = struct{}{}
+		}
+		for _, criterion := range attempt.plan.Excluded {
+			excluded[normalizeIdentity(criterion.Kind)+"\x00"+normalizeIdentity(criterion.Value)] = struct{}{}
+		}
+	}
+	for identity := range required {
+		if _, ok := excluded[identity]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 func uniqueStrings(values []string) []string {
@@ -908,7 +958,7 @@ func uniqueTerms(values []string) []string {
 }
 
 func criterionKey(criterion Criterion) string {
-	return strings.ToLower(strings.TrimSpace(criterion.Kind) + "\x00" + strings.TrimSpace(criterion.Value))
+	return normalizeIdentity(criterion.Kind) + "\x00" + normalizeIdentity(criterion.Value)
 }
 
 type CandidateMatcher interface {
@@ -976,7 +1026,7 @@ func (s *QueryRetrievalPipeline) ExecuteWithTrace(ctx context.Context, reader ca
 	if err := s.validate(); err != nil {
 		return query.Result{}, nil, err
 	}
-	trace := &Trace{Variant: "query-retrieval-v1", EvidenceThreshold: resolvedEvidenceThreshold(s.options), Expansion: ExpansionTrace{RequestedAttempts: s.options.ExpansionAttempts, KeywordsPerAttempt: s.options.KeywordsPerAttempt, RareKeywordMaxDocumentFrequency: s.options.RareDocumentFrequency}}
+	trace := &Trace{Variant: "query-retrieval-v1", EvidenceThreshold: resolvedEvidenceThreshold(s.options), Expansion: ExpansionTrace{RequestedAttempts: s.options.ExpansionAttempts, KeywordsPerAttempt: s.options.KeywordsPerAttempt, RareKeywordMaxDocumentFrequency: s.options.RareDocumentFrequency, KeywordConsensusMinimum: MinimumKeywordConsensusSupport}}
 	result, err := s.execute(ctx, reader, request, trace)
 	return result, trace, err
 }
@@ -1042,10 +1092,15 @@ func (s *QueryRetrievalPipeline) execute(ctx context.Context, reader cache.Reade
 			support = append(support, query.KeywordSupportReceipt{Role: item.Role, Kind: item.Kind, Value: item.Value, Keyword: item.Keyword, SupportCount: item.SupportCount, AttemptIndexes: append([]int(nil), item.AttemptIndexes...)})
 		}
 		recorder.SetExpansionConfig(info.RequestedAttempts, info.SuccessfulAttempts, info.ProviderFailedAttempts, info.KeywordsPerAttempt, resolvedEvidenceThreshold(s.options), s.options.RareDocumentFrequency, support)
+		outcomes := make([]query.ExpansionAttemptReceipt, 0, len(info.AttemptOutcomes))
+		for _, outcome := range info.AttemptOutcomes {
+			outcomes = append(outcomes, query.ExpansionAttemptReceipt{AttemptIndex: outcome.AttemptIndex, Outcome: outcome.Outcome})
+		}
+		recorder.SetExpansionAttemptOutcomes(outcomes)
 		recorder.SetFallbackExpansionCount(info.FallbackCount)
 	}
 	if trace != nil {
-		trace.Expansion = ExpansionTrace{RequestedAttempts: info.RequestedAttempts, SuccessfulAttempts: info.SuccessfulAttempts, ProviderFailedAttempts: info.ProviderFailedAttempts, FallbackCount: info.FallbackCount, KeywordsPerAttempt: info.KeywordsPerAttempt, RareKeywordMaxDocumentFrequency: s.options.RareDocumentFrequency, EvidenceThreshold: resolvedEvidenceThreshold(s.options), KeywordSupport: append([]KeywordSupport(nil), plan.KeywordSupport...)}
+		trace.Expansion = ExpansionTrace{RequestedAttempts: info.RequestedAttempts, SuccessfulAttempts: info.SuccessfulAttempts, ProviderFailedAttempts: info.ProviderFailedAttempts, FallbackCount: info.FallbackCount, KeywordsPerAttempt: info.KeywordsPerAttempt, RareKeywordMaxDocumentFrequency: s.options.RareDocumentFrequency, EvidenceThreshold: resolvedEvidenceThreshold(s.options), KeywordConsensusMinimum: MinimumKeywordConsensusSupport, KeywordSupport: append([]KeywordSupport(nil), plan.KeywordSupport...)}
 	}
 	appendTraceStage(trace, StageTrace{
 		Name: "expansion", Outcome: PlanOutcome(plan), Source: info.Source, FallbackReason: info.FallbackReason,
@@ -1172,6 +1227,7 @@ type ExpansionTrace struct {
 	KeywordsPerAttempt              int              `json:"keywords_per_attempt"`
 	RareKeywordMaxDocumentFrequency int              `json:"rare_keyword_max_document_frequency"`
 	EvidenceThreshold               int              `json:"evidence_threshold"`
+	KeywordConsensusMinimum         int              `json:"keyword_consensus_minimum"`
 	KeywordSupport                  []KeywordSupport `json:"keyword_support,omitempty"`
 }
 
@@ -1437,7 +1493,7 @@ func matchGroupsForRole(ctx context.Context, criteria []Criterion, role string, 
 
 func hasMatchedGroup(groups []GroupEvidence, role string, criterion Criterion) bool {
 	for _, group := range groups {
-		if group.Role != role || normalizeKind(group.Kind) != normalizeKind(criterion.Kind) || group.Value != criterion.Value {
+		if normalizeIdentity(group.Role) != normalizeIdentity(role) || normalizeKind(group.Kind) != normalizeKind(criterion.Kind) || normalizeIdentity(group.Value) != normalizeIdentity(criterion.Value) {
 			continue
 		}
 		for _, match := range group.Matches {
@@ -1467,7 +1523,7 @@ func independentDimensionScore(plan QueryPlan, groups []GroupEvidence) int {
 }
 
 func normalizeKind(kind string) string {
-	return strings.ReplaceAll(strings.ToLower(strings.TrimSpace(kind)), "_", "-")
+	return strings.ReplaceAll(normalizeIdentity(kind), " ", "-")
 }
 
 func exactIdentityKind(kind string) bool {
@@ -1483,7 +1539,7 @@ func hasExactRequiredIdentity(plan QueryPlan, groups []GroupEvidence) bool {
 	for _, criterion := range plan.Required {
 		if exactIdentityKind(criterion.Kind) && criterion.Proof != "semantic" && hasMatchedGroup(groups, "required", criterion) {
 			for _, group := range groups {
-				if group.Role != "required" || normalizeKind(group.Kind) != normalizeKind(criterion.Kind) || group.Value != criterion.Value {
+				if normalizeIdentity(group.Role) != "required" || normalizeKind(group.Kind) != normalizeKind(criterion.Kind) || normalizeIdentity(group.Value) != normalizeIdentity(criterion.Value) {
 					continue
 				}
 				for _, match := range group.Matches {
@@ -1552,7 +1608,7 @@ func keywordEvidence(plan QueryPlan, groups []GroupEvidence, entries []cache.Ent
 		}
 		matched := false
 		for _, group := range groups {
-			if group.Role != support.Role || normalizeKind(group.Kind) != normalizeKind(support.Kind) || group.Value != support.Value {
+			if normalizeIdentity(group.Role) != normalizeIdentity(support.Role) || normalizeKind(group.Kind) != normalizeKind(support.Kind) || normalizeIdentity(group.Value) != normalizeIdentity(support.Value) {
 				continue
 			}
 			for _, field := range group.Matches {
@@ -1570,7 +1626,7 @@ func keywordEvidence(plan QueryPlan, groups []GroupEvidence, entries []cache.Ent
 		frequency := 0
 		for _, corpusEntry := range entries {
 			for _, value := range searchableFields(corpusEntry) {
-				if strings.Contains(strings.ToLower(value), support.Keyword) {
+				if containsNormalizedPhrase(value, support.Keyword) {
 					frequency++
 					break
 				}
@@ -1578,7 +1634,7 @@ func keywordEvidence(plan QueryPlan, groups []GroupEvidence, entries []cache.Ent
 		}
 		fieldsForKeyword := make([]string, 0, len(fields))
 		for field, value := range fields {
-			if strings.Contains(strings.ToLower(value), support.Keyword) {
+			if containsNormalizedPhrase(value, support.Keyword) {
 				fieldsForKeyword = appendUnique(fieldsForKeyword, field)
 			}
 		}
@@ -1616,13 +1672,13 @@ func qualifyCandidate(candidate CandidateEvidence, threshold int, rawQuery strin
 	}
 	if len(candidate.KeywordEvidence) > 0 {
 		for _, evidence := range candidate.KeywordEvidence {
-			if evidence.SupportCount >= threshold {
+			if evidence.SupportCount >= MinimumKeywordConsensusSupport {
 				return true, "keyword_consensus", "keyword_consensus"
 			}
 		}
 		raw := normalizeKeyword(rawQuery)
 		for _, evidence := range candidate.KeywordEvidence {
-			if evidence.SupportCount != 1 || evidence.DocumentFrequency > rareDocumentFrequency || !strings.Contains(raw, evidence.Keyword) {
+			if evidence.SupportCount != 1 || evidence.DocumentFrequency > rareDocumentFrequency || !containsNormalizedPhrase(raw, evidence.Keyword) {
 				continue
 			}
 			if containsString(evidence.MatchedFields, "title") || containsString(evidence.MatchedFields, "frontmatter") {
@@ -1641,6 +1697,43 @@ func qualifyCandidate(candidate CandidateEvidence, threshold int, rawQuery strin
 		return true, "evidence_threshold_met", "legacy_positive_evidence"
 	}
 	return false, "evidence_below_threshold", "legacy_positive_evidence"
+}
+
+func containsNormalizedPhrase(value, phrase string) bool {
+	value, phrase = normalizeIdentity(value), normalizeIdentity(phrase)
+	if value == "" || phrase == "" {
+		return false
+	}
+	if containsCJK(phrase) {
+		return strings.Contains(value, phrase)
+	}
+	start := 0
+	for {
+		index := strings.Index(value[start:], phrase)
+		if index < 0 {
+			return false
+		}
+		index += start
+		end := index + len(phrase)
+		beforeOK := index == 0 || !unicode.IsLetter(rune(value[index-1])) && !unicode.IsDigit(rune(value[index-1]))
+		afterOK := end == len(value) || !unicode.IsLetter(rune(value[end])) && !unicode.IsDigit(rune(value[end]))
+		if beforeOK && afterOK {
+			return true
+		}
+		start = index + 1
+		if start >= len(value) {
+			return false
+		}
+	}
+}
+
+func containsCJK(value string) bool {
+	for _, r := range value {
+		if (r >= 0x3400 && r <= 0x9fff) || (r >= 0xf900 && r <= 0xfaff) {
+			return true
+		}
+	}
+	return false
 }
 
 func containsString(values []string, want string) bool {

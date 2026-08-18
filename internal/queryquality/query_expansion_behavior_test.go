@@ -212,6 +212,89 @@ func TestConsensusAndRareQualificationPaths(t *testing.T) {
 	}
 }
 
+func TestKeywordConsensusUsesFixedSupportAndNormalizedIdentity(t *testing.T) {
+	matcher := queryquality.NewLexicalMatcher(nil)
+	base := queryquality.QueryPlan{RawQuery: "cafe", Preferred: []queryquality.Criterion{{Kind: "Topic", Value: "cafe", Terms: []string{"cafe"}, Proof: "lexical"}}}
+	for _, test := range []struct {
+		name      string
+		threshold int
+		support   int
+		want      bool
+	}{
+		{name: "threshold one support one is not consensus", threshold: 1, support: 1, want: false},
+		{name: "threshold three support two is consensus", threshold: 3, support: 2, want: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			plan := base
+			plan.KeywordSupport = []queryquality.KeywordSupport{{Role: "preferred", Kind: "topic", Value: "cafe", Keyword: "cafe", SupportCount: test.support, AttemptIndexes: []int{1, 2}}}
+			got, err := matcher.Match(context.Background(), queryquality.MatchRequest{Plan: plan, CorpusEntries: []cache.Entry{{Slug: "one", Title: "Cafe", Body: ""}, {Slug: "two", Title: "Cafe", Body: ""}}, EvidenceThreshold: test.threshold, EvidenceThresholdSet: true, RareKeywordMaxDocumentFrequency: 1})
+			wantPath := "keyword_support_below_threshold"
+			if test.want {
+				wantPath = "keyword_consensus"
+			}
+			if err != nil || got.Candidates[0].QualificationPath != wantPath {
+				t.Fatalf("candidate=%#v err=%v", got.Candidates[0], err)
+			}
+		})
+	}
+
+	left := queryquality.QueryPlan{RawQuery: "x", Preferred: []queryquality.Criterion{{Kind: "Topic", Value: "Coffee—Shops", Terms: []string{"Cafe Shops", " cafe\u00a0shops "}, Proof: "lexical"}}}
+	right := queryquality.QueryPlan{RawQuery: "x", Preferred: []queryquality.Criterion{{Kind: "topic", Value: "coffee shops", Terms: []string{"cafe shops"}, Proof: "lexical"}}}
+	leftExpander := &singlePlanExpander{plans: []queryquality.QueryPlan{left, left}}
+	rightExpander := &singlePlanExpander{plans: []queryquality.QueryPlan{right, right}}
+	leftParallel, _ := queryquality.NewParallelQueryExpander(leftExpander, nil, queryquality.Options{ExpansionAttempts: 2, KeywordsPerAttempt: 24})
+	rightParallel, _ := queryquality.NewParallelQueryExpander(rightExpander, nil, queryquality.Options{ExpansionAttempts: 2, KeywordsPerAttempt: 24})
+	leftPlan, _ := leftParallel.Expand(context.Background(), queryquality.ExpansionRequest{Query: "x"})
+	rightPlan, _ := rightParallel.Expand(context.Background(), queryquality.ExpansionRequest{Query: "x"})
+	if !reflect.DeepEqual(leftPlan.KeywordSupport, rightPlan.KeywordSupport) || len(leftPlan.KeywordSupport) != 1 || leftPlan.KeywordSupport[0].SupportCount != 2 {
+		t.Fatalf("normalized support differs: left=%#v right=%#v", leftPlan.KeywordSupport, rightPlan.KeywordSupport)
+	}
+}
+
+func TestRareGroundingUsesTokenBoundaries(t *testing.T) {
+	matcher := queryquality.NewLexicalMatcher(nil)
+	plan := queryquality.QueryPlan{Preferred: []queryquality.Criterion{{Kind: "topic", Value: "art", Terms: []string{"art"}, Proof: "lexical"}}, KeywordSupport: []queryquality.KeywordSupport{{Role: "preferred", Kind: "topic", Value: "art", Keyword: "art", SupportCount: 1, AttemptIndexes: []int{1}}}}
+	for _, test := range []struct {
+		query string
+		want  bool
+	}{
+		{query: "party", want: false}, {query: "art gallery", want: true},
+	} {
+		plan.RawQuery = test.query
+		got, err := matcher.Match(context.Background(), queryquality.MatchRequest{Plan: plan, CorpusEntries: []cache.Entry{{Slug: "art", Title: "Art Gallery", Body: ""}}, EvidenceThreshold: 2, EvidenceThresholdSet: true, RareKeywordMaxDocumentFrequency: 1})
+		if err != nil || got.Candidates[0].Qualified != test.want {
+			t.Fatalf("query=%q candidate=%#v err=%v", test.query, got.Candidates[0], err)
+		}
+	}
+}
+
+func TestConflictingHardConstraintsUseTypedFallbackOnce(t *testing.T) {
+	constraint := queryquality.Criterion{Kind: "location", Value: "Taipei", Terms: []string{"Taipei"}, Proof: "lexical"}
+	expander, err := queryquality.NewParallelQueryExpander(&singlePlanExpander{plans: []queryquality.QueryPlan{
+		{RawQuery: "x", Required: []queryquality.Criterion{constraint}},
+		{RawQuery: "x", Excluded: []queryquality.Criterion{constraint}},
+	}}, queryquality.NewDeterministicExpander(), queryquality.Options{ExpansionAttempts: 2, KeywordsPerAttempt: 24})
+	if err != nil {
+		t.Fatal(err)
+	}
+	traced := expander.(queryquality.TracedQueryExpander)
+	plan, info, err := traced.ExpandWithTrace(context.Background(), queryquality.ExpansionRequest{Query: "x"})
+	if err != nil || !plan.Fallback || info.FallbackCount != 1 || info.FallbackReason != "conflicting_hard_constraints" {
+		t.Fatalf("plan=%#v info=%#v err=%v", plan, info, err)
+	}
+}
+
+type singlePlanExpander struct {
+	mu    sync.Mutex
+	plans []queryquality.QueryPlan
+}
+
+func (e *singlePlanExpander) Expand(_ context.Context, request queryquality.ExpansionRequest) (queryquality.QueryPlan, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.plans[request.Attempt-1], nil
+}
+
 func runParallel(t *testing.T, expander queryquality.QueryExpander) queryquality.QueryPlan {
 	t.Helper()
 	parallel, err := queryquality.NewParallelQueryExpander(expander, nil, queryquality.Options{ExpansionAttempts: 3, KeywordsPerAttempt: 24})

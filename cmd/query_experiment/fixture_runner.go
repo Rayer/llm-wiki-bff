@@ -348,15 +348,17 @@ func runFixtureAttempt(ctx context.Context, options experimentOptions, retrieval
 		}
 	}
 	attemptReceipts := make([]fixtureExpansionAttemptReceipt, 0, expansionInfo.RequestedAttempts)
+	var expansionUsage fixtureUsage
 	for _, outcome := range expansionInfo.AttemptOutcomes {
 		call := expander.call(outcome.AttemptIndex)
 		attemptReceipts = append(attemptReceipts, fixtureExpansionAttemptReceipt{AttemptIndex: outcome.AttemptIndex, Outcome: outcome.Outcome, LatencyMS: call.LatencyMS, Usage: call.Usage})
+		expansionUsage = addFixtureUsage(expansionUsage, call.Usage)
 	}
 	validation := "valid"
 	if plan.Fallback {
 		validation = "fallback"
 	}
-	if err := write("expansion.output.json", fixtureExpansionOutput{RawModelResponse: scrubSecret(firstCall.RawResponse, variant.Model.APIKey), ParsedPlan: plan, Source: expansionInfo.Source, Validation: validation, Fallback: plan.Fallback, FallbackReason: expansionInfo.FallbackReason, Error: "", LatencyMS: expansionElapsed, Usage: firstCall.Usage, RequestedAttempts: expansionInfo.RequestedAttempts, SuccessfulAttempts: expansionInfo.SuccessfulAttempts, ProviderFailedAttempts: expansionInfo.ProviderFailedAttempts, FallbackCount: expansionInfo.FallbackCount, KeywordsPerAttempt: expansionInfo.KeywordsPerAttempt, KeywordSupport: plan.KeywordSupport, Attempts: attemptReceipts}); err != nil {
+	if err := write("expansion.output.json", fixtureExpansionOutput{RawModelResponse: scrubSecret(firstCall.RawResponse, variant.Model.APIKey), ParsedPlan: plan, Source: expansionInfo.Source, Validation: validation, Fallback: plan.Fallback, FallbackReason: expansionInfo.FallbackReason, Error: "", LatencyMS: expansionElapsed, Usage: expansionUsage, RequestedAttempts: expansionInfo.RequestedAttempts, SuccessfulAttempts: expansionInfo.SuccessfulAttempts, ProviderFailedAttempts: expansionInfo.ProviderFailedAttempts, FallbackCount: expansionInfo.FallbackCount, KeywordsPerAttempt: expansionInfo.KeywordsPerAttempt, KeywordSupport: plan.KeywordSupport, Attempts: attemptReceipts}); err != nil {
 		return fixtureAttempt{}, err
 	}
 	trace := &queryRetrievalTrace{Variant: variant.VariantID, Seed: seed, Stages: []stageTrace{{Name: "expansion", Outcome: planOutcome(plan), Source: expansionInfo.Source, FallbackReason: expansionInfo.FallbackReason, ElapsedMS: expansionElapsed, InputCount: expansionInfo.RequestedAttempts, OutputCount: criterionCount(plan), Plan: &plan}}}
@@ -420,7 +422,14 @@ func runFixtureAttempt(ctx context.Context, options experimentOptions, retrieval
 	record.QueryReceivedAt, record.RunCompletedAt, record.DurationMS = queryReceivedAtStr, runCompletedAtStr, durationMS
 	record.VariantID, record.ProfileID, record.PromptID, record.Provider, record.Model = variant.VariantID, variant.Profile.ID, variant.Prompt.ID, variant.Model.Provider, variant.Model.Model
 	selectionDigest := digestJSON(selectionInput)
-	return fixtureAttempt{Record: record, Case: input, Candidates: eligible.Candidates, Decisions: selected.Selected, EffectiveSeed: seed, SelectionInputDigest: selectionDigest, Fallback: plan.Fallback, LatencyMS: expansionElapsed, Usage: firstCall.Usage, EvidenceThreshold: retrievalOptions.evidenceThreshold}, nil
+	return fixtureAttempt{Record: record, Case: input, Candidates: eligible.Candidates, Decisions: selected.Selected, EffectiveSeed: seed, SelectionInputDigest: selectionDigest, Fallback: plan.Fallback, LatencyMS: expansionElapsed, Usage: expansionUsage, EvidenceThreshold: retrievalOptions.evidenceThreshold}, nil
+}
+
+func addFixtureUsage(total, next fixtureUsage) fixtureUsage {
+	total.PromptTokens += next.PromptTokens
+	total.CompletionTokens += next.CompletionTokens
+	total.TotalTokens += next.TotalTokens
+	return total
 }
 
 func elapsedBetween(end, start time.Time) int64 {

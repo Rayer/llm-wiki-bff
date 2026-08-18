@@ -2,7 +2,9 @@ package query
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net"
 	"net/url"
@@ -15,32 +17,42 @@ import (
 )
 
 type Receipt struct {
-	QueryReceivedAt                 time.Time               `json:"query_received_at"`
-	RunStartedAt                    time.Time               `json:"run_started_at"`
-	RunFinishedAt                   time.Time               `json:"run_finished_at"`
-	ElapsedMS                       int64                   `json:"elapsed_ms"`
-	Stages                          []StageReceipt          `json:"stages"`
-	HostCalls                       []HostCallReceipt       `json:"host_calls"`
-	SelectionLimit                  int                     `json:"selection_limit"`
-	ExplorationSlots                int                     `json:"exploration_slots"`
-	EvidenceThreshold               int                     `json:"evidence_threshold"`
-	ExpansionAttempts               int                     `json:"expansion_attempts"`
-	SuccessfulExpansionAttempts     int                     `json:"successful_expansion_attempts"`
-	ProviderFailedExpansionAttempts int                     `json:"provider_failed_expansion_attempts"`
-	FallbackExpansionCount          int                     `json:"fallback_expansion_count"`
-	KeywordsPerExpansionAttempt     int                     `json:"keywords_per_expansion_attempt"`
-	RareKeywordMaxDocumentFrequency int                     `json:"rare_keyword_max_document_frequency"`
-	KeywordSupport                  []KeywordSupportReceipt `json:"keyword_support,omitempty"`
+	QueryReceivedAt                 time.Time                 `json:"query_received_at"`
+	RunStartedAt                    time.Time                 `json:"run_started_at"`
+	RunFinishedAt                   time.Time                 `json:"run_finished_at"`
+	ElapsedMS                       int64                     `json:"elapsed_ms"`
+	Stages                          []StageReceipt            `json:"stages"`
+	HostCalls                       []HostCallReceipt         `json:"host_calls"`
+	SelectionLimit                  int                       `json:"selection_limit"`
+	ExplorationSlots                int                       `json:"exploration_slots"`
+	EvidenceThreshold               int                       `json:"evidence_threshold"`
+	ExpansionAttempts               int                       `json:"expansion_attempts"`
+	SuccessfulExpansionAttempts     int                       `json:"successful_expansion_attempts"`
+	ProviderFailedExpansionAttempts int                       `json:"provider_failed_expansion_attempts"`
+	FallbackExpansionCount          int                       `json:"fallback_expansion_count"`
+	KeywordsPerExpansionAttempt     int                       `json:"keywords_per_expansion_attempt"`
+	RareKeywordMaxDocumentFrequency int                       `json:"rare_keyword_max_document_frequency"`
+	KeywordConsensusMinimum         int                       `json:"keyword_consensus_minimum"`
+	KeywordSupport                  []KeywordSupportReceipt   `json:"keyword_support,omitempty"`
+	ExpansionAttemptOutcomes        []ExpansionAttemptReceipt `json:"expansion_attempt_outcomes,omitempty"`
 	runStartedMono                  time.Time
 }
 
 type KeywordSupportReceipt struct {
 	Role           string `json:"role"`
-	Kind           string `json:"kind,omitempty"`
-	Value          string `json:"value,omitempty"`
-	Keyword        string `json:"keyword"`
+	Kind           string `json:"-"`
+	Value          string `json:"-"`
+	Keyword        string `json:"-"`
+	KindDigest     string `json:"kind_digest,omitempty"`
+	ValueDigest    string `json:"value_digest,omitempty"`
+	KeywordDigest  string `json:"keyword_digest,omitempty"`
 	SupportCount   int    `json:"support_count"`
 	AttemptIndexes []int  `json:"attempt_indexes"`
+}
+
+type ExpansionAttemptReceipt struct {
+	AttemptIndex int    `json:"attempt_index"`
+	Outcome      string `json:"outcome"`
 }
 
 func (r *ReceiptRecorder) SetRetrievalConfig(selectionLimit, explorationSlots, evidenceThreshold int) {
@@ -60,13 +72,32 @@ func (r *ReceiptRecorder) SetExpansionConfig(attempts, successful, providerFaile
 	r.receipt.KeywordsPerExpansionAttempt = keywordsPerAttempt
 	r.receipt.EvidenceThreshold = evidenceThreshold
 	r.receipt.RareKeywordMaxDocumentFrequency = rareDocumentFrequency
-	r.receipt.KeywordSupport = append([]KeywordSupportReceipt(nil), support...)
+	r.receipt.KeywordConsensusMinimum = 2
+	r.receipt.KeywordSupport = make([]KeywordSupportReceipt, 0, len(support))
+	for _, item := range support {
+		item.KindDigest = receiptDigest(item.Kind)
+		item.ValueDigest = receiptDigest(item.Value)
+		item.KeywordDigest = receiptDigest(item.Keyword)
+		item.Kind, item.Value, item.Keyword = "", "", ""
+		r.receipt.KeywordSupport = append(r.receipt.KeywordSupport, item)
+	}
+}
+
+func receiptDigest(value string) string {
+	digest := sha256.Sum256([]byte(value))
+	return fmt.Sprintf("sha256:%x", digest[:])
 }
 
 func (r *ReceiptRecorder) SetFallbackExpansionCount(count int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.receipt.FallbackExpansionCount = count
+}
+
+func (r *ReceiptRecorder) SetExpansionAttemptOutcomes(outcomes []ExpansionAttemptReceipt) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.receipt.ExpansionAttemptOutcomes = append([]ExpansionAttemptReceipt(nil), outcomes...)
 }
 
 type StageReceipt struct {

@@ -80,12 +80,22 @@ func TestTimedHostReceiptEndsAtNetworkBoundary(t *testing.T) {
 
 func TestReceiptRecordsResolvedExpansionConfigAndSupport(t *testing.T) {
 	_, recorder := WithReceipt(context.Background())
-	recorder.SetExpansionConfig(3, 2, 1, 24, 2, 1, []KeywordSupportReceipt{{Role: "preferred", Keyword: "coffee", SupportCount: 2, AttemptIndexes: []int{1, 2}}})
+	recorder.SetExpansionConfig(3, 2, 1, 24, 2, 1, []KeywordSupportReceipt{{Role: "preferred", Kind: "sentinel-value", Value: "raw-query", Keyword: "provider-body", SupportCount: 2, AttemptIndexes: []int{1, 2}}})
 	got := recorder.Receipt()
-	if got.ExpansionAttempts != 3 || got.SuccessfulExpansionAttempts != 2 || got.ProviderFailedExpansionAttempts != 1 || got.FallbackExpansionCount != 0 || got.KeywordsPerExpansionAttempt != 24 || got.EvidenceThreshold != 2 || got.RareKeywordMaxDocumentFrequency != 1 {
+	if got.ExpansionAttempts != 3 || got.SuccessfulExpansionAttempts != 2 || got.ProviderFailedExpansionAttempts != 1 || got.FallbackExpansionCount != 0 || got.KeywordsPerExpansionAttempt != 24 || got.EvidenceThreshold != 2 || got.KeywordConsensusMinimum != 2 || got.RareKeywordMaxDocumentFrequency != 1 {
 		t.Fatalf("expansion config receipt = %#v", got)
 	}
 	if len(got.KeywordSupport) != 1 || got.KeywordSupport[0].SupportCount != 2 || !reflect.DeepEqual(got.KeywordSupport[0].AttemptIndexes, []int{1, 2}) {
 		t.Fatalf("keyword support receipt = %#v", got.KeywordSupport)
+	}
+	data, _ := json.Marshal(got)
+	encoded := string(data)
+	for _, forbidden := range []string{"coffee", "sentinel-value", "raw-query", "provider-body"} {
+		if strings.Contains(encoded, forbidden) {
+			t.Fatalf("receipt leaked %q: %s", forbidden, encoded)
+		}
+	}
+	if !strings.Contains(encoded, "keyword_digest") || !strings.Contains(encoded, "support_count") || !strings.Contains(encoded, "attempt_indexes") {
+		t.Fatalf("receipt lost auditable sanitized support: %s", encoded)
 	}
 }

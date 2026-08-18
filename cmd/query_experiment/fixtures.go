@@ -134,9 +134,16 @@ func callFixtureModel(ctx context.Context, model modelFixtureEntry, system, user
 		return fixtureModelCall{LatencyMS: latency}, fmt.Errorf("model request failed: %w", err)
 	}
 	defer response.Body.Close()
+	responseBytes, err := io.ReadAll(response.Body)
+	if err != nil {
+		return fixtureModelCall{LatencyMS: latency}, fmt.Errorf("read model response: %w", err)
+	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		_, _ = io.Copy(io.Discard, response.Body)
-		return fixtureModelCall{LatencyMS: latency}, fmt.Errorf("model request returned HTTP %d", response.StatusCode)
+		var failed struct {
+			Usage fixtureUsage `json:"usage"`
+		}
+		_ = json.Unmarshal(responseBytes, &failed)
+		return fixtureModelCall{LatencyMS: latency, RawResponse: string(responseBytes), Usage: failed.Usage}, fmt.Errorf("model request returned HTTP %d", response.StatusCode)
 	}
 	var decoded struct {
 		Choices []struct {
@@ -145,10 +152,6 @@ func callFixtureModel(ctx context.Context, model modelFixtureEntry, system, user
 			} `json:"message"`
 		} `json:"choices"`
 		Usage fixtureUsage `json:"usage"`
-	}
-	responseBytes, err := io.ReadAll(response.Body)
-	if err != nil {
-		return fixtureModelCall{LatencyMS: latency}, fmt.Errorf("read model response: %w", err)
 	}
 	if err := json.Unmarshal(responseBytes, &decoded); err != nil {
 		return fixtureModelCall{LatencyMS: latency, RawResponse: string(responseBytes)}, errors.New("decode model response")
