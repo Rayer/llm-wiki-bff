@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -148,9 +149,9 @@ func TestEvidenceThresholdQualificationAndSelection(t *testing.T) {
 func TestExactRequiredEntityQualifiesWithoutLegacyScore(t *testing.T) {
 	for _, kind := range []string{"entity", "name", "entity_name", "entity-name", "venue_name", "venue-name"} {
 		t.Run(kind, func(t *testing.T) {
-			plan := queryquality.QueryPlan{Required: []queryquality.Criterion{{Kind: kind, Value: "Boven", Terms: []string{"Boven"}, Proof: "lexical"}}}
+			plan := queryquality.QueryPlan{RawQuery: "Boven", Required: []queryquality.Criterion{{Kind: kind, Value: "Boven", Terms: []string{"Boven"}, Proof: "lexical"}}}
 			matched, err := queryquality.NewLexicalMatcher(nil).Match(context.Background(), queryquality.MatchRequest{
-				Plan: plan, CorpusEntries: []cache.Entry{{Slug: "boven", Title: "Boven 雜誌圖書館"}}, EvidenceThreshold: 3, EvidenceThresholdSet: true,
+				Plan: plan, CorpusEntries: []cache.Entry{{Slug: "boven", Title: "Boven"}}, EvidenceThreshold: 3, EvidenceThresholdSet: true,
 			})
 			if err != nil {
 				t.Fatal(err)
@@ -162,7 +163,7 @@ func TestExactRequiredEntityQualifiesWithoutLegacyScore(t *testing.T) {
 		})
 	}
 	matched, err := queryquality.NewLexicalMatcher(nil).Match(context.Background(), queryquality.MatchRequest{
-		Plan:          queryquality.QueryPlan{Required: []queryquality.Criterion{{Kind: "entity", Value: "Boven", Terms: []string{"Boven"}, Proof: "lexical"}}},
+		Plan:          queryquality.QueryPlan{RawQuery: "Boven", Required: []queryquality.Criterion{{Kind: "entity", Value: "Boven", Terms: []string{"Boven"}, Proof: "lexical"}}},
 		CorpusEntries: []cache.Entry{{Slug: "body-only", Title: "雜誌圖書館", Body: "Boven"}}, EvidenceThreshold: 1, EvidenceThresholdSet: true,
 	})
 	if err != nil {
@@ -472,7 +473,7 @@ func TestStructuredPlanPromptIsMinimalV1(t *testing.T) {
 	}
 	wantSystem := `You produce a retrieval plan for a frozen Lifestyle concept corpus. Return exactly one JSON object and no markdown. The object fields and exact types are: raw_query string; required array of Criterion; excluded array of Criterion; preferred array of Criterion; goals array of Criterion; supporting_dimensions array of Criterion; acceptable_alternatives array of Criterion; ambiguity array of strings; fallback boolean. Every Criterion is exactly {kind:string,value:string,terms:array of strings,proof:"lexical" or "semantic"}. Every lexical Criterion needs at least one discovery term. Never output a string where an array or object is required. Be conservative: only explicit user constraints may be required or excluded; absent never means excluded. In this minimal variant, supporting_dimensions and acceptable_alternatives must be empty arrays and fallback must be false.`
 	wantUser := `Raw query: "coffee"` + "\n" + `Criterion policy: {"required_when_explicit":["location","explicit_exclusion"],"preferred_by_default":["venue_type","activity","audience","setting"],"goals_to_expand":["suitability","recommendation","discovery"]}` + "\nInterpret the query into required, excluded, preferred and goals. Preserve the raw query exactly in raw_query. Return the single JSON object only."
-	if provider.system != wantSystem || provider.user != wantUser {
+	if provider.system != wantSystem || !strings.HasPrefix(provider.user, wantUser) || !strings.Contains(provider.user, "Maximum normalized positive discovery keywords for this attempt: 24.") {
 		t.Fatalf("prompt mismatch:\nsystem=%q\nuser=%q", provider.system, provider.user)
 	}
 	if queryquality.StructuredPlanPromptID != "minimal-v1" {
@@ -637,7 +638,7 @@ func TestProductionExpansionFailureAndInvalidJSONUseDeterministicFallback(t *tes
 
 func TestProductionExpansionCancellationDoesNotFallback(t *testing.T) {
 	started := make(chan struct{})
-	provider := blockingProvider{started: started}
+	provider := blockingProvider{started: started, startedOnce: &sync.Once{}}
 	legacy := &countingExecutor{}
 	executor, err := queryquality.NewProductionExecutor(cache.New(), provider, legacy, nil, queryquality.DefaultOptions())
 	if err != nil {
@@ -665,6 +666,26 @@ func TestProductionExpansionCancellationDoesNotFallback(t *testing.T) {
 	}
 	if legacy.called {
 		t.Fatal("cancellation must not invoke legacy fallback")
+	}
+}
+
+func TestQueryRetrievalTraceAndReceiptUseSharedConsensusMinimum(t *testing.T) {
+	pipeline := queryquality.NewQueryRetrievalPipelineWithOptions(
+		queryquality.NewStructuredPlanExpander(&fakeProvider{response: `{"raw_query":"coffee","required":[],"excluded":[],"preferred":[{"kind":"topic","value":"coffee","terms":["coffee"],"proof":"lexical"}],"goals":[],"supporting_dimensions":[],"acceptable_alternatives":[],"ambiguity":[],"fallback":false}`}, nil),
+		queryquality.NewLexicalMatcher(nil), queryquality.NewResultSelector(), nil, queryquality.DefaultOptions(),
+	)
+	ctx, receipt := query.WithReceipt(context.Background())
+	defer query.FinishReceipt(receipt)
+	_, trace, err := pipeline.ExecuteWithTrace(ctx, &jsonlReader{data: []byte(`{"slug":"coffee","title":"Coffee","body":"coffee"}` + "\n")}, query.Request{Query: "coffee"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if trace.Expansion.KeywordConsensusMinimum != queryquality.MinimumKeywordConsensusSupport {
+		t.Fatalf("trace keyword_consensus_minimum = %d, want %d", trace.Expansion.KeywordConsensusMinimum, queryquality.MinimumKeywordConsensusSupport)
+	}
+	got := receipt.Receipt()
+	if got.KeywordConsensusMinimum != queryquality.MinimumKeywordConsensusSupport {
+		t.Fatalf("receipt keyword_consensus_minimum = %d, want %d", got.KeywordConsensusMinimum, queryquality.MinimumKeywordConsensusSupport)
 	}
 }
 
@@ -893,10 +914,13 @@ func (e *countingExecutor) Execute(context.Context, cache.Reader, query.Request)
 	return query.Result{}, nil
 }
 
-type blockingProvider struct{ started chan struct{} }
+type blockingProvider struct {
+	started     chan struct{}
+	startedOnce *sync.Once
+}
 
 func (p blockingProvider) Chat(ctx context.Context, _, _ string) (string, error) {
-	close(p.started)
+	p.startedOnce.Do(func() { close(p.started) })
 	<-ctx.Done()
 	return "", ctx.Err()
 }

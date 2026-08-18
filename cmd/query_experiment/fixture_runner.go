@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rayer/llm-wiki-bff/internal/buildinfo"
@@ -51,46 +52,92 @@ type fixtureReceiptMeta struct {
 }
 
 type fixtureRequestReceipt struct {
-	Query             string             `json:"query"`
-	Mode              string             `json:"mode"`
-	SnapshotIdentity  string             `json:"snapshot_identity"`
-	CorpusSHA256      string             `json:"corpus_sha256"`
-	SelectionLimit    int                `json:"selection_limit"`
-	ExplorationSlots  int                `json:"exploration_slots"`
-	EvidenceThreshold int                `json:"evidence_threshold"`
-	SeedMode          string             `json:"seed_mode"`
-	Model             publicModelFixture `json:"model"`
+	Query                           string `json:"query"`
+	Mode                            string `json:"mode"`
+	SnapshotIdentity                string `json:"snapshot_identity"`
+	CorpusSHA256                    string `json:"corpus_sha256"`
+	SelectionLimit                  int    `json:"selection_limit"`
+	ExplorationSlots                int    `json:"exploration_slots"`
+	EvidenceThreshold               int    `json:"evidence_threshold"`
+	KeywordsPerAttempt              int    `json:"keywords_per_attempt"`
+	ExpansionAttempts               int    `json:"expansion_attempts"`
+	RareKeywordMaxDocumentFrequency int    `json:"rare_keyword_max_document_frequency"`
+	SeedMode                        string `json:"seed_mode"`
+	Model                           string `json:"model"`
 }
 
 type fixtureExpansionInput struct {
-	Query           string          `json:"query"`
-	CriterionPolicy CriterionPolicy `json:"criterion_policy"`
-	PromptID        string          `json:"prompt_id"`
-	Provider        string          `json:"provider"`
-	Model           string          `json:"model"`
-	BaseURL         string          `json:"base_url"`
-	SystemPrompt    string          `json:"system_prompt"`
-	UserPrompt      string          `json:"user_prompt"`
+	Query              string          `json:"query"`
+	CriterionPolicy    CriterionPolicy `json:"criterion_policy"`
+	PromptID           string          `json:"prompt_id"`
+	Provider           string          `json:"provider"`
+	Model              string          `json:"model"`
+	BaseURL            string          `json:"base_url"`
+	SystemPrompt       string          `json:"system_prompt"`
+	UserPrompt         string          `json:"user_prompt"`
+	KeywordsPerAttempt int             `json:"keywords_per_attempt"`
+	ExpansionAttempts  int             `json:"expansion_attempts"`
 }
 
 type fixtureExpansionOutput struct {
-	RawModelResponse string       `json:"raw_model_response,omitempty"`
-	ParsedPlan       QueryPlan    `json:"parsed_plan"`
-	Source           string       `json:"source"`
-	Validation       string       `json:"validation"`
-	Fallback         bool         `json:"fallback"`
-	FallbackReason   string       `json:"fallback_reason,omitempty"`
-	Error            string       `json:"error,omitempty"`
-	LatencyMS        int64        `json:"latency_ms"`
-	Usage            fixtureUsage `json:"usage,omitempty"`
+	RawModelResponse       string                           `json:"raw_model_response,omitempty"`
+	ParsedPlan             QueryPlan                        `json:"parsed_plan"`
+	Source                 string                           `json:"source"`
+	Validation             string                           `json:"validation"`
+	Fallback               bool                             `json:"fallback"`
+	FallbackReason         string                           `json:"fallback_reason,omitempty"`
+	Error                  string                           `json:"error,omitempty"`
+	LatencyMS              int64                            `json:"latency_ms"`
+	Usage                  fixtureUsage                     `json:"usage,omitempty"`
+	RequestedAttempts      int                              `json:"requested_attempts"`
+	SuccessfulAttempts     int                              `json:"successful_attempts"`
+	ProviderFailedAttempts int                              `json:"provider_failed_attempts"`
+	FallbackCount          int                              `json:"fallback_count"`
+	KeywordsPerAttempt     int                              `json:"keywords_per_attempt"`
+	KeywordSupport         []queryquality.KeywordSupport    `json:"keyword_support,omitempty"`
+	Attempts               []fixtureExpansionAttemptReceipt `json:"attempts"`
+}
+
+type fixtureExpansionAttemptReceipt struct {
+	AttemptIndex int          `json:"attempt_index"`
+	Outcome      string       `json:"outcome"`
+	LatencyMS    int64        `json:"latency_ms"`
+	Usage        fixtureUsage `json:"usage,omitempty"`
+}
+
+type fixtureModelExpander struct {
+	model  modelFixtureEntry
+	system string
+	user   string
+	mu     sync.Mutex
+	calls  map[int]fixtureModelCall
+}
+
+func (e *fixtureModelExpander) Expand(ctx context.Context, request queryquality.ExpansionRequest) (queryquality.QueryPlan, error) {
+	call, err := callFixtureModel(ctx, e.model, e.system, e.user)
+	e.mu.Lock()
+	e.calls[request.Attempt] = call
+	e.mu.Unlock()
+	if err != nil {
+		return queryquality.QueryPlan{}, err
+	}
+	return decodeStructuredPlan(call.Content, request.Query)
+}
+
+func (e *fixtureModelExpander) call(attempt int) fixtureModelCall {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.calls[attempt]
 }
 
 type fixtureMatchingInput struct {
-	Plan              QueryPlan      `json:"plan"`
-	SnapshotIdentity  string         `json:"snapshot_identity"`
-	CorpusSHA256      string         `json:"corpus_sha256"`
-	Parameters        map[string]any `json:"parameters"`
-	EvidenceThreshold int            `json:"evidence_threshold"`
+	Plan                            QueryPlan      `json:"plan"`
+	SnapshotIdentity                string         `json:"snapshot_identity"`
+	CorpusSHA256                    string         `json:"corpus_sha256"`
+	Parameters                      map[string]any `json:"parameters"`
+	EvidenceThreshold               int            `json:"evidence_threshold"`
+	RareKeywordMaxDocumentFrequency int            `json:"rare_keyword_max_document_frequency"`
+	FallbackQualificationAllowed    bool           `json:"fallback_qualification_allowed"`
 }
 
 type fixtureMatchingOutput struct {
@@ -156,6 +203,15 @@ func runFixtureExperiment(ctx context.Context, options experimentOptions, prepar
 	}
 	retrievalOptions := defaultQueryRetrievalOptions()
 	retrievalOptions.selectionLimit = options.selectionLimit
+	if options.keywordsPerAttempt > 0 {
+		retrievalOptions.keywordsPerAttempt = options.keywordsPerAttempt
+	}
+	if options.expansionAttempts > 0 {
+		retrievalOptions.expansionAttempts = options.expansionAttempts
+	}
+	if options.rareDocumentFrequency > 0 {
+		retrievalOptions.rareDocumentFrequency = options.rareDocumentFrequency
+	}
 	if options.explorationSlotsSet {
 		retrievalOptions.explorationSlots = options.explorationSlots
 	}
@@ -170,6 +226,9 @@ func runFixtureExperiment(ctx context.Context, options experimentOptions, prepar
 	}
 	options.selectionLimit = retrievalOptions.selectionLimit
 	options.explorationSlots = retrievalOptions.explorationSlots
+	options.keywordsPerAttempt = retrievalOptions.keywordsPerAttempt
+	options.expansionAttempts = retrievalOptions.expansionAttempts
+	options.rareDocumentFrequency = retrievalOptions.rareDocumentFrequency
 	if err := os.MkdirAll(filepath.Clean(options.artifactsDir), 0o755); err != nil {
 		return fmt.Errorf("create artifacts directory: %w", err)
 	}
@@ -239,7 +298,7 @@ func fixtureVariantID(base string, options experimentOptions, prepared preparedS
 	if !options.evidenceThresholdSet {
 		threshold = queryquality.DefaultEvidenceThreshold
 	}
-	return fmt.Sprintf("%s__limit=%d__exploration=%d__threshold=%d__seed=%s__corpus=%s", base, options.selectionLimit, options.explorationSlots, threshold, seed, prepared.digest)
+	return fmt.Sprintf("%s__limit=%d__exploration=%d__threshold=%d__keywords=%d__attempts=%d__rare-df=%d__seed=%s__corpus=%s", base, options.selectionLimit, options.explorationSlots, threshold, options.keywordsPerAttempt, options.expansionAttempts, options.rareDocumentFrequency, seed, prepared.digest)
 }
 
 func runFixtureAttempt(ctx context.Context, options experimentOptions, retrievalOptions queryRetrievalOptions, variant fixtureVariant, input caseInput, runIndex int, prepared preparedSnapshot, entries []cache.Entry, now func() time.Time, metadata recordMetadata) (fixtureAttempt, error) {
@@ -259,8 +318,7 @@ func runFixtureAttempt(ctx context.Context, options experimentOptions, retrieval
 		seed = *retrievalOptions.seed
 		seedMode = "explicit"
 	}
-	publicModel := publicModelFixture{ID: variant.Model.ID, Provider: variant.Model.Provider, BaseURL: variant.Model.BaseURL, Model: variant.Model.Model, Temperature: variant.Model.Temperature, Reasoning: variant.Model.Reasoning}
-	if err := write("request.json", fixtureRequestReceipt{Query: input.Query, Mode: input.Mode, SnapshotIdentity: prepared.label, CorpusSHA256: prepared.digest, SelectionLimit: retrievalOptions.selectionLimit, ExplorationSlots: retrievalOptions.explorationSlots, EvidenceThreshold: retrievalOptions.evidenceThreshold, SeedMode: seedMode, Model: publicModel}); err != nil {
+	if err := write("request.json", fixtureRequestReceipt{Query: input.Query, Mode: input.Mode, SnapshotIdentity: prepared.label, CorpusSHA256: prepared.digest, SelectionLimit: retrievalOptions.selectionLimit, ExplorationSlots: retrievalOptions.explorationSlots, EvidenceThreshold: retrievalOptions.evidenceThreshold, KeywordsPerAttempt: retrievalOptions.keywordsPerAttempt, ExpansionAttempts: retrievalOptions.expansionAttempts, RareKeywordMaxDocumentFrequency: retrievalOptions.rareDocumentFrequency, SeedMode: seedMode, Model: variant.Model.Model}); err != nil {
 		return fixtureAttempt{}, err
 	}
 	policy := CriterionPolicy{RequiredWhenExplicit: append([]string(nil), variant.Profile.RequiredWhenExplicit...), PreferredByDefault: append([]string(nil), variant.Profile.PreferredByDefault...), GoalsToExpand: append([]string(nil), variant.Profile.GoalsToExpand...)}
@@ -268,42 +326,55 @@ func runFixtureAttempt(ctx context.Context, options experimentOptions, retrieval
 	if err != nil {
 		return fixtureAttempt{}, fmt.Errorf("render prompt: %w", err)
 	}
-	if err := write("expansion.input.json", fixtureExpansionInput{Query: input.Query, CriterionPolicy: policy, PromptID: variant.Prompt.ID, Provider: variant.Model.Provider, Model: variant.Model.Model, BaseURL: variant.Model.BaseURL, SystemPrompt: rendered.System, UserPrompt: rendered.User}); err != nil {
+	rendered.User += fmt.Sprintf("\nMaximum normalized positive discovery keywords for this attempt: %d.", retrievalOptions.keywordsPerAttempt)
+	if err := write("expansion.input.json", fixtureExpansionInput{Query: input.Query, CriterionPolicy: policy, PromptID: variant.Prompt.ID, Provider: variant.Model.Provider, Model: variant.Model.Model, BaseURL: variant.Model.BaseURL, SystemPrompt: rendered.System, UserPrompt: rendered.User, KeywordsPerAttempt: retrievalOptions.keywordsPerAttempt, ExpansionAttempts: retrievalOptions.expansionAttempts}); err != nil {
 		return fixtureAttempt{}, err
 	}
-	call, callErr := callFixtureModel(ctx, variant.Model, rendered.System, rendered.User)
-	plan, expansionErr := QueryPlan{}, error(nil)
-	info := expansionInfo{}
-	validation := "valid"
-	if callErr == nil {
-		plan, expansionErr = decodeStructuredPlan(call.Content, input.Query)
-		if expansionErr == nil {
-			info = expansionInfo{source: "structured-llm"}
-		} else {
-			info.fallbackReason = "invalid_plan"
-		}
-	} else {
-		expansionErr = callErr
-		info.fallbackReason = "provider_error"
+	expander := &fixtureModelExpander{model: variant.Model, system: rendered.System, user: rendered.User, calls: make(map[int]fixtureModelCall)}
+	parallel, err := queryquality.NewParallelQueryExpander(expander, newDeterministicExpander(), toQueryRetrievalCoreOptions(retrievalOptions))
+	if err != nil {
+		return fixtureAttempt{}, err
 	}
+	expansionStarted := now()
+	plan, expansionInfo, expansionErr := parallel.(queryquality.TracedQueryExpander).ExpandWithTrace(ctx, queryquality.ExpansionRequest{Query: input.Query, CriterionPolicy: policy})
+	expansionElapsed := elapsedBetween(now(), expansionStarted)
 	if expansionErr != nil {
-		validation = "fallback"
-		plan, expansionErr = newDeterministicExpander().Expand(ctx, queryquality.ExpansionRequest{Query: input.Query, CriterionPolicy: policy})
-		if expansionErr != nil {
-			return fixtureAttempt{}, fmt.Errorf("fixture fallback: %w", expansionErr)
-		}
-		plan.Fallback = true
-		info.source = "deterministic-fallback"
+		return fixtureAttempt{}, fmt.Errorf("fixture expansion: %w", expansionErr)
 	}
-	if err := write("expansion.output.json", fixtureExpansionOutput{RawModelResponse: scrubSecret(call.RawResponse, variant.Model.APIKey), ParsedPlan: plan, Source: info.source, Validation: validation, Fallback: plan.Fallback, FallbackReason: info.fallbackReason, Error: scrubSecret(errorString(callErr), variant.Model.APIKey), LatencyMS: call.LatencyMS, Usage: call.Usage}); err != nil {
+	firstCall := fixtureModelCall{}
+	for attempt := 1; attempt <= expansionInfo.RequestedAttempts; attempt++ {
+		if call := expander.call(attempt); call.RawResponse != "" || call.Content != "" || call.LatencyMS != 0 {
+			firstCall = call
+			break
+		}
+	}
+	attemptReceipts := make([]fixtureExpansionAttemptReceipt, 0, expansionInfo.RequestedAttempts)
+	var expansionUsage fixtureUsage
+	for _, outcome := range expansionInfo.AttemptOutcomes {
+		call := expander.call(outcome.AttemptIndex)
+		attemptReceipts = append(attemptReceipts, fixtureExpansionAttemptReceipt{AttemptIndex: outcome.AttemptIndex, Outcome: outcome.Outcome, LatencyMS: call.LatencyMS, Usage: call.Usage})
+		expansionUsage = addFixtureUsage(expansionUsage, call.Usage)
+	}
+	validation := "valid"
+	if plan.Fallback {
+		validation = "fallback"
+	}
+	if err := write("expansion.output.json", fixtureExpansionOutput{RawModelResponse: scrubSecret(firstCall.RawResponse, variant.Model.APIKey), ParsedPlan: plan, Source: expansionInfo.Source, Validation: validation, Fallback: plan.Fallback, FallbackReason: expansionInfo.FallbackReason, Error: "", LatencyMS: expansionElapsed, Usage: expansionUsage, RequestedAttempts: expansionInfo.RequestedAttempts, SuccessfulAttempts: expansionInfo.SuccessfulAttempts, ProviderFailedAttempts: expansionInfo.ProviderFailedAttempts, FallbackCount: expansionInfo.FallbackCount, KeywordsPerAttempt: expansionInfo.KeywordsPerAttempt, KeywordSupport: plan.KeywordSupport, Attempts: attemptReceipts}); err != nil {
 		return fixtureAttempt{}, err
 	}
-	trace := &queryRetrievalTrace{Variant: variant.VariantID, Seed: seed, Stages: []stageTrace{{Name: "expansion", Outcome: planOutcome(plan), Source: info.source, FallbackReason: info.fallbackReason, ElapsedMS: call.LatencyMS, InputCount: 1, OutputCount: criterionCount(plan), Plan: &plan}}}
-	if err := write("matching.input.json", fixtureMatchingInput{Plan: plan, SnapshotIdentity: prepared.label, CorpusSHA256: prepared.digest, EvidenceThreshold: retrievalOptions.evidenceThreshold, Parameters: map[string]any{"semantic_required_fail_closed": semanticRequiredFailClosed, "semantic_excluded_fail_closed": semanticExcludedFailClosed}}); err != nil {
+	trace := &queryRetrievalTrace{Variant: variant.VariantID, Seed: seed, Stages: []stageTrace{{Name: "expansion", Outcome: planOutcome(plan), Source: expansionInfo.Source, FallbackReason: expansionInfo.FallbackReason, ElapsedMS: expansionElapsed, InputCount: expansionInfo.RequestedAttempts, OutputCount: criterionCount(plan), Plan: &plan}}}
+	trace.Expansion = queryquality.ExpansionTrace{RequestedAttempts: expansionInfo.RequestedAttempts, SuccessfulAttempts: expansionInfo.SuccessfulAttempts, ProviderFailedAttempts: expansionInfo.ProviderFailedAttempts, FallbackCount: expansionInfo.FallbackCount, KeywordsPerAttempt: expansionInfo.KeywordsPerAttempt, RareKeywordMaxDocumentFrequency: retrievalOptions.rareDocumentFrequency, EvidenceThreshold: retrievalOptions.evidenceThreshold, KeywordSupport: append([]queryquality.KeywordSupport(nil), plan.KeywordSupport...)}
+	matchReq := queryquality.MatchRequest{
+		Plan: plan, CorpusEntries: entries, EvidenceThreshold: retrievalOptions.evidenceThreshold, EvidenceThresholdSet: true,
+		RareKeywordMaxDocumentFrequency: retrievalOptions.rareDocumentFrequency, FallbackQualificationAllowed: false,
+	}
+	if err := write("matching.input.json", fixtureMatchingInput{
+		Plan: plan, SnapshotIdentity: prepared.label, CorpusSHA256: prepared.digest, EvidenceThreshold: matchReq.EvidenceThreshold, RareKeywordMaxDocumentFrequency: matchReq.RareKeywordMaxDocumentFrequency, FallbackQualificationAllowed: matchReq.FallbackQualificationAllowed,
+		Parameters: map[string]any{"semantic_required_fail_closed": semanticRequiredFailClosed, "semantic_excluded_fail_closed": semanticExcludedFailClosed},
+	}); err != nil {
 		return fixtureAttempt{}, err
 	}
 	matchingStarted := now()
-	matchReq := queryquality.MatchRequest{Plan: plan, CorpusEntries: entries, EvidenceThreshold: retrievalOptions.evidenceThreshold, EvidenceThresholdSet: true}
 	eligible, err := newLexicalMatcher(nil).Match(ctx, matchReq)
 	matchingElapsed := elapsedBetween(now(), matchingStarted)
 	if err != nil {
@@ -354,11 +425,18 @@ func runFixtureAttempt(ctx context.Context, options experimentOptions, retrieval
 	for _, identity := range resultIdentities {
 		result.Results = append(result.Results, search.Result{Slug: identity.Slug, Title: identity.Title, Type: identity.Type})
 	}
-	record := makeResultRecordWithTrace(input, runIndex, prepared, result, nil, call.LatencyMS+matchingElapsed+selectionElapsed, metadata, trace)
+	record := makeResultRecordWithTrace(input, runIndex, prepared, result, nil, expansionElapsed+matchingElapsed+selectionElapsed, metadata, trace)
 	record.QueryReceivedAt, record.RunCompletedAt, record.DurationMS = queryReceivedAtStr, runCompletedAtStr, durationMS
 	record.VariantID, record.ProfileID, record.PromptID, record.Provider, record.Model = variant.VariantID, variant.Profile.ID, variant.Prompt.ID, variant.Model.Provider, variant.Model.Model
 	selectionDigest := digestJSON(selectionInput)
-	return fixtureAttempt{Record: record, Case: input, Candidates: eligible.Candidates, Decisions: selected.Selected, EffectiveSeed: seed, SelectionInputDigest: selectionDigest, Fallback: plan.Fallback, LatencyMS: call.LatencyMS, Usage: call.Usage, EvidenceThreshold: retrievalOptions.evidenceThreshold}, nil
+	return fixtureAttempt{Record: record, Case: input, Candidates: eligible.Candidates, Decisions: selected.Selected, EffectiveSeed: seed, SelectionInputDigest: selectionDigest, Fallback: plan.Fallback, LatencyMS: expansionElapsed, Usage: expansionUsage, EvidenceThreshold: retrievalOptions.evidenceThreshold}, nil
+}
+
+func addFixtureUsage(total, next fixtureUsage) fixtureUsage {
+	total.PromptTokens += next.PromptTokens
+	total.CompletionTokens += next.CompletionTokens
+	total.TotalTokens += next.TotalTokens
+	return total
 }
 
 func elapsedBetween(end, start time.Time) int64 {

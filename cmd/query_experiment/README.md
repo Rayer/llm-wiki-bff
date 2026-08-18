@@ -12,7 +12,8 @@ the existing production query service and its existing output contract. The
 
 ```sh
 go run ./cmd/query_experiment --service query-retrieval \
-  --selection-limit 10 --exploration-slots 1 --evidence-threshold 1 --seed -7 \
+  --selection-limit 10 --exploration-slots 1 --evidence-threshold 2 \
+  --keywords-per-attempt 24 --expansion-attempts 3 --rare-keyword-max-document-frequency 1 --seed -7 \
   --snapshot ./frozen-project --cases ./cases.jsonl
 ```
 
@@ -22,9 +23,14 @@ the selection limit. `--seed` accepts a signed 64-bit integer; when omitted,
 the seed is derived reproducibly from the query. Selection is therefore causal
 and exactly replayable for the same query, corpus, and knobs.
 
-`--evidence-threshold` defaults to 1 and counts independent positive evidence
+`--evidence-threshold` defaults to 2 and counts independent positive evidence
 dimensions. Explicit `--evidence-threshold 0` is the trusted-local legacy
 control only; production configuration rejects zero.
+
+`--keywords-per-attempt` defaults to 24 and bounds normalized positive
+discovery keywords per provider attempt. `--expansion-attempts` defaults to 3;
+those calls run concurrently within each query while cases and top-level runs
+remain sequential. `--rare-keyword-max-document-frequency` defaults to 1.
 
 `--snapshot` must directly contain `cache/concepts.jsonl`:
 

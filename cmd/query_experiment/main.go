@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/rayer/llm-wiki-bff/internal/config"
+	"github.com/rayer/llm-wiki-bff/internal/queryquality"
 )
 
 func main() {
@@ -33,6 +34,9 @@ func main() {
 		options.evidenceThresholdSet = true
 		return nil
 	})
+	flag.IntVar(&options.keywordsPerAttempt, "keywords-per-attempt", queryquality.DefaultKeywordsPerAttempt, "maximum normalized positive expansion keywords per attempt")
+	flag.IntVar(&options.expansionAttempts, "expansion-attempts", queryquality.DefaultExpansionAttempts, "bounded parallel expansion attempts")
+	flag.IntVar(&options.rareDocumentFrequency, "rare-keyword-max-document-frequency", queryquality.DefaultRareDocumentFrequency, "maximum corpus document frequency for rare lexical qualification")
 	var seed int64
 	var seedSet bool
 	flag.Func("seed", "query-retrieval signed selection seed; query-derived when omitted", func(value string) error {

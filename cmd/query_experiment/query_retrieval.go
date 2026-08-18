@@ -21,16 +21,19 @@ const (
 )
 
 type queryRetrievalOptions struct {
-	selectionLimit       int
-	explorationSlots     int
-	evidenceThreshold    int
-	evidenceThresholdSet bool
-	seed                 *int64
-	seedFor              func(string) int64
+	selectionLimit        int
+	explorationSlots      int
+	evidenceThreshold     int
+	evidenceThresholdSet  bool
+	keywordsPerAttempt    int
+	expansionAttempts     int
+	rareDocumentFrequency int
+	seed                  *int64
+	seedFor               func(string) int64
 }
 
 func defaultQueryRetrievalOptions() queryRetrievalOptions {
-	return queryRetrievalOptions{selectionLimit: defaultLimit, explorationSlots: 1, evidenceThreshold: queryquality.DefaultEvidenceThreshold}
+	return queryRetrievalOptions{selectionLimit: defaultLimit, explorationSlots: 1, evidenceThreshold: queryquality.DefaultEvidenceThreshold, keywordsPerAttempt: queryquality.DefaultKeywordsPerAttempt, expansionAttempts: queryquality.DefaultExpansionAttempts, rareDocumentFrequency: queryquality.DefaultRareDocumentFrequency}
 }
 
 func normalizeQueryRetrievalOptions(options queryRetrievalOptions) (queryRetrievalOptions, error) {
@@ -42,11 +45,11 @@ func normalizeQueryRetrievalOptions(options queryRetrievalOptions) (queryRetriev
 }
 
 func toQueryRetrievalCoreOptions(options queryRetrievalOptions) queryquality.Options {
-	return queryquality.Options{SelectionLimit: options.selectionLimit, ExplorationSlots: options.explorationSlots, EvidenceThreshold: options.evidenceThreshold, EvidenceThresholdSet: options.evidenceThresholdSet, Seed: options.seed, SeedFor: options.seedFor}
+	return queryquality.Options{SelectionLimit: options.selectionLimit, ExplorationSlots: options.explorationSlots, EvidenceThreshold: options.evidenceThreshold, EvidenceThresholdSet: options.evidenceThresholdSet, KeywordsPerAttempt: options.keywordsPerAttempt, ExpansionAttempts: options.expansionAttempts, RareDocumentFrequency: options.rareDocumentFrequency, Seed: options.seed, SeedFor: options.seedFor}
 }
 
 func fromQueryRetrievalCoreOptions(options queryquality.Options) queryRetrievalOptions {
-	return queryRetrievalOptions{selectionLimit: options.SelectionLimit, explorationSlots: options.ExplorationSlots, evidenceThreshold: options.EvidenceThreshold, evidenceThresholdSet: options.EvidenceThresholdSet, seed: options.Seed, seedFor: options.SeedFor}
+	return queryRetrievalOptions{selectionLimit: options.SelectionLimit, explorationSlots: options.ExplorationSlots, evidenceThreshold: options.EvidenceThreshold, evidenceThresholdSet: options.EvidenceThresholdSet, keywordsPerAttempt: options.KeywordsPerAttempt, expansionAttempts: options.ExpansionAttempts, rareDocumentFrequency: options.RareDocumentFrequency, seed: options.Seed, seedFor: options.SeedFor}
 }
 
 type CriterionPolicy = queryquality.CriterionPolicy

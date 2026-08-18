@@ -29,26 +29,29 @@ const (
 )
 
 type experimentOptions struct {
-	snapshotPath         string
-	casesPath            string
-	runs                 int
-	outputPath           string
-	configDir            string
-	service              string
-	selectionLimit       int
-	explorationSlots     int
-	explorationSlotsSet  bool
-	evidenceThreshold    int
-	evidenceThresholdSet bool
-	seed                 *int64
-	modelFixturePath     string
-	models               string
-	profileFixturePath   string
-	profiles             string
-	promptFixturePath    string
-	prompts              string
-	artifactsDir         string
-	summaryPath          string
+	snapshotPath          string
+	casesPath             string
+	runs                  int
+	outputPath            string
+	configDir             string
+	service               string
+	selectionLimit        int
+	explorationSlots      int
+	explorationSlotsSet   bool
+	evidenceThreshold     int
+	evidenceThresholdSet  bool
+	keywordsPerAttempt    int
+	expansionAttempts     int
+	rareDocumentFrequency int
+	seed                  *int64
+	modelFixturePath      string
+	models                string
+	profileFixturePath    string
+	profiles              string
+	promptFixturePath     string
+	prompts               string
+	artifactsDir          string
+	summaryPath           string
 }
 
 type caseInput struct {
@@ -407,6 +410,9 @@ func runExperiment(ctx context.Context, options experimentOptions, deps dependen
 			queryRetrievalOptions.evidenceThreshold = options.evidenceThreshold
 			queryRetrievalOptions.evidenceThresholdSet = true
 		}
+		queryRetrievalOptions.keywordsPerAttempt = options.keywordsPerAttempt
+		queryRetrievalOptions.expansionAttempts = options.expansionAttempts
+		queryRetrievalOptions.rareDocumentFrequency = options.rareDocumentFrequency
 		queryRetrievalOptions.seed = options.seed
 		queryRetrievalOptions.seedFor = deps.queryRetrievalSeed
 		executor, err = deps.newQueryRetrievalExecutor(prepared.cache, cfg, queryRetrievalOptions)

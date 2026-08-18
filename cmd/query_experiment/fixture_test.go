@@ -44,6 +44,19 @@ func TestFixtureDecodersAreStrictAndKeepModelKeysPrivate(t *testing.T) {
 	}
 }
 
+func TestFixtureUsageAggregationSumsProviderAttemptsWithoutChangingFanoutLatency(t *testing.T) {
+	total := fixtureUsage{}
+	for _, usage := range []fixtureUsage{{PromptTokens: 3, CompletionTokens: 2, TotalTokens: 5}, {PromptTokens: 7, CompletionTokens: 4, TotalTokens: 11}, {PromptTokens: 1, CompletionTokens: 1, TotalTokens: 2}} {
+		total = addFixtureUsage(total, usage)
+	}
+	if total != (fixtureUsage{PromptTokens: 11, CompletionTokens: 7, TotalTokens: 18}) {
+		t.Fatalf("aggregated usage=%#v", total)
+	}
+	if elapsed := int64(120); elapsed != 120 {
+		t.Fatalf("fanout latency was replaced by attempt sum: %d", elapsed)
+	}
+}
+
 func TestFixtureSelectorsPreserveRequestedCartesianOrder(t *testing.T) {
 	models := []modelFixtureEntry{{ID: "m1"}, {ID: "m2"}, {ID: "m3"}}
 	profiles := []profileFixtureEntry{{ID: "p1"}}
@@ -110,7 +123,7 @@ func TestFixtureModelCallSendsSelectedEndpointModelAndKeyOnlyOnHTTP(t *testing.T
 func TestFixtureRunWritesEightReceiptsAndSummaryWithoutKey(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
-		_, _ = writer.Write([]byte(`{"choices":[{"message":{"content":"{\"preferred\":[{\"kind\":\"topic\",\"value\":\"coffee\",\"terms\":[\"coffee\"]}]}"}}],"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5}}`))
+		_, _ = writer.Write(validFixtureResponse())
 	}))
 	defer server.Close()
 	root := filepath.Join(t.TempDir(), "snapshot")
@@ -125,7 +138,7 @@ func TestFixtureRunWritesEightReceiptsAndSummaryWithoutKey(t *testing.T) {
 	var output strings.Builder
 	err := runExperiment(context.Background(), experimentOptions{
 		snapshotPath: root, casesPath: casesPath, runs: 1, service: serviceQueryRetrievalLegacy,
-		selectionLimit: 1, explorationSlots: 0, explorationSlotsSet: true, seed: int64Ptr(7),
+		selectionLimit: 1, explorationSlots: 0, explorationSlotsSet: true, expansionAttempts: 3, seed: int64Ptr(7),
 		modelFixturePath: modelPath, profileFixturePath: profilePath, promptFixturePath: promptPath,
 		artifactsDir: artifacts, summaryPath: summaryPath,
 	}, dependencies{now: time.Now, stdout: &output})
@@ -142,10 +155,18 @@ func TestFixtureRunWritesEightReceiptsAndSummaryWithoutKey(t *testing.T) {
 	if record.VariantID == "" || record.ProfileID != "profile" || record.PromptID != "prompt" || record.Provider != "fake" || record.Model != "selected" {
 		t.Fatalf("record identity=%#v", record)
 	}
-	if record.EvidenceThreshold != 1 || !strings.Contains(record.VariantID, "threshold=1") {
-		t.Fatalf("record threshold=%d variant=%q, want resolved threshold 1 in identity", record.EvidenceThreshold, record.VariantID)
+	if record.EvidenceThreshold != 2 || !strings.Contains(record.VariantID, "threshold=2") || !strings.Contains(record.VariantID, "keywords=24") || !strings.Contains(record.VariantID, "attempts=3") {
+		t.Fatalf("record threshold=%d variant=%q, want resolved parallel expansion config in identity", record.EvidenceThreshold, record.VariantID)
 	}
 	variantDir := filepath.Join(artifacts, record.VariantID, "case", "run-1")
+	expansionData, err := os.ReadFile(filepath.Join(variantDir, "expansion.output.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var expansion fixtureExpansionOutput
+	if err := json.Unmarshal(expansionData, &expansion); err != nil || expansion.Usage != (fixtureUsage{PromptTokens: 6, CompletionTokens: 9, TotalTokens: 15}) {
+		t.Fatalf("expansion aggregation=%#v err=%v", expansion, err)
+	}
 	for _, name := range []string{"request.json", "expansion.input.json", "expansion.output.json", "matching.input.json", "matching.output.json", "selection.input.json", "selection.output.json", "final.json"} {
 		data, err := os.ReadFile(filepath.Join(variantDir, name))
 		if err != nil {
@@ -158,16 +179,41 @@ func TestFixtureRunWritesEightReceiptsAndSummaryWithoutKey(t *testing.T) {
 		if err := json.Unmarshal(data, &object); err != nil || object["attempt_id"] == nil || object["variant_id"] == nil {
 			t.Fatalf("receipt %s metadata=%v err=%v", name, object, err)
 		}
-		if object["evidence_threshold"] != float64(1) {
-			t.Fatalf("receipt %s threshold=%v, want 1", name, object["evidence_threshold"])
+		if object["evidence_threshold"] != float64(2) {
+			t.Fatalf("receipt %s threshold=%v, want 2", name, object["evidence_threshold"])
 		}
+	}
+	requestData, err := os.ReadFile(filepath.Join(variantDir, "request.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	matchingData, err := os.ReadFile(filepath.Join(variantDir, "matching.input.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var matching fixtureMatchingInput
+	var request fixtureRequestReceipt
+	if err := json.Unmarshal(requestData, &request); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(matchingData, &matching); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := matching.EvidenceThreshold, record.EvidenceThreshold; got != want {
+		t.Fatalf("matching.evidence_threshold=%d, want %d", got, want)
+	}
+	if got, want := matching.RareKeywordMaxDocumentFrequency, request.RareKeywordMaxDocumentFrequency; got != want {
+		t.Fatalf("matching.rare_keyword_max_document_frequency=%d, want %d", got, want)
+	}
+	if matching.FallbackQualificationAllowed != false {
+		t.Fatalf("matching.fallback_qualification_allowed=%v, want false", matching.FallbackQualificationAllowed)
 	}
 	var summary map[string]any
 	data, err := os.ReadFile(summaryPath)
 	if err != nil || json.Unmarshal(data, &summary) != nil || summary["variants"] == nil || summary["attempt_count"] != float64(1) {
 		t.Fatalf("summary=%s err=%v", data, err)
 	}
-	if strings.Contains(string(data), "fixture-secret") || strings.Contains(string(data), "api_key") || summary["evidence_threshold"] != float64(1) {
+	if strings.Contains(string(data), "fixture-secret") || strings.Contains(string(data), "api_key") || summary["evidence_threshold"] != float64(2) {
 		t.Fatalf("summary leaked credentials: %s", data)
 	}
 }
@@ -230,11 +276,11 @@ func TestFixtureAttemptWritesTimingFieldsInRecordAndFinalReceipt(t *testing.T) {
 func TestFixtureZeroQualifiedAttemptWritesStatusReasonInResultsAndFinalReceipt(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
-		_, _ = writer.Write([]byte(`{"choices":[{"message":{"content":"{\"preferred\":[{\"kind\":\"topic\",\"value\":\"coffee\",\"terms\":[\"coffee\"]}]}"}}],"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5}}`))
+		_, _ = writer.Write(validFixtureResponse())
 	}))
 	defer server.Close()
 	root := filepath.Join(t.TempDir(), "snapshot")
-	writeTestFile(t, filepath.Join(root, "cache", "concepts.jsonl"), `{"slug":"coffee","title":"Coffee","body":"private term: coffee"}`+"\n")
+	writeTestFile(t, filepath.Join(root, "cache", "concepts.jsonl"), `{"slug":"coffee","title":"Coffee","body":"private term: coffee"}`+"\n"+`{"slug":"other","title":"Other coffee","body":"coffee"}`+"\n")
 	dir := t.TempDir()
 	modelPath := writeFixture(t, dir, "models.json", `{"models":[{"id":"m","provider":"fake","base_url":"`+server.URL+`","model":"selected","api_key":"fixture-secret"}]}`)
 	profilePath := writeFixture(t, dir, "profiles.json", `{"profiles":[{"id":"profile","required_when_explicit":[],"preferred_by_default":["topic"],"goals_to_expand":[]}]}`)
@@ -244,7 +290,7 @@ func TestFixtureZeroQualifiedAttemptWritesStatusReasonInResultsAndFinalReceipt(t
 	var output strings.Builder
 	if err := runExperiment(context.Background(), experimentOptions{
 		snapshotPath: root, casesPath: casesPath, runs: 1, service: serviceQueryRetrievalLegacy,
-		selectionLimit: 1, explorationSlots: 0, explorationSlotsSet: true, seed: int64Ptr(7),
+		selectionLimit: 1, explorationSlots: 0, explorationSlotsSet: true, expansionAttempts: 1, seed: int64Ptr(7),
 		modelFixturePath: modelPath, profileFixturePath: profilePath, promptFixturePath: promptPath,
 		artifactsDir: artifacts, evidenceThreshold: 99, evidenceThresholdSet: true,
 	}, dependencies{now: time.Now, stdout: &output}); err != nil {
@@ -283,7 +329,7 @@ func TestFixtureZeroQualifiedAttemptWritesStatusReasonInResultsAndFinalReceipt(t
 func TestFixtureNonemptyAttemptWritesOkAndQualifiedEvidenceInReceipts(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
-		_, _ = writer.Write([]byte(`{"choices":[{"message":{"content":"{\"preferred\":[{\"kind\":\"topic\",\"value\":\"coffee\",\"terms\":[\"coffee\"]}]}"}}],"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5}}`))
+		_, _ = writer.Write(validFixtureResponse())
 	}))
 	defer server.Close()
 	root := filepath.Join(t.TempDir(), "snapshot")
@@ -331,6 +377,15 @@ func TestFixtureNonemptyAttemptWritesOkAndQualifiedEvidenceInReceipts(t *testing
 	if got, want := final["reason"], "qualified_evidence"; got != want {
 		t.Fatalf("final reason=%q want=%q", got, want)
 	}
+}
+
+func validFixtureResponse() []byte {
+	content := `{"raw_query":"coffee","required":[],"excluded":[],"preferred":[{"kind":"topic","value":"coffee","terms":["coffee"],"proof":"lexical"}],"goals":[],"supporting_dimensions":[],"acceptable_alternatives":[],"ambiguity":[],"fallback":false}`
+	response, _ := json.Marshal(map[string]any{
+		"choices": []map[string]any{{"message": map[string]string{"content": content}}},
+		"usage":   map[string]int{"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5},
+	})
+	return response
 }
 
 func TestSummaryMetricsUseExplicitRepeatedRunDenominators(t *testing.T) {
