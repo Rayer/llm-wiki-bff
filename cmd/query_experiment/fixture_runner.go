@@ -39,25 +39,27 @@ func (options experimentOptions) validateFixtureFlags() error {
 }
 
 type fixtureReceiptMeta struct {
-	AttemptID string `json:"attempt_id"`
-	VariantID string `json:"variant_id"`
-	ProfileID string `json:"profile_id"`
-	PromptID  string `json:"prompt_id"`
-	Provider  string `json:"provider"`
-	Model     string `json:"model"`
-	CaseID    string `json:"case_id"`
-	RunIndex  int    `json:"run_index"`
+	AttemptID         string `json:"attempt_id"`
+	VariantID         string `json:"variant_id"`
+	ProfileID         string `json:"profile_id"`
+	PromptID          string `json:"prompt_id"`
+	Provider          string `json:"provider"`
+	Model             string `json:"model"`
+	CaseID            string `json:"case_id"`
+	RunIndex          int    `json:"run_index"`
+	EvidenceThreshold int    `json:"evidence_threshold"`
 }
 
 type fixtureRequestReceipt struct {
-	Query            string             `json:"query"`
-	Mode             string             `json:"mode"`
-	SnapshotIdentity string             `json:"snapshot_identity"`
-	CorpusSHA256     string             `json:"corpus_sha256"`
-	SelectionLimit   int                `json:"selection_limit"`
-	ExplorationSlots int                `json:"exploration_slots"`
-	SeedMode         string             `json:"seed_mode"`
-	Model            publicModelFixture `json:"model"`
+	Query             string             `json:"query"`
+	Mode              string             `json:"mode"`
+	SnapshotIdentity  string             `json:"snapshot_identity"`
+	CorpusSHA256      string             `json:"corpus_sha256"`
+	SelectionLimit    int                `json:"selection_limit"`
+	ExplorationSlots  int                `json:"exploration_slots"`
+	EvidenceThreshold int                `json:"evidence_threshold"`
+	SeedMode          string             `json:"seed_mode"`
+	Model             publicModelFixture `json:"model"`
 }
 
 type fixtureExpansionInput struct {
@@ -84,10 +86,11 @@ type fixtureExpansionOutput struct {
 }
 
 type fixtureMatchingInput struct {
-	Plan             QueryPlan      `json:"plan"`
-	SnapshotIdentity string         `json:"snapshot_identity"`
-	CorpusSHA256     string         `json:"corpus_sha256"`
-	Parameters       map[string]any `json:"parameters"`
+	Plan              QueryPlan      `json:"plan"`
+	SnapshotIdentity  string         `json:"snapshot_identity"`
+	CorpusSHA256      string         `json:"corpus_sha256"`
+	Parameters        map[string]any `json:"parameters"`
+	EvidenceThreshold int            `json:"evidence_threshold"`
 }
 
 type fixtureMatchingOutput struct {
@@ -96,15 +99,17 @@ type fixtureMatchingOutput struct {
 }
 
 type fixtureSelectionInput struct {
-	Candidates       []CandidateEvidence `json:"candidates"`
-	Limit            int                 `json:"limit"`
-	ExplorationSlots int                 `json:"exploration_slots"`
-	EffectiveSeed    int64               `json:"effective_seed"`
+	Candidates        []CandidateEvidence `json:"candidates"`
+	Limit             int                 `json:"limit"`
+	ExplorationSlots  int                 `json:"exploration_slots"`
+	EvidenceThreshold int                 `json:"evidence_threshold"`
+	EffectiveSeed     int64               `json:"effective_seed"`
 }
 
 type fixtureSelectionOutput struct {
-	Decisions  []SelectedCandidate `json:"decisions"`
-	FinalOrder []string            `json:"final_order"`
+	Decisions         []SelectedCandidate `json:"decisions"`
+	FinalOrder        []string            `json:"final_order"`
+	EvidenceThreshold int                 `json:"evidence_threshold"`
 }
 
 type fixtureFinalReceipt struct {
@@ -127,6 +132,7 @@ type fixtureAttempt struct {
 	Fallback             bool
 	LatencyMS            int64
 	Usage                fixtureUsage
+	EvidenceThreshold    int
 }
 
 func runFixtureExperiment(ctx context.Context, options experimentOptions, prepared preparedSnapshot, cases []caseInput, deps dependencies) error {
@@ -150,6 +156,10 @@ func runFixtureExperiment(ctx context.Context, options experimentOptions, prepar
 	retrievalOptions.selectionLimit = options.selectionLimit
 	if options.explorationSlotsSet {
 		retrievalOptions.explorationSlots = options.explorationSlots
+	}
+	if options.evidenceThresholdSet {
+		retrievalOptions.evidenceThreshold = options.evidenceThreshold
+		retrievalOptions.evidenceThresholdSet = true
 	}
 	retrievalOptions.seed = options.seed
 	retrievalOptions, err = normalizeQueryRetrievalOptions(retrievalOptions)
@@ -223,12 +233,16 @@ func fixtureVariantID(base string, options experimentOptions, prepared preparedS
 	if options.seed != nil {
 		seed = fmt.Sprintf("%d", *options.seed)
 	}
-	return fmt.Sprintf("%s__limit=%d__exploration=%d__seed=%s__corpus=%s", base, options.selectionLimit, options.explorationSlots, seed, prepared.digest)
+	threshold := options.evidenceThreshold
+	if !options.evidenceThresholdSet {
+		threshold = queryquality.DefaultEvidenceThreshold
+	}
+	return fmt.Sprintf("%s__limit=%d__exploration=%d__threshold=%d__seed=%s__corpus=%s", base, options.selectionLimit, options.explorationSlots, threshold, seed, prepared.digest)
 }
 
 func runFixtureAttempt(ctx context.Context, options experimentOptions, retrievalOptions queryRetrievalOptions, variant fixtureVariant, input caseInput, runIndex int, prepared preparedSnapshot, entries []cache.Entry, now func() time.Time, metadata recordMetadata) (fixtureAttempt, error) {
 	attemptID := fmt.Sprintf("%s__case=%s__run=%d", variant.VariantID, input.ID, runIndex)
-	meta := fixtureReceiptMeta{AttemptID: attemptID, VariantID: variant.VariantID, ProfileID: variant.Profile.ID, PromptID: variant.Prompt.ID, Provider: variant.Model.Provider, Model: variant.Model.Model, CaseID: input.ID, RunIndex: runIndex}
+	meta := fixtureReceiptMeta{AttemptID: attemptID, VariantID: variant.VariantID, ProfileID: variant.Profile.ID, PromptID: variant.Prompt.ID, Provider: variant.Model.Provider, Model: variant.Model.Model, CaseID: input.ID, RunIndex: runIndex, EvidenceThreshold: retrievalOptions.evidenceThreshold}
 	dir := filepath.Join(filepath.Clean(options.artifactsDir), variant.VariantID, receiptSegment(input.ID), fmt.Sprintf("run-%d", runIndex))
 	queryReceivedAt := now()
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -244,7 +258,7 @@ func runFixtureAttempt(ctx context.Context, options experimentOptions, retrieval
 		seedMode = "explicit"
 	}
 	publicModel := publicModelFixture{ID: variant.Model.ID, Provider: variant.Model.Provider, BaseURL: variant.Model.BaseURL, Model: variant.Model.Model, Temperature: variant.Model.Temperature, Reasoning: variant.Model.Reasoning}
-	if err := write("request.json", fixtureRequestReceipt{Query: input.Query, Mode: input.Mode, SnapshotIdentity: prepared.label, CorpusSHA256: prepared.digest, SelectionLimit: retrievalOptions.selectionLimit, ExplorationSlots: retrievalOptions.explorationSlots, SeedMode: seedMode, Model: publicModel}); err != nil {
+	if err := write("request.json", fixtureRequestReceipt{Query: input.Query, Mode: input.Mode, SnapshotIdentity: prepared.label, CorpusSHA256: prepared.digest, SelectionLimit: retrievalOptions.selectionLimit, ExplorationSlots: retrievalOptions.explorationSlots, EvidenceThreshold: retrievalOptions.evidenceThreshold, SeedMode: seedMode, Model: publicModel}); err != nil {
 		return fixtureAttempt{}, err
 	}
 	policy := CriterionPolicy{RequiredWhenExplicit: append([]string(nil), variant.Profile.RequiredWhenExplicit...), PreferredByDefault: append([]string(nil), variant.Profile.PreferredByDefault...), GoalsToExpand: append([]string(nil), variant.Profile.GoalsToExpand...)}
@@ -283,11 +297,11 @@ func runFixtureAttempt(ctx context.Context, options experimentOptions, retrieval
 		return fixtureAttempt{}, err
 	}
 	trace := &queryRetrievalTrace{Variant: variant.VariantID, Seed: seed, Stages: []stageTrace{{Name: "expansion", Outcome: planOutcome(plan), Source: info.source, FallbackReason: info.fallbackReason, ElapsedMS: call.LatencyMS, InputCount: 1, OutputCount: criterionCount(plan), Plan: &plan}}}
-	if err := write("matching.input.json", fixtureMatchingInput{Plan: plan, SnapshotIdentity: prepared.label, CorpusSHA256: prepared.digest, Parameters: map[string]any{"semantic_required_fail_closed": semanticRequiredFailClosed, "semantic_excluded_fail_closed": semanticExcludedFailClosed}}); err != nil {
+	if err := write("matching.input.json", fixtureMatchingInput{Plan: plan, SnapshotIdentity: prepared.label, CorpusSHA256: prepared.digest, EvidenceThreshold: retrievalOptions.evidenceThreshold, Parameters: map[string]any{"semantic_required_fail_closed": semanticRequiredFailClosed, "semantic_excluded_fail_closed": semanticExcludedFailClosed}}); err != nil {
 		return fixtureAttempt{}, err
 	}
 	matchingStarted := now()
-	matchReq := queryquality.MatchRequest{Plan: plan, CorpusEntries: entries}
+	matchReq := queryquality.MatchRequest{Plan: plan, CorpusEntries: entries, EvidenceThreshold: retrievalOptions.evidenceThreshold, EvidenceThresholdSet: true}
 	eligible, err := newLexicalMatcher(nil).Match(ctx, matchReq)
 	matchingElapsed := elapsedBetween(now(), matchingStarted)
 	if err != nil {
@@ -297,11 +311,12 @@ func runFixtureAttempt(ctx context.Context, options experimentOptions, retrieval
 	for _, candidate := range eligible.Candidates {
 		identities = append(identities, resultIdentity{Slug: candidate.Slug, Title: candidate.Title, Type: "concept"})
 	}
-	trace.Stages = append(trace.Stages, stageTrace{Name: "matching", Outcome: "success", ElapsedMS: matchingElapsed, InputCount: len(entries), OutputCount: eligibleCount(eligible.Candidates), TotalCount: len(eligible.Candidates), Candidates: eligible.Candidates})
+	trace.EvidenceThreshold = retrievalOptions.evidenceThreshold
+	trace.Stages = append(trace.Stages, stageTrace{Name: "matching", Outcome: "success", ElapsedMS: matchingElapsed, InputCount: len(entries), OutputCount: queryquality.QualifiedCount(eligible.Candidates), TotalCount: len(eligible.Candidates), Candidates: eligible.Candidates, EvidenceThreshold: retrievalOptions.evidenceThreshold})
 	if err := write("matching.output.json", fixtureMatchingOutput{CandidateIdentities: identities, Candidates: eligible.Candidates}); err != nil {
 		return fixtureAttempt{}, err
 	}
-	selectionInput := fixtureSelectionInput{Candidates: eligible.Candidates, Limit: retrievalOptions.selectionLimit, ExplorationSlots: retrievalOptions.explorationSlots, EffectiveSeed: seed}
+	selectionInput := fixtureSelectionInput{Candidates: eligible.Candidates, Limit: retrievalOptions.selectionLimit, ExplorationSlots: retrievalOptions.explorationSlots, EvidenceThreshold: retrievalOptions.evidenceThreshold, EffectiveSeed: seed}
 	if err := write("selection.input.json", selectionInput); err != nil {
 		return fixtureAttempt{}, err
 	}
@@ -319,8 +334,8 @@ func runFixtureAttempt(ctx context.Context, options experimentOptions, retrieval
 			resultIdentities = append(resultIdentities, resultIdentity{Slug: decision.Slug, Title: decision.Title, Type: "concept"})
 		}
 	}
-	trace.Stages = append(trace.Stages, stageTrace{Name: "selection", Outcome: "success", ElapsedMS: selectionElapsed, InputCount: len(eligible.Candidates), OutputCount: len(finalOrder), TotalCount: len(selected.Selected), Decisions: selected.Selected})
-	if err := write("selection.output.json", fixtureSelectionOutput{Decisions: selected.Selected, FinalOrder: finalOrder}); err != nil {
+	trace.Stages = append(trace.Stages, stageTrace{Name: "selection", Outcome: "success", ElapsedMS: selectionElapsed, InputCount: len(eligible.Candidates), OutputCount: len(finalOrder), TotalCount: len(selected.Selected), Decisions: selected.Selected, EvidenceThreshold: retrievalOptions.evidenceThreshold})
+	if err := write("selection.output.json", fixtureSelectionOutput{Decisions: selected.Selected, FinalOrder: finalOrder, EvidenceThreshold: retrievalOptions.evidenceThreshold}); err != nil {
 		return fixtureAttempt{}, err
 	}
 	runCompletedAt := now()
@@ -340,7 +355,7 @@ func runFixtureAttempt(ctx context.Context, options experimentOptions, retrieval
 	record.QueryReceivedAt, record.RunCompletedAt, record.DurationMS = queryReceivedAtStr, runCompletedAtStr, durationMS
 	record.VariantID, record.ProfileID, record.PromptID, record.Provider, record.Model = variant.VariantID, variant.Profile.ID, variant.Prompt.ID, variant.Model.Provider, variant.Model.Model
 	selectionDigest := digestJSON(selectionInput)
-	return fixtureAttempt{Record: record, Case: input, Candidates: eligible.Candidates, Decisions: selected.Selected, EffectiveSeed: seed, SelectionInputDigest: selectionDigest, Fallback: plan.Fallback, LatencyMS: call.LatencyMS, Usage: call.Usage}, nil
+	return fixtureAttempt{Record: record, Case: input, Candidates: eligible.Candidates, Decisions: selected.Selected, EffectiveSeed: seed, SelectionInputDigest: selectionDigest, Fallback: plan.Fallback, LatencyMS: call.LatencyMS, Usage: call.Usage, EvidenceThreshold: retrievalOptions.evidenceThreshold}, nil
 }
 
 func elapsedBetween(end, start time.Time) int64 {
@@ -405,6 +420,7 @@ func digestJSON(value any) string {
 
 type summaryDocument struct {
 	SchemaVersion     int               `json:"schema_version"`
+	EvidenceThreshold int               `json:"evidence_threshold"`
 	AttemptCount      int               `json:"attempt_count"`
 	Variants          []variantSummary  `json:"variants"`
 	Totals            summaryMetrics    `json:"totals"`
@@ -412,9 +428,10 @@ type summaryDocument struct {
 }
 
 type variantSummary struct {
-	VariantID string         `json:"variant_id"`
-	Cases     []caseSummary  `json:"cases"`
-	Totals    summaryMetrics `json:"totals"`
+	VariantID         string         `json:"variant_id"`
+	EvidenceThreshold int            `json:"evidence_threshold"`
+	Cases             []caseSummary  `json:"cases"`
+	Totals            summaryMetrics `json:"totals"`
 }
 
 type caseSummary struct {
@@ -487,6 +504,9 @@ func writeFixtureSummary(path string, attempts []fixtureAttempt) error {
 		"score_changed_candidate_rate":  "candidate slugs with differing scores across 2+ runs / candidate slugs observed in 2+ runs",
 		"exact_selection_replay_rate":   "identical selection outputs / repeated attempts with identical effective seed and selection input digest",
 	}}
+	if len(attempts) > 0 {
+		document.EvidenceThreshold = attempts[0].EvidenceThreshold
+	}
 	all := make([]fixtureAttempt, 0, len(attempts))
 	for _, id := range variantIDs {
 		group := byVariant[id]
@@ -501,6 +521,9 @@ func writeFixtureSummary(path string, attempts []fixtureAttempt) error {
 		}
 		sort.Strings(caseIDs)
 		variant := variantSummary{VariantID: id, Cases: make([]caseSummary, 0, len(caseIDs)), Totals: aggregateSummaryMetrics(group)}
+		if len(group) > 0 {
+			variant.EvidenceThreshold = group[0].EvidenceThreshold
+		}
 		for _, caseID := range caseIDs {
 			variant.Cases = append(variant.Cases, caseSummary{CaseID: caseID, Metrics: aggregateSummaryMetrics(casesByID[caseID])})
 		}

@@ -125,6 +125,8 @@ developer workflow and is never used by the deployed worker.
 
 The BFF supports `FIRESTORE_DATABASE_ID`, `PIPELINE_JOB_URL`, and `ALLOWED_ORIGINS` environment overrides. Auth additionally requires the exact `ALLOWED_HOSTS` Host allowlist. Empty database and pipeline values preserve the legacy defaults; configured pipeline URLs must be HTTPS Cloud Run Jobs `:run` URLs on `run.googleapis.com` with the expected resource path.
 
+Query retrieval selection is typed configuration: `query_selection_evidence_threshold` / `QUERY_SELECTION_EVIDENCE_THRESHOLD` defaults to `1` and must be at least `1` in the application; `query_selection_limit` / `QUERY_SELECTION_LIMIT` defaults to `10` and accepts `1..1000`; `query_selection_exploration_slots` / `QUERY_SELECTION_EXPLORATION_SLOTS` defaults to `1` and accepts `0..limit`. The selection limit is a maximum. Candidates are returned only when hard-eligible and qualified by the resolved evidence threshold; an empty result reports insufficient evidence rather than corpus or world absence.
+
 ## Useful Commands
 
 ```sh

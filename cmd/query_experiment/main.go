@@ -24,6 +24,15 @@ func main() {
 	flag.IntVar(&options.selectionLimit, "selection-limit", defaultLimit, "query-retrieval maximum selected concepts")
 	flag.IntVar(&options.explorationSlots, "exploration-slots", 1, "query-retrieval selected concepts reserved for exploration")
 	options.explorationSlotsSet = true
+	flag.Func("evidence-threshold", "query-retrieval minimum independent evidence dimensions; explicit zero is trusted-local legacy control", func(value string) error {
+		parsed, err := strconv.Atoi(value)
+		if err != nil {
+			return err
+		}
+		options.evidenceThreshold = parsed
+		options.evidenceThresholdSet = true
+		return nil
+	})
 	var seed int64
 	var seedSet bool
 	flag.Func("seed", "query-retrieval signed selection seed; query-derived when omitted", func(value string) error {

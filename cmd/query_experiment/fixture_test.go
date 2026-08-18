@@ -142,6 +142,9 @@ func TestFixtureRunWritesEightReceiptsAndSummaryWithoutKey(t *testing.T) {
 	if record.VariantID == "" || record.ProfileID != "profile" || record.PromptID != "prompt" || record.Provider != "fake" || record.Model != "selected" {
 		t.Fatalf("record identity=%#v", record)
 	}
+	if record.EvidenceThreshold != 1 || !strings.Contains(record.VariantID, "threshold=1") {
+		t.Fatalf("record threshold=%d variant=%q, want resolved threshold 1 in identity", record.EvidenceThreshold, record.VariantID)
+	}
 	variantDir := filepath.Join(artifacts, record.VariantID, "case", "run-1")
 	for _, name := range []string{"request.json", "expansion.input.json", "expansion.output.json", "matching.input.json", "matching.output.json", "selection.input.json", "selection.output.json", "final.json"} {
 		data, err := os.ReadFile(filepath.Join(variantDir, name))
@@ -155,13 +158,16 @@ func TestFixtureRunWritesEightReceiptsAndSummaryWithoutKey(t *testing.T) {
 		if err := json.Unmarshal(data, &object); err != nil || object["attempt_id"] == nil || object["variant_id"] == nil {
 			t.Fatalf("receipt %s metadata=%v err=%v", name, object, err)
 		}
+		if object["evidence_threshold"] != float64(1) {
+			t.Fatalf("receipt %s threshold=%v, want 1", name, object["evidence_threshold"])
+		}
 	}
 	var summary map[string]any
 	data, err := os.ReadFile(summaryPath)
 	if err != nil || json.Unmarshal(data, &summary) != nil || summary["variants"] == nil || summary["attempt_count"] != float64(1) {
 		t.Fatalf("summary=%s err=%v", data, err)
 	}
-	if strings.Contains(string(data), "fixture-secret") || strings.Contains(string(data), "api_key") {
+	if strings.Contains(string(data), "fixture-secret") || strings.Contains(string(data), "api_key") || summary["evidence_threshold"] != float64(1) {
 		t.Fatalf("summary leaked credentials: %s", data)
 	}
 }

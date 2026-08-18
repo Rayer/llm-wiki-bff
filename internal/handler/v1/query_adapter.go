@@ -19,5 +19,7 @@ func mapQueryResult(result query.Result) handler.QueryResponse {
 		Expand:    result.Expand,
 		AISynth:   result.AISynth,
 		Citations: result.Citations,
+		Status:    result.Status,
+		Reason:    result.Reason,
 	}
 }

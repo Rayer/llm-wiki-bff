@@ -1158,6 +1158,12 @@ func TestBFFDevWorkflowUsesCanonicalRevisionTransaction(t *testing.T) {
 		`REMOTE_SHA=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${GITHUB_REF_NAME}" --jq .object.sha)`,
 		`[[ ! "$REMOTE_SHA" =~ ^[0-9a-f]{40}$ ]]`,
 		"Cloud Run traffic changed before cutover; refusing to mutate traffic.",
+		"QUERY_SELECTION_LIMIT: 10",
+		"QUERY_SELECTION_EXPLORATION_SLOTS: 1",
+		"QUERY_SELECTION_EVIDENCE_THRESHOLD: 1",
+		"QUERY_SELECTION_LIMIT=${{ env.QUERY_SELECTION_LIMIT }}",
+		"QUERY_SELECTION_EXPLORATION_SLOTS=${{ env.QUERY_SELECTION_EXPLORATION_SLOTS }}",
+		"QUERY_SELECTION_EVIDENCE_THRESHOLD=${{ env.QUERY_SELECTION_EVIDENCE_THRESHOLD }}",
 	} {
 		if !strings.Contains(contents, want) {
 			t.Errorf("BFF workflow missing contract %q", want)

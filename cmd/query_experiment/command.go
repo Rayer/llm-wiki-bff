@@ -29,24 +29,26 @@ const (
 )
 
 type experimentOptions struct {
-	snapshotPath        string
-	casesPath           string
-	runs                int
-	outputPath          string
-	configDir           string
-	service             string
-	selectionLimit      int
-	explorationSlots    int
-	explorationSlotsSet bool
-	seed                *int64
-	modelFixturePath    string
-	models              string
-	profileFixturePath  string
-	profiles            string
-	promptFixturePath   string
-	prompts             string
-	artifactsDir        string
-	summaryPath         string
+	snapshotPath         string
+	casesPath            string
+	runs                 int
+	outputPath           string
+	configDir            string
+	service              string
+	selectionLimit       int
+	explorationSlots     int
+	explorationSlotsSet  bool
+	evidenceThreshold    int
+	evidenceThresholdSet bool
+	seed                 *int64
+	modelFixturePath     string
+	models               string
+	profileFixturePath   string
+	profiles             string
+	promptFixturePath    string
+	prompts              string
+	artifactsDir         string
+	summaryPath          string
 }
 
 type caseInput struct {
@@ -106,6 +108,7 @@ type resultRecord struct {
 	VariantID           string               `json:"variant_id,omitempty"`
 	ProfileID           string               `json:"profile_id,omitempty"`
 	PromptID            string               `json:"prompt_id,omitempty"`
+	EvidenceThreshold   int                  `json:"evidence_threshold,omitempty"`
 	QueryRetrievalTrace *queryRetrievalTrace `json:"three_host_trace,omitempty"`
 }
 
@@ -398,6 +401,10 @@ func runExperiment(ctx context.Context, options experimentOptions, deps dependen
 		if options.explorationSlotsSet {
 			queryRetrievalOptions.explorationSlots = options.explorationSlots
 		}
+		if options.evidenceThresholdSet {
+			queryRetrievalOptions.evidenceThreshold = options.evidenceThreshold
+			queryRetrievalOptions.evidenceThresholdSet = true
+		}
 		queryRetrievalOptions.seed = options.seed
 		queryRetrievalOptions.seedFor = deps.queryRetrievalSeed
 		executor, err = deps.newQueryRetrievalExecutor(prepared.cache, cfg, queryRetrievalOptions)
@@ -523,6 +530,9 @@ func makeResultRecordWithTrace(input caseInput, runIndex int, snapshot preparedS
 		Provider:            metadata.provider,
 		Model:               metadata.model,
 		QueryRetrievalTrace: trace,
+	}
+	if trace != nil {
+		record.EvidenceThreshold = trace.EvidenceThreshold
 	}
 	if executeErr != nil {
 		record.ErrorStage = "execute"

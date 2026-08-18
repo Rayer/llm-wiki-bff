@@ -38,6 +38,8 @@ type QueryResponse struct {
 	Expand    *llm.ExpandResult `json:"expand,omitempty"`
 	AISynth   string            `json:"ai_synth,omitempty"`
 	Citations []search.Citation `json:"citations,omitempty"`
+	Status    string            `json:"status,omitempty"`
+	Reason    string            `json:"reason,omitempty"`
 }
 
 // SourcesListResponse is the response for a sources list endpoint.

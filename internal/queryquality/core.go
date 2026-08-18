@@ -22,25 +22,34 @@ import (
 
 const (
 	DefaultSelectionLimit      = 10
+	DefaultEvidenceThreshold   = 1
 	maxSelectionLimit          = 1000
 	semanticRequiredFailClosed = true
 	semanticExcludedFailClosed = true
 )
 
 type Options struct {
-	SelectionLimit   int
-	ExplorationSlots int
-	Seed             *int64
-	SeedFor          func(string) int64
+	SelectionLimit       int
+	ExplorationSlots     int
+	EvidenceThreshold    int
+	EvidenceThresholdSet bool
+	Seed                 *int64
+	SeedFor              func(string) int64
 }
 
 func DefaultOptions() Options {
-	return Options{SelectionLimit: DefaultSelectionLimit, ExplorationSlots: 1}
+	return Options{SelectionLimit: DefaultSelectionLimit, ExplorationSlots: 1, EvidenceThreshold: DefaultEvidenceThreshold}
 }
 
 func NormalizeOptions(options Options) (Options, error) {
 	if options.SelectionLimit == 0 {
 		options.SelectionLimit = DefaultSelectionLimit
+	}
+	if !options.EvidenceThresholdSet {
+		options.EvidenceThreshold = DefaultEvidenceThreshold
+	}
+	if options.EvidenceThreshold < 0 {
+		return Options{}, errors.New("evidence threshold must not be negative")
 	}
 	if options.SelectionLimit < 1 || options.SelectionLimit > maxSelectionLimit {
 		return Options{}, fmt.Errorf("selection limit must be between 1 and %d", maxSelectionLimit)
@@ -96,13 +105,20 @@ type GroupEvidence struct {
 }
 
 type CandidateEvidence struct {
-	Slug            string          `json:"slug"`
-	Title           string          `json:"title"`
-	Eligible        bool            `json:"eligible"`
-	Rejection       string          `json:"rejection,omitempty"`
-	Groups          []GroupEvidence `json:"groups,omitempty"`
-	SemanticOutcome string          `json:"semantic_outcome,omitempty"`
-	Score           int             `json:"score"`
+	Slug                       string          `json:"slug"`
+	Title                      string          `json:"title"`
+	Eligible                   bool            `json:"eligible"`
+	Rejection                  string          `json:"rejection,omitempty"`
+	Groups                     []GroupEvidence `json:"groups,omitempty"`
+	SemanticOutcome            string          `json:"semantic_outcome,omitempty"`
+	SemanticResolution         string          `json:"semantic_resolution"`
+	ExactIdentityEvidence      bool            `json:"exact_identity_evidence"`
+	PositiveEvidenceDimensions []string        `json:"positive_evidence_dimensions,omitempty"`
+	PositiveEvidenceCount      int             `json:"positive_evidence_count"`
+	Qualified                  bool            `json:"qualified"`
+	QualificationReason        string          `json:"qualification_reason"`
+	EvidenceThreshold          int             `json:"evidence_threshold"`
+	Score                      int             `json:"score"`
 }
 
 type EligibilityResult struct{ Candidates []CandidateEvidence }
@@ -113,8 +129,10 @@ type ExpansionRequest struct {
 }
 
 type MatchRequest struct {
-	Plan          QueryPlan
-	CorpusEntries []cache.Entry
+	Plan                 QueryPlan
+	CorpusEntries        []cache.Entry
+	EvidenceThreshold    int
+	EvidenceThresholdSet bool
 }
 
 type SelectionInput struct {
@@ -618,7 +636,7 @@ func (s *QueryRetrievalPipeline) ExecuteWithTrace(ctx context.Context, reader ca
 	if err := s.validate(); err != nil {
 		return query.Result{}, nil, err
 	}
-	trace := &Trace{Variant: "query-retrieval-v1"}
+	trace := &Trace{Variant: "query-retrieval-v1", EvidenceThreshold: resolvedEvidenceThreshold(s.options)}
 	result, err := s.execute(ctx, reader, request, trace)
 	return result, trace, err
 }
@@ -631,6 +649,9 @@ func (s *QueryRetrievalPipeline) validate() error {
 }
 
 func (s *QueryRetrievalPipeline) execute(ctx context.Context, reader cache.Reader, request query.Request, trace *Trace) (query.Result, error) {
+	if recorder := query.ReceiptRecorderFromContext(ctx); recorder != nil {
+		recorder.SetRetrievalConfig(s.options.SelectionLimit, s.options.ExplorationSlots, resolvedEvidenceThreshold(s.options))
+	}
 	cacheCtx := ctx
 	if recorder := query.ReceiptRecorderFromContext(ctx); recorder != nil {
 		cacheCtx = recorder.StartStage(ctx, "cache_load", "", "", "")
@@ -695,7 +716,7 @@ func (s *QueryRetrievalPipeline) execute(ctx context.Context, reader cache.Reade
 	if recorder := query.ReceiptRecorderFromContext(ctx); recorder != nil {
 		matchCtx = recorder.StartStage(ctx, "candidate_matching", "", "", "")
 	}
-	matchReq := MatchRequest{Plan: plan, CorpusEntries: entries}
+	matchReq := MatchRequest{Plan: plan, CorpusEntries: entries, EvidenceThreshold: s.options.EvidenceThreshold, EvidenceThresholdSet: s.options.EvidenceThresholdSet}
 	eligible, err := s.candidateMatcher.Match(matchCtx, matchReq)
 	if err != nil {
 		query.FinishStage(matchCtx, "failure")
@@ -708,7 +729,7 @@ func (s *QueryRetrievalPipeline) execute(ctx context.Context, reader cache.Reade
 		}
 		return query.Result{}, fmt.Errorf("query-retrieval matching failed: %w", err)
 	}
-	appendTraceStage(trace, StageTrace{Name: "matching", Outcome: "success", ElapsedMS: elapsedSince(started), InputCount: len(entries), OutputCount: EligibleCount(eligible.Candidates), TotalCount: len(eligible.Candidates), Candidates: eligible.Candidates})
+	appendTraceStage(trace, StageTrace{Name: "matching", Outcome: "success", ElapsedMS: elapsedSince(started), InputCount: len(entries), OutputCount: QualifiedCount(eligible.Candidates), TotalCount: len(eligible.Candidates), Candidates: eligible.Candidates, EvidenceThreshold: resolvedEvidenceThreshold(s.options)})
 	query.FinishStage(matchCtx, "success")
 
 	started = time.Now()
@@ -728,7 +749,7 @@ func (s *QueryRetrievalPipeline) execute(ctx context.Context, reader cache.Reade
 		}
 		return query.Result{}, fmt.Errorf("query-retrieval selection failed: %w", err)
 	}
-	appendTraceStage(trace, StageTrace{Name: "selection", Outcome: "success", ElapsedMS: elapsedSince(started), InputCount: len(eligible.Candidates), OutputCount: selectedCount(selected.Selected), TotalCount: len(selected.Selected), Decisions: selected.Selected})
+	appendTraceStage(trace, StageTrace{Name: "selection", Outcome: "success", ElapsedMS: elapsedSince(started), InputCount: len(eligible.Candidates), OutputCount: selectedCount(selected.Selected), TotalCount: len(selected.Selected), Decisions: selected.Selected, EvidenceThreshold: resolvedEvidenceThreshold(s.options)})
 	query.FinishStage(selectionCtx, "success")
 	results := make([]search.Result, 0, len(selected.Selected))
 	for _, candidate := range selected.Selected {
@@ -739,7 +760,11 @@ func (s *QueryRetrievalPipeline) execute(ctx context.Context, reader cache.Reade
 			results = append(results, search.Result{Slug: candidate.Slug, Title: candidate.Title, Type: "concept"})
 		}
 	}
-	return query.Result{Query: request.Query, Mode: request.Mode, Results: results, Expand: expandFromPlan(plan)}, nil
+	status, reason := "ok", "qualified_evidence"
+	if len(results) == 0 {
+		status, reason = "insufficient_evidence", "no_qualified_evidence"
+	}
+	return query.Result{Query: request.Query, Mode: request.Mode, Results: results, Expand: expandFromPlan(plan), Status: status, Reason: reason}, nil
 }
 
 func providerIdentity(expander QueryExpander) (string, string, string) {
@@ -780,23 +805,32 @@ func expandFromPlan(plan QueryPlan) *llm.ExpandResult {
 }
 
 type Trace struct {
-	Variant string       `json:"variant"`
-	Seed    int64        `json:"seed"`
-	Stages  []StageTrace `json:"stages"`
+	Variant           string       `json:"variant"`
+	Seed              int64        `json:"seed"`
+	EvidenceThreshold int          `json:"evidence_threshold"`
+	Stages            []StageTrace `json:"stages"`
+}
+
+func resolvedEvidenceThreshold(options Options) int {
+	if options.EvidenceThresholdSet {
+		return options.EvidenceThreshold
+	}
+	return DefaultEvidenceThreshold
 }
 
 type StageTrace struct {
-	Name           string              `json:"name"`
-	Outcome        string              `json:"outcome"`
-	Source         string              `json:"source,omitempty"`
-	ElapsedMS      int64               `json:"elapsed_ms"`
-	InputCount     int                 `json:"input_count"`
-	OutputCount    int                 `json:"output_count"`
-	TotalCount     int                 `json:"total_count,omitempty"`
-	FallbackReason string              `json:"fallback_reason,omitempty"`
-	Plan           *QueryPlan          `json:"plan,omitempty"`
-	Candidates     []CandidateEvidence `json:"candidates,omitempty"`
-	Decisions      []SelectedCandidate `json:"decisions,omitempty"`
+	Name              string              `json:"name"`
+	Outcome           string              `json:"outcome"`
+	Source            string              `json:"source,omitempty"`
+	ElapsedMS         int64               `json:"elapsed_ms"`
+	InputCount        int                 `json:"input_count"`
+	OutputCount       int                 `json:"output_count"`
+	TotalCount        int                 `json:"total_count,omitempty"`
+	FallbackReason    string              `json:"fallback_reason,omitempty"`
+	Plan              *QueryPlan          `json:"plan,omitempty"`
+	Candidates        []CandidateEvidence `json:"candidates,omitempty"`
+	Decisions         []SelectedCandidate `json:"decisions,omitempty"`
+	EvidenceThreshold int                 `json:"evidence_threshold,omitempty"`
 }
 
 func elapsedSince(start time.Time) int64 {
@@ -822,6 +856,16 @@ func EligibleCount(candidates []CandidateEvidence) int {
 	count := 0
 	for _, candidate := range candidates {
 		if candidate.Eligible {
+			count++
+		}
+	}
+	return count
+}
+
+func QualifiedCount(candidates []CandidateEvidence) int {
+	count := 0
+	for _, candidate := range candidates {
+		if candidate.Eligible && candidate.Qualified {
 			count++
 		}
 	}
@@ -870,12 +914,19 @@ func NewLexicalMatcher(semantic SemanticEvaluator) CandidateMatcher {
 }
 
 func (m lexicalMatcher) Match(ctx context.Context, request MatchRequest) (EligibilityResult, error) {
+	threshold := request.EvidenceThreshold
+	if !request.EvidenceThresholdSet {
+		threshold = DefaultEvidenceThreshold
+	}
+	if threshold < 0 {
+		return EligibilityResult{}, errors.New("evidence threshold must not be negative")
+	}
 	candidates := make([]CandidateEvidence, 0, len(request.CorpusEntries))
 	for _, entry := range request.CorpusEntries {
 		if err := ctx.Err(); err != nil {
 			return EligibilityResult{}, err
 		}
-		candidate := CandidateEvidence{Slug: entry.Slug, Title: entry.Title, Eligible: true}
+		candidate := CandidateEvidence{Slug: entry.Slug, Title: entry.Title, Eligible: true, EvidenceThreshold: threshold}
 		fields := searchableFields(entry)
 		for _, role := range []struct {
 			name       string
@@ -894,35 +945,34 @@ func (m lexicalMatcher) Match(ctx context.Context, request MatchRequest) (Eligib
 			}
 			candidate.Groups = append(candidate.Groups, groups...)
 			for _, group := range groups {
-				if group.SemanticOutcome == "unavailable" || group.SemanticOutcome == "unknown" {
-					candidate.SemanticOutcome = group.SemanticOutcome
-				}
-				if role.name == "required" && group.SemanticOutcome != "" && group.SemanticOutcome != "pass" && role.failClosed {
+				if role.name == "required" && group.SemanticOutcome != "" && group.SemanticOutcome != "matched" && role.failClosed {
 					candidate.Eligible = false
-					candidate.Rejection = "semantic_required_not_satisfied"
+					candidate.Rejection = "semantic_required_" + group.SemanticOutcome
 				}
-				if role.name == "excluded" && group.SemanticOutcome == "pass" {
+				if role.name == "excluded" && group.SemanticOutcome == "matched" {
 					candidate.Eligible = false
 					candidate.Rejection = "excluded_criterion_matched"
-				}
-				if role.name == "excluded" && (group.SemanticOutcome == "unknown" || group.SemanticOutcome == "unavailable") {
-					candidate.Eligible = false
-					candidate.Rejection = "semantic_excluded_unavailable"
 				}
 			}
 		}
 		for _, criterion := range request.Plan.Required {
-			if criterion.Proof != "semantic" && !hasMatchedGroup(candidate.Groups, criterion) {
+			if criterion.Proof != "semantic" && !hasMatchedGroup(candidate.Groups, "required", criterion) {
 				candidate.Eligible = false
 				candidate.Rejection = "required_" + criterion.Kind + "_not_matched"
 				break
 			}
 		}
-		if candidate.Eligible && hasAnyMatchedGroup(candidate.Groups, request.Plan.Excluded) {
+		if candidate.Eligible && hasAnyMatchedGroup(candidate.Groups, "excluded", request.Plan.Excluded) {
 			candidate.Eligible = false
 			candidate.Rejection = "excluded_criterion_matched"
 		}
+		candidate.SemanticResolution = semanticResolution(candidate.Groups)
+		candidate.SemanticOutcome = candidate.SemanticResolution
+		candidate.ExactIdentityEvidence = hasExactRequiredIdentity(request.Plan, candidate.Groups)
+		candidate.PositiveEvidenceDimensions = positiveEvidenceDimensions(request.Plan, candidate.Groups)
+		candidate.PositiveEvidenceCount = len(candidate.PositiveEvidenceDimensions)
 		candidate.Score = independentDimensionScore(request.Plan, candidate.Groups)
+		candidate.Qualified, candidate.QualificationReason = qualifyCandidate(candidate, threshold)
 		candidates = append(candidates, candidate)
 	}
 	return EligibilityResult{Candidates: candidates}, nil
@@ -935,7 +985,7 @@ func matchRole(ctx context.Context, role string, criteria []Criterion, fields ma
 			return nil, err
 		}
 		if criterion.Proof == "semantic" {
-			outcome := "unavailable"
+			outcome := "unresolved"
 			if evaluator != nil {
 				decision, err := evaluator.Evaluate(ctx, criterion, entry)
 				if err != nil {
@@ -957,10 +1007,14 @@ func matchRole(ctx context.Context, role string, criteria []Criterion, fields ma
 
 func safeSemanticOutcome(outcome string) string {
 	switch outcome {
-	case "pass", "fail", "unknown", "unavailable":
-		return outcome
+	case "pass", "matched":
+		return "matched"
+	case "fail", "not_matched":
+		return "not_matched"
+	case "unknown", "unavailable", "unresolved":
+		return "unresolved"
 	default:
-		return "unknown"
+		return "unresolved"
 	}
 }
 
@@ -981,7 +1035,7 @@ func matchGroupsForRole(ctx context.Context, criteria []Criterion, role string, 
 			return nil, err
 		}
 		if criterion.Proof == "semantic" {
-			groups = append(groups, GroupEvidence{Role: role, Kind: criterion.Kind, Value: criterion.Value, SemanticOutcome: "unavailable"})
+			groups = append(groups, GroupEvidence{Role: role, Kind: criterion.Kind, Value: criterion.Value, SemanticOutcome: "unresolved"})
 			continue
 		}
 		group := GroupEvidence{Role: role, Kind: criterion.Kind, Value: criterion.Value}
@@ -1009,18 +1063,27 @@ func matchGroupsForRole(ctx context.Context, criteria []Criterion, role string, 
 	return groups, nil
 }
 
-func hasMatchedGroup(groups []GroupEvidence, criterion Criterion) bool {
+func hasMatchedGroup(groups []GroupEvidence, role string, criterion Criterion) bool {
 	for _, group := range groups {
-		if group.Kind == criterion.Kind && group.Value == criterion.Value && len(group.Matches) > 0 {
-			return true
+		if group.Role != role || normalizeKind(group.Kind) != normalizeKind(criterion.Kind) || group.Value != criterion.Value {
+			continue
+		}
+		for _, match := range group.Matches {
+			for _, matchedTerm := range match.Terms {
+				for _, term := range criterion.Terms {
+					if strings.EqualFold(matchedTerm, term) {
+						return true
+					}
+				}
+			}
 		}
 	}
 	return false
 }
 
-func hasAnyMatchedGroup(groups []GroupEvidence, criteria []Criterion) bool {
+func hasAnyMatchedGroup(groups []GroupEvidence, role string, criteria []Criterion) bool {
 	for _, criterion := range criteria {
-		if hasMatchedGroup(groups, criterion) {
+		if hasMatchedGroup(groups, role, criterion) {
 			return true
 		}
 	}
@@ -1028,17 +1091,102 @@ func hasAnyMatchedGroup(groups []GroupEvidence, criteria []Criterion) bool {
 }
 
 func independentDimensionScore(plan QueryPlan, groups []GroupEvidence) int {
-	criteria := append([]Criterion{}, plan.Preferred...)
-	criteria = append(criteria, plan.SupportingDimensions...)
-	criteria = append(criteria, plan.Goals...)
-	criteria = append(criteria, plan.AcceptableAlternatives...)
-	seen := make(map[string]struct{})
-	for _, criterion := range criteria {
-		if criterion.Proof != "semantic" && hasMatchedGroup(groups, criterion) {
-			seen[strings.ToLower(strings.TrimSpace(criterion.Kind))] = struct{}{}
+	return len(positiveEvidenceDimensions(plan, groups))
+}
+
+func normalizeKind(kind string) string {
+	return strings.ReplaceAll(strings.ToLower(strings.TrimSpace(kind)), "_", "-")
+}
+
+func exactIdentityKind(kind string) bool {
+	switch normalizeKind(kind) {
+	case "entity", "name", "entity-name", "venue-name":
+		return true
+	default:
+		return false
+	}
+}
+
+func hasExactRequiredIdentity(plan QueryPlan, groups []GroupEvidence) bool {
+	for _, criterion := range plan.Required {
+		if exactIdentityKind(criterion.Kind) && criterion.Proof != "semantic" && hasMatchedGroup(groups, "required", criterion) {
+			for _, group := range groups {
+				if group.Role != "required" || normalizeKind(group.Kind) != normalizeKind(criterion.Kind) || group.Value != criterion.Value {
+					continue
+				}
+				for _, match := range group.Matches {
+					if match.Field == "title" && len(match.Terms) > 0 {
+						return true
+					}
+				}
+			}
 		}
 	}
-	return len(seen)
+	return false
+}
+
+func positiveEvidenceDimensions(plan QueryPlan, groups []GroupEvidence) []string {
+	roleCriteria := []struct {
+		role     string
+		criteria []Criterion
+	}{
+		{"preferred", plan.Preferred},
+		{"supporting", plan.SupportingDimensions},
+		{"goal", plan.Goals},
+		{"alternative", plan.AcceptableAlternatives},
+	}
+	seen := make(map[string]struct{})
+	dimensions := make([]string, 0, len(plan.Preferred)+len(plan.SupportingDimensions)+len(plan.Goals)+len(plan.AcceptableAlternatives))
+	for _, rc := range roleCriteria {
+		for _, criterion := range rc.criteria {
+			if criterion.Proof == "semantic" || !hasMatchedGroup(groups, rc.role, criterion) {
+				continue
+			}
+			kind := normalizeKind(criterion.Kind)
+			if _, exists := seen[kind]; exists {
+				continue
+			}
+			seen[kind] = struct{}{}
+			dimensions = append(dimensions, kind)
+		}
+	}
+	return dimensions
+}
+
+func semanticResolution(groups []GroupEvidence) string {
+	seen := ""
+	for _, group := range groups {
+		switch group.SemanticOutcome {
+		case "unresolved":
+			return "unresolved"
+		case "matched":
+			seen = "matched"
+		case "not_matched":
+			if seen == "" {
+				seen = "not_matched"
+			}
+		}
+	}
+	return seen
+}
+
+func qualifyCandidate(candidate CandidateEvidence, threshold int) (bool, string) {
+	if !candidate.Eligible {
+		return false, "hard_ineligible"
+	}
+	if candidate.ExactIdentityEvidence {
+		return true, "exact_identity_evidence"
+	}
+	if candidate.SemanticResolution == "unresolved" && candidate.PositiveEvidenceCount == 0 {
+		return false, "unresolved_semantic_evidence"
+	}
+	if threshold == 0 {
+		return true, "legacy_threshold_zero"
+	}
+	if candidate.PositiveEvidenceCount >= threshold {
+		return true, "evidence_threshold_met"
+	}
+	return false, "evidence_below_threshold"
 }
 
 func ContainsString(values []string, want string) bool {
@@ -1074,7 +1222,7 @@ func (randomSelector) Select(ctx context.Context, input SelectionInput) (Selecti
 		if err := ctx.Err(); err != nil {
 			return SelectionResult{}, err
 		}
-		if candidate.Eligible {
+		if candidate.Eligible && candidate.Qualified {
 			eligible = append(eligible, candidate)
 		}
 	}
@@ -1125,7 +1273,12 @@ func (randomSelector) Select(ctx context.Context, input SelectionInput) (Selecti
 		}
 		reason := "selection_omission"
 		if !candidate.Eligible {
-			reason = "ineligible"
+			reason = candidate.Rejection
+			if reason == "" {
+				reason = "ineligible"
+			}
+		} else if !candidate.Qualified {
+			reason = candidate.QualificationReason
 		}
 		decisions = append(decisions, selectionDecision(candidate, false, reason, false))
 	}
