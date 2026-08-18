@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -18,6 +19,57 @@ func TestLoadDefaultsQueryExpansionModel(t *testing.T) {
 	}
 	if cfg.AnswerSynthesisModel != "deepseek-v4-pro" || cfg.AnswerSynthesisReasoning != "none" {
 		t.Fatalf("synthesis config = %#v, want pro/none", cfg)
+	}
+}
+
+func TestLoadQuerySelectionDefaultsAndTypedEnv(t *testing.T) {
+	t.Setenv("QUERY_SELECTION_LIMIT", "")
+	t.Setenv("QUERY_SELECTION_EXPLORATION_SLOTS", "")
+	t.Setenv("QUERY_SELECTION_EVIDENCE_THRESHOLD", "")
+	cfg, err := Load(writeConfig(t, "dev_jwt = true\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.QuerySelectionLimit != DefaultQuerySelectionLimit || cfg.QuerySelectionExplorationSlots != DefaultQuerySelectionExplorationSlots || cfg.QuerySelectionEvidenceThreshold != DefaultQuerySelectionEvidenceThreshold {
+		t.Fatalf("query selection defaults = %#v", cfg)
+	}
+	t.Setenv("QUERY_SELECTION_LIMIT", "7")
+	t.Setenv("QUERY_SELECTION_EXPLORATION_SLOTS", "2")
+	t.Setenv("QUERY_SELECTION_EVIDENCE_THRESHOLD", "3")
+	cfg, err = Load(writeConfig(t, "dev_jwt = true\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.QuerySelectionLimit != 7 || cfg.QuerySelectionExplorationSlots != 2 || cfg.QuerySelectionEvidenceThreshold != 3 {
+		t.Fatalf("query selection env = %#v", cfg)
+	}
+}
+
+func TestLoadRejectsMalformedOrUnsafeQuerySelectionConfig(t *testing.T) {
+	tests := []struct {
+		name string
+		env  string
+	}{
+		{name: "threshold zero", env: "QUERY_SELECTION_EVIDENCE_THRESHOLD=0"},
+		{name: "threshold malformed", env: "QUERY_SELECTION_EVIDENCE_THRESHOLD=nope"},
+		{name: "limit zero", env: "QUERY_SELECTION_LIMIT=0"},
+		{name: "limit too large", env: "QUERY_SELECTION_LIMIT=1001"},
+		{name: "exploration negative", env: "QUERY_SELECTION_EXPLORATION_SLOTS=-1"},
+		{name: "exploration over limit", env: "QUERY_SELECTION_LIMIT=2\nQUERY_SELECTION_EXPLORATION_SLOTS=3"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv("QUERY_SELECTION_LIMIT", "")
+			t.Setenv("QUERY_SELECTION_EXPLORATION_SLOTS", "")
+			t.Setenv("QUERY_SELECTION_EVIDENCE_THRESHOLD", "")
+			for _, line := range strings.Split(test.env, "\n") {
+				parts := strings.SplitN(line, "=", 2)
+				t.Setenv(parts[0], parts[1])
+			}
+			if _, err := Load(writeConfig(t, "dev_jwt = true\n")); err == nil {
+				t.Fatal("Load() accepted invalid query selection configuration")
+			}
+		})
 	}
 }
 

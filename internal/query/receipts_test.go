@@ -10,6 +10,7 @@ import (
 
 func TestReceiptRecordsDistinctStagesCallsAndRedactsSensitiveValues(t *testing.T) {
 	ctx, recorder := WithReceipt(context.Background())
+	recorder.SetRetrievalConfig(10, 1, 2)
 	expansion := recorder.StartStage(ctx, "query_expansion", "deepseek", "deepseek-v4-flash", "none")
 	finishCall := recorder.StartCall("query_expansion", "deepseek-v4-flash", "none")
 	time.Sleep(time.Millisecond)
@@ -22,6 +23,9 @@ func TestReceiptRecordsDistinctStagesCallsAndRedactsSensitiveValues(t *testing.T
 	got := recorder.Receipt()
 	if len(got.Stages) != 2 || len(got.HostCalls) != 1 || got.HostCalls[0].Sequence != 1 {
 		t.Fatalf("receipt = %#v", got)
+	}
+	if got.SelectionLimit != 10 || got.ExplorationSlots != 1 || got.EvidenceThreshold != 2 {
+		t.Fatalf("retrieval config receipt = %#v", got)
 	}
 	if got.HostCalls[0].Stage != "query_expansion" || got.HostCalls[0].Outcome != "provider_error" || got.HostCalls[0].Scheme != "https" || got.HostCalls[0].Host != "api.deepseek.com" {
 		t.Fatalf("host call = %#v", got.HostCalls[0])

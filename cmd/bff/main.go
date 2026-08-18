@@ -165,6 +165,18 @@ func main() {
 }
 
 func newProductionQueryExecutor(cfg config.Config, conceptCache *conceptcache.Cache) (query.Executor, error) {
+	selectionLimit := cfg.QuerySelectionLimit
+	if selectionLimit == 0 {
+		selectionLimit = config.DefaultQuerySelectionLimit
+	}
+	explorationSlots := cfg.QuerySelectionExplorationSlots
+	if cfg.QuerySelectionLimit == 0 && explorationSlots == 0 {
+		explorationSlots = config.DefaultQuerySelectionExplorationSlots
+	}
+	evidenceThreshold := cfg.QuerySelectionEvidenceThreshold
+	if evidenceThreshold == 0 {
+		evidenceThreshold = config.DefaultQuerySelectionEvidenceThreshold
+	}
 	if cfg.QueryExpansionModel == "" {
 		cfg.QueryExpansionModel = config.DefaultQueryExpansionModel
 	}
@@ -192,7 +204,10 @@ func newProductionQueryExecutor(cfg config.Config, conceptCache *conceptcache.Ca
 		return nil, err
 	}
 	legacy := query.NewService(conceptCache, legacyExpander, synthesisClient)
-	return queryquality.NewProductionExecutor(conceptCache, expansionProvider, legacy, legacy, queryquality.DefaultOptions())
+	return queryquality.NewProductionExecutor(conceptCache, expansionProvider, legacy, legacy, queryquality.Options{
+		SelectionLimit: selectionLimit, ExplorationSlots: explorationSlots,
+		EvidenceThreshold: evidenceThreshold, EvidenceThresholdSet: true,
+	})
 }
 
 type rawScrapeHandler interface {

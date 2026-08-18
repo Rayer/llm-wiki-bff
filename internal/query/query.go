@@ -30,6 +30,8 @@ type Result struct {
 	Expand    *llm.ExpandResult
 	AISynth   string
 	Citations []search.Citation
+	Status    string
+	Reason    string
 }
 
 // Executor is the narrow seam used by transport adapters.

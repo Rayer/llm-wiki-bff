@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"strconv"
 	"strings"
 
 	"github.com/rayer/llm-wiki-bff/internal/llm"
@@ -12,15 +13,19 @@ import (
 
 // Default pipeline quota limits (LWC-138).
 const (
-	DefaultPipelineDailyLimit                     = 2
-	DefaultPipelineCooldownSeconds                = 3600
-	DefaultPipelineMinNewRaw                      = 1
-	DefaultPipelineJobURL                         = "https://run.googleapis.com/v2/projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline:run"
-	DefaultAuthServiceURL                         = "https://auth.dev.rayer.idv.tw"
-	DefaultQueryExpansionModel                    = "deepseek-v4-flash"
-	DefaultAnswerSynthesisModel                   = "deepseek-v4-pro"
-	DefaultQueryExpansionReasoning  llm.Reasoning = llm.ReasoningNone
-	DefaultAnswerSynthesisReasoning llm.Reasoning = llm.ReasoningNone
+	DefaultPipelineDailyLimit                            = 2
+	DefaultPipelineCooldownSeconds                       = 3600
+	DefaultPipelineMinNewRaw                             = 1
+	DefaultPipelineJobURL                                = "https://run.googleapis.com/v2/projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline:run"
+	DefaultAuthServiceURL                                = "https://auth.dev.rayer.idv.tw"
+	DefaultQueryExpansionModel                           = "deepseek-v4-flash"
+	DefaultAnswerSynthesisModel                          = "deepseek-v4-pro"
+	DefaultQueryExpansionReasoning         llm.Reasoning = llm.ReasoningNone
+	DefaultAnswerSynthesisReasoning        llm.Reasoning = llm.ReasoningNone
+	DefaultQuerySelectionLimit                           = 10
+	DefaultQuerySelectionExplorationSlots                = 1
+	DefaultQuerySelectionEvidenceThreshold               = 1
+	MaxQuerySelectionLimit                               = 1000
 )
 
 var defaultAllowedOrigins = []string{
@@ -64,6 +69,12 @@ type Config struct {
 	// AuthServiceURL is the public URL of the dedicated auth service (LWC-258).
 	// Env: AUTH_SERVICE_URL. Default: https://auth.dev.rayer.idv.tw
 	AuthServiceURL string
+
+	// Query retrieval selection contract. Env: QUERY_SELECTION_LIMIT,
+	// QUERY_SELECTION_EXPLORATION_SLOTS, QUERY_SELECTION_EVIDENCE_THRESHOLD.
+	QuerySelectionLimit             int
+	QuerySelectionExplorationSlots  int
+	QuerySelectionEvidenceThreshold int
 }
 
 // UserConfig holds a hardcoded user for authentication.
@@ -88,6 +99,9 @@ func Load(path string) (Config, error) {
 	v.SetDefault("query_expansion_reasoning", DefaultQueryExpansionReasoning)
 	v.SetDefault("answer_synthesis_model", DefaultAnswerSynthesisModel)
 	v.SetDefault("answer_synthesis_reasoning", DefaultAnswerSynthesisReasoning)
+	v.SetDefault("query_selection_limit", DefaultQuerySelectionLimit)
+	v.SetDefault("query_selection_exploration_slots", DefaultQuerySelectionExplorationSlots)
+	v.SetDefault("query_selection_evidence_threshold", DefaultQuerySelectionEvidenceThreshold)
 	v.AutomaticEnv()
 	v.BindEnv("deepseek_api_key")
 	v.BindEnv("firestore_database_id", "FIRESTORE_DATABASE_ID")
@@ -104,6 +118,9 @@ func Load(path string) (Config, error) {
 	v.BindEnv("query_expansion_reasoning", "QUERY_EXPANSION_REASONING")
 	v.BindEnv("answer_synthesis_model", "ANSWER_SYNTHESIS_MODEL")
 	v.BindEnv("answer_synthesis_reasoning", "ANSWER_SYNTHESIS_REASONING")
+	v.BindEnv("query_selection_limit", "QUERY_SELECTION_LIMIT")
+	v.BindEnv("query_selection_exploration_slots", "QUERY_SELECTION_EXPLORATION_SLOTS")
+	v.BindEnv("query_selection_evidence_threshold", "QUERY_SELECTION_EVIDENCE_THRESHOLD")
 
 	if err := v.ReadInConfig(); err != nil {
 		var notFound viper.ConfigFileNotFoundError
@@ -166,33 +183,66 @@ func Load(path string) (Config, error) {
 	if !answerSynthesisReasoning.Valid() {
 		return Config{}, fmt.Errorf("answer_synthesis_reasoning must be none, low, high, or max")
 	}
+	selectionLimit, err := configuredInt(v, "query_selection_limit", DefaultQuerySelectionLimit, 1, MaxQuerySelectionLimit)
+	if err != nil {
+		return Config{}, err
+	}
+	explorationSlots, err := configuredInt(v, "query_selection_exploration_slots", DefaultQuerySelectionExplorationSlots, 0, selectionLimit)
+	if err != nil {
+		return Config{}, err
+	}
+	evidenceThreshold, err := configuredInt(v, "query_selection_evidence_threshold", DefaultQuerySelectionEvidenceThreshold, 1, 0)
+	if err != nil {
+		return Config{}, err
+	}
 
 	cfg := Config{
-		GCPProject:               v.GetString("gcp_project"),
-		Bucket:                   v.GetString("bucket"),
-		FirestoreDatabaseID:      strings.TrimSpace(v.GetString("firestore_database_id")),
-		UserID:                   v.GetString("user_id"),
-		ProjectID:                v.GetString("project_id"),
-		Port:                     v.GetString("port"),
-		DeepSeekAPIKey:           v.GetString("deepseek_api_key"),
-		QueryExpansionModel:      queryExpansionModel,
-		QueryExpansionReasoning:  queryExpansionReasoning,
-		AnswerSynthesisModel:     answerSynthesisModel,
-		AnswerSynthesisReasoning: answerSynthesisReasoning,
-		JWTSecret:                v.GetString("jwt_secret"),
-		DevJWT:                   v.GetBool("dev_jwt"),
-		LocalDataDir:             v.GetString("local_data_dir"),
-		PipelineJobURL:           pipelineJobURL,
-		AllowedOrigins:           parseAllowedOrigins(v.GetString("allowed_origins")),
-		AllowedHosts:             allowedHosts,
-		PipelineDailyLimit:       dailyLimit,
-		PipelineCooldownSeconds:  cooldownSeconds,
-		PipelineMinNewRaw:        minNewRaw,
-		PipelineDemoUserIDs:      splitCommaList(v.GetString("pipeline_demo_user_ids")),
-		RegistrationEnabled:      registrationEnabled,
-		AuthServiceURL:           authServiceURL,
+		GCPProject:                      v.GetString("gcp_project"),
+		Bucket:                          v.GetString("bucket"),
+		FirestoreDatabaseID:             strings.TrimSpace(v.GetString("firestore_database_id")),
+		UserID:                          v.GetString("user_id"),
+		ProjectID:                       v.GetString("project_id"),
+		Port:                            v.GetString("port"),
+		DeepSeekAPIKey:                  v.GetString("deepseek_api_key"),
+		QueryExpansionModel:             queryExpansionModel,
+		QueryExpansionReasoning:         queryExpansionReasoning,
+		AnswerSynthesisModel:            answerSynthesisModel,
+		AnswerSynthesisReasoning:        answerSynthesisReasoning,
+		JWTSecret:                       v.GetString("jwt_secret"),
+		DevJWT:                          v.GetBool("dev_jwt"),
+		LocalDataDir:                    v.GetString("local_data_dir"),
+		PipelineJobURL:                  pipelineJobURL,
+		AllowedOrigins:                  parseAllowedOrigins(v.GetString("allowed_origins")),
+		AllowedHosts:                    allowedHosts,
+		PipelineDailyLimit:              dailyLimit,
+		PipelineCooldownSeconds:         cooldownSeconds,
+		PipelineMinNewRaw:               minNewRaw,
+		PipelineDemoUserIDs:             splitCommaList(v.GetString("pipeline_demo_user_ids")),
+		RegistrationEnabled:             registrationEnabled,
+		AuthServiceURL:                  authServiceURL,
+		QuerySelectionLimit:             selectionLimit,
+		QuerySelectionExplorationSlots:  explorationSlots,
+		QuerySelectionEvidenceThreshold: evidenceThreshold,
 	}
 	return cfg, nil
+}
+
+func configuredInt(v *viper.Viper, key string, fallback, minimum, maximum int) (int, error) {
+	raw := strings.TrimSpace(v.GetString(key))
+	if raw == "" {
+		return fallback, nil
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, fmt.Errorf("invalid %s: must be an integer", key)
+	}
+	if value < minimum {
+		return 0, fmt.Errorf("invalid %s: must be at least %d", key, minimum)
+	}
+	if maximum > 0 && value > maximum {
+		return 0, fmt.Errorf("invalid %s: must be at most %d", key, maximum)
+	}
+	return value, nil
 }
 
 func validatePipelineJobURL(rawURL string) error {

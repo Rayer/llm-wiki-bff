@@ -54,7 +54,7 @@ func TestCorePlanEligibilityAndSelectionContracts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if semanticMatched.Candidates[0].Eligible || semanticMatched.Candidates[0].Groups[0].SemanticOutcome != "unavailable" {
+	if semanticMatched.Candidates[0].Eligible || semanticMatched.Candidates[0].Groups[0].SemanticOutcome != "unresolved" {
 		t.Fatal("lexical text must not infer semantic proof")
 	}
 
@@ -82,6 +82,143 @@ func TestCorePlanEligibilityAndSelectionContracts(t *testing.T) {
 	if !containsSelected(first.Selected, "positive") {
 		t.Fatal("known-positive fixture was not selected")
 	}
+}
+
+func TestEvidenceThresholdQualificationAndSelection(t *testing.T) {
+	plan := queryquality.QueryPlan{Preferred: []queryquality.Criterion{{Kind: "venue_type", Value: "cafe", Terms: []string{"cafe"}, Proof: "lexical"}}}
+	entries := []cache.Entry{
+		{Slug: "no-evidence", Title: "No evidence", Body: "library"},
+		{Slug: "one", Title: "One cafe", Body: "cafe"},
+		{Slug: "two", Title: "Two cafe", Body: "cafe"},
+	}
+	matched, err := queryquality.NewLexicalMatcher(nil).Match(context.Background(), queryquality.MatchRequest{
+		Plan: plan, CorpusEntries: entries, EvidenceThreshold: 1, EvidenceThresholdSet: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bySlug := make(map[string]queryquality.CandidateEvidence, len(matched.Candidates))
+	for _, candidate := range matched.Candidates {
+		bySlug[candidate.Slug] = candidate
+	}
+	if bySlug["no-evidence"].Qualified || bySlug["no-evidence"].Score != 0 {
+		t.Fatalf("score-zero candidate = %#v, want unqualified", bySlug["no-evidence"])
+	}
+	selection, err := queryquality.NewResultSelector().Select(context.Background(), queryquality.SelectionInput{Candidates: matched.Candidates, Limit: 10, ExplorationSlots: 1, Seed: 7})
+	if err != nil {
+		t.Fatal(err)
+	}
+	selected := 0
+	for _, decision := range selection.Selected {
+		if decision.Selected {
+			selected++
+		}
+	}
+	if selected != 2 {
+		t.Fatalf("selected count = %d, want 2 qualified candidates", selected)
+	}
+
+	legacy, err := queryquality.NewLexicalMatcher(nil).Match(context.Background(), queryquality.MatchRequest{
+		Plan: plan, CorpusEntries: []cache.Entry{{Slug: "legacy", Title: "Legacy", Body: "library"}}, EvidenceThreshold: 0, EvidenceThresholdSet: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !legacy.Candidates[0].Qualified || legacy.Candidates[0].QualificationReason != "legacy_threshold_zero" {
+		t.Fatalf("threshold-zero candidate = %#v, want explicit legacy qualification", legacy.Candidates[0])
+	}
+}
+
+func TestExactRequiredEntityQualifiesWithoutLegacyScore(t *testing.T) {
+	plan := queryquality.QueryPlan{
+		Required:  []queryquality.Criterion{{Kind: "venue-name", Value: "Boven", Terms: []string{"Boven"}, Proof: "lexical"}},
+		Preferred: []queryquality.Criterion{{Kind: "venue_type", Value: "libraries", Terms: []string{"libraries"}, Proof: "lexical"}},
+	}
+	matched, err := queryquality.NewLexicalMatcher(nil).Match(context.Background(), queryquality.MatchRequest{
+		Plan: plan,
+		CorpusEntries: []cache.Entry{
+			{Slug: "boven", Title: "Boven", Body: ""},
+			{Slug: "generic", Title: "Libraries and cafes", Body: "libraries cafes"},
+		},
+		EvidenceThreshold: 3, EvidenceThresholdSet: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !matched.Candidates[0].ExactIdentityEvidence || !matched.Candidates[0].Qualified || matched.Candidates[0].Score != 0 {
+		t.Fatalf("Boven candidate = %#v, want exact qualified score zero", matched.Candidates[0])
+	}
+	if matched.Candidates[1].Qualified {
+		t.Fatalf("generic candidate = %#v, want unqualified", matched.Candidates[1])
+	}
+}
+
+func TestEvidenceThresholdsChangeQualificationCausally(t *testing.T) {
+	plan := queryquality.QueryPlan{Preferred: []queryquality.Criterion{
+		{Kind: "venue_type", Value: "cafe", Terms: []string{"cafe"}, Proof: "lexical"},
+		{Kind: "activity", Value: "work", Terms: []string{"work"}, Proof: "lexical"},
+		{Kind: "setting", Value: "quiet", Terms: []string{"quiet"}, Proof: "lexical"},
+	}}
+	entry := cache.Entry{Slug: "candidate", Title: "Cafe", Body: "cafe work"}
+	for _, test := range []struct {
+		threshold int
+		qualified bool
+		count     int
+	}{
+		{threshold: 0, qualified: true, count: 2},
+		{threshold: 1, qualified: true, count: 2},
+		{threshold: 2, qualified: true, count: 2},
+		{threshold: 3, qualified: false, count: 2},
+		{threshold: 4, qualified: false, count: 2},
+	} {
+		matched, err := queryquality.NewLexicalMatcher(nil).Match(context.Background(), queryquality.MatchRequest{Plan: plan, CorpusEntries: []cache.Entry{entry}, EvidenceThreshold: test.threshold, EvidenceThresholdSet: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		candidate := matched.Candidates[0]
+		if candidate.Qualified != test.qualified || candidate.PositiveEvidenceCount != test.count {
+			t.Fatalf("threshold=%d candidate=%#v, want qualified=%v count=%d", test.threshold, candidate, test.qualified, test.count)
+		}
+	}
+}
+
+func TestUnresolvedSemanticEvidenceIsTriStateAndCannotQualifyAlone(t *testing.T) {
+	plan := queryquality.QueryPlan{
+		Excluded: []queryquality.Criterion{{Kind: "activity", Value: "skiing", Proof: "semantic"}},
+		Required: []queryquality.Criterion{{Kind: "activity", Value: "snow", Proof: "semantic"}},
+	}
+	matched, err := queryquality.NewLexicalMatcher(fixedSemanticOutcomeEvaluator{outcome: "unknown"}).Match(context.Background(), queryquality.MatchRequest{
+		Plan: plan, CorpusEntries: []cache.Entry{{Slug: "candidate", Title: "Candidate"}}, EvidenceThreshold: 0, EvidenceThresholdSet: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate := matched.Candidates[0]
+	if candidate.Eligible || candidate.Qualified || candidate.SemanticResolution != "unresolved" {
+		t.Fatalf("candidate = %#v, want unresolved required semantic fail-closed and unqualified", candidate)
+	}
+	for _, group := range candidate.Groups {
+		if group.SemanticOutcome != "unresolved" {
+			t.Fatalf("semantic group = %#v, want unresolved", group)
+		}
+	}
+
+	excludedOnly, err := queryquality.NewLexicalMatcher(fixedSemanticOutcomeEvaluator{outcome: "unknown"}).Match(context.Background(), queryquality.MatchRequest{
+		Plan:          queryquality.QueryPlan{Excluded: []queryquality.Criterion{{Kind: "activity", Value: "skiing", Proof: "semantic"}}},
+		CorpusEntries: []cache.Entry{{Slug: "excluded-unknown", Title: "Candidate"}}, EvidenceThreshold: 0, EvidenceThresholdSet: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !excludedOnly.Candidates[0].Eligible || excludedOnly.Candidates[0].Qualified || excludedOnly.Candidates[0].QualificationReason != "unresolved_semantic_evidence" {
+		t.Fatalf("excluded-only unresolved candidate = %#v, want eligible but unqualified", excludedOnly.Candidates[0])
+	}
+}
+
+type fixedSemanticOutcomeEvaluator struct{ outcome string }
+
+func (e fixedSemanticOutcomeEvaluator) Evaluate(context.Context, queryquality.Criterion, cache.Entry) (queryquality.SemanticDecision, error) {
+	return queryquality.SemanticDecision{Outcome: e.outcome}, nil
 }
 
 func TestNoGenericConstructorAliases(t *testing.T) {
@@ -250,8 +387,8 @@ func TestSemanticRequiredAndExcludedFailClosedRoles(t *testing.T) {
 		{outcome: "unavailable", required: true, want: false},
 		{outcome: "pass", want: false},
 		{outcome: "fail", want: true},
-		{outcome: "unknown", want: false},
-		{outcome: "unavailable", want: false},
+		{outcome: "unknown", want: true},
+		{outcome: "unavailable", want: true},
 	} {
 		name := "excluded-" + test.outcome
 		if test.required {
@@ -335,10 +472,10 @@ func TestProductionExecutorSynthesisCancellationDoesNotFallback(t *testing.T) {
 func TestSelectorDeterministicReplayAndContextCancellation(t *testing.T) {
 	input := queryquality.SelectionInput{
 		Candidates: []queryquality.CandidateEvidence{
-			{Slug: "a", Title: "A", Eligible: true, Score: 3},
-			{Slug: "b", Title: "B", Eligible: true, Score: 2},
-			{Slug: "c", Title: "C", Eligible: true, Score: 1},
-			{Slug: "d", Title: "D", Eligible: true, Score: 0},
+			{Slug: "a", Title: "A", Eligible: true, Qualified: true, Score: 3},
+			{Slug: "b", Title: "B", Eligible: true, Qualified: true, Score: 2},
+			{Slug: "c", Title: "C", Eligible: true, Qualified: true, Score: 1},
+			{Slug: "d", Title: "D", Eligible: true, Qualified: true, Score: 0},
 		},
 		Limit:            2,
 		ExplorationSlots: 2,
@@ -386,8 +523,8 @@ func TestProductionExpansionFailureAndInvalidJSONUseDeterministicFallback(t *tes
 			if err != nil {
 				t.Fatal(err)
 			}
-			if len(got.Results) != 1 || got.Results[0].Slug != "all-candidate" {
-				t.Fatalf("fallback result = %#v, want deterministic raw-query result", got.Results)
+			if len(got.Results) != 0 || got.Status != "insufficient_evidence" || got.Reason != "no_qualified_evidence" {
+				t.Fatalf("fallback result = %#v status=%q reason=%q, want truthful insufficient evidence", got.Results, got.Status, got.Reason)
 			}
 		})
 	}

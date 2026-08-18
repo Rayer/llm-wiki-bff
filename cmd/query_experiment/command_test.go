@@ -75,11 +75,11 @@ func TestSemanticCriteriaNeverBecomeLexicalEvidenceOrScore(t *testing.T) {
 		t.Fatal(err)
 	}
 	candidate := got.Candidates[0]
-	if candidate.Eligible || candidate.Score != 0 || candidate.SemanticOutcome != "unavailable" {
+	if candidate.Eligible || candidate.Score != 0 || candidate.SemanticOutcome != "unresolved" {
 		t.Fatalf("candidate = %#v, want required unavailable and optional semantics unscored", candidate)
 	}
 	for _, group := range candidate.Groups {
-		if len(group.Matches) != 0 || group.SemanticOutcome != "unavailable" {
+		if len(group.Matches) != 0 || group.SemanticOutcome != "unresolved" {
 			t.Fatalf("semantic group = %#v, want unavailable without lexical matches", group)
 		}
 	}
@@ -97,7 +97,7 @@ func TestSemanticEvaluatorIsExplicitAndStillNeverScores(t *testing.T) {
 		t.Fatalf("candidate=%#v calls=%v err=%v", got.Candidates[0], evaluator.calls, err)
 	}
 	for _, group := range got.Candidates[0].Groups {
-		if group.SemanticOutcome != "pass" || len(group.Matches) != 0 {
+		if group.SemanticOutcome != "matched" || len(group.Matches) != 0 {
 			t.Fatalf("semantic group=%#v, want evaluator outcome without lexical evidence", group)
 		}
 	}
@@ -121,9 +121,9 @@ func TestStructuredExpansionUsesOneCallAndSimpleFallback(t *testing.T) {
 
 func TestSelectionReplaysSeedAndHonorsZeroOneAndMultipleExplorationSlots(t *testing.T) {
 	candidates := []CandidateEvidence{
-		{Slug: "one", Title: "One", Eligible: true, Score: 5}, {Slug: "two", Title: "Two", Eligible: true, Score: 4},
-		{Slug: "three", Title: "Three", Eligible: true, Score: 3}, {Slug: "four", Title: "Four", Eligible: true, Score: 2},
-		{Slug: "five", Title: "Five", Eligible: true, Score: 1},
+		{Slug: "one", Title: "One", Eligible: true, Qualified: true, Score: 5}, {Slug: "two", Title: "Two", Eligible: true, Qualified: true, Score: 4},
+		{Slug: "three", Title: "Three", Eligible: true, Qualified: true, Score: 3}, {Slug: "four", Title: "Four", Eligible: true, Qualified: true, Score: 2},
+		{Slug: "five", Title: "Five", Eligible: true, Qualified: true, Score: 1},
 	}
 	selector := newRandomSelector()
 	for _, slots := range []int{0, 1, 2} {
@@ -164,6 +164,13 @@ func TestQueryRetrievalOptionBoundsAndQueryDerivedSeed(t *testing.T) {
 		if _, err := normalizeQueryRetrievalOptions(options); err == nil {
 			t.Fatalf("options=%#v accepted, want validation error", options)
 		}
+	}
+	legacy, err := normalizeQueryRetrievalOptions(queryRetrievalOptions{selectionLimit: 3, explorationSlots: 0, evidenceThreshold: 0, evidenceThresholdSet: true})
+	if err != nil || legacy.evidenceThreshold != 0 || !legacy.evidenceThresholdSet {
+		t.Fatalf("explicit legacy threshold = %#v err=%v, want preserved zero", legacy, err)
+	}
+	if _, err := normalizeQueryRetrievalOptions(queryRetrievalOptions{evidenceThreshold: -1, evidenceThresholdSet: true}); err == nil {
+		t.Fatal("negative explicit evidence threshold accepted")
 	}
 	if reproducibleSeed("coffee") != reproducibleSeed("coffee") || reproducibleSeed("coffee") == reproducibleSeed("tea") {
 		t.Fatal("query-derived seed is not reproducible/query-specific")

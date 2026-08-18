@@ -21,14 +21,16 @@ const (
 )
 
 type queryRetrievalOptions struct {
-	selectionLimit   int
-	explorationSlots int
-	seed             *int64
-	seedFor          func(string) int64
+	selectionLimit       int
+	explorationSlots     int
+	evidenceThreshold    int
+	evidenceThresholdSet bool
+	seed                 *int64
+	seedFor              func(string) int64
 }
 
 func defaultQueryRetrievalOptions() queryRetrievalOptions {
-	return queryRetrievalOptions{selectionLimit: defaultLimit, explorationSlots: 1}
+	return queryRetrievalOptions{selectionLimit: defaultLimit, explorationSlots: 1, evidenceThreshold: queryquality.DefaultEvidenceThreshold}
 }
 
 func normalizeQueryRetrievalOptions(options queryRetrievalOptions) (queryRetrievalOptions, error) {
@@ -40,11 +42,11 @@ func normalizeQueryRetrievalOptions(options queryRetrievalOptions) (queryRetriev
 }
 
 func toQueryRetrievalCoreOptions(options queryRetrievalOptions) queryquality.Options {
-	return queryquality.Options{SelectionLimit: options.selectionLimit, ExplorationSlots: options.explorationSlots, Seed: options.seed, SeedFor: options.seedFor}
+	return queryquality.Options{SelectionLimit: options.selectionLimit, ExplorationSlots: options.explorationSlots, EvidenceThreshold: options.evidenceThreshold, EvidenceThresholdSet: options.evidenceThresholdSet, Seed: options.seed, SeedFor: options.seedFor}
 }
 
 func fromQueryRetrievalCoreOptions(options queryquality.Options) queryRetrievalOptions {
-	return queryRetrievalOptions{selectionLimit: options.SelectionLimit, explorationSlots: options.ExplorationSlots, seed: options.Seed, seedFor: options.SeedFor}
+	return queryRetrievalOptions{selectionLimit: options.SelectionLimit, explorationSlots: options.ExplorationSlots, evidenceThreshold: options.EvidenceThreshold, evidenceThresholdSet: options.EvidenceThresholdSet, seed: options.Seed, seedFor: options.SeedFor}
 }
 
 type CriterionPolicy = queryquality.CriterionPolicy

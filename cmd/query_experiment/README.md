@@ -12,7 +12,7 @@ the existing production query service and its existing output contract. The
 
 ```sh
 go run ./cmd/query_experiment --service query-retrieval \
-  --selection-limit 10 --exploration-slots 1 --seed -7 \
+  --selection-limit 10 --exploration-slots 1 --evidence-threshold 1 --seed -7 \
   --snapshot ./frozen-project --cases ./cases.jsonl
 ```
 
@@ -21,6 +21,10 @@ and accepts 1..1000. `--exploration-slots` defaults to 1 and accepts 0 through
 the selection limit. `--seed` accepts a signed 64-bit integer; when omitted,
 the seed is derived reproducibly from the query. Selection is therefore causal
 and exactly replayable for the same query, corpus, and knobs.
+
+`--evidence-threshold` defaults to 1 and counts independent positive evidence
+dimensions. Explicit `--evidence-threshold 0` is the trusted-local legacy
+control only; production configuration rejects zero.
 
 `--snapshot` must directly contain `cache/concepts.jsonl`:
 
@@ -51,7 +55,8 @@ The query-retrieval trace preserves the ordered `expansion`, `matching`, and
 eligibility reasons, selection reasons, exploration markers, and seed metadata,
 but never concept bodies/snippets, prompts, credentials, or raw provider
 responses. Semantic criteria are never treated as lexical proof; required or
-excluded semantic criteria are explicitly unavailable without an evaluator.
+excluded semantic criteria use stable matched/not_matched/unresolved outcomes;
+required unresolved criteria fail closed without an evaluator.
 
 query-retrieval returns selected identities only. It does not produce production
 synthesis or citation resolution. The honest remaining limit is that this
@@ -97,7 +102,7 @@ Each attempt is written below
 `expansion.input.json`, `expansion.output.json`, `matching.input.json`,
 `matching.output.json`, `selection.input.json`, `selection.output.json`, and
 `final.json`. Inputs contain the exact prompts, full plan/policy, frozen corpus
-identity and digest, candidate evidence, and effective selection seed. Outputs
+identity and digest, resolved evidence threshold, candidate qualification evidence, and effective selection seed. Outputs
 contain the raw model response, parsed/fallback plan, all candidate evidence,
 all selection decisions, and final identities. Bodies and snippets are never
 written.

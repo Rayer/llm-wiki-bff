@@ -151,6 +151,25 @@ func TestDefaultProductionQueryCompositionPreservesRequestCancellation(t *testin
 	}
 }
 
+func TestProductionQueryReportsInsufficientEvidenceWithoutConcepts(t *testing.T) {
+	root := localfs.New(t.TempDir())
+	reader := root.Scope("user", "project")
+	if _, err := reader.WriteBytes(context.Background(), []byte(`{"slug":"generic","title":"Generic","body":"coffee"}`+"\n"), conceptcache.GCSPath); err != nil {
+		t.Fatal(err)
+	}
+	executor, err := newProductionQueryExecutor(config.Config{QuerySelectionEvidenceThreshold: 2}, conceptcache.New())
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := executor.Execute(context.Background(), reader, query.Request{Query: "coffee", Mode: "wiki"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Results) != 0 || result.Status != "insufficient_evidence" || result.Reason != "no_qualified_evidence" {
+		t.Fatalf("result=%#v, want zero concepts with truthful insufficient-evidence status", result)
+	}
+}
+
 type productionCancellationTransport struct{ started chan struct{} }
 
 func (t productionCancellationTransport) RoundTrip(req *http.Request) (*http.Response, error) {

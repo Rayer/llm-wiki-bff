@@ -14,14 +14,26 @@ import (
 )
 
 type Receipt struct {
-	QueryReceivedAt time.Time         `json:"query_received_at"`
-	RunStartedAt    time.Time         `json:"run_started_at"`
-	RunFinishedAt   time.Time         `json:"run_finished_at"`
-	ElapsedMS       int64             `json:"elapsed_ms"`
-	Stages          []StageReceipt    `json:"stages"`
-	HostCalls       []HostCallReceipt `json:"host_calls"`
-	runStartedMono  time.Time
+	QueryReceivedAt   time.Time         `json:"query_received_at"`
+	RunStartedAt      time.Time         `json:"run_started_at"`
+	RunFinishedAt     time.Time         `json:"run_finished_at"`
+	ElapsedMS         int64             `json:"elapsed_ms"`
+	Stages            []StageReceipt    `json:"stages"`
+	HostCalls         []HostCallReceipt `json:"host_calls"`
+	SelectionLimit    int               `json:"selection_limit"`
+	ExplorationSlots  int               `json:"exploration_slots"`
+	EvidenceThreshold int               `json:"evidence_threshold"`
+	runStartedMono    time.Time
 }
+
+func (r *ReceiptRecorder) SetRetrievalConfig(selectionLimit, explorationSlots, evidenceThreshold int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.receipt.SelectionLimit = selectionLimit
+	r.receipt.ExplorationSlots = explorationSlots
+	r.receipt.EvidenceThreshold = evidenceThreshold
+}
+
 type StageReceipt struct {
 	Name        string    `json:"name"`
 	StartedAt   time.Time `json:"started_at"`
