@@ -183,6 +183,31 @@ func TestFixtureRunWritesEightReceiptsAndSummaryWithoutKey(t *testing.T) {
 			t.Fatalf("receipt %s threshold=%v, want 2", name, object["evidence_threshold"])
 		}
 	}
+	requestData, err := os.ReadFile(filepath.Join(variantDir, "request.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	matchingData, err := os.ReadFile(filepath.Join(variantDir, "matching.input.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var matching fixtureMatchingInput
+	var request fixtureRequestReceipt
+	if err := json.Unmarshal(requestData, &request); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(matchingData, &matching); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := matching.EvidenceThreshold, record.EvidenceThreshold; got != want {
+		t.Fatalf("matching.evidence_threshold=%d, want %d", got, want)
+	}
+	if got, want := matching.RareKeywordMaxDocumentFrequency, request.RareKeywordMaxDocumentFrequency; got != want {
+		t.Fatalf("matching.rare_keyword_max_document_frequency=%d, want %d", got, want)
+	}
+	if matching.FallbackQualificationAllowed != false {
+		t.Fatalf("matching.fallback_qualification_allowed=%v, want false", matching.FallbackQualificationAllowed)
+	}
 	var summary map[string]any
 	data, err := os.ReadFile(summaryPath)
 	if err != nil || json.Unmarshal(data, &summary) != nil || summary["variants"] == nil || summary["attempt_count"] != float64(1) {

@@ -669,6 +669,26 @@ func TestProductionExpansionCancellationDoesNotFallback(t *testing.T) {
 	}
 }
 
+func TestQueryRetrievalTraceAndReceiptUseSharedConsensusMinimum(t *testing.T) {
+	pipeline := queryquality.NewQueryRetrievalPipelineWithOptions(
+		queryquality.NewStructuredPlanExpander(&fakeProvider{response: `{"raw_query":"coffee","required":[],"excluded":[],"preferred":[{"kind":"topic","value":"coffee","terms":["coffee"],"proof":"lexical"}],"goals":[],"supporting_dimensions":[],"acceptable_alternatives":[],"ambiguity":[],"fallback":false}`}, nil),
+		queryquality.NewLexicalMatcher(nil), queryquality.NewResultSelector(), nil, queryquality.DefaultOptions(),
+	)
+	ctx, receipt := query.WithReceipt(context.Background())
+	defer query.FinishReceipt(receipt)
+	_, trace, err := pipeline.ExecuteWithTrace(ctx, &jsonlReader{data: []byte(`{"slug":"coffee","title":"Coffee","body":"coffee"}` + "\n")}, query.Request{Query: "coffee"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if trace.Expansion.KeywordConsensusMinimum != queryquality.MinimumKeywordConsensusSupport {
+		t.Fatalf("trace keyword_consensus_minimum = %d, want %d", trace.Expansion.KeywordConsensusMinimum, queryquality.MinimumKeywordConsensusSupport)
+	}
+	got := receipt.Receipt()
+	if got.KeywordConsensusMinimum != queryquality.MinimumKeywordConsensusSupport {
+		t.Fatalf("receipt keyword_consensus_minimum = %d, want %d", got.KeywordConsensusMinimum, queryquality.MinimumKeywordConsensusSupport)
+	}
+}
+
 func TestStructuredPlanExpanderPreservesCancellationBeforeFallbackWithoutProvider(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()

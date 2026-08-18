@@ -52,18 +52,18 @@ type fixtureReceiptMeta struct {
 }
 
 type fixtureRequestReceipt struct {
-	Query                           string             `json:"query"`
-	Mode                            string             `json:"mode"`
-	SnapshotIdentity                string             `json:"snapshot_identity"`
-	CorpusSHA256                    string             `json:"corpus_sha256"`
-	SelectionLimit                  int                `json:"selection_limit"`
-	ExplorationSlots                int                `json:"exploration_slots"`
-	EvidenceThreshold               int                `json:"evidence_threshold"`
-	KeywordsPerAttempt              int                `json:"keywords_per_attempt"`
-	ExpansionAttempts               int                `json:"expansion_attempts"`
-	RareKeywordMaxDocumentFrequency int                `json:"rare_keyword_max_document_frequency"`
-	SeedMode                        string             `json:"seed_mode"`
-	Model                           publicModelFixture `json:"model"`
+	Query                           string `json:"query"`
+	Mode                            string `json:"mode"`
+	SnapshotIdentity                string `json:"snapshot_identity"`
+	CorpusSHA256                    string `json:"corpus_sha256"`
+	SelectionLimit                  int    `json:"selection_limit"`
+	ExplorationSlots                int    `json:"exploration_slots"`
+	EvidenceThreshold               int    `json:"evidence_threshold"`
+	KeywordsPerAttempt              int    `json:"keywords_per_attempt"`
+	ExpansionAttempts               int    `json:"expansion_attempts"`
+	RareKeywordMaxDocumentFrequency int    `json:"rare_keyword_max_document_frequency"`
+	SeedMode                        string `json:"seed_mode"`
+	Model                           string `json:"model"`
 }
 
 type fixtureExpansionInput struct {
@@ -131,11 +131,13 @@ func (e *fixtureModelExpander) call(attempt int) fixtureModelCall {
 }
 
 type fixtureMatchingInput struct {
-	Plan              QueryPlan      `json:"plan"`
-	SnapshotIdentity  string         `json:"snapshot_identity"`
-	CorpusSHA256      string         `json:"corpus_sha256"`
-	Parameters        map[string]any `json:"parameters"`
-	EvidenceThreshold int            `json:"evidence_threshold"`
+	Plan                            QueryPlan      `json:"plan"`
+	SnapshotIdentity                string         `json:"snapshot_identity"`
+	CorpusSHA256                    string         `json:"corpus_sha256"`
+	Parameters                      map[string]any `json:"parameters"`
+	EvidenceThreshold               int            `json:"evidence_threshold"`
+	RareKeywordMaxDocumentFrequency int            `json:"rare_keyword_max_document_frequency"`
+	FallbackQualificationAllowed    bool           `json:"fallback_qualification_allowed"`
 }
 
 type fixtureMatchingOutput struct {
@@ -316,8 +318,7 @@ func runFixtureAttempt(ctx context.Context, options experimentOptions, retrieval
 		seed = *retrievalOptions.seed
 		seedMode = "explicit"
 	}
-	publicModel := publicModelFixture{ID: variant.Model.ID, Provider: variant.Model.Provider, BaseURL: variant.Model.BaseURL, Model: variant.Model.Model, Temperature: variant.Model.Temperature, Reasoning: variant.Model.Reasoning}
-	if err := write("request.json", fixtureRequestReceipt{Query: input.Query, Mode: input.Mode, SnapshotIdentity: prepared.label, CorpusSHA256: prepared.digest, SelectionLimit: retrievalOptions.selectionLimit, ExplorationSlots: retrievalOptions.explorationSlots, EvidenceThreshold: retrievalOptions.evidenceThreshold, KeywordsPerAttempt: retrievalOptions.keywordsPerAttempt, ExpansionAttempts: retrievalOptions.expansionAttempts, RareKeywordMaxDocumentFrequency: retrievalOptions.rareDocumentFrequency, SeedMode: seedMode, Model: publicModel}); err != nil {
+	if err := write("request.json", fixtureRequestReceipt{Query: input.Query, Mode: input.Mode, SnapshotIdentity: prepared.label, CorpusSHA256: prepared.digest, SelectionLimit: retrievalOptions.selectionLimit, ExplorationSlots: retrievalOptions.explorationSlots, EvidenceThreshold: retrievalOptions.evidenceThreshold, KeywordsPerAttempt: retrievalOptions.keywordsPerAttempt, ExpansionAttempts: retrievalOptions.expansionAttempts, RareKeywordMaxDocumentFrequency: retrievalOptions.rareDocumentFrequency, SeedMode: seedMode, Model: variant.Model.Model}); err != nil {
 		return fixtureAttempt{}, err
 	}
 	policy := CriterionPolicy{RequiredWhenExplicit: append([]string(nil), variant.Profile.RequiredWhenExplicit...), PreferredByDefault: append([]string(nil), variant.Profile.PreferredByDefault...), GoalsToExpand: append([]string(nil), variant.Profile.GoalsToExpand...)}
@@ -363,11 +364,17 @@ func runFixtureAttempt(ctx context.Context, options experimentOptions, retrieval
 	}
 	trace := &queryRetrievalTrace{Variant: variant.VariantID, Seed: seed, Stages: []stageTrace{{Name: "expansion", Outcome: planOutcome(plan), Source: expansionInfo.Source, FallbackReason: expansionInfo.FallbackReason, ElapsedMS: expansionElapsed, InputCount: expansionInfo.RequestedAttempts, OutputCount: criterionCount(plan), Plan: &plan}}}
 	trace.Expansion = queryquality.ExpansionTrace{RequestedAttempts: expansionInfo.RequestedAttempts, SuccessfulAttempts: expansionInfo.SuccessfulAttempts, ProviderFailedAttempts: expansionInfo.ProviderFailedAttempts, FallbackCount: expansionInfo.FallbackCount, KeywordsPerAttempt: expansionInfo.KeywordsPerAttempt, RareKeywordMaxDocumentFrequency: retrievalOptions.rareDocumentFrequency, EvidenceThreshold: retrievalOptions.evidenceThreshold, KeywordSupport: append([]queryquality.KeywordSupport(nil), plan.KeywordSupport...)}
-	if err := write("matching.input.json", fixtureMatchingInput{Plan: plan, SnapshotIdentity: prepared.label, CorpusSHA256: prepared.digest, EvidenceThreshold: retrievalOptions.evidenceThreshold, Parameters: map[string]any{"semantic_required_fail_closed": semanticRequiredFailClosed, "semantic_excluded_fail_closed": semanticExcludedFailClosed}}); err != nil {
+	matchReq := queryquality.MatchRequest{
+		Plan: plan, CorpusEntries: entries, EvidenceThreshold: retrievalOptions.evidenceThreshold, EvidenceThresholdSet: true,
+		RareKeywordMaxDocumentFrequency: retrievalOptions.rareDocumentFrequency, FallbackQualificationAllowed: false,
+	}
+	if err := write("matching.input.json", fixtureMatchingInput{
+		Plan: plan, SnapshotIdentity: prepared.label, CorpusSHA256: prepared.digest, EvidenceThreshold: matchReq.EvidenceThreshold, RareKeywordMaxDocumentFrequency: matchReq.RareKeywordMaxDocumentFrequency, FallbackQualificationAllowed: matchReq.FallbackQualificationAllowed,
+		Parameters: map[string]any{"semantic_required_fail_closed": semanticRequiredFailClosed, "semantic_excluded_fail_closed": semanticExcludedFailClosed},
+	}); err != nil {
 		return fixtureAttempt{}, err
 	}
 	matchingStarted := now()
-	matchReq := queryquality.MatchRequest{Plan: plan, CorpusEntries: entries, EvidenceThreshold: retrievalOptions.evidenceThreshold, EvidenceThresholdSet: true, RareKeywordMaxDocumentFrequency: retrievalOptions.rareDocumentFrequency}
 	eligible, err := newLexicalMatcher(nil).Match(ctx, matchReq)
 	matchingElapsed := elapsedBetween(now(), matchingStarted)
 	if err != nil {

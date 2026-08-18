@@ -129,6 +129,40 @@ func TestParallelExpansionCancellationCancelsEveryAttempt(t *testing.T) {
 	}
 }
 
+func TestParallelExpansionReturnsOnCancellationBeforeNonCompliantWorkerReleases(t *testing.T) {
+	provider := newNonCompliantExpander(3)
+	expander, err := queryquality.NewParallelQueryExpander(provider, nil, queryquality.Options{ExpansionAttempts: 3, KeywordsPerAttempt: 24})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := expander.Expand(ctx, queryquality.ExpansionRequest{Query: "coffee"})
+		done <- err
+	}()
+	select {
+	case <-provider.allStarted:
+	case <-time.After(time.Second):
+		t.Fatal("attempts did not start")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("canceled expansion did not return before release")
+	}
+	provider.release()
+	select {
+	case <-provider.allDone:
+	case <-time.After(time.Second):
+		t.Fatal("non-compliant expansion workers did not finish after release")
+	}
+}
+
 func TestParallelExpansionPartialAndAllFailureFallbackSemantics(t *testing.T) {
 	partial := &failureExpander{fail: map[int]bool{1: true}}
 	expander, err := queryquality.NewParallelQueryExpander(partial, queryquality.NewDeterministicExpander(), queryquality.Options{ExpansionAttempts: 3, KeywordsPerAttempt: 24})
@@ -338,6 +372,49 @@ func (e *barrierExpander) Expand(ctx context.Context, request queryquality.Expan
 	}
 }
 func (e *barrierExpander) release() { e.releaseOnce.Do(func() { close(e.releaseCh) }) }
+
+type nonCompliantExpander struct {
+	allStarted  chan struct{}
+	allDone     chan struct{}
+	hold        chan struct{}
+	releaseOnce sync.Once
+	started     chan struct{}
+	done        chan struct{}
+	count       int
+	mu          sync.Mutex
+	completed   int
+}
+
+func newNonCompliantExpander(count int) *nonCompliantExpander {
+	return &nonCompliantExpander{
+		allStarted: make(chan struct{}),
+		allDone:    make(chan struct{}),
+		hold:       make(chan struct{}),
+		started:    make(chan struct{}, count),
+		done:       make(chan struct{}, count),
+		count:      count,
+	}
+}
+
+func (e *nonCompliantExpander) Expand(_ context.Context, request queryquality.ExpansionRequest) (queryquality.QueryPlan, error) {
+	e.started <- struct{}{}
+	if len(e.started) == e.count {
+		close(e.allStarted)
+	}
+	<-e.hold
+	e.done <- struct{}{}
+	e.mu.Lock()
+	e.completed++
+	if e.completed == e.count {
+		close(e.allDone)
+	}
+	e.mu.Unlock()
+	return queryquality.QueryPlan{RawQuery: request.Query}, nil
+}
+
+func (e *nonCompliantExpander) release() {
+	e.releaseOnce.Do(func() { close(e.hold) })
+}
 
 type orderedExpander struct {
 	reverse    bool

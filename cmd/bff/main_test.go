@@ -119,8 +119,12 @@ func TestDefaultProductionQueryCompositionPreservesRequestCancellation(t *testin
 	}
 	started := make(chan struct{})
 	previousTransport := http.DefaultTransport
-	http.DefaultTransport = productionCancellationTransport{started: started, startedOnce: &sync.Once{}}
-	defer func() { http.DefaultTransport = previousTransport }()
+	transport := &productionCancellationTransport{started: started, startedOnce: &sync.Once{}}
+	http.DefaultTransport = transport
+	defer func() {
+		transport.awaitCompletion(time.Second)
+		http.DefaultTransport = previousTransport
+	}()
 	executor, err := newProductionQueryExecutor(config.Config{DeepSeekAPIKey: "test-key"}, conceptcache.New())
 	if err != nil {
 		t.Fatal(err)
@@ -174,12 +178,27 @@ func TestProductionQueryReportsInsufficientEvidenceWithoutConcepts(t *testing.T)
 type productionCancellationTransport struct {
 	started     chan struct{}
 	startedOnce *sync.Once
+	done        sync.WaitGroup
 }
 
-func (t productionCancellationTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+func (t *productionCancellationTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	t.done.Add(1)
+	defer t.done.Done()
 	t.startedOnce.Do(func() { close(t.started) })
 	<-req.Context().Done()
 	return nil, req.Context().Err()
+}
+
+func (t *productionCancellationTransport) awaitCompletion(timeout time.Duration) {
+	completed := make(chan struct{})
+	go func() {
+		t.done.Wait()
+		close(completed)
+	}()
+	select {
+	case <-completed:
+	case <-time.After(timeout):
+	}
 }
 
 type productionRequest struct {

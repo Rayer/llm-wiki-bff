@@ -63,7 +63,7 @@ func (r *ReceiptRecorder) SetRetrievalConfig(selectionLimit, explorationSlots, e
 	r.receipt.EvidenceThreshold = evidenceThreshold
 }
 
-func (r *ReceiptRecorder) SetExpansionConfig(attempts, successful, providerFailed, keywordsPerAttempt, evidenceThreshold, rareDocumentFrequency int, support []KeywordSupportReceipt) {
+func (r *ReceiptRecorder) SetExpansionConfig(attempts, successful, providerFailed, keywordsPerAttempt, evidenceThreshold, rareDocumentFrequency, keywordConsensusMinimum int, support []KeywordSupportReceipt) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.receipt.ExpansionAttempts = attempts
@@ -72,7 +72,7 @@ func (r *ReceiptRecorder) SetExpansionConfig(attempts, successful, providerFaile
 	r.receipt.KeywordsPerExpansionAttempt = keywordsPerAttempt
 	r.receipt.EvidenceThreshold = evidenceThreshold
 	r.receipt.RareKeywordMaxDocumentFrequency = rareDocumentFrequency
-	r.receipt.KeywordConsensusMinimum = 2
+	r.receipt.KeywordConsensusMinimum = keywordConsensusMinimum
 	r.receipt.KeywordSupport = make([]KeywordSupportReceipt, 0, len(support))
 	for _, item := range support {
 		item.KindDigest = receiptDigest(item.Kind)

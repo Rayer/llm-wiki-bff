@@ -11,7 +11,6 @@ import (
 	"math/rand"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 	"unicode"
 
@@ -447,20 +446,28 @@ func (e parallelQueryExpander) ExpandWithTrace(ctx context.Context, request Expa
 	if err := ctx.Err(); err != nil {
 		return QueryPlan{}, ExpansionInfo{}, err
 	}
+	type indexedExpansionResult struct {
+		index int
+		value parallelExpansionResult
+	}
+	outcomes := make(chan indexedExpansionResult, e.options.ExpansionAttempts)
 	results := make([]parallelExpansionResult, e.options.ExpansionAttempts)
-	var wait sync.WaitGroup
-	wait.Add(len(results))
 	for index := range results {
-		index := index
-		go func() {
-			defer wait.Done()
+		go func(index int) {
 			attempt := request
 			attempt.Attempt = index + 1
 			attempt.KeywordsPerAttempt = e.options.KeywordsPerAttempt
-			results[index] = e.expandOne(ctx, attempt)
-		}()
+			outcomes <- indexedExpansionResult{index: index, value: e.expandOne(ctx, attempt)}
+		}(index)
 	}
-	wait.Wait()
+	for completed := 0; completed < e.options.ExpansionAttempts; completed++ {
+		select {
+		case outcome := <-outcomes:
+			results[outcome.index] = outcome.value
+		case <-ctx.Done():
+			return QueryPlan{}, ExpansionInfo{}, ctx.Err()
+		}
+	}
 	if err := ctx.Err(); err != nil {
 		return QueryPlan{}, ExpansionInfo{}, err
 	}
@@ -1041,7 +1048,7 @@ func (s *QueryRetrievalPipeline) validate() error {
 func (s *QueryRetrievalPipeline) execute(ctx context.Context, reader cache.Reader, request query.Request, trace *Trace) (query.Result, error) {
 	if recorder := query.ReceiptRecorderFromContext(ctx); recorder != nil {
 		recorder.SetRetrievalConfig(s.options.SelectionLimit, s.options.ExplorationSlots, resolvedEvidenceThreshold(s.options))
-		recorder.SetExpansionConfig(s.options.ExpansionAttempts, 0, 0, s.options.KeywordsPerAttempt, resolvedEvidenceThreshold(s.options), s.options.RareDocumentFrequency, nil)
+		recorder.SetExpansionConfig(s.options.ExpansionAttempts, 0, 0, s.options.KeywordsPerAttempt, resolvedEvidenceThreshold(s.options), s.options.RareDocumentFrequency, MinimumKeywordConsensusSupport, nil)
 	}
 	cacheCtx := ctx
 	if recorder := query.ReceiptRecorderFromContext(ctx); recorder != nil {
@@ -1091,7 +1098,7 @@ func (s *QueryRetrievalPipeline) execute(ctx context.Context, reader cache.Reade
 		for _, item := range plan.KeywordSupport {
 			support = append(support, query.KeywordSupportReceipt{Role: item.Role, Kind: item.Kind, Value: item.Value, Keyword: item.Keyword, SupportCount: item.SupportCount, AttemptIndexes: append([]int(nil), item.AttemptIndexes...)})
 		}
-		recorder.SetExpansionConfig(info.RequestedAttempts, info.SuccessfulAttempts, info.ProviderFailedAttempts, info.KeywordsPerAttempt, resolvedEvidenceThreshold(s.options), s.options.RareDocumentFrequency, support)
+		recorder.SetExpansionConfig(info.RequestedAttempts, info.SuccessfulAttempts, info.ProviderFailedAttempts, info.KeywordsPerAttempt, resolvedEvidenceThreshold(s.options), s.options.RareDocumentFrequency, MinimumKeywordConsensusSupport, support)
 		outcomes := make([]query.ExpansionAttemptReceipt, 0, len(info.AttemptOutcomes))
 		for _, outcome := range info.AttemptOutcomes {
 			outcomes = append(outcomes, query.ExpansionAttemptReceipt{AttemptIndex: outcome.AttemptIndex, Outcome: outcome.Outcome})

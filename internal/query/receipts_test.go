@@ -80,7 +80,7 @@ func TestTimedHostReceiptEndsAtNetworkBoundary(t *testing.T) {
 
 func TestReceiptRecordsResolvedExpansionConfigAndSupport(t *testing.T) {
 	_, recorder := WithReceipt(context.Background())
-	recorder.SetExpansionConfig(3, 2, 1, 24, 2, 1, []KeywordSupportReceipt{{Role: "preferred", Kind: "sentinel-value", Value: "raw-query", Keyword: "provider-body", SupportCount: 2, AttemptIndexes: []int{1, 2}}})
+	recorder.SetExpansionConfig(3, 2, 1, 24, 2, 1, 2, []KeywordSupportReceipt{{Role: "preferred", Kind: "sentinel-value", Value: "raw-query", Keyword: "provider-body", SupportCount: 2, AttemptIndexes: []int{1, 2}}})
 	got := recorder.Receipt()
 	if got.ExpansionAttempts != 3 || got.SuccessfulExpansionAttempts != 2 || got.ProviderFailedExpansionAttempts != 1 || got.FallbackExpansionCount != 0 || got.KeywordsPerExpansionAttempt != 24 || got.EvidenceThreshold != 2 || got.KeywordConsensusMinimum != 2 || got.RareKeywordMaxDocumentFrequency != 1 {
 		t.Fatalf("expansion config receipt = %#v", got)
