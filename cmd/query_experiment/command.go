@@ -96,6 +96,8 @@ type resultRecord struct {
 	Citations           []search.Citation    `json:"citations"`
 	Synthesis           string               `json:"synthesis"`
 	Outcome             string               `json:"outcome"`
+	Status              string               `json:"status"`
+	Reason              string               `json:"reason"`
 	ErrorStage          string               `json:"error_stage,omitempty"`
 	ErrorMessage        string               `json:"error_message,omitempty"`
 	ElapsedMS           int64                `json:"elapsed_ms"`
@@ -525,6 +527,8 @@ func makeResultRecordWithTrace(input caseInput, runIndex int, snapshot preparedS
 		Citations:           citations,
 		Synthesis:           result.AISynth,
 		Outcome:             outcome,
+		Status:              result.Status,
+		Reason:              result.Reason,
 		ElapsedMS:           elapsed,
 		SourceRevision:      metadata.sourceRevision,
 		Provider:            metadata.provider,
