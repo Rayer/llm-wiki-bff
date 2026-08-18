@@ -227,6 +227,112 @@ func TestFixtureAttemptWritesTimingFieldsInRecordAndFinalReceipt(t *testing.T) {
 	}
 }
 
+func TestFixtureZeroQualifiedAttemptWritesStatusReasonInResultsAndFinalReceipt(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write([]byte(`{"choices":[{"message":{"content":"{\"preferred\":[{\"kind\":\"topic\",\"value\":\"coffee\",\"terms\":[\"coffee\"]}]}"}}],"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5}}`))
+	}))
+	defer server.Close()
+	root := filepath.Join(t.TempDir(), "snapshot")
+	writeTestFile(t, filepath.Join(root, "cache", "concepts.jsonl"), `{"slug":"coffee","title":"Coffee","body":"private term: coffee"}`+"\n")
+	dir := t.TempDir()
+	modelPath := writeFixture(t, dir, "models.json", `{"models":[{"id":"m","provider":"fake","base_url":"`+server.URL+`","model":"selected","api_key":"fixture-secret"}]}`)
+	profilePath := writeFixture(t, dir, "profiles.json", `{"profiles":[{"id":"profile","required_when_explicit":[],"preferred_by_default":["topic"],"goals_to_expand":[]}]}`)
+	promptPath := writeFixture(t, dir, "prompts.json", `{"prompts":[{"id":"prompt","system_template":"system {{raw_query}}","user_template":"user {{criterion_policy}} {{raw_query}}"}]}`)
+	casesPath := writeFixture(t, dir, "cases.jsonl", `{"id":"case","query":"coffee","mode":"wiki"}`+"\n")
+	artifacts := filepath.Join(dir, "artifacts")
+	var output strings.Builder
+	if err := runExperiment(context.Background(), experimentOptions{
+		snapshotPath: root, casesPath: casesPath, runs: 1, service: serviceQueryRetrievalLegacy,
+		selectionLimit: 1, explorationSlots: 0, explorationSlotsSet: true, seed: int64Ptr(7),
+		modelFixturePath: modelPath, profileFixturePath: profilePath, promptFixturePath: promptPath,
+		artifactsDir: artifacts, evidenceThreshold: 99, evidenceThresholdSet: true,
+	}, dependencies{now: time.Now, stdout: &output}); err != nil {
+		t.Fatal(err)
+	}
+	var record map[string]any
+	if err := json.Unmarshal([]byte(strings.TrimSpace(output.String())), &record); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := record["outcome"], "retrieval_miss"; got != want {
+		t.Fatalf("results outcome=%v want=%q", got, want)
+	}
+	if got, want := record["status"], "insufficient_evidence"; got != want {
+		t.Fatalf("results status=%v want=%q", got, want)
+	}
+	if got, want := record["reason"], "no_qualified_evidence"; got != want {
+		t.Fatalf("results reason=%v want=%q", got, want)
+	}
+	variantDir := filepath.Join(artifacts, record["variant_id"].(string), "case", "run-1")
+	finalReceiptContents, err := os.ReadFile(filepath.Join(variantDir, "final.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var final map[string]any
+	if err := json.Unmarshal(finalReceiptContents, &final); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := final["status"], "insufficient_evidence"; got != want {
+		t.Fatalf("final status=%v want=%q", got, want)
+	}
+	if got, want := final["reason"], "no_qualified_evidence"; got != want {
+		t.Fatalf("final reason=%v want=%q", got, want)
+	}
+}
+
+func TestFixtureNonemptyAttemptWritesOkAndQualifiedEvidenceInReceipts(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write([]byte(`{"choices":[{"message":{"content":"{\"preferred\":[{\"kind\":\"topic\",\"value\":\"coffee\",\"terms\":[\"coffee\"]}]}"}}],"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5}}`))
+	}))
+	defer server.Close()
+	root := filepath.Join(t.TempDir(), "snapshot")
+	writeTestFile(t, filepath.Join(root, "cache", "concepts.jsonl"), `{"slug":"coffee","title":"Coffee","body":"private term: coffee"}`+"\n")
+	dir := t.TempDir()
+	modelPath := writeFixture(t, dir, "models.json", `{"models":[{"id":"m","provider":"fake","base_url":"`+server.URL+`","model":"selected","api_key":"fixture-secret"}]}`)
+	profilePath := writeFixture(t, dir, "profiles.json", `{"profiles":[{"id":"profile","required_when_explicit":[],"preferred_by_default":["topic"],"goals_to_expand":[]}]}`)
+	promptPath := writeFixture(t, dir, "prompts.json", `{"prompts":[{"id":"prompt","system_template":"system {{raw_query}}","user_template":"user {{criterion_policy}} {{raw_query}}"}]}`)
+	casesPath := writeFixture(t, dir, "cases.jsonl", `{"id":"case","query":"coffee","mode":"wiki"}`+"\n")
+	artifacts := filepath.Join(dir, "artifacts")
+	var output strings.Builder
+	if err := runExperiment(context.Background(), experimentOptions{
+		snapshotPath: root, casesPath: casesPath, runs: 1, service: serviceQueryRetrievalLegacy,
+		selectionLimit: 1, explorationSlots: 0, explorationSlotsSet: true, seed: int64Ptr(7),
+		modelFixturePath: modelPath, profileFixturePath: profilePath, promptFixturePath: promptPath,
+		artifactsDir: artifacts,
+	}, dependencies{now: time.Now, stdout: &output}); err != nil {
+		t.Fatal(err)
+	}
+	var record map[string]any
+	if err := json.Unmarshal([]byte(strings.TrimSpace(output.String())), &record); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := record["status"], "ok"; got != want {
+		t.Fatalf("results status=%q want=%q", got, want)
+	}
+	if got, want := record["reason"], "qualified_evidence"; got != want {
+		t.Fatalf("results reason=%q want=%q", got, want)
+	}
+	if got, want := record["outcome"], "success"; got != want {
+		t.Fatalf("outcome=%v want=%q", got, want)
+	}
+	variantDir := filepath.Join(artifacts, record["variant_id"].(string), "case", "run-1")
+	finalReceiptContents, err := os.ReadFile(filepath.Join(variantDir, "final.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var final map[string]any
+	if err := json.Unmarshal(finalReceiptContents, &final); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := final["status"], "ok"; got != want {
+		t.Fatalf("final status=%q want=%q", got, want)
+	}
+	if got, want := final["reason"], "qualified_evidence"; got != want {
+		t.Fatalf("final reason=%q want=%q", got, want)
+	}
+}
+
 func TestSummaryMetricsUseExplicitRepeatedRunDenominators(t *testing.T) {
 	makeAttempt := func(run int, slugs []string, scores []int, fallback bool) fixtureAttempt {
 		results := make([]resultIdentity, 0, len(slugs))

@@ -114,6 +114,8 @@ type fixtureSelectionOutput struct {
 
 type fixtureFinalReceipt struct {
 	Outcome         string            `json:"outcome"`
+	Status          string            `json:"status"`
+	Reason          string            `json:"reason"`
 	FinalIdentities []resultIdentity  `json:"final_identities"`
 	Receipts        map[string]string `json:"receipts"`
 	QueryReceivedAt string            `json:"query_received_at"`
@@ -340,14 +342,15 @@ func runFixtureAttempt(ctx context.Context, options experimentOptions, retrieval
 	}
 	runCompletedAt := now()
 	outcome := "success"
-	if len(resultIdentities) == 0 {
+	resultStatus, resultReason := queryquality.ResultStatus(len(resultIdentities))
+	if resultStatus != "ok" {
 		outcome = "retrieval_miss"
 	}
 	queryReceivedAtStr, runCompletedAtStr, durationMS := attemptTiming(queryReceivedAt, runCompletedAt)
-	if err := write("final.json", fixtureFinalReceipt{Outcome: outcome, FinalIdentities: resultIdentities, Receipts: map[string]string{"request": "request.json", "expansion_input": "expansion.input.json", "expansion_output": "expansion.output.json", "matching_input": "matching.input.json", "matching_output": "matching.output.json", "selection_input": "selection.input.json", "selection_output": "selection.output.json", "final": "final.json"}, QueryReceivedAt: queryReceivedAtStr, RunCompletedAt: runCompletedAtStr, DurationMS: durationMS}); err != nil {
+	if err := write("final.json", fixtureFinalReceipt{Outcome: outcome, Status: resultStatus, Reason: resultReason, FinalIdentities: resultIdentities, Receipts: map[string]string{"request": "request.json", "expansion_input": "expansion.input.json", "expansion_output": "expansion.output.json", "matching_input": "matching.input.json", "matching_output": "matching.output.json", "selection_input": "selection.input.json", "selection_output": "selection.output.json", "final": "final.json"}, QueryReceivedAt: queryReceivedAtStr, RunCompletedAt: runCompletedAtStr, DurationMS: durationMS}); err != nil {
 		return fixtureAttempt{}, err
 	}
-	result := query.Result{Query: input.Query, Mode: input.Mode}
+	result := query.Result{Query: input.Query, Mode: input.Mode, Status: resultStatus, Reason: resultReason}
 	for _, identity := range resultIdentities {
 		result.Results = append(result.Results, search.Result{Slug: identity.Slug, Title: identity.Title, Type: identity.Type})
 	}
