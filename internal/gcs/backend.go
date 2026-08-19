@@ -9,9 +9,30 @@ import (
 
 	"cloud.google.com/go/storage"
 	"github.com/rayer/llm-wiki-bff/internal/generation"
+	"github.com/rayer/llm-wiki-bff/internal/llm"
 	store "github.com/rayer/llm-wiki-bff/internal/storage"
 	"google.golang.org/api/iterator"
 )
+
+func startGCSCall(ctx context.Context) func(string) {
+	if recorder := llm.HostCallRecorderFromContext(ctx); recorder != nil {
+		return recorder.StartHostCall(llm.CallStage(ctx), "https", "storage.googleapis.com")
+	}
+	return func(string) {}
+}
+
+func finishGCSCall(ctx context.Context, err error) string {
+	if err == nil {
+		return "success"
+	}
+	if errors.Is(err, context.Canceled) {
+		return "canceled"
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "timeout"
+	}
+	return "provider_error"
+}
 
 // clientBackend is a deliberately small, per-Client seam used by adapter tests.
 // Production clients leave it nil and use the GCS bucket directly.
@@ -74,19 +95,33 @@ func (c *Client) readObject(ctx context.Context, name string, generation, limit 
 	if generation > 0 {
 		obj = obj.Generation(generation)
 	}
+	finish := startGCSCall(ctx)
+	finished := false
+	finishOnce := func(err error) {
+		if !finished {
+			finished = true
+			finish(finishGCSCall(ctx, err))
+		}
+	}
 	r, err := obj.NewReader(ctx)
+	if err != nil {
+		finishOnce(err)
+	}
 	if err != nil {
 		return backendObject{}, err
 	}
 	defer r.Close()
 	if r.Attrs.Size < 0 || r.Attrs.Size > limit {
+		finishOnce(nil)
 		return backendObject{}, errors.New("object size does not match attributes")
 	}
 	data, err := io.ReadAll(io.LimitReader(r, limit+1))
+	finishOnce(err)
 	if err != nil {
 		return backendObject{}, err
 	}
 	if int64(len(data)) != r.Attrs.Size || int64(len(data)) > limit {
+		finishOnce(nil)
 		return backendObject{}, errors.New("object exceeds input limit")
 	}
 	return backendObject{Name: name, Data: data, Generation: r.Attrs.Generation, Size: r.Attrs.Size}, nil
@@ -100,7 +135,9 @@ func (c *Client) objectAttrs(ctx context.Context, name string, generation int64)
 	if generation > 0 {
 		obj = obj.Generation(generation)
 	}
+	finish := startGCSCall(ctx)
 	attrs, err := obj.Attrs(ctx)
+	finish(finishGCSCall(ctx, err))
 	if err != nil {
 		return backendObject{}, err
 	}
@@ -154,18 +191,22 @@ func (c *Client) visitObjectsRaw(ctx context.Context, prefix string, directOnly 
 		query.Delimiter = "/"
 	}
 	it := c.bucket.Objects(ctx, query)
+	finish := startGCSCall(ctx)
 	for {
 		attrs, err := it.Next()
 		if errors.Is(err, iterator.Done) {
+			finish("success")
 			return nil
 		}
 		if err != nil {
+			finish(finishGCSCall(ctx, err))
 			return err
 		}
 		if attrs.Name == "" {
 			continue
 		}
 		if err := visit(backendObject{Name: attrs.Name, Generation: attrs.Generation, Size: attrs.Size, Metadata: attrs.Metadata, Updated: attrs.Updated.UTC()}); err != nil {
+			finish(finishGCSCall(ctx, err))
 			return err
 		}
 	}
@@ -173,16 +214,21 @@ func (c *Client) visitObjectsRaw(ctx context.Context, prefix string, directOnly 
 
 func (c *Client) writeObject(ctx context.Context, name string, data []byte, contentType string, metadata map[string]string, condition writeCondition) (backendObject, error) {
 	if c.backend != nil {
-		return c.backend.Write(ctx, name, data, contentType, metadata, condition)
+		finish := startGCSCall(ctx)
+		object, err := c.backend.Write(ctx, name, data, contentType, metadata, condition)
+		finish(finishGCSCall(ctx, err))
+		return object, err
 	}
 	obj := c.bucket.Object(name)
 	if condition.DoesNotExist || condition.GenerationMatch != nil {
 		obj = obj.If(gcsConditions(condition))
 	}
+	finish := startGCSCall(ctx)
 	w := obj.NewWriter(ctx)
 	w.ContentType = contentType
 	w.Metadata = metadata
 	if _, err := w.Write(data); err != nil {
+		finish(finishGCSCall(ctx, err))
 		closeErr := w.Close()
 		if errors.Is(conditionalWriteError(err), store.ErrGenerationMismatch) || errors.Is(conditionalWriteError(closeErr), store.ErrGenerationMismatch) {
 			return backendObject{}, store.ErrGenerationMismatch
@@ -190,22 +236,31 @@ func (c *Client) writeObject(ctx context.Context, name string, data []byte, cont
 		return backendObject{}, err
 	}
 	if err := w.Close(); err != nil {
+		finish(finishGCSCall(ctx, err))
 		return backendObject{}, conditionalWriteError(err)
 	}
 	attrs := w.Attrs()
 	if attrs == nil {
+		finish("provider_error")
 		return backendObject{}, fmt.Errorf("write %s: missing object attributes", name)
 	}
+	finish("success")
 	return backendObject{Name: attrs.Name, Generation: attrs.Generation, Size: attrs.Size, Metadata: attrs.Metadata, Updated: attrs.Updated.UTC()}, nil
 }
 
 func (c *Client) deleteObject(ctx context.Context, name string, objectGeneration int64) error {
 	if c.backend != nil {
-		return c.backend.Delete(ctx, name, objectGeneration)
+		finish := startGCSCall(ctx)
+		err := c.backend.Delete(ctx, name, objectGeneration)
+		finish(finishGCSCall(ctx, err))
+		return err
 	}
 	object := c.bucket.Object(name)
 	if objectGeneration > 0 {
 		object = object.If(storage.Conditions{GenerationMatch: objectGeneration})
 	}
-	return conditionalWriteError(object.Delete(ctx))
+	finish := startGCSCall(ctx)
+	err := conditionalWriteError(object.Delete(ctx))
+	finish(finishGCSCall(ctx, err))
+	return err
 }

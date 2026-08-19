@@ -125,6 +125,8 @@ developer workflow and is never used by the deployed worker.
 
 The BFF supports `FIRESTORE_DATABASE_ID`, `PIPELINE_JOB_URL`, and `ALLOWED_ORIGINS` environment overrides. Empty database and pipeline values preserve the legacy defaults; configured pipeline URLs must be HTTPS Cloud Run Jobs `:run` URLs on `run.googleapis.com` with the expected resource path.
 
+Query retrieval is typed configuration: `query_expansion_keywords_per_attempt` / `QUERY_EXPANSION_KEYWORDS_PER_ATTEMPT` defaults to `24` and accepts `1..100`; `query_expansion_attempts` / `QUERY_EXPANSION_ATTEMPTS` defaults to `3` and accepts `1..10`; `query_selection_evidence_threshold` / `QUERY_SELECTION_EVIDENCE_THRESHOLD` defaults to `2` and accepts `1..100`; and `query_matching_rare_keyword_max_document_frequency` / `QUERY_MATCHING_RARE_KEYWORD_MAX_DOCUMENT_FREQUENCY` defaults to `1` and accepts `1..1000`. Selection limit defaults to `10` and accepts `1..1000`; exploration slots default to `1` and accept `0..limit`. Positive expansion keywords are bounded per attempt, calls share the request context and run concurrently, and aggregation is deterministic by attempt index. Candidates remain hard-eligible first and require exact identity, consensus support, or the configured rare lexical exception; an empty result reports insufficient evidence rather than corpus or world absence.
+
 ## Useful Commands
 
 ```sh

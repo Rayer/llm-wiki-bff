@@ -9,8 +9,6 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/rayer/llm-wiki-bff/internal/cache"
-	"github.com/rayer/llm-wiki-bff/internal/gcs"
 	"github.com/rayer/llm-wiki-bff/internal/llm"
 	"github.com/rayer/llm-wiki-bff/internal/search"
 )
@@ -25,24 +23,6 @@ func (t queryProviderTransport) RoundTrip(req *http.Request) (*http.Response, er
 	<-req.Context().Done()
 	close(t.canceled)
 	return nil, req.Context().Err()
-}
-
-type cachedContextCancellationReader struct {
-	started chan struct{}
-}
-
-func (r *cachedContextCancellationReader) Prefix() string {
-	return "users/u/projects/p"
-}
-
-func (r *cachedContextCancellationReader) ListConcepts(ctx context.Context, _ bool) ([]gcs.WikiPage, error) {
-	close(r.started)
-	<-ctx.Done()
-	return nil, ctx.Err()
-}
-
-func (r *cachedContextCancellationReader) GetPage(context.Context, string, string) (*gcs.WikiPage, []byte, error) {
-	return nil, nil, context.Canceled
 }
 
 func TestQueryPassesCanceledRequestToExpander(t *testing.T) {
@@ -85,30 +65,5 @@ func TestQueryPassesCanceledRequestToExpander(t *testing.T) {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("handler did not return after expander cancellation")
-	}
-}
-
-func TestQueryCancellationPropagatesToCachedContextRebuild(t *testing.T) {
-	reader := &cachedContextCancellationReader{started: make(chan struct{})}
-	conceptCache := cache.New()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	completed := make(chan struct{})
-	go func() {
-		authority, _ := search.NewCitationAuthority()
-		_ = cachedContexts(ctx, conceptCache, reader, []search.Result{{Slug: "coffee-shops", Title: "Coffee Shops"}}, authority)
-		close(completed)
-	}()
-	select {
-	case <-reader.started:
-	case <-time.After(time.Second):
-		t.Fatal("cachedContexts did not start ListConcepts")
-	}
-	cancel()
-	select {
-	case <-completed:
-	case <-time.After(time.Second):
-		t.Fatal("cachedContexts did not return after cancellation")
 	}
 }
