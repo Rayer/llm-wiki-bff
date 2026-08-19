@@ -149,17 +149,42 @@ func (a *CitationAuthority) Resolve(answer string) (string, []Citation, []Result
 
 func appendCitation(normalized *strings.Builder, citations *[]Citation, cited map[string]struct{}, target citationTarget) {
 	result := target.result
+	identity := result.Type + "\x00" + result.Slug
+	if _, ok := cited[identity]; !ok {
+		*citations = append(*citations, citationForResult(result))
+		cited[identity] = struct{}{}
+	}
+	title := NeutralizeCitationReferences(result.Title)
+	normalized.WriteByte('[')
+	normalized.WriteString(title)
+	normalized.WriteByte(']')
+}
+
+// IssuedCitations returns the complete canonical evidence inventory supplied
+// to synthesis, in selected-rank order, independent of model mentions.
+func (a *CitationAuthority) IssuedCitations() []Citation {
+	targets := append([]citationTarget(nil), a.issued...)
+	sort.SliceStable(targets, func(i, j int) bool { return targets[i].rank < targets[j].rank })
+	citations := make([]Citation, 0, len(targets))
+	seen := make(map[string]struct{}, len(targets))
+	for _, target := range targets {
+		identity := target.result.Type + "\x00" + target.result.Slug
+		if _, ok := seen[identity]; ok {
+			continue
+		}
+		seen[identity] = struct{}{}
+		citations = append(citations, citationForResult(target.result))
+	}
+	return citations
+}
+
+func citationForResult(result Result) Citation {
 	title := NeutralizeCitationReferences(result.Title)
 	collection := "concepts"
 	if result.Type == "source" {
 		collection = "sources"
 	}
-	path := "/" + collection + "/" + url.PathEscape(result.Slug)
-	*citations = append(*citations, Citation{Text: title, Slug: result.Slug, Type: result.Type, Path: path})
-	cited[result.Type+"\x00"+result.Slug] = struct{}{}
-	normalized.WriteByte('[')
-	normalized.WriteString(title)
-	normalized.WriteByte(']')
+	return Citation{Text: title, Slug: result.Slug, Type: result.Type, Path: "/" + collection + "/" + url.PathEscape(result.Slug)}
 }
 
 func (a *CitationAuthority) authorizedResults(cited map[string]struct{}) []Result {

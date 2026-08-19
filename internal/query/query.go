@@ -148,11 +148,10 @@ func (s *Service) SynthesizeWithError(ctx context.Context, reader cache.Reader, 
 		return response, nil
 	}
 
-	answer, citations, filtered := authority.Resolve(answer)
+	answer, _, _ = authority.Resolve(answer)
 	FinishStage(synthesisCtx, outcome)
 	response.AISynth = answer
-	response.Citations = citations
-	response.Results = filtered
+	response.Citations = authority.IssuedCitations()
 	return response, nil
 }
 

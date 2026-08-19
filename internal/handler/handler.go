@@ -112,10 +112,9 @@ func (h *Handler) Query(c *gin.Context) {
 			systemPrompt := buildSystemPrompt(mode)
 			userPrompt := buildUserPrompt(q, contexts)
 			if answer, err := h.llm.Chat(ctx, systemPrompt, userPrompt); err == nil {
-				answer, citations, filtered := authority.Resolve(answer)
+				answer, _, _ = authority.Resolve(answer)
 				resp.AISynth = answer
-				resp.Citations = citations
-				resp.Results = filtered
+				resp.Citations = authority.IssuedCitations()
 			} else {
 				log.Printf("LLM synthesis failed: %v", err)
 			}

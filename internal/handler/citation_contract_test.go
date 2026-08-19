@@ -159,8 +159,8 @@ func TestLegacyQuerySkippedContextCannotBindAndIncludedContextCan(t *testing.T) 
 	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
 		t.Fatal(err)
 	}
-	if len(response.Citations) != 1 || response.Citations[0].Slug != "included" || len(response.Results) != 1 || response.Results[0].Slug != "included" {
-		t.Fatalf("legacy skipped context was not excluded from authority: %#v", response)
+	if len(response.Citations) != 1 || response.Citations[0].Slug != "included" || len(response.Results) != 2 || response.Results[0].Slug != "skipped" || response.Results[1].Slug != "included" {
+		t.Fatalf("legacy response did not preserve ranked results while excluding unavailable citation: %#v", response)
 	}
 }
 
@@ -188,7 +188,7 @@ func TestLegacyQueryZeroValidatedCitationsPreservesRankedResults(t *testing.T) {
 	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
 		t.Fatal(err)
 	}
-	if len(response.Results) != 1 || len(response.Citations) != 0 || strings.Contains(response.AISynth, "CITATION_REF_") {
-		t.Fatalf("legacy zero-validation response was unsafe or dropped ranked results: %#v", response)
+	if len(response.Results) != 1 || len(response.Citations) != 1 || response.Citations[0].Slug != "coffee-shops" || strings.Contains(response.AISynth, "CITATION_REF_") {
+		t.Fatalf("legacy zero-validation response was unsafe or missing canonical inventory: %#v", response)
 	}
 }

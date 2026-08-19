@@ -108,11 +108,11 @@ func TestV1QueryUsesIssuedCapabilityFromActualPromptContext(t *testing.T) {
 	if response.AISynth != "answer [Alpha Coffee]" {
 		t.Fatalf("V1 query did not normalize token to canonical citation title: %#v", response)
 	}
-	if len(response.Citations) != 1 || response.Citations[0].Text != "Alpha Coffee" || response.Citations[0].Slug != "alpha-coffee" {
-		t.Fatalf("V1 query did not resolve exactly one expected citation: %#v", response.Citations)
+	if len(response.Citations) != 2 || response.Citations[0].Text != "Alpha Coffee" || response.Citations[0].Slug != "alpha-coffee" || response.Citations[1].Text != "Beta Coffee" || response.Citations[1].Slug != "beta-coffee" {
+		t.Fatalf("V1 query did not return all canonical hydrated citations: %#v", response.Citations)
 	}
-	if len(response.Results) != 1 || response.Results[0].Slug != "alpha-coffee" {
-		t.Fatalf("V1 query did not resolve the issued token: %#v", response)
+	if len(response.Results) != 2 || response.Results[0].Slug != "alpha-coffee" || response.Results[1].Slug != "beta-coffee" {
+		t.Fatalf("V1 query did not preserve all ranked results: %#v", response)
 	}
 
 }
@@ -174,7 +174,7 @@ func TestV1QueryZeroValidatedCitationsPreservesRankedResults(t *testing.T) {
 	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
 		t.Fatal(err)
 	}
-	if len(response.Results) != 1 || len(response.Citations) != 0 || strings.Contains(response.AISynth, "CITATION_REF_") {
-		t.Fatalf("V1 zero-validation response was unsafe or dropped ranked results: %#v", response)
+	if len(response.Results) != 1 || len(response.Citations) != 1 || response.Citations[0].Slug != "coffee-shops" || strings.Contains(response.AISynth, "CITATION_REF_") {
+		t.Fatalf("V1 zero-validation response was unsafe or missing canonical inventory: %#v", response)
 	}
 }
