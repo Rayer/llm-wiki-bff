@@ -10,6 +10,10 @@ on:
         required: true
         type: string
 
+concurrency:
+  group: llm-wiki-bff-dev
+  cancel-in-progress: false
+
 env:
   PROJECT_ID: llm-wiki-cloud
   SERVICE_NAME: llm-wiki-bff-dev
@@ -277,24 +281,74 @@ jobs:
             --update-secrets "JWT_SECRET=${{ env.JWT_SECRET_NAME }}:latest,DEEPSEEK_API_KEY=deepseek-apikey:latest" \
             --update-env-vars "^@^GCP_PROJECT=${{ env.PROJECT_ID }}@BUCKET=${{ env.BUCKET }}@FIRESTORE_DATABASE_ID=${{ env.FIRESTORE_DATABASE_ID }}@PIPELINE_JOB_URL=https://run.googleapis.com/v2/projects/${{ env.PROJECT_ID }}/locations/${{ env.REGION }}/jobs/${{ env.PIPELINE_JOB_NAME }}:run@ALLOWED_ORIGINS=${{ env.ALLOWED_ORIGINS }}@QUERY_EXPANSION_MODEL=${{ env.QUERY_EXPANSION_MODEL }}@QUERY_EXPANSION_REASONING=${{ env.QUERY_EXPANSION_REASONING }}@ANSWER_SYNTHESIS_MODEL=${{ env.ANSWER_SYNTHESIS_MODEL }}@ANSWER_SYNTHESIS_REASONING=${{ env.ANSWER_SYNTHESIS_REASONING }}@QUERY_SELECTION_LIMIT=${{ env.QUERY_SELECTION_LIMIT }}@QUERY_SELECTION_EXPLORATION_SLOTS=${{ env.QUERY_SELECTION_EXPLORATION_SLOTS }}@QUERY_SELECTION_EVIDENCE_THRESHOLD=${{ env.QUERY_SELECTION_EVIDENCE_THRESHOLD }}@QUERY_EXPANSION_KEYWORDS_PER_ATTEMPT=${{ env.QUERY_EXPANSION_KEYWORDS_PER_ATTEMPT }}@QUERY_EXPANSION_ATTEMPTS=${{ env.QUERY_EXPANSION_ATTEMPTS }}@QUERY_MATCHING_RARE_KEYWORD_MAX_DOCUMENT_FREQUENCY=${{ env.QUERY_MATCHING_RARE_KEYWORD_MAX_DOCUMENT_FREQUENCY }}@DEV_JWT=false" \
             --quiet
-          echo "✅ Deployed ${{ env.SERVICE_NAME }} ($GIT_SHA)"
+          if ! SERVICE_JSON=$(gcloud run services describe "${{ env.SERVICE_NAME }}" \
+            --region "${{ env.REGION }}" \
+            --format=json \
+            --quiet); then
+            echo "Unable to read Cloud Run service after deploy; refusing to mutate traffic."
+            exit 1
+          fi
+          if ! LATEST_CREATED_REVISION=$(jq -er '.status.latestCreatedRevisionName // empty' <<<"$SERVICE_JSON"); then
+            echo "Cloud Run did not report the exact newly created revision; refusing to mutate traffic."
+            exit 1
+          fi
+          if ! REVISION_JSON=$(gcloud run revisions describe "$LATEST_CREATED_REVISION" \
+            --region "${{ env.REGION }}" \
+            --format=json \
+            --quiet); then
+            echo "Unable to read exact newly created revision $LATEST_CREATED_REVISION; refusing to mutate traffic."
+            exit 1
+          fi
+          if ! DEPLOYED_IMAGE_DIGEST=$(jq -er '.status.imageDigest' <<<"$REVISION_JSON"); then
+            echo "Exact newly created revision has no readable immutable image; refusing to mutate traffic."
+            exit 1
+          fi
+          if [[ "$DEPLOYED_IMAGE_DIGEST" != "$IMMUTABLE_IMAGE" && "$DEPLOYED_IMAGE_DIGEST" != "$DIGEST" ]]; then
+            echo "Exact newly created revision $LATEST_CREATED_REVISION image digest does not match the deployed build result; refusing to mutate traffic."
+            exit 1
+          fi
 
-          LATEST_READY_REVISION=$(gcloud run services describe ${{ env.SERVICE_NAME }} \
-            --region ${{ env.REGION }} \
-            --format='value(status.latestReadyRevisionName)' \
-            --quiet)
-          if [[ -z "$LATEST_READY_REVISION" ]]; then
-            echo "Cloud Run did not report a latest ready revision; refusing to publish provenance."
+          gcloud run services update-traffic "${{ env.SERVICE_NAME }}" \
+            --region "${{ env.REGION }}" \
+            --to-revisions "$LATEST_CREATED_REVISION=100" \
+            --quiet
+
+          if ! SERVICE_JSON=$(gcloud run services describe "${{ env.SERVICE_NAME }}" \
+            --region "${{ env.REGION }}" \
+            --format=json \
+            --quiet); then
+            echo "Unable to read Cloud Run service after traffic mutation; refusing to publish provenance."
             exit 1
           fi
-          DEPLOYED_IMAGE_DIGEST=$(gcloud run revisions describe "$LATEST_READY_REVISION" \
-            --region ${{ env.REGION }} \
-            --format='value(status.imageDigest)' \
-            --quiet)
-          if [[ "$DEPLOYED_IMAGE_DIGEST" != "$IMMUTABLE_IMAGE" ]]; then
-            echo "Latest ready revision $LATEST_READY_REVISION image digest does not match the deployed build result; refusing to publish provenance."
+          if ! SERVING_REVISION=$(jq -er --arg revision "$LATEST_CREATED_REVISION" '
+            .status.traffic as $traffic |
+            [ $traffic[]? | select((.percent // 0) > 0) ] as $positive |
+            if ($positive | length) != 1 then empty
+            elif $positive[0].percent != 100 then empty
+            elif (($positive[0].revisionName // "") | type) != "string" or (($positive[0].revisionName // "") | length) == 0 then empty
+            elif ($positive[0].tag? != null) then empty
+            elif $positive[0].revisionName != $revision then empty
+            else $positive[0].revisionName
+            end' <<<"$SERVICE_JSON"); then
+            echo "Cloud Run did not report exactly one untagged 100% serving revision $LATEST_CREATED_REVISION; refusing to publish provenance."
             exit 1
           fi
+          if ! REVISION_JSON=$(gcloud run revisions describe "$LATEST_CREATED_REVISION" \
+            --region "${{ env.REGION }}" \
+            --format=json \
+            --quiet); then
+            echo "Unable to read verified serving revision $SERVING_REVISION; refusing to publish provenance."
+            exit 1
+          fi
+          if ! DEPLOYED_IMAGE_DIGEST=$(jq -er '.status.imageDigest' <<<"$REVISION_JSON"); then
+            echo "Verified serving revision has no readable immutable image; refusing to publish provenance."
+            exit 1
+          fi
+          if [[ "$DEPLOYED_IMAGE_DIGEST" != "$IMMUTABLE_IMAGE" && "$DEPLOYED_IMAGE_DIGEST" != "$DIGEST" ]]; then
+            echo "Verified serving revision $SERVING_REVISION image digest does not match the deployed build result; refusing to publish provenance."
+            exit 1
+          fi
+          echo "✅ Deployed ${{ env.SERVICE_NAME }} ($GIT_SHA) as $SERVING_REVISION"
 
       - name: Persist build image digest
         id: image_digest

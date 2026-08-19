@@ -400,6 +400,161 @@ func TestBFFDevWorkflowPushesMainOnlyAndSupportsManualDispatch(t *testing.T) {
 	}
 }
 
+func TestBFFDevWorkflowSerializesDeployments(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
+	var workflow struct {
+		Concurrency struct {
+			Group            string `yaml:"group"`
+			CancelInProgress bool   `yaml:"cancel-in-progress"`
+		} `yaml:"concurrency"`
+	}
+	if err := yaml.Unmarshal([]byte(contents), &workflow); err != nil {
+		t.Fatalf("deploy workflow is not valid YAML: %v", err)
+	}
+	if workflow.Concurrency.Group != "llm-wiki-bff-dev" {
+		t.Fatalf("BFF DEV concurrency group = %q, want llm-wiki-bff-dev", workflow.Concurrency.Group)
+	}
+	if workflow.Concurrency.CancelInProgress {
+		t.Fatal("BFF DEV deploys must not cancel an in-flight provider mutation")
+	}
+}
+
+func TestBFFDevWorkflowVerifiesExactRevisionAndTrafficBeforePublishing(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
+	deployAt := strings.Index(contents, "gcloud run deploy ${{ env.SERVICE_NAME }}")
+	firstDescribe := strings.Index(contents, `gcloud run revisions describe "$LATEST_CREATED_REVISION"`)
+	trafficAt := strings.Index(contents, "gcloud run services update-traffic")
+	readbackAt := strings.Index(contents, `if ! SERVING_REVISION=$(jq`)
+	secondDescribe := strings.Index(contents[firstDescribe+1:], `gcloud run revisions describe "$LATEST_CREATED_REVISION"`)
+	if secondDescribe >= 0 {
+		secondDescribe += firstDescribe + 1
+	}
+	artifactAt := strings.Index(contents, "- name: Upload image digest artifact")
+	if deployAt < 0 || firstDescribe < 0 || trafficAt < 0 || readbackAt < 0 || secondDescribe < 0 || artifactAt < 0 ||
+		!(deployAt < firstDescribe && firstDescribe < trafficAt && trafficAt < readbackAt && readbackAt < secondDescribe && secondDescribe < artifactAt) {
+		t.Fatalf("BFF deployment contract must order deploy < first exact-revision verification < traffic update < readback < second exact-revision verification < artifact: deploy=%d first=%d traffic=%d readback=%d second=%d artifact=%d", deployAt, firstDescribe, trafficAt, readbackAt, secondDescribe, artifactAt)
+	}
+
+	canonicalCheck := `if [[ "$DEPLOYED_IMAGE_DIGEST" != "$IMMUTABLE_IMAGE" && "$DEPLOYED_IMAGE_DIGEST" != "$DIGEST" ]]; then`
+	if strings.Count(contents, canonicalCheck) < 2 {
+		t.Fatalf("BFF workflow must fail closed against both canonical digest representations at both verification points; found %d checks", strings.Count(contents, canonicalCheck))
+	}
+	if strings.Contains(contents, `[[ "$DEPLOYED_IMAGE_DIGEST" != "$IMMUTABLE_IMAGE" ]]`) {
+		t.Fatal("BFF workflow must not compare revision image evidence only to the full immutable image reference")
+	}
+
+	trafficReadback := contents[readbackAt:secondDescribe]
+	for _, want := range []string{
+		"[ $traffic[]? | select((.percent // 0) > 0) ] as $positive",
+		"($positive | length) != 1",
+		"$positive[0].percent != 100",
+		"($positive[0].tag? != null)",
+		"$positive[0].revisionName != $revision",
+	} {
+		if !strings.Contains(trafficReadback, want) {
+			t.Errorf("traffic readback is missing precise positive-target contract %q", want)
+		}
+	}
+	if strings.Contains(trafficReadback, "($traffic | length) != 1") {
+		t.Fatal("traffic readback must tolerate unrelated zero-percent tagged entries")
+	}
+	if strings.Contains(contents, "latestReadyRevisionName") {
+		t.Fatal("BFF workflow must not use latestReadyRevisionName as deployment provenance")
+	}
+}
+
+func TestBFFDevWorkflowTrafficPredicateFixtures(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
+	filter := extractWorkflowText(t, contents,
+		`jq -er --arg revision "$LATEST_CREATED_REVISION" '`,
+		`' <<<"$SERVICE_JSON"`,
+	)
+	revision := "bff-dev-20260819-abc"
+	cases := []struct {
+		name string
+		file string
+		want string
+	}{
+		{name: "exact untagged 100 percent target", file: "traffic-exact.json", want: revision},
+		{name: "target plus unrelated zero percent tagged entries", file: "traffic-zero-percent-tagged.json", want: revision},
+		{name: "multiple positive targets", file: "traffic-multiple-positive.json"},
+		{name: "tagged 100 percent target", file: "traffic-tagged.json"},
+		{name: "wrong revision", file: "traffic-wrong-revision.json"},
+		{name: "percent is not exactly 100", file: "traffic-not-100.json"},
+		{name: "no positive target", file: "traffic-no-positive.json"},
+		{name: "missing revision name", file: "traffic-missing-revision-name.json"},
+		{name: "invalid revision name", file: "traffic-invalid-revision-name.json"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture := readWorkflow(t, "scripts/fixtures/"+tc.file)
+			cmd := exec.Command("jq", "-er", "--arg", "revision", revision, filter)
+			cmd.Stdin = strings.NewReader(fixture)
+			output, err := cmd.CombinedOutput()
+			if tc.want == "" {
+				if err == nil {
+					t.Fatalf("predicate accepted fixture; output=%q", output)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("predicate rejected fixture: %v\n%s", err, output)
+			}
+			if got := strings.TrimSpace(string(output)); got != tc.want {
+				t.Fatalf("predicate output = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestBFFDevWorkflowDigestGuardFixtures(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
+	guardStart := `if [[ "$DEPLOYED_IMAGE_DIGEST" != "$IMMUTABLE_IMAGE" && "$DEPLOYED_IMAGE_DIGEST" != "$DIGEST" ]]; then`
+	guard := guardStart + extractWorkflowText(t, contents,
+		guardStart,
+		"\n          fi",
+	)
+	guard += "\nfi"
+	guard = strings.ReplaceAll(guard, "\n            ", "\n")
+	const digest = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	const immutableImage = "asia-east1-docker.pkg.dev/llm-wiki-cloud/cloud-run-images/llm-wiki-bff@" + digest
+	cases := []struct {
+		name    string
+		image   string
+		wantErr bool
+	}{
+		{name: "full immutable image", image: immutableImage},
+		{name: "bare digest", image: digest},
+		{name: "unrelated repository", image: "asia-east1-docker.pkg.dev/other/repo@" + digest, wantErr: true},
+		{name: "unrelated digest", image: "sha256:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210", wantErr: true},
+		{name: "malformed", image: "not-a-digest", wantErr: true},
+		{name: "empty", image: "", wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := exec.Command("bash", "-euo", "pipefail", "-c", "set -euo pipefail\n"+guard)
+			cmd.Env = append(os.Environ(), "IMMUTABLE_IMAGE="+immutableImage, "DIGEST="+digest, "DEPLOYED_IMAGE_DIGEST="+tc.image, "LATEST_CREATED_REVISION=bff-dev-20260819-abc")
+			output, err := cmd.CombinedOutput()
+			if tc.wantErr == (err == nil) {
+				t.Fatalf("guard error = %v, want error %v; output=%s", err, tc.wantErr, output)
+			}
+		})
+	}
+}
+
+func extractWorkflowText(t *testing.T, contents, start, end string) string {
+	t.Helper()
+	startAt := strings.Index(contents, start)
+	if startAt < 0 {
+		t.Fatalf("workflow is missing extraction start %q", start)
+	}
+	endAt := strings.Index(contents[startAt+len(start):], end)
+	if endAt < 0 {
+		t.Fatalf("workflow is missing extraction end %q after %q", end, start)
+	}
+	return contents[startAt+len(start) : startAt+len(start)+endAt]
+}
+
 func TestBFFDevWorkflowSetsExpansionModelWithoutChangingSecretBinding(t *testing.T) {
 	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
 	if !strings.Contains(contents, "QUERY_EXPANSION_MODEL: deepseek-v4-flash") {
@@ -454,14 +609,20 @@ func TestDeployWorkflowUsesImmutableCloudBuildResultDigest(t *testing.T) {
 		`--image "$IMMUTABLE_IMAGE"`,
 		`echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"`,
 		`DIGEST: ${{ steps.build.outputs.digest }}`,
-		"latestReadyRevisionName",
+		"status.latestCreatedRevisionName",
 		"gcloud run revisions describe",
 		"status.imageDigest",
-		`[[ "$DEPLOYED_IMAGE_DIGEST" != "$IMMUTABLE_IMAGE" ]]`,
+		`[[ "$DEPLOYED_IMAGE_DIGEST" != "$IMMUTABLE_IMAGE" && "$DEPLOYED_IMAGE_DIGEST" != "$DIGEST" ]]`,
+		"gcloud run services update-traffic",
+		"--to-revisions \"$LATEST_CREATED_REVISION=100\"",
+		"exactly one untagged 100% serving revision",
 	} {
 		if !strings.Contains(contents, want) {
 			t.Errorf("deploy workflow is missing immutable build provenance contract %q", want)
 		}
+	}
+	if strings.Contains(contents, "latestReadyRevisionName") {
+		t.Fatal("deploy workflow must not use latestReadyRevisionName as deployment provenance")
 	}
 	if strings.Contains(contents, "gcloud artifacts docker images describe") {
 		t.Fatal("deploy workflow must not re-resolve the mutable image tag after Cloud Build")
@@ -472,8 +633,15 @@ func TestDeployWorkflowUsesImmutableCloudBuildResultDigest(t *testing.T) {
 	if strings.Index(contents, `BUILD_RESULT=$(gcloud builds describe "$BUILD_ID"`) > strings.Index(contents, `--image "$IMMUTABLE_IMAGE"`) {
 		t.Fatal("deploy workflow must read the exact Cloud Build result before deploying")
 	}
-	if strings.Index(contents, "latestReadyRevisionName") > strings.Index(contents, "Upload image digest artifact") {
-		t.Fatal("deploy workflow must verify the latest ready revision before uploading the digest artifact")
+	deployAt := strings.Index(contents, "gcloud run deploy")
+	routeAt := strings.Index(contents, "gcloud run services update-traffic")
+	artifactAt := strings.Index(contents, "Upload image digest artifact")
+	preVerifyAt := strings.Index(contents, `if ! DEPLOYED_IMAGE_DIGEST=$(jq -er '.status.imageDigest' <<<"$REVISION_JSON")`)
+	if deployAt < 0 || preVerifyAt < 0 || routeAt < 0 || artifactAt < 0 || deployAt > preVerifyAt || preVerifyAt > routeAt || routeAt > artifactAt {
+		t.Fatal("deploy, exact revision verification/routing, and artifact publication are out of order")
+	}
+	if strings.Count(contents, "gcloud run revisions describe \"$LATEST_CREATED_REVISION\"") < 2 {
+		t.Fatal("deploy workflow must describe the exact created revision before and after traffic mutation")
 	}
 }
 
