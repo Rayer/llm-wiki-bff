@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
@@ -86,6 +87,42 @@ func TestServiceFullSynthesizesAndResolvesCitations(t *testing.T) {
 	}
 	if len(result.Results) != 1 || result.Results[0].Slug != "alpha-coffee" {
 		t.Fatalf("results = %#v, want resolved alpha-coffee result", result.Results)
+	}
+}
+
+func TestServiceRetainsAllHydratedResultsAndCitations(t *testing.T) {
+	transport := &queryLLMTransport{t: t}
+	baseTransport := http.DefaultTransport
+	http.DefaultTransport = transport
+	t.Cleanup(func() { http.DefaultTransport = baseTransport })
+
+	service, reader := serviceFixture(t, strings.Join([]string{
+		`{"slug":"restaurant-alpha","title":"Restaurant Alpha","body":"restaurant alpha"}`,
+		`{"slug":"restaurant-beta","title":"Restaurant Beta","body":"restaurant beta"}`,
+		`{"slug":"restaurant-gamma","title":"Restaurant Gamma","body":"restaurant gamma"}`,
+	}, "\n")+"\n")
+	service.llm = llm.NewClient("test")
+	result, err := service.Execute(context.Background(), reader, Request{Query: "restaurant", Mode: "full"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(result.Results) != 3 {
+		t.Fatalf("results = %#v, want all three selected results", result.Results)
+	}
+	if got := []string{result.Results[0].Slug, result.Results[1].Slug, result.Results[2].Slug}; !reflect.DeepEqual(got, []string{"restaurant-alpha", "restaurant-beta", "restaurant-gamma"}) {
+		t.Fatalf("results = %#v, want all selected results in rank order", result.Results)
+	}
+	if len(result.Citations) != 3 {
+		t.Fatalf("citations = %#v, want all three hydrated results", result.Citations)
+	}
+	wantCitations := []search.Citation{
+		{Text: "Restaurant Alpha", Slug: "restaurant-alpha", Type: "concept", Path: "/concepts/restaurant-alpha"},
+		{Text: "Restaurant Beta", Slug: "restaurant-beta", Type: "concept", Path: "/concepts/restaurant-beta"},
+		{Text: "Restaurant Gamma", Slug: "restaurant-gamma", Type: "concept", Path: "/concepts/restaurant-gamma"},
+	}
+	if !reflect.DeepEqual(result.Citations, wantCitations) {
+		t.Fatalf("citations = %#v, want all canonical hydrated results in rank order", result.Citations)
 	}
 }
 
@@ -223,6 +260,50 @@ Alpha body [CITATION_REF_8]
 	}
 	if len(filtered) != 1 || filtered[0].Slug != "alpha" {
 		t.Fatalf("authority expected filtered alpha result: %#v", filtered)
+	}
+}
+
+func TestServiceHydrationFailureExcludesOnlyUnavailableCitation(t *testing.T) {
+	transport := &queryLLMTransport{t: t}
+	baseTransport := http.DefaultTransport
+	http.DefaultTransport = transport
+	t.Cleanup(func() { http.DefaultTransport = baseTransport })
+
+	reader := &queryContextReader{
+		prefix: "users/u/projects/p",
+		concepts: []gcs.WikiPage{
+			{Slug: "restaurant-alpha", Title: "Restaurant Alpha"},
+			{Slug: "restaurant-beta", Title: "Restaurant Beta"},
+			{Slug: "restaurant-gamma", Title: "Restaurant Gamma"},
+		},
+		pages: map[string][]byte{
+			"restaurant-alpha": []byte("Restaurant Alpha body"),
+			"restaurant-gamma": []byte("Restaurant Gamma body"),
+		},
+	}
+	service := NewService(cache.New(), nil, llm.NewClient("test"))
+	response := Result{
+		Query: "restaurant",
+		Mode:  "full",
+		Results: []search.Result{
+			{Slug: "restaurant-alpha", Title: "Restaurant Alpha", Type: "concept"},
+			{Slug: "restaurant-beta", Title: "Restaurant Beta", Type: "concept"},
+			{Slug: "restaurant-gamma", Title: "Restaurant Gamma", Type: "concept"},
+		},
+	}
+
+	result, err := service.SynthesizeWithError(context.Background(), reader, Request{Query: "restaurant", Mode: "full"}, response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Results) != 3 || result.Results[1].Slug != "restaurant-beta" {
+		t.Fatalf("results = %#v, want all selected results including unavailable item", result.Results)
+	}
+	if len(result.Citations) != 2 {
+		t.Fatalf("citations = %#v, want only hydrated items", result.Citations)
+	}
+	if got := []string{result.Citations[0].Slug, result.Citations[1].Slug}; !reflect.DeepEqual(got, []string{"restaurant-alpha", "restaurant-gamma"}) {
+		t.Fatalf("citations = %#v, want only hydrated items in selected order", result.Citations)
 	}
 }
 
@@ -443,8 +524,8 @@ func TestServiceZeroValidatedCitationsPreservesRankedResults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(result.Citations) != 0 || len(result.Results) != 1 || result.Results[0].Slug != "alpha-coffee" {
-		t.Fatalf("zero-valid-citation response = %#v, want ranked result preserved", result)
+	if len(result.Citations) != 1 || result.Citations[0].Slug != "alpha-coffee" || len(result.Results) != 1 || result.Results[0].Slug != "alpha-coffee" {
+		t.Fatalf("zero-valid-citation response = %#v, want canonical inventory and ranked result preserved", result)
 	}
 }
 

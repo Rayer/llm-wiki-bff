@@ -94,6 +94,71 @@ func TestCitationAuthorityRequiresExactUniqueTitles(t *testing.T) {
 	}
 }
 
+func TestCitationAuthorityIssuedCitationsPreserveConceptSourceIdentity(t *testing.T) {
+	ranked := []Result{
+		{Slug: "shared", Title: "Restaurant", Type: "concept"},
+		{Slug: "shared", Title: "Restaurant", Type: "source"},
+	}
+	authority := testAuthority(t, ranked)
+	conceptToken := tokenInContext(authority.AddContext(0, ranked[0], "concept body"))
+	sourceToken := tokenInContext(authority.AddContext(1, ranked[1], "source body"))
+
+	_, citations, _ := authority.Resolve(conceptToken + sourceToken)
+	if len(citations) != 2 || citations[0].Type != "concept" || citations[1].Type != "source" {
+		t.Fatalf("inline citations = %#v, want distinct concept/source identities", citations)
+	}
+	issued := authority.IssuedCitations()
+	if len(issued) != 2 || issued[0].Path != "/concepts/shared" || issued[1].Path != "/sources/shared" {
+		t.Fatalf("issued citations = %#v, want rank-ordered type-specific paths", issued)
+	}
+}
+
+func TestCitationAuthorityIssuedCitationsDeduplicateDisplayTitlesOnlyByIdentity(t *testing.T) {
+	ranked := []Result{
+		{Slug: "restaurant-one", Title: "Restaurant", Type: "concept"},
+		{Slug: "restaurant-two", Title: "Restaurant", Type: "concept"},
+	}
+	authority := testAuthority(t, ranked)
+	authority.AddContext(0, ranked[0], "one body")
+	authority.AddContext(1, ranked[1], "two body")
+
+	if normalized, citations, _ := authority.Resolve("[Restaurant]"); normalized != "[Restaurant]" || len(citations) != 0 {
+		t.Fatalf("ambiguous title resolved unexpectedly: %q %#v", normalized, citations)
+	}
+	issued := authority.IssuedCitations()
+	if len(issued) != 2 || issued[0].Slug != "restaurant-one" || issued[1].Slug != "restaurant-two" {
+		t.Fatalf("issued citations = %#v, want both distinct identities once", issued)
+	}
+}
+
+func TestCitationAuthorityRepeatedInlineReferenceDoesNotDuplicateCitation(t *testing.T) {
+	result := Result{Slug: "restaurant", Title: "Restaurant", Type: "concept"}
+	authority := testAuthority(t, []Result{result})
+	token := tokenInContext(authority.AddContext(0, result, "body"))
+
+	_, citations, _ := authority.Resolve(token + " and again " + token)
+	if len(citations) != 1 || citations[0].Slug != "restaurant" {
+		t.Fatalf("repeated inline reference citations = %#v, want one canonical citation", citations)
+	}
+	if issued := authority.IssuedCitations(); len(issued) != 1 || issued[0].Slug != "restaurant" {
+		t.Fatalf("issued citations = %#v, want one canonical citation", issued)
+	}
+}
+
+func TestCitationAuthorityUnknownBracketLabelDoesNotBind(t *testing.T) {
+	result := Result{Slug: "restaurant", Title: "Restaurant", Type: "concept"}
+	authority := testAuthority(t, []Result{result})
+	authority.AddContext(0, result, "body")
+
+	normalized, citations, _ := authority.Resolve("answer [Unknown Restaurant]")
+	if normalized != "answer [Unknown Restaurant]" || len(citations) != 0 {
+		t.Fatalf("unknown bracket label resolved unexpectedly: %q %#v", normalized, citations)
+	}
+	if issued := authority.IssuedCitations(); len(issued) != 1 || issued[0].Slug != "restaurant" {
+		t.Fatalf("issued citations = %#v, want hydrated inventory unchanged", issued)
+	}
+}
+
 func TestCitationAuthorityRejectsWhitespaceInSlugs(t *testing.T) {
 	for _, slug := range []string{"coffee shops", "coffee\tshops", "coffee\u00a0shops", "coffee\u2003shops"} {
 		result := Result{Slug: slug, Title: "Coffee Shops", Type: "concept"}
