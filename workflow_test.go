@@ -400,6 +400,46 @@ func TestBFFDevWorkflowPushesMainOnlyAndSupportsManualDispatch(t *testing.T) {
 	}
 }
 
+func TestBFFDevWorkflowSetsExpansionModelWithoutChangingSecretBinding(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
+	if !strings.Contains(contents, "QUERY_EXPANSION_MODEL: deepseek-v4-flash") {
+		t.Fatal("BFF DEV workflow must set the platform-owned expansion model")
+	}
+	for _, want := range []string{"QUERY_EXPANSION_REASONING: none", "ANSWER_SYNTHESIS_MODEL: deepseek-v4-pro", "ANSWER_SYNTHESIS_REASONING: none", "@QUERY_EXPANSION_REASONING=${{ env.QUERY_EXPANSION_REASONING }}", "@ANSWER_SYNTHESIS_MODEL=${{ env.ANSWER_SYNTHESIS_MODEL }}", "@ANSWER_SYNTHESIS_REASONING=${{ env.ANSWER_SYNTHESIS_REASONING }}"} {
+		if !strings.Contains(contents, want) {
+			t.Fatalf("BFF DEV workflow missing %q", want)
+		}
+	}
+	if !strings.Contains(contents, "@QUERY_EXPANSION_MODEL=${{ env.QUERY_EXPANSION_MODEL }}") {
+		t.Fatal("BFF DEV deploy must pass the non-secret expansion model config")
+	}
+	if !strings.Contains(contents, "DEEPSEEK_API_KEY=deepseek-apikey:latest") {
+		t.Fatal("BFF DEV deploy must preserve the existing DeepSeek secret reference")
+	}
+}
+
+func TestBFFDevWorkflowSetsQuerySelectionPolicy(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
+	for _, want := range []string{
+		"QUERY_SELECTION_LIMIT: 10",
+		"QUERY_SELECTION_EXPLORATION_SLOTS: 1",
+		"QUERY_SELECTION_EVIDENCE_THRESHOLD: 2",
+		"QUERY_EXPANSION_KEYWORDS_PER_ATTEMPT: 24",
+		"QUERY_EXPANSION_ATTEMPTS: 3",
+		"QUERY_MATCHING_RARE_KEYWORD_MAX_DOCUMENT_FREQUENCY: 1",
+		"QUERY_SELECTION_LIMIT=${{ env.QUERY_SELECTION_LIMIT }}",
+		"QUERY_SELECTION_EXPLORATION_SLOTS=${{ env.QUERY_SELECTION_EXPLORATION_SLOTS }}",
+		"QUERY_SELECTION_EVIDENCE_THRESHOLD=${{ env.QUERY_SELECTION_EVIDENCE_THRESHOLD }}",
+		"QUERY_EXPANSION_KEYWORDS_PER_ATTEMPT=${{ env.QUERY_EXPANSION_KEYWORDS_PER_ATTEMPT }}",
+		"QUERY_EXPANSION_ATTEMPTS=${{ env.QUERY_EXPANSION_ATTEMPTS }}",
+		"QUERY_MATCHING_RARE_KEYWORD_MAX_DOCUMENT_FREQUENCY=${{ env.QUERY_MATCHING_RARE_KEYWORD_MAX_DOCUMENT_FREQUENCY }}",
+	} {
+		if !strings.Contains(contents, want) {
+			t.Fatalf("BFF DEV workflow missing %q", want)
+		}
+	}
+}
+
 func TestDeployWorkflowUsesImmutableCloudBuildResultDigest(t *testing.T) {
 	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
 	for _, want := range []string{

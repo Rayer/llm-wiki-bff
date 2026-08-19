@@ -66,13 +66,13 @@ func (e *QueryExpander) Expand(ctx context.Context, query string) (*ExpandResult
 
 	raw, err := e.client.Chat(ctx, e.systemPrompt, query)
 	if err != nil {
-		log.Printf("[expander] LLM call failed for query %q: %v", query, err)
+		log.Printf("[expander] LLM call failed: %v", err)
 		return nil, fmt.Errorf("expander: chat: %w", err)
 	}
 
 	result, err := parseExpandResult(raw)
 	if err != nil {
-		log.Printf("[expander] parse failed for query %q (raw=%q): %v", query, raw, err)
+		log.Printf("[expander] parse failed: %v", err)
 		return nil, fmt.Errorf("expander: parse: %w", err)
 	}
 
@@ -93,10 +93,10 @@ func parseExpandResult(raw string) (*ExpandResult, error) {
 
 	var r ExpandResult
 	if err := json.Unmarshal([]byte(raw), &r); err != nil {
-		return nil, fmt.Errorf("json parse: %w (raw=%q)", err, raw[:min(len(raw), 200)])
+		return nil, fmt.Errorf("json parse: %w", err)
 	}
 	if len(r.Keywords) == 0 {
-		return nil, fmt.Errorf("no keywords in response (raw=%q)", raw[:min(len(raw), 200)])
+		return nil, fmt.Errorf("no keywords in response")
 	}
 	return &r, nil
 }

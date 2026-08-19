@@ -4,8 +4,99 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
+
+func TestLoadDefaultsQueryExpansionModel(t *testing.T) {
+	t.Setenv("QUERY_EXPANSION_MODEL", "")
+	cfg, err := Load(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.QueryExpansionModel != DefaultQueryExpansionModel || cfg.QueryExpansionReasoning != DefaultQueryExpansionReasoning {
+		t.Fatalf("expansion config = %#v, want flash/none", cfg)
+	}
+	if cfg.AnswerSynthesisModel != DefaultAnswerSynthesisModel || cfg.AnswerSynthesisReasoning != DefaultAnswerSynthesisReasoning {
+		t.Fatalf("synthesis config = %#v, want pro/none", cfg)
+	}
+}
+
+func TestLoadRejectsEnabledExpansionAndInvalidSynthesisReasoning(t *testing.T) {
+	t.Setenv("QUERY_EXPANSION_REASONING", "low")
+	if _, err := Load(t.TempDir()); err == nil {
+		t.Fatal("Load() accepted enabled expansion reasoning")
+	}
+	t.Setenv("QUERY_EXPANSION_REASONING", "none")
+	t.Setenv("ANSWER_SYNTHESIS_REASONING", "medium")
+	if _, err := Load(t.TempDir()); err == nil {
+		t.Fatal("Load() accepted invalid synthesis reasoning")
+	}
+}
+
+func TestLoadRejectsNonBaselineQueryExpansionModel(t *testing.T) {
+	t.Setenv("QUERY_EXPANSION_MODEL", "deepseek-chat")
+	if _, err := Load(t.TempDir()); err == nil {
+		t.Fatal("Load() error = nil, want fixed baseline rejection")
+	}
+}
+
+func TestLoadQuerySelectionDefaultsAndTypedEnv(t *testing.T) {
+	t.Setenv("QUERY_SELECTION_LIMIT", "")
+	t.Setenv("QUERY_SELECTION_EXPLORATION_SLOTS", "")
+	t.Setenv("QUERY_SELECTION_EVIDENCE_THRESHOLD", "")
+	cfg, err := Load(writeConfig(t, "dev_jwt = true\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.QuerySelectionLimit != DefaultQuerySelectionLimit || cfg.QuerySelectionExplorationSlots != DefaultQuerySelectionExplorationSlots || cfg.QuerySelectionEvidenceThreshold != DefaultQuerySelectionEvidenceThreshold {
+		t.Fatalf("query selection defaults = %#v", cfg)
+	}
+	t.Setenv("QUERY_SELECTION_LIMIT", "7")
+	t.Setenv("QUERY_SELECTION_EXPLORATION_SLOTS", "2")
+	t.Setenv("QUERY_SELECTION_EVIDENCE_THRESHOLD", "3")
+	cfg, err = Load(writeConfig(t, "dev_jwt = true\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.QuerySelectionLimit != 7 || cfg.QuerySelectionExplorationSlots != 2 || cfg.QuerySelectionEvidenceThreshold != 3 {
+		t.Fatalf("query selection env = %#v", cfg)
+	}
+	t.Setenv("QUERY_EXPANSION_KEYWORDS_PER_ATTEMPT", "24")
+	t.Setenv("QUERY_EXPANSION_ATTEMPTS", "3")
+	t.Setenv("QUERY_MATCHING_RARE_KEYWORD_MAX_DOCUMENT_FREQUENCY", "1")
+	cfg, err = Load(writeConfig(t, "dev_jwt = true\n"))
+	if err != nil || cfg.QueryExpansionKeywordsPerAttempt != 24 || cfg.QueryExpansionAttempts != 3 || cfg.QueryMatchingRareKeywordMaxDocumentFrequency != 1 {
+		t.Fatalf("query expansion env = %#v, err=%v", cfg, err)
+	}
+}
+
+func TestLoadRejectsMalformedOrUnsafeQuerySelectionConfig(t *testing.T) {
+	for name, env := range map[string]string{
+		"threshold zero":       "QUERY_SELECTION_EVIDENCE_THRESHOLD=0",
+		"threshold malformed":  "QUERY_SELECTION_EVIDENCE_THRESHOLD=nope",
+		"limit zero":           "QUERY_SELECTION_LIMIT=0",
+		"limit too large":      "QUERY_SELECTION_LIMIT=1001",
+		"exploration negative": "QUERY_SELECTION_EXPLORATION_SLOTS=-1",
+		"keywords zero":        "QUERY_EXPANSION_KEYWORDS_PER_ATTEMPT=0",
+		"attempts too large":   "QUERY_EXPANSION_ATTEMPTS=11",
+		"rare frequency zero":  "QUERY_MATCHING_RARE_KEYWORD_MAX_DOCUMENT_FREQUENCY=0",
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("QUERY_SELECTION_LIMIT", "")
+			t.Setenv("QUERY_SELECTION_EXPLORATION_SLOTS", "")
+			t.Setenv("QUERY_SELECTION_EVIDENCE_THRESHOLD", "")
+			t.Setenv("QUERY_EXPANSION_KEYWORDS_PER_ATTEMPT", "")
+			t.Setenv("QUERY_EXPANSION_ATTEMPTS", "")
+			t.Setenv("QUERY_MATCHING_RARE_KEYWORD_MAX_DOCUMENT_FREQUENCY", "")
+			parts := strings.SplitN(env, "=", 2)
+			t.Setenv(parts[0], parts[1])
+			if _, err := Load(writeConfig(t, "dev_jwt = true\n")); err == nil {
+				t.Fatal("Load() accepted invalid query selection configuration")
+			}
+		})
+	}
+}
 
 func TestLoadAllowsEmptyJWTSecretInProduction(t *testing.T) {
 	t.Setenv("JWT_SECRET", "")

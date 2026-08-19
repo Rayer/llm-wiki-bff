@@ -4,7 +4,9 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -27,6 +29,8 @@ import (
 	"github.com/rayer/llm-wiki-bff/internal/localfs"
 	"github.com/rayer/llm-wiki-bff/internal/middleware"
 	"github.com/rayer/llm-wiki-bff/internal/observability"
+	"github.com/rayer/llm-wiki-bff/internal/query"
+	"github.com/rayer/llm-wiki-bff/internal/queryquality"
 	"github.com/rayer/llm-wiki-bff/internal/search"
 	store "github.com/rayer/llm-wiki-bff/internal/storage"
 	"github.com/rayer/llm-wiki-bff/internal/syssettings"
@@ -111,20 +115,9 @@ func main() {
 	conceptCache := conceptcache.New()
 	log.Printf("Concept cache: not yet rebuilt — call /api/v1/pipeline/rebuild-index")
 
-	// LLM client (optional — query works without it)
-	llmClient := llm.NewClient(cfg.DeepSeekAPIKey)
-	if llmClient != nil {
-		log.Printf("LLM client: DeepSeek ready")
-	} else {
-		log.Printf("LLM client: DEEPSEEK_API_KEY not set — query synthesis disabled")
-	}
-
-	// Query expander (lifestyle domain for MVP)
-	expander, err := llm.NewExpander(llmClient, "lifestyle")
+	productionExecutor, err := newProductionQueryExecutor(cfg, conceptCache)
 	if err != nil {
-		log.Printf("Query expander: %v", err)
-	} else if expander != nil {
-		log.Printf("Query expander: lifestyle domain ready")
+		log.Fatalf("Failed to create production query executor: %v", err)
 	}
 
 	// OpenTelemetry metrics (graceful fallback)
@@ -140,7 +133,8 @@ func main() {
 	}
 
 	// Handlers
-	hV1 := handlerv1.New(wikiStore, fsClient, idx, conceptCache, llmClient, expander)
+	hV1 := handlerv1.New(wikiStore, fsClient, idx, conceptCache, nil, nil)
+	hV1.SetQueryExecutor(productionExecutor)
 	hV1.SetPipelineJobURL(cfg.PipelineJobURL)
 	hV1.SetPipelineQuotaConfig(
 		cfg.PipelineDailyLimit,
@@ -259,6 +253,56 @@ func main() {
 	log.Printf("BFF listening on :%s", cfg.Port)
 	log.Printf("Swagger UI: http://localhost:%s/swagger/index.html", cfg.Port)
 	log.Fatal(r.Run(":" + cfg.Port))
+}
+
+func newProductionQueryExecutor(cfg config.Config, conceptCache *conceptcache.Cache) (query.Executor, error) {
+	selectionLimit := cfg.QuerySelectionLimit
+	if selectionLimit == 0 {
+		selectionLimit = config.DefaultQuerySelectionLimit
+	}
+	explorationSlots := cfg.QuerySelectionExplorationSlots
+	if cfg.QuerySelectionLimit == 0 && explorationSlots == 0 {
+		explorationSlots = config.DefaultQuerySelectionExplorationSlots
+	}
+	evidenceThreshold := cfg.QuerySelectionEvidenceThreshold
+	evidenceThresholdSet := cfg.QuerySelectionEvidenceThreshold != 0
+	if evidenceThreshold == 0 {
+		evidenceThreshold = config.DefaultQuerySelectionEvidenceThreshold
+	}
+	if cfg.QueryExpansionModel == "" {
+		cfg.QueryExpansionModel = config.DefaultQueryExpansionModel
+	}
+	if cfg.AnswerSynthesisModel == "" {
+		cfg.AnswerSynthesisModel = config.DefaultAnswerSynthesisModel
+	}
+	if cfg.AnswerSynthesisReasoning == "" {
+		cfg.AnswerSynthesisReasoning = config.DefaultAnswerSynthesisReasoning
+	}
+	if cfg.QueryExpansionModel != "" && cfg.QueryExpansionModel != config.DefaultQueryExpansionModel {
+		return nil, fmt.Errorf("query expansion model must be %s", config.DefaultQueryExpansionModel)
+	}
+	synthesisClient := llm.NewClientWithOptions(cfg.DeepSeekAPIKey, llm.ClientOptions{Model: cfg.AnswerSynthesisModel, Reasoning: cfg.AnswerSynthesisReasoning})
+	if cfg.DeepSeekAPIKey != "" && synthesisClient == nil {
+		return nil, errors.New("invalid answer synthesis client configuration")
+	}
+	temperature := 0.0
+	expansionClient := llm.NewClientWithOptions(cfg.DeepSeekAPIKey, llm.ClientOptions{Model: cfg.QueryExpansionModel, Temperature: &temperature, Reasoning: config.DefaultQueryExpansionReasoning})
+	var expansionProvider queryquality.ChatProvider
+	if expansionClient != nil {
+		expansionProvider = expansionClient
+	}
+	legacyExpander, err := llm.NewExpander(nil, "lifestyle")
+	if err != nil {
+		return nil, err
+	}
+	legacy := query.NewService(conceptCache, legacyExpander, synthesisClient)
+	return queryquality.NewProductionExecutor(conceptCache, expansionProvider, legacy, legacy, queryquality.Options{
+		SelectionLimit: selectionLimit, ExplorationSlots: explorationSlots,
+		EvidenceThreshold: evidenceThreshold, EvidenceThresholdSet: evidenceThresholdSet,
+		KeywordsPerAttempt:    cfg.QueryExpansionKeywordsPerAttempt,
+		ExpansionAttempts:     cfg.QueryExpansionAttempts,
+		RareDocumentFrequency: cfg.QueryMatchingRareKeywordMaxDocumentFrequency,
+	})
 }
 
 func registerPublicRoutes(r *gin.Engine, settingsStore syssettings.RegistrationGate) {
