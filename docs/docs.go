@@ -474,6 +474,9 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
+                "consumes": [
+                    "application/json"
+                ],
                 "produces": [
                     "application/json"
                 ],
@@ -481,11 +484,31 @@ const docTemplate = `{
                     "admin"
                 ],
                 "summary": "Publish announcement (admin)",
+                "parameters": [
+                    {
+                        "description": "Announcement Markdown",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/syssettings.publishAnnouncementRequest"
+                        }
+                    }
+                ],
                 "responses": {
                     "200": {
                         "description": "OK",
                         "schema": {
                             "$ref": "#/definitions/syssettings.Settings"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
                         }
                     },
                     "401": {
@@ -2408,10 +2431,7 @@ const docTemplate = `{
         "syssettings.Settings": {
             "type": "object",
             "properties": {
-                "announcement_draft_markdown": {
-                    "type": "string"
-                },
-                "announcement_published_markdown": {
+                "announcement_markdown": {
                     "type": "string"
                 },
                 "registration_enabled": {
@@ -2422,11 +2442,19 @@ const docTemplate = `{
         "syssettings.patchSettingsRequest": {
             "type": "object",
             "properties": {
-                "announcement_draft_markdown": {
-                    "type": "string"
-                },
                 "registration_enabled": {
                     "type": "boolean"
+                }
+            }
+        },
+        "syssettings.publishAnnouncementRequest": {
+            "type": "object",
+            "required": [
+                "announcement_markdown"
+            ],
+            "properties": {
+                "announcement_markdown": {
+                    "type": "string"
                 }
             }
         },
