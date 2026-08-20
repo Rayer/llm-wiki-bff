@@ -1443,7 +1443,7 @@ func (m lexicalMatcher) Match(ctx context.Context, request MatchRequest) (Eligib
 		}
 		candidate.SemanticResolution = semanticResolution(candidate.Groups)
 		candidate.SemanticOutcome = candidate.SemanticResolution
-		candidate.ExactIdentityEvidence = hasExactRequiredIdentity(request.Plan, searchCorpus[index], candidate.Groups)
+		candidate.ExactIdentityEvidence = hasExactRequiredIdentity(request.Plan, searchCorpus[index], candidate.Groups) || hasExactRawQueryIdentity(request.Plan, searchCorpus[index])
 		candidate.PositiveEvidenceDimensions = positiveEvidenceDimensions(request.Plan, candidate.Groups)
 		candidate.PositiveEvidenceCount = len(candidate.PositiveEvidenceDimensions)
 		candidate.Score = independentDimensionScore(request.Plan, candidate.Groups)
@@ -1511,9 +1511,12 @@ func prepareSearchableEntry(entry cache.Entry) searchableEntry {
 	for _, key := range searchableFrontmatterKeys {
 		values = appendSearchableValues(values, entry.Frontmatter[key])
 	}
-	identities := make([]string, 0, 1+len(values))
+	identities := make([]string, 0, 2+len(values))
 	if normalizeIdentity(entry.Title) != "" {
 		identities = append(identities, entry.Title)
+	}
+	if normalizeIdentity(entry.Slug) != "" {
+		identities = append(identities, entry.Slug)
 	}
 	identities = append(identities, frontmatterIdentityAliases(entry.Frontmatter)...)
 	return searchableEntry{Fields: []searchableField{{Name: "title", Value: entry.Title}, {Name: "frontmatter", Value: strings.Join(values, " ")}, {Name: "body", Value: entry.Body}}, Identities: identities}
@@ -1659,6 +1662,25 @@ func hasExactRequiredIdentity(plan QueryPlan, candidate searchableEntry, groups 
 						}
 					}
 				}
+			}
+		}
+	}
+	return false
+}
+
+func hasExactRawQueryIdentity(plan QueryPlan, candidate searchableEntry) bool {
+	rawQuery := normalizeIdentity(plan.RawQuery)
+	if rawQuery == "" {
+		return false
+	}
+	for _, identity := range candidate.Identities {
+		identity = normalizeIdentity(identity)
+		if identity == "" || !containsNormalizedPhrase(rawQuery, identity) {
+			continue
+		}
+		for _, field := range candidate.Fields {
+			if (field.Name == "title" || field.Name == "frontmatter") && containsNormalizedPhrase(field.Value, identity) {
+				return true
 			}
 		}
 	}
@@ -2040,6 +2062,9 @@ func (randomSelector) Select(ctx context.Context, input SelectionInput) (Selecti
 		}
 		if eligible[i].Score != eligible[j].Score {
 			return eligible[i].Score > eligible[j].Score
+		}
+		if eligible[i].ExactIdentityEvidence != eligible[j].ExactIdentityEvidence {
+			return eligible[i].ExactIdentityEvidence
 		}
 		return eligible[i].Slug < eligible[j].Slug
 	})

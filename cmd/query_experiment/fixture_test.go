@@ -287,7 +287,7 @@ func TestFixtureZeroQualifiedAttemptWritesStatusReasonInResultsAndFinalReceipt(t
 	}))
 	defer server.Close()
 	root := filepath.Join(t.TempDir(), "snapshot")
-	writeTestFile(t, filepath.Join(root, "cache", "concepts.jsonl"), `{"slug":"coffee","title":"Coffee","body":"private term: coffee"}`+"\n"+`{"slug":"other","title":"Other coffee","body":"coffee"}`+"\n")
+	writeTestFile(t, filepath.Join(root, "cache", "concepts.jsonl"), `{"slug":"coffee-guide","title":"Coffee Guide","body":"private term: coffee"}`+"\n"+`{"slug":"other","title":"Other coffee","body":"coffee"}`+"\n")
 	writeTestFile(t, filepath.Join(root, "cache", "suggested_queries.json"), `{"version":2,"queries":[],"candidates":[],"updated_at":"2026-08-20T00:00:00Z"}`)
 	dir := t.TempDir()
 	modelPath := writeFixture(t, dir, "models.json", `{"models":[{"id":"m","provider":"fake","base_url":"`+server.URL+`","model":"selected","api_key":"fixture-secret"}]}`)
