@@ -33,7 +33,7 @@ type gcsSnapshotSource interface {
 
 func parseGCSProjectRoot(raw string) (gcsProjectRoot, error) {
 	u, err := url.Parse(strings.TrimSpace(raw))
-	if err != nil || u.Scheme != "gs" || u.Host == "" || u.RawQuery != "" || u.Fragment != "" || u.User != nil {
+	if err != nil || u.Scheme != "gs" || u.Opaque != "" || u.Host == "" || u.Port() != "" || u.RawPath != "" || strings.Contains(raw, "%") || u.RawQuery != "" || u.Fragment != "" || u.User != nil {
 		return gcsProjectRoot{}, errors.New("snapshot must be a canonical gs:// Project-root URI")
 	}
 	parts := strings.Split(strings.TrimPrefix(u.Path, "/"), "/")
@@ -59,6 +59,7 @@ func loadGCSSnapshot(ctx context.Context, root string, newClient func(string) (*
 	if err != nil {
 		return preparedSnapshot{}, fmt.Errorf("create GCS client: %w", err)
 	}
+	defer client.Close()
 	pinned, snapshot, err := client.WithScope(parsed.userID, parsed.project).PinCurrentGeneration(ctx)
 	if err != nil {
 		return preparedSnapshot{}, err

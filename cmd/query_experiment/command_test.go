@@ -231,10 +231,7 @@ func TestProductionIgnoresQueryRetrievalKnobsAndKeepsOutputContract(t *testing.T
 func TestRunExperimentAppendsSuggestedCasesThroughCLIComposition(t *testing.T) {
 	root := t.TempDir()
 	writeTestFile(t, filepath.Join(root, "cache", "concepts.jsonl"), `{"slug":"coffee","title":"Coffee","body":"coffee"}`+"\n")
-	writeTestFile(t, filepath.Join(root, "cache", "suggested_queries.json"), `{"version":2,"queries":["one?","two?","three?"],"candidates":[`+
-		`{"question":"One?","intent/use_case":"learn","corpus_anchor_concept_ids":["coffee"],"generation":{"model":"m","prompt_version":"p"}},`+
-		`{"question":"Two?","intent/use_case":"compare","corpus_anchor_concept_ids":["coffee"],"generation":{"model":"m","prompt_version":"p"}},`+
-		`{"question":"Three?","intent/use_case":"plan","corpus_anchor_concept_ids":["coffee"],"generation":{"model":"m","prompt_version":"p"}}],"updated_at":"2026-08-20T00:00:00Z"}`)
+	writeTestFile(t, filepath.Join(root, "cache", "suggested_queries.json"), string(validExperimentSuggestedQueries(t)))
 	var output bytes.Buffer
 	executor := &recordingExecutor{}
 	err := runExperiment(context.Background(), experimentOptions{snapshotPath: root, suggestedQueryMode: "wiki", runs: 1}, dependencies{
@@ -245,7 +242,7 @@ func TestRunExperimentAppendsSuggestedCasesThroughCLIComposition(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !equalStrings(executor.calls, []string{"One?:wiki", "Two?:wiki", "Three?:wiki"}) {
+	if len(executor.calls) != 20 || executor.calls[0] != "Question 1?:wiki" || executor.calls[19] != "Question 20?:wiki" {
 		t.Fatalf("executor calls = %v", executor.calls)
 	}
 	var record resultRecord

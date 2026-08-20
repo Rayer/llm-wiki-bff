@@ -1,11 +1,16 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
+	"time"
 
 	"github.com/rayer/llm-wiki-bff/internal/gcs"
+	"github.com/rayer/llm-wiki-bff/internal/suggestedqueries"
 )
 
 func TestParseGCSProjectRootIsStrict(t *testing.T) {
@@ -19,6 +24,11 @@ func TestParseGCSProjectRootIsStrict(t *testing.T) {
 		"gs://bucket/users/../projects/project",
 		"https://bucket/users/user/projects/project",
 		"gs://bucket/users/user/projects/project?token=secret",
+		"gs://bucket:443/users/user/projects/project",
+		"gs:bucket/users/user/projects/project",
+		"gs://bucket/users/user%2Fpart/projects/project",
+		"gs://bucket/users/user/projects/pro%2Fject",
+		"gs://bucket/users/user/../projects/project",
 	} {
 		if _, err := parseGCSProjectRoot(raw); err == nil {
 			t.Fatalf("parseGCSProjectRoot(%q) accepted malformed URI", raw)
@@ -27,10 +37,7 @@ func TestParseGCSProjectRootIsStrict(t *testing.T) {
 }
 
 func TestSuggestedCasesAreModeSpecificDeterministicAndBounded(t *testing.T) {
-	data := []byte(`{"version":2,"queries":["one?","two?","three?"],"candidates":[` +
-		`{"question":"One?","intent/use_case":"learn","corpus_anchor_concept_ids":["c1"],"generation":{"model":"m","prompt_version":"p"}},` +
-		`{"question":"Two?","intent/use_case":"compare","corpus_anchor_concept_ids":["c2"],"generation":{"model":"m","prompt_version":"p"}},` +
-		`{"question":"Three?","intent/use_case":"plan","corpus_anchor_concept_ids":["c3"],"generation":{"model":"m","prompt_version":"p"}}] ,"updated_at":"2026-08-20T00:00:00Z"}`)
+	data := validExperimentSuggestedQueries(t)
 	one, err := suggestedCases(data, "wiki", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -39,7 +46,7 @@ func TestSuggestedCasesAreModeSpecificDeterministicAndBounded(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(one) != 3 || one[0].ID != "suggested-wiki-01" || one[0].Mode != "wiki" || one[0].Tags[2] != "intent:learn" {
+	if len(one) != 20 || one[0].ID != "suggested-wiki-01" || one[0].Mode != "wiki" || one[0].Tags[2] != "intent:learn" {
 		t.Fatalf("wiki cases = %#v", one)
 	}
 	if two[0].ID != "suggested-full-01" || two[0].Query != one[0].Query || two[0].Mode != "full" {
@@ -53,14 +60,30 @@ func TestSuggestedCasesAreModeSpecificDeterministicAndBounded(t *testing.T) {
 	}
 }
 
+func validExperimentSuggestedQueries(t *testing.T) []byte {
+	t.Helper()
+	candidates := make([]suggestedqueries.Candidate, 0, suggestedqueries.RequiredQueries)
+	for i := 1; i <= suggestedqueries.RequiredQueries; i++ {
+		candidates = append(candidates, suggestedqueries.Candidate{Question: fmt.Sprintf("Question %d?", i), Intent: "learn", CorpusAnchorConceptIDs: []string{"c1"}, Generation: suggestedqueries.GenerationMetadata{Model: "m", PromptVersion: "p"}})
+	}
+	data, err := json.Marshal(suggestedqueries.ArtifactFromCandidates(candidates, time.Date(2026, 8, 20, 0, 0, 0, 0, time.UTC)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
+func TestSuggestedCasesRejectIncompleteV2ArtifactBeforeGeneratingCases(t *testing.T) {
+	data := validExperimentSuggestedQueries(t)
+	data = bytes.Replace(data, []byte(`"Question 1?"`), []byte(`"different?"`), 1)
+	if cases, err := suggestedCases(data, "wiki", nil); err == nil || cases != nil {
+		t.Fatalf("incomplete or inconsistent artifact produced cases=%#v err=%v", cases, err)
+	}
+}
+
 func TestSuggestedCasesRejectUnsupportedSchemaBeforeEffects(t *testing.T) {
 	if _, err := suggestedCases([]byte(`{"version":1}`), "wiki", nil); err == nil {
 		t.Fatal("unsupported schema accepted")
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	if !errors.Is(ctx.Err(), context.Canceled) {
-		t.Fatal("test context was not canceled")
 	}
 }
 

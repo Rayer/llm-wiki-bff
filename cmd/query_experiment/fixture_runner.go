@@ -40,15 +40,22 @@ func (options experimentOptions) validateFixtureFlags() error {
 }
 
 type fixtureReceiptMeta struct {
-	AttemptID         string `json:"attempt_id"`
-	VariantID         string `json:"variant_id"`
-	ProfileID         string `json:"profile_id"`
-	PromptID          string `json:"prompt_id"`
-	Provider          string `json:"provider"`
-	Model             string `json:"model"`
-	CaseID            string `json:"case_id"`
-	RunIndex          int    `json:"run_index"`
-	EvidenceThreshold int    `json:"evidence_threshold"`
+	AttemptID              string `json:"attempt_id"`
+	VariantID              string `json:"variant_id"`
+	ProfileID              string `json:"profile_id"`
+	PromptID               string `json:"prompt_id"`
+	Provider               string `json:"provider"`
+	Model                  string `json:"model"`
+	CaseID                 string `json:"case_id"`
+	RunIndex               int    `json:"run_index"`
+	EvidenceThreshold      int    `json:"evidence_threshold"`
+	SnapshotIdentity       string `json:"snapshot_identity"`
+	CorpusSHA256           string `json:"corpus_sha256"`
+	ManifestGeneration     int64  `json:"manifest_generation,omitempty"`
+	ManifestSHA256         string `json:"manifest_sha256,omitempty"`
+	GenerationID           string `json:"generation_id,omitempty"`
+	InputFingerprint       string `json:"input_fingerprint,omitempty"`
+	SuggestedQueriesSHA256 string `json:"suggested_queries_sha256"`
 }
 
 type fixtureRequestReceipt struct {
@@ -229,6 +236,20 @@ func runFixtureExperiment(ctx context.Context, options experimentOptions, prepar
 	options.keywordsPerAttempt = retrievalOptions.keywordsPerAttempt
 	options.expansionAttempts = retrievalOptions.expansionAttempts
 	options.rareDocumentFrequency = retrievalOptions.rareDocumentFrequency
+	if len(prepared.suggestedData) == 0 {
+		reader, ok := prepared.reader.(interface {
+			ReadFile(context.Context, string) ([]byte, error)
+		})
+		if !ok {
+			return errors.New("snapshot reader does not support suggested queries")
+		}
+		prepared.suggestedData, err = reader.ReadFile(ctx, suggestedPath)
+		if err != nil {
+			return fmt.Errorf("snapshot suggested queries: %w", err)
+		}
+	}
+	suggestedDigest := sha256.Sum256(prepared.suggestedData)
+	prepared.suggestedDigest = hex.EncodeToString(suggestedDigest[:])
 	if err := os.MkdirAll(filepath.Clean(options.artifactsDir), 0o755); err != nil {
 		return fmt.Errorf("create artifacts directory: %w", err)
 	}
@@ -304,6 +325,13 @@ func fixtureVariantID(base string, options experimentOptions, prepared preparedS
 func runFixtureAttempt(ctx context.Context, options experimentOptions, retrievalOptions queryRetrievalOptions, variant fixtureVariant, input caseInput, runIndex int, prepared preparedSnapshot, entries []cache.Entry, now func() time.Time, metadata recordMetadata) (fixtureAttempt, error) {
 	attemptID := fmt.Sprintf("%s__case=%s__run=%d", variant.VariantID, input.ID, runIndex)
 	meta := fixtureReceiptMeta{AttemptID: attemptID, VariantID: variant.VariantID, ProfileID: variant.Profile.ID, PromptID: variant.Prompt.ID, Provider: variant.Model.Provider, Model: variant.Model.Model, CaseID: input.ID, RunIndex: runIndex, EvidenceThreshold: retrievalOptions.evidenceThreshold}
+	meta.SnapshotIdentity = prepared.label
+	meta.CorpusSHA256 = prepared.digest
+	meta.ManifestGeneration = prepared.manifestGeneration
+	meta.ManifestSHA256 = prepared.manifestDigest
+	meta.GenerationID = prepared.generationID
+	meta.InputFingerprint = prepared.inputFingerprint
+	meta.SuggestedQueriesSHA256 = prepared.suggestedDigest
 	dir := filepath.Join(filepath.Clean(options.artifactsDir), variant.VariantID, receiptSegment(input.ID), fmt.Sprintf("run-%d", runIndex))
 	queryReceivedAt := now()
 	if err := os.MkdirAll(dir, 0o755); err != nil {

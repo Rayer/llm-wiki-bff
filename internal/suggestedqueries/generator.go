@@ -413,6 +413,27 @@ func ValidatePublishedCandidates(candidates []Candidate) error {
 	return validateCandidates(candidates, nil, false, true)
 }
 
+func ValidatePublishedArtifact(artifact Artifact) error {
+	if artifact.Version != 2 || len(artifact.Queries) != RequiredQueries || len(artifact.Candidates) != RequiredQueries {
+		return fmt.Errorf("%w: artifact must contain exactly %d queries and candidates", ErrInvalidCandidates, RequiredQueries)
+	}
+	if strings.TrimSpace(artifact.UpdatedAt) == "" {
+		return fmt.Errorf("%w: artifact updated_at is required", ErrInvalidCandidates)
+	}
+	if _, err := time.Parse(time.RFC3339, artifact.UpdatedAt); err != nil {
+		return fmt.Errorf("%w: artifact updated_at is invalid", ErrInvalidCandidates)
+	}
+	if err := ValidatePublishedCandidates(artifact.Candidates); err != nil {
+		return err
+	}
+	for i, candidate := range artifact.Candidates {
+		if strings.TrimSpace(artifact.Queries[i]) != strings.TrimSpace(candidate.Question) {
+			return fmt.Errorf("%w: query %d does not match candidate question", ErrInvalidCandidates, i)
+		}
+	}
+	return nil
+}
+
 func validateGeneratedCandidates(candidates []Candidate, concepts []ConceptEvidence) error {
 	if len(candidates) != RequiredQueries {
 		return fmt.Errorf("%w: candidate count %d, want exactly %d", ErrInvalidCandidates, len(candidates), RequiredQueries)

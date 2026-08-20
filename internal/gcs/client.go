@@ -14,6 +14,7 @@ import (
 	"path"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"cloud.google.com/go/storage"
@@ -35,6 +36,13 @@ type Client struct {
 	backend          clientBackend
 	view             *generationView
 	legacyWriteLease *legacyGenerationLease
+	owner            *clientOwner
+}
+
+type clientOwner struct {
+	closer io.Closer
+	once   sync.Once
+	err    error
 }
 
 type WikiPage = store.WikiPage
@@ -98,7 +106,16 @@ func NewClient(bucket string) (*Client, error) {
 	}
 	return &Client{
 		bucket: client.Bucket(bucket),
+		owner:  &clientOwner{closer: client},
 	}, nil
+}
+
+func (c *Client) Close() error {
+	if c == nil || c.owner == nil || c.owner.closer == nil {
+		return nil
+	}
+	c.owner.once.Do(func() { c.owner.err = c.owner.closer.Close() })
+	return c.owner.err
 }
 
 // WithScope returns a client that shares the bucket connection but uses the
@@ -111,6 +128,7 @@ func (c *Client) WithScope(userID, projectID string) *Client {
 		backend:          c.backend,
 		view:             c.view,
 		legacyWriteLease: c.legacyWriteLease,
+		owner:            c.owner,
 	}
 }
 

@@ -19,7 +19,7 @@ func suggestedCases(data []byte, mode string, existing []caseInput) ([]caseInput
 		}
 		return nil, fmt.Errorf("suggested queries: %w", err)
 	}
-	if err := suggestedqueries.ValidatePublishedCandidates(artifact.Candidates); err != nil {
+	if err := suggestedqueries.ValidatePublishedArtifact(artifact); err != nil {
 		return nil, fmt.Errorf("suggested queries: %w", err)
 	}
 	if len(existing)+len(artifact.Candidates) > maxExperimentCases {
