@@ -456,6 +456,43 @@ func TestCIWorkflowPushesAndPRsMainAndDevelop(t *testing.T) {
 	}
 }
 
+func TestCIMainFastForwardEligibilityGate(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/ci.yml")
+	job := workflowSection(t, contents, "  main-fast-forward-eligible:", "\n\n")
+	want := normalizeWorkflowContract(`
+main-fast-forward-eligible:
+  if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
+  needs: test
+  runs-on: ubuntu-latest
+  steps:
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      with:
+        fetch-depth: 0
+        persist-credentials: false
+    - name: Verify main fast-forward eligibility
+      run: |
+        set -euo pipefail
+        git fetch --no-tags origin main develop
+        test "$(git rev-parse origin/develop)" = "$GITHUB_SHA"
+        git merge-base --is-ancestor origin/main "$GITHUB_SHA"
+`)
+	if got := normalizeWorkflowContract(job); got != want {
+		t.Errorf("main fast-forward gate contract changed\n got:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+func normalizeWorkflowContract(contents string) string {
+	lines := strings.Split(strings.ReplaceAll(contents, "\r\n", "\n"), "\n")
+	normalized := lines[:0]
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			normalized = append(normalized, line)
+		}
+	}
+	return strings.Join(normalized, "\n")
+}
+
 func TestBFFDevWorkflowPushesMainOnlyAndSupportsManualDispatch(t *testing.T) {
 	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
 	for _, want := range []string{
