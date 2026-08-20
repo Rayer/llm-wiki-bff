@@ -407,6 +407,12 @@ func ValidateCandidates(candidates []Candidate, concepts []ConceptEvidence) erro
 	return validateCandidates(candidates, concepts, true, true)
 }
 
+// ValidatePublishedCandidates validates the published artifact contract while
+// leaving anchor-to-corpus resolution to the consumer that has the corpus.
+func ValidatePublishedCandidates(candidates []Candidate) error {
+	return validateCandidates(candidates, nil, false, true)
+}
+
 func validateGeneratedCandidates(candidates []Candidate, concepts []ConceptEvidence) error {
 	if len(candidates) != RequiredQueries {
 		return fmt.Errorf("%w: candidate count %d, want exactly %d", ErrInvalidCandidates, len(candidates), RequiredQueries)

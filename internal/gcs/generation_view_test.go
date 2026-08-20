@@ -348,6 +348,40 @@ func TestGenerationViewCapturesManifestOnceForWholeList(t *testing.T) {
 	}
 }
 
+func TestPinCurrentGenerationReadsManifestOnceAndExactCacheGenerations(t *testing.T) {
+	client, backend := newMemoryClient()
+	files := map[string]backendObject{
+		"cache/concepts.jsonl":         {Data: []byte(`{"slug":"one"}` + "\n"), Generation: 101},
+		"cache/suggested_queries.json": {Data: []byte(`{"version":2}`), Generation: 102},
+	}
+	seedManifest(t, backend, "generation-one", files)
+	pinned, snapshot, err := client.PinCurrentGeneration(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Manifest.GenerationID != "generation-one" || snapshot.ManifestGeneration != 7 || snapshot.ManifestSHA256 == "" {
+		t.Fatalf("snapshot = %#v", snapshot)
+	}
+	if _, err := pinned.ReadFile(context.Background(), "cache/concepts.jsonl"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pinned.ReadFile(context.Background(), "cache/suggested_queries.json"); err != nil {
+		t.Fatal(err)
+	}
+	requests, manifestReads := backend.snapshots()
+	if manifestReads != 1 {
+		t.Fatalf("manifest reads = %d, want 1", manifestReads)
+	}
+	for _, request := range requests {
+		if request.Name == projectObject(generation.ManifestPath) {
+			continue
+		}
+		if request.Generation == 0 || !strings.Contains(request.Name, "/"+generation.Prefix+"generation-one/") {
+			t.Fatalf("un-pinned request = %#v", request)
+		}
+	}
+}
+
 func TestPinnedGenerationViewSurvivesManifestCommitAndNextPinSeesIt(t *testing.T) {
 	client, backend := newMemoryClient()
 	first := map[string]backendObject{"wiki/alpha.md": {Data: []byte("A"), Generation: 101}}

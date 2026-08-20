@@ -25,8 +25,8 @@ func (r *snapshotReader) ReadFile(ctx context.Context, relPath string) ([]byte, 
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if relPath != "cache/concepts.jsonl" {
-		return nil, errors.New("snapshot reader permits only cache/concepts.jsonl")
+	if relPath != "cache/concepts.jsonl" && relPath != "cache/suggested_queries.json" {
+		return nil, errors.New("snapshot reader permits only supported cache artifacts")
 	}
 	file, err := openSnapshotRegularFile(r.root, relPath)
 	if err != nil {

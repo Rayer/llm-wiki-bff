@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -71,6 +72,13 @@ type sourceMeta struct {
 type generationView struct {
 	manifest *generation.Manifest
 	token    string
+}
+
+// GenerationSnapshot identifies one immutable published generation.
+type GenerationSnapshot struct {
+	Manifest           generation.Manifest
+	ManifestGeneration int64
+	ManifestSHA256     string
 }
 
 type legacyGenerationLease struct{ generation int64 }
@@ -203,6 +211,28 @@ func (c *Client) ViewToken() string {
 		return ""
 	}
 	return c.view.token
+}
+
+// PinCurrentGeneration reads and validates the current manifest once, then
+// returns a client whose generation-owned reads use that immutable view.
+func (c *Client) PinCurrentGeneration(ctx context.Context) (*Client, GenerationSnapshot, error) {
+	object, err := c.readObject(ctx, c.prefix()+"/"+generation.ManifestPath, 0, generation.MaxManifestBytes)
+	if err != nil {
+		return nil, GenerationSnapshot{}, fmt.Errorf("read generation manifest: %w", err)
+	}
+	manifest, err := generation.Decode(object.Data)
+	if err != nil {
+		return nil, GenerationSnapshot{}, err
+	}
+	digest := sha256.Sum256(object.Data)
+	view := &generationView{manifest: &manifest, token: fmt.Sprintf("manifest-%d", object.Generation)}
+	pinned := c.WithScope(c.userID, c.projectID)
+	pinned.view = view
+	return pinned, GenerationSnapshot{
+		Manifest:           manifest,
+		ManifestGeneration: object.Generation,
+		ManifestSHA256:     hex.EncodeToString(digest[:]),
+	}, nil
 }
 
 // NewScopedClient returns a client that shares the bucket connection but uses
