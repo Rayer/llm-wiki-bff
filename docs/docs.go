@@ -467,6 +467,71 @@ const docTemplate = `{
                 }
             }
         },
+        "/api/v1/admin/settings/announcement/publish": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin"
+                ],
+                "summary": "Publish announcement (admin)",
+                "parameters": [
+                    {
+                        "description": "Announcement Markdown",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/syssettings.publishAnnouncementRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/syssettings.Settings"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "401": {
+                        "description": "Unauthorized",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
         "/api/v1/admin/users": {
             "get": {
                 "security": [
@@ -1298,7 +1363,7 @@ const docTemplate = `{
         },
         "/api/v1/public/config": {
             "get": {
-                "description": "Returns public feature flags such as registration_enabled.",
+                "description": "Returns the registration flag and currently published announcement Markdown.",
                 "produces": [
                     "application/json"
                 ],
@@ -1310,7 +1375,7 @@ const docTemplate = `{
                     "200": {
                         "description": "OK",
                         "schema": {
-                            "$ref": "#/definitions/syssettings.Settings"
+                            "$ref": "#/definitions/syssettings.PublicSettings"
                         }
                     }
                 }
@@ -2405,9 +2470,23 @@ const docTemplate = `{
                 }
             }
         },
+        "syssettings.PublicSettings": {
+            "type": "object",
+            "properties": {
+                "announcement_markdown": {
+                    "type": "string"
+                },
+                "registration_enabled": {
+                    "type": "boolean"
+                }
+            }
+        },
         "syssettings.Settings": {
             "type": "object",
             "properties": {
+                "announcement_markdown": {
+                    "type": "string"
+                },
                 "registration_enabled": {
                     "type": "boolean"
                 }
@@ -2421,6 +2500,32 @@ const docTemplate = `{
                 }
             }
         },
+        "syssettings.publishAnnouncementRequest": {
+            "type": "object",
+            "required": [
+                "announcement_markdown"
+            ],
+            "properties": {
+                "announcement_markdown": {
+                    "type": "string"
+                }
+            }
+        },
+        "v1.adminRenameProjectResponse": {
+            "type": "object",
+            "properties": {
+                "id": {
+                    "type": "string"
+                },
+                "name": {
+                    "type": "string"
+                },
+                "user_id": {
+                    "type": "string"
+                }
+            }
+        },
+
         "v1.pipelineStatusResponse": {
             "type": "object",
             "properties": {

@@ -326,6 +326,7 @@ func registerAdminRoutes(r *gin.Engine, cfg config.Config, hV1 *handlerv1.Handle
 	{
 		admin.GET("/settings", syssettings.AdminGetSettingsHandler(settingsStore))
 		admin.PATCH("/settings", syssettings.AdminPatchSettingsHandler(settingsStore))
+		admin.POST("/settings/announcement/publish", syssettings.AdminPublishAnnouncementHandler(settingsStore))
 		admin.GET("/projects", hV1.AdminProjects)
 		admin.PATCH("/projects/:id", hV1.AdminRenameProject)
 		admin.DELETE("/projects/:id", hV1.AdminDeleteProject)
