@@ -92,6 +92,48 @@ func TestIsPublishableReadCardinalityMatrix(t *testing.T) {
 	}
 }
 
+func TestValidatePublishedArtifactReadCardinalityMatrix(t *testing.T) {
+	for _, tc := range []struct {
+		count int
+		want  bool
+	}{
+		{count: 0, want: false},
+		{count: 1, want: false},
+		{count: 2, want: false},
+		{count: 3, want: true},
+		{count: 5, want: true},
+		{count: 6, want: false},
+		{count: 19, want: false},
+		{count: 20, want: true},
+		{count: 21, want: false},
+	} {
+		t.Run(strconv.Itoa(tc.count), func(t *testing.T) {
+			if err := ValidatePublishedArtifact(readCardinalityArtifact(tc.count)); (err == nil) != tc.want {
+				t.Fatalf("ValidatePublishedArtifact(%d) error = %v, want accepted=%t", tc.count, err, tc.want)
+			}
+		})
+	}
+}
+
+func TestValidatePublishedArtifactRejectsInconsistentOrInvalidMetadata(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		mutate func(*Artifact)
+	}{
+		{name: "mismatched queries", mutate: func(artifact *Artifact) { artifact.Queries[0] = "different?" }},
+		{name: "missing updated_at", mutate: func(artifact *Artifact) { artifact.UpdatedAt = "" }},
+		{name: "malformed updated_at", mutate: func(artifact *Artifact) { artifact.UpdatedAt = "not-a-timestamp" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			artifact := readCardinalityArtifact(3)
+			tc.mutate(&artifact)
+			if err := ValidatePublishedArtifact(artifact); err == nil {
+				t.Fatal("ValidatePublishedArtifact() accepted invalid artifact")
+			}
+		})
+	}
+}
+
 func readCardinalityArtifact(count int) Artifact {
 	candidates := make([]Candidate, count)
 	for i := range candidates {

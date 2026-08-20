@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"path"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"cloud.google.com/go/storage"
@@ -34,6 +36,13 @@ type Client struct {
 	backend          clientBackend
 	view             *generationView
 	legacyWriteLease *legacyGenerationLease
+	owner            *clientOwner
+}
+
+type clientOwner struct {
+	closer io.Closer
+	once   sync.Once
+	err    error
 }
 
 type WikiPage = store.WikiPage
@@ -73,6 +82,13 @@ type generationView struct {
 	token    string
 }
 
+// GenerationSnapshot identifies one immutable published generation.
+type GenerationSnapshot struct {
+	Manifest           generation.Manifest
+	ManifestGeneration int64
+	ManifestSHA256     string
+}
+
 type legacyGenerationLease struct{ generation int64 }
 
 const maxLegacyStatsObjects = 1000
@@ -90,7 +106,16 @@ func NewClient(bucket string) (*Client, error) {
 	}
 	return &Client{
 		bucket: client.Bucket(bucket),
+		owner:  &clientOwner{closer: client},
 	}, nil
+}
+
+func (c *Client) Close() error {
+	if c == nil || c.owner == nil || c.owner.closer == nil {
+		return nil
+	}
+	c.owner.once.Do(func() { c.owner.err = c.owner.closer.Close() })
+	return c.owner.err
 }
 
 // WithScope returns a client that shares the bucket connection but uses the
@@ -103,6 +128,7 @@ func (c *Client) WithScope(userID, projectID string) *Client {
 		backend:          c.backend,
 		view:             c.view,
 		legacyWriteLease: c.legacyWriteLease,
+		owner:            c.owner,
 	}
 }
 
@@ -203,6 +229,28 @@ func (c *Client) ViewToken() string {
 		return ""
 	}
 	return c.view.token
+}
+
+// PinCurrentGeneration reads and validates the current manifest once, then
+// returns a client whose generation-owned reads use that immutable view.
+func (c *Client) PinCurrentGeneration(ctx context.Context) (*Client, GenerationSnapshot, error) {
+	object, err := c.readObject(ctx, c.prefix()+"/"+generation.ManifestPath, 0, generation.MaxManifestBytes)
+	if err != nil {
+		return nil, GenerationSnapshot{}, fmt.Errorf("read generation manifest: %w", err)
+	}
+	manifest, err := generation.Decode(object.Data)
+	if err != nil {
+		return nil, GenerationSnapshot{}, err
+	}
+	digest := sha256.Sum256(object.Data)
+	view := &generationView{manifest: &manifest, token: fmt.Sprintf("manifest-%d", object.Generation)}
+	pinned := c.WithScope(c.userID, c.projectID)
+	pinned.view = view
+	return pinned, GenerationSnapshot{
+		Manifest:           manifest,
+		ManifestGeneration: object.Generation,
+		ManifestSHA256:     hex.EncodeToString(digest[:]),
+	}, nil
 }
 
 // NewScopedClient returns a client that shares the bucket connection but uses

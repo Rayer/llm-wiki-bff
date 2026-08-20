@@ -17,7 +17,11 @@ import (
 func main() {
 	var options experimentOptions
 	flag.StringVar(&options.snapshotPath, "snapshot", "", "frozen Project snapshot directory")
+	flag.StringVar(&options.gcsBucket, "gcs-bucket", "", "explicit GCS bucket")
+	flag.StringVar(&options.gcsUserID, "gcs-user-id", "", "explicit GCS user ID")
+	flag.StringVar(&options.projectID, "project-id", "", "explicit GCS project ID")
 	flag.StringVar(&options.casesPath, "cases", "", "strict JSONL case file")
+	flag.StringVar(&options.suggestedQueryMode, "suggested-query-mode", "", "append published suggested queries in wiki or full mode")
 	flag.IntVar(&options.runs, "runs", 0, "positive number of runs per case (maximum 100)")
 	flag.StringVar(&options.outputPath, "output", "", "JSONL output file; stdout when omitted")
 	flag.StringVar(&options.configDir, "config-dir", ".", "directory for optional config.toml")

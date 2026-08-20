@@ -18,6 +18,7 @@ import (
 	"github.com/rayer/llm-wiki-bff/internal/buildinfo"
 	"github.com/rayer/llm-wiki-bff/internal/cache"
 	"github.com/rayer/llm-wiki-bff/internal/config"
+	"github.com/rayer/llm-wiki-bff/internal/gcs"
 	"github.com/rayer/llm-wiki-bff/internal/llm"
 	"github.com/rayer/llm-wiki-bff/internal/query"
 	"github.com/rayer/llm-wiki-bff/internal/search"
@@ -30,7 +31,11 @@ const (
 
 type experimentOptions struct {
 	snapshotPath          string
+	gcsBucket             string
+	gcsUserID             string
+	projectID             string
 	casesPath             string
+	suggestedQueryMode    string
 	runs                  int
 	outputPath            string
 	configDir             string
@@ -71,13 +76,24 @@ type dependencies struct {
 	stdout                    io.Writer
 	openOutput                func(string, io.Writer) (recordSink, error)
 	queryRetrievalSeed        func(string) int64
+	newGCSClient              func(string) (*gcs.Client, error)
+	loadGCSSnapshot           func(context.Context, string, func(string) (*gcs.Client, error)) (preparedSnapshot, error)
 }
 
 type preparedSnapshot struct {
-	label  string
-	digest string
-	reader *snapshotReader
-	cache  *cache.Cache
+	label              string
+	digest             string
+	reader             cache.Reader
+	cache              *cache.Cache
+	sourceRoot         string
+	manifestGeneration int64
+	manifestDigest     string
+	generationID       string
+	inputFingerprint   string
+	suggestedDigest    string
+	suggestedData      []byte
+	suggestedDataSet   bool
+	cleanup            func() error
 }
 
 type resultIdentity struct {
@@ -87,34 +103,39 @@ type resultIdentity struct {
 }
 
 type resultRecord struct {
-	SchemaVersion       int                  `json:"schema_version"`
-	CaseID              string               `json:"case_id"`
-	RunIndex            int                  `json:"run_index"`
-	Snapshot            string               `json:"snapshot_identity"`
-	CorpusSHA256        string               `json:"corpus_sha256"`
-	Query               string               `json:"query"`
-	Mode                string               `json:"mode"`
-	Expansion           *llm.ExpandResult    `json:"expansion,omitempty"`
-	Results             []resultIdentity     `json:"results"`
-	Citations           []search.Citation    `json:"citations"`
-	Synthesis           string               `json:"synthesis"`
-	Outcome             string               `json:"outcome"`
-	Status              string               `json:"status"`
-	Reason              string               `json:"reason"`
-	ErrorStage          string               `json:"error_stage,omitempty"`
-	ErrorMessage        string               `json:"error_message,omitempty"`
-	ElapsedMS           int64                `json:"elapsed_ms"`
-	QueryReceivedAt     string               `json:"query_received_at"`
-	RunCompletedAt      string               `json:"run_completed_at"`
-	DurationMS          int64                `json:"duration_ms"`
-	SourceRevision      string               `json:"source_revision"`
-	Provider            string               `json:"provider,omitempty"`
-	Model               string               `json:"model,omitempty"`
-	VariantID           string               `json:"variant_id,omitempty"`
-	ProfileID           string               `json:"profile_id,omitempty"`
-	PromptID            string               `json:"prompt_id,omitempty"`
-	EvidenceThreshold   int                  `json:"evidence_threshold,omitempty"`
-	QueryRetrievalTrace *queryRetrievalTrace `json:"three_host_trace,omitempty"`
+	SchemaVersion          int                  `json:"schema_version"`
+	CaseID                 string               `json:"case_id"`
+	RunIndex               int                  `json:"run_index"`
+	Snapshot               string               `json:"snapshot_identity"`
+	CorpusSHA256           string               `json:"corpus_sha256"`
+	ManifestGeneration     int64                `json:"manifest_generation,omitempty"`
+	ManifestSHA256         string               `json:"manifest_sha256,omitempty"`
+	GenerationID           string               `json:"generation_id,omitempty"`
+	InputFingerprint       string               `json:"input_fingerprint,omitempty"`
+	SuggestedQueriesSHA256 string               `json:"suggested_queries_sha256,omitempty"`
+	Query                  string               `json:"query"`
+	Mode                   string               `json:"mode"`
+	Expansion              *llm.ExpandResult    `json:"expansion,omitempty"`
+	Results                []resultIdentity     `json:"results"`
+	Citations              []search.Citation    `json:"citations"`
+	Synthesis              string               `json:"synthesis"`
+	Outcome                string               `json:"outcome"`
+	Status                 string               `json:"status"`
+	Reason                 string               `json:"reason"`
+	ErrorStage             string               `json:"error_stage,omitempty"`
+	ErrorMessage           string               `json:"error_message,omitempty"`
+	ElapsedMS              int64                `json:"elapsed_ms"`
+	QueryReceivedAt        string               `json:"query_received_at"`
+	RunCompletedAt         string               `json:"run_completed_at"`
+	DurationMS             int64                `json:"duration_ms"`
+	SourceRevision         string               `json:"source_revision"`
+	Provider               string               `json:"provider,omitempty"`
+	Model                  string               `json:"model,omitempty"`
+	VariantID              string               `json:"variant_id,omitempty"`
+	ProfileID              string               `json:"profile_id,omitempty"`
+	PromptID               string               `json:"prompt_id,omitempty"`
+	EvidenceThreshold      int                  `json:"evidence_threshold,omitempty"`
+	QueryRetrievalTrace    *queryRetrievalTrace `json:"three_host_trace,omitempty"`
 }
 
 type recordSink interface {
@@ -314,6 +335,13 @@ func preflightSnapshot(ctx context.Context, root string) (preparedSnapshot, erro
 		return preparedSnapshot{}, fmt.Errorf("snapshot corpus: %w", err)
 	}
 	digest := sha256.Sum256(corpus)
+	reader.freezeConcepts(corpus)
+	suggested, suggestedErr := reader.ReadFile(ctx, suggestedPath)
+	if suggestedErr == nil {
+		reader.freezeSuggested(suggested)
+	} else if !errors.Is(suggestedErr, errSnapshotPathNotFound) {
+		return preparedSnapshot{}, fmt.Errorf("snapshot suggested queries: %w", suggestedErr)
+	}
 	conceptCache := cache.New()
 	if _, err := conceptCache.All(ctx, reader); err != nil {
 		return preparedSnapshot{}, fmt.Errorf("snapshot corpus: %w", err)
@@ -322,12 +350,20 @@ func preflightSnapshot(ctx context.Context, root string) (preparedSnapshot, erro
 	if label == "." || label == string(filepath.Separator) || label == "" {
 		label = "snapshot"
 	}
-	return preparedSnapshot{
-		label:  label,
-		digest: hex.EncodeToString(digest[:]),
-		reader: reader,
-		cache:  conceptCache,
-	}, nil
+	prepared := preparedSnapshot{
+		label:            label,
+		digest:           hex.EncodeToString(digest[:]),
+		reader:           reader,
+		cache:            conceptCache,
+		sourceRoot:       cleanRoot,
+		suggestedData:    suggested,
+		suggestedDataSet: suggestedErr == nil,
+	}
+	if suggestedErr == nil {
+		suggestedDigest := sha256.Sum256(suggested)
+		prepared.suggestedDigest = hex.EncodeToString(suggestedDigest[:])
+	}
+	return prepared, nil
 }
 
 func validateOutputPath(path string) error {
@@ -352,15 +388,19 @@ func validateOutputPath(path string) error {
 	return nil
 }
 
-func runExperiment(ctx context.Context, options experimentOptions, deps dependencies) error {
+func runExperiment(ctx context.Context, options experimentOptions, deps dependencies) (runErr error) {
+	root, err := resolveSnapshotLocator(options)
+	if err != nil {
+		return err
+	}
 	if options.runs <= 0 || options.runs > maxExperimentRuns {
 		return fmt.Errorf("runs must be between 1 and %d", maxExperimentRuns)
 	}
-	if strings.TrimSpace(options.snapshotPath) == "" {
-		return errors.New("snapshot is required")
-	}
-	if strings.TrimSpace(options.casesPath) == "" {
+	if strings.TrimSpace(options.casesPath) == "" && strings.TrimSpace(options.suggestedQueryMode) == "" {
 		return errors.New("cases is required")
+	}
+	if options.suggestedQueryMode != "" && options.suggestedQueryMode != "wiki" && options.suggestedQueryMode != "full" {
+		return fmt.Errorf("unsupported suggested-query-mode %q", options.suggestedQueryMode)
 	}
 	if options.service == "" {
 		options.service = serviceProduction
@@ -374,13 +414,58 @@ func runExperiment(ctx context.Context, options experimentOptions, deps dependen
 	if err := validateOutputPath(options.outputPath); err != nil {
 		return err
 	}
-	cases, err := readCases(options.casesPath)
+	cases := []caseInput{}
+	err = nil
+	if strings.TrimSpace(options.casesPath) != "" {
+		cases, err = readCases(options.casesPath)
+		if err != nil {
+			return err
+		}
+	}
+	var prepared preparedSnapshot
+	if strings.HasPrefix(root, "gs://") {
+		load := deps.loadGCSSnapshot
+		if load == nil {
+			load = loadGCSSnapshot
+		}
+		prepared, err = load(ctx, root, deps.newGCSClient)
+	} else {
+		prepared, err = preflightSnapshot(ctx, root)
+	}
 	if err != nil {
 		return err
 	}
-	prepared, err := preflightSnapshot(ctx, options.snapshotPath)
-	if err != nil {
-		return err
+	if prepared.cleanup != nil {
+		defer func() {
+			if cleanupErr := prepared.cleanup(); runErr == nil && cleanupErr != nil {
+				runErr = fmt.Errorf("close GCS client: %w", cleanupErr)
+			}
+		}()
+	}
+	if options.suggestedQueryMode != "" {
+		if !prepared.suggestedDataSet {
+			reader, ok := prepared.reader.(interface {
+				ReadFile(context.Context, string) ([]byte, error)
+			})
+			if !ok {
+				return errors.New("snapshot reader does not support suggested queries")
+			}
+			prepared.suggestedData, err = reader.ReadFile(ctx, suggestedPath)
+			if err != nil {
+				return fmt.Errorf("snapshot suggested queries: %w", err)
+			}
+			digest := sha256.Sum256(prepared.suggestedData)
+			prepared.suggestedDigest = hex.EncodeToString(digest[:])
+			prepared.suggestedDataSet = true
+		}
+		generated, err := suggestedCases(prepared.suggestedData, options.suggestedQueryMode, cases)
+		if err != nil {
+			return err
+		}
+		cases = append(cases, generated...)
+	}
+	if len(cases) == 0 {
+		return errors.New("cases must contain at least one case")
 	}
 	if options.service == serviceQueryRetrieval && options.fixtureFlagsSet() {
 		if err := options.validateFixtureFlags(); err != nil {
@@ -521,32 +606,37 @@ func makeResultRecordWithTrace(input caseInput, runIndex int, snapshot preparedS
 		citations = []search.Citation{}
 	}
 	record := resultRecord{
-		SchemaVersion:       1,
-		CaseID:              input.ID,
-		RunIndex:            runIndex,
-		Snapshot:            snapshot.label,
-		CorpusSHA256:        snapshot.digest,
-		Query:               input.Query,
-		Mode:                input.Mode,
-		Expansion:           result.Expand,
-		Results:             identities,
-		Citations:           citations,
-		Synthesis:           result.AISynth,
-		Outcome:             outcome,
-		Status:              result.Status,
-		Reason:              result.Reason,
-		ElapsedMS:           elapsed,
-		SourceRevision:      metadata.sourceRevision,
-		Provider:            metadata.provider,
-		Model:               metadata.model,
-		QueryRetrievalTrace: trace,
+		SchemaVersion:          1,
+		CaseID:                 input.ID,
+		RunIndex:               runIndex,
+		Snapshot:               snapshot.label,
+		CorpusSHA256:           snapshot.digest,
+		ManifestGeneration:     snapshot.manifestGeneration,
+		ManifestSHA256:         snapshot.manifestDigest,
+		GenerationID:           snapshot.generationID,
+		InputFingerprint:       snapshot.inputFingerprint,
+		SuggestedQueriesSHA256: snapshot.suggestedDigest,
+		Query:                  input.Query,
+		Mode:                   input.Mode,
+		Expansion:              result.Expand,
+		Results:                identities,
+		Citations:              citations,
+		Synthesis:              result.AISynth,
+		Outcome:                outcome,
+		Status:                 result.Status,
+		Reason:                 result.Reason,
+		ElapsedMS:              elapsed,
+		SourceRevision:         metadata.sourceRevision,
+		Provider:               metadata.provider,
+		Model:                  metadata.model,
+		QueryRetrievalTrace:    trace,
 	}
 	if trace != nil {
 		record.EvidenceThreshold = trace.EvidenceThreshold
 	}
 	if executeErr != nil {
 		record.ErrorStage = "execute"
-		record.ErrorMessage = sanitizeError(executeErr.Error(), snapshot.reader.root, snapshot.label, metadata.apiKey)
+		record.ErrorMessage = sanitizeError(executeErr.Error(), snapshot.sourceRoot, snapshot.label, metadata.apiKey)
 	}
 	return record
 }

@@ -22,6 +22,24 @@ type gcsHostReceipt struct {
 	finished            int
 }
 
+type countingCloser struct{ calls int }
+
+func (c *countingCloser) Close() error {
+	c.calls++
+	return nil
+}
+
+func TestClientCloseOwnsProviderAndScopesPreserveOwnership(t *testing.T) {
+	closer := &countingCloser{}
+	client := &Client{owner: &clientOwner{closer: closer}}
+	if err := client.WithScope("user", "project").Close(); err != nil {
+		t.Fatal(err)
+	}
+	if closer.calls != 1 {
+		t.Fatalf("close calls=%d want 1", closer.calls)
+	}
+}
+
 func (r *gcsHostReceipt) StartHostCall(stage, scheme, host string) func(string) {
 	r.stage, r.scheme, r.host = stage, scheme, host
 	return func(string) { r.finished++ }

@@ -212,7 +212,7 @@ func TestConsensusAndRareQualificationPaths(t *testing.T) {
 		KeywordSupport: []queryquality.KeywordSupport{{Role: "preferred", Kind: "topic", Value: "rare", Keyword: "rare", SupportCount: 2, AttemptIndexes: []int{1, 2}}},
 	}
 	matched, err := queryquality.NewLexicalMatcher(nil).Match(context.Background(), queryquality.MatchRequest{
-		Plan: plan, CorpusEntries: []cache.Entry{{Slug: "consensus", Title: "Rare Cafe", Body: ""}, {Slug: "other", Title: "Other", Body: ""}}, EvidenceThreshold: 2, EvidenceThresholdSet: true, RareKeywordMaxDocumentFrequency: 1,
+		Plan: plan, CorpusEntries: []cache.Entry{{Slug: "consensus", Title: "Rare Guide", Body: ""}, {Slug: "other", Title: "Other", Body: ""}}, EvidenceThreshold: 2, EvidenceThresholdSet: true, RareKeywordMaxDocumentFrequency: 1,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -223,7 +223,7 @@ func TestConsensusAndRareQualificationPaths(t *testing.T) {
 
 	plan.KeywordSupport = []queryquality.KeywordSupport{{Role: "preferred", Kind: "topic", Value: "rare", Keyword: "rare", SupportCount: 1, AttemptIndexes: []int{1}}}
 	matched, err = queryquality.NewLexicalMatcher(nil).Match(context.Background(), queryquality.MatchRequest{
-		Plan: plan, CorpusEntries: []cache.Entry{{Slug: "title", Title: "Rare Cafe", Body: ""}, {Slug: "other", Title: "Other", Body: ""}}, EvidenceThreshold: 2, EvidenceThresholdSet: true, RareKeywordMaxDocumentFrequency: 1,
+		Plan: plan, CorpusEntries: []cache.Entry{{Slug: "title", Title: "Rare Guide", Body: ""}, {Slug: "other", Title: "Other", Body: ""}}, EvidenceThreshold: 2, EvidenceThresholdSet: true, RareKeywordMaxDocumentFrequency: 1,
 	})
 	if err != nil || !matched.Candidates[0].Qualified || matched.Candidates[0].QualificationPath != "rare_discriminative_lexical" {
 		t.Fatalf("rare title candidate=%#v err=%v", matched.Candidates[0], err)
@@ -239,7 +239,7 @@ func TestConsensusAndRareQualificationPaths(t *testing.T) {
 	}
 
 	matched, err = queryquality.NewLexicalMatcher(nil).Match(context.Background(), queryquality.MatchRequest{
-		Plan: plan, CorpusEntries: []cache.Entry{{Slug: "body", Title: "Cafe", Body: "rare"}}, EvidenceThreshold: 2, EvidenceThresholdSet: true, RareKeywordMaxDocumentFrequency: 1,
+		Plan: plan, CorpusEntries: []cache.Entry{{Slug: "body", Title: "Guide", Body: "rare"}}, EvidenceThreshold: 2, EvidenceThresholdSet: true, RareKeywordMaxDocumentFrequency: 1,
 	})
 	if err != nil || matched.Candidates[0].Qualified || matched.Candidates[0].QualificationPath == "rare_discriminative_lexical" {
 		t.Fatalf("rare body candidate=%#v err=%v", matched.Candidates[0], err)
@@ -261,7 +261,7 @@ func TestKeywordConsensusUsesFixedSupportAndNormalizedIdentity(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			plan := base
 			plan.KeywordSupport = []queryquality.KeywordSupport{{Role: "preferred", Kind: "topic", Value: "cafe", Keyword: "cafe", SupportCount: test.support, AttemptIndexes: []int{1, 2}}}
-			got, err := matcher.Match(context.Background(), queryquality.MatchRequest{Plan: plan, CorpusEntries: []cache.Entry{{Slug: "one", Title: "Cafe", Body: ""}, {Slug: "two", Title: "Cafe", Body: ""}}, EvidenceThreshold: test.threshold, EvidenceThresholdSet: true, RareKeywordMaxDocumentFrequency: 1})
+			got, err := matcher.Match(context.Background(), queryquality.MatchRequest{Plan: plan, CorpusEntries: []cache.Entry{{Slug: "one", Title: "Cafe Guide", Body: ""}, {Slug: "two", Title: "Cafe Guide", Body: ""}}, EvidenceThreshold: test.threshold, EvidenceThresholdSet: true, RareKeywordMaxDocumentFrequency: 1})
 			wantPath := "keyword_support_below_threshold"
 			if test.want {
 				wantPath = "keyword_consensus"

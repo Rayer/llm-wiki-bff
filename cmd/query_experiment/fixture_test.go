@@ -128,6 +128,7 @@ func TestFixtureRunWritesEightReceiptsAndSummaryWithoutKey(t *testing.T) {
 	defer server.Close()
 	root := filepath.Join(t.TempDir(), "snapshot")
 	writeTestFile(t, filepath.Join(root, "cache", "concepts.jsonl"), `{"slug":"coffee","title":"Coffee","body":"coffee"}`+"\n")
+	writeTestFile(t, filepath.Join(root, "cache", "suggested_queries.json"), `{"version":2,"queries":[],"candidates":[],"updated_at":"2026-08-20T00:00:00Z"}`)
 	dir := t.TempDir()
 	modelPath := writeFixture(t, dir, "models.json", `{"models":[{"id":"m","provider":"fake","base_url":"`+server.URL+`","model":"selected","api_key":"fixture-secret"}]}`)
 	profilePath := writeFixture(t, dir, "profiles.json", `{"profiles":[{"id":"profile","required_when_explicit":[],"preferred_by_default":["topic"],"goals_to_expand":[]}]}`)
@@ -182,6 +183,11 @@ func TestFixtureRunWritesEightReceiptsAndSummaryWithoutKey(t *testing.T) {
 		if object["evidence_threshold"] != float64(2) {
 			t.Fatalf("receipt %s threshold=%v, want 2", name, object["evidence_threshold"])
 		}
+		for _, key := range []string{"snapshot_identity", "corpus_sha256", "suggested_queries_sha256"} {
+			if value, ok := object[key].(string); !ok || value == "" {
+				t.Fatalf("receipt %s provenance %s=%v, want non-empty string", name, key, object[key])
+			}
+		}
 	}
 	requestData, err := os.ReadFile(filepath.Join(variantDir, "request.json"))
 	if err != nil {
@@ -226,6 +232,7 @@ func TestFixtureAttemptWritesTimingFieldsInRecordAndFinalReceipt(t *testing.T) {
 	defer server.Close()
 	root := filepath.Join(t.TempDir(), "snapshot")
 	writeTestFile(t, filepath.Join(root, "cache", "concepts.jsonl"), `{"slug":"coffee","title":"Coffee","body":"coffee"}`+"\n")
+	writeTestFile(t, filepath.Join(root, "cache", "suggested_queries.json"), `{"version":2,"queries":[],"candidates":[],"updated_at":"2026-08-20T00:00:00Z"}`)
 	dir := t.TempDir()
 	modelPath := writeFixture(t, dir, "models.json", `{"models":[{"id":"m","provider":"fake","base_url":"`+server.URL+`","model":"selected","api_key":"fixture-secret"}]}`)
 	profilePath := writeFixture(t, dir, "profiles.json", `{"profiles":[{"id":"profile","required_when_explicit":[],"preferred_by_default":["topic"],"goals_to_expand":[]}]}`)
@@ -280,7 +287,8 @@ func TestFixtureZeroQualifiedAttemptWritesStatusReasonInResultsAndFinalReceipt(t
 	}))
 	defer server.Close()
 	root := filepath.Join(t.TempDir(), "snapshot")
-	writeTestFile(t, filepath.Join(root, "cache", "concepts.jsonl"), `{"slug":"coffee","title":"Coffee","body":"private term: coffee"}`+"\n"+`{"slug":"other","title":"Other coffee","body":"coffee"}`+"\n")
+	writeTestFile(t, filepath.Join(root, "cache", "concepts.jsonl"), `{"slug":"coffee-guide","title":"Coffee Guide","body":"private term: coffee"}`+"\n"+`{"slug":"other","title":"Other coffee","body":"coffee"}`+"\n")
+	writeTestFile(t, filepath.Join(root, "cache", "suggested_queries.json"), `{"version":2,"queries":[],"candidates":[],"updated_at":"2026-08-20T00:00:00Z"}`)
 	dir := t.TempDir()
 	modelPath := writeFixture(t, dir, "models.json", `{"models":[{"id":"m","provider":"fake","base_url":"`+server.URL+`","model":"selected","api_key":"fixture-secret"}]}`)
 	profilePath := writeFixture(t, dir, "profiles.json", `{"profiles":[{"id":"profile","required_when_explicit":[],"preferred_by_default":["topic"],"goals_to_expand":[]}]}`)
@@ -334,6 +342,7 @@ func TestFixtureNonemptyAttemptWritesOkAndQualifiedEvidenceInReceipts(t *testing
 	defer server.Close()
 	root := filepath.Join(t.TempDir(), "snapshot")
 	writeTestFile(t, filepath.Join(root, "cache", "concepts.jsonl"), `{"slug":"coffee","title":"Coffee","body":"private term: coffee"}`+"\n")
+	writeTestFile(t, filepath.Join(root, "cache", "suggested_queries.json"), `{"version":2,"queries":[],"candidates":[],"updated_at":"2026-08-20T00:00:00Z"}`)
 	dir := t.TempDir()
 	modelPath := writeFixture(t, dir, "models.json", `{"models":[{"id":"m","provider":"fake","base_url":"`+server.URL+`","model":"selected","api_key":"fixture-secret"}]}`)
 	profilePath := writeFixture(t, dir, "profiles.json", `{"profiles":[{"id":"profile","required_when_explicit":[],"preferred_by_default":["topic"],"goals_to_expand":[]}]}`)

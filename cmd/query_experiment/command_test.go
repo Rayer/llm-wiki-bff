@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -225,6 +226,54 @@ func TestProductionIgnoresQueryRetrievalKnobsAndKeepsOutputContract(t *testing.T
 	})
 	if err != nil || queryRetrievalExecutorCalled || strings.Contains(output.String(), "three_host_trace") {
 		t.Fatalf("production err=%v query_retrieval_executor_called=%v output=%s", err, queryRetrievalExecutorCalled, output.String())
+	}
+}
+
+func TestRunExperimentAppendsSuggestedCasesThroughCLIComposition(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, filepath.Join(root, "cache", "concepts.jsonl"), `{"slug":"coffee","title":"Coffee","body":"coffee"}`+"\n")
+	writeTestFile(t, filepath.Join(root, "cache", "suggested_queries.json"), string(validExperimentSuggestedQueries(t)))
+	var output bytes.Buffer
+	executor := &recordingExecutor{}
+	err := runExperiment(context.Background(), experimentOptions{snapshotPath: root, suggestedQueryMode: "wiki", runs: 1}, dependencies{
+		loadConfig:  func(string) (config.Config, error) { return config.Config{}, nil },
+		newExecutor: func(*cache.Cache, config.Config) (query.Executor, error) { return executor, nil },
+		now:         time.Now, stdout: &output,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(executor.calls) != 20 || executor.calls[0] != "Question 1?:wiki" || executor.calls[19] != "Question 20?:wiki" {
+		t.Fatalf("executor calls = %v", executor.calls)
+	}
+	var record resultRecord
+	if err := json.Unmarshal(bytes.Split(bytes.TrimSpace(output.Bytes()), []byte{'\n'})[0], &record); err != nil {
+		t.Fatal(err)
+	}
+	if record.SuggestedQueriesSHA256 == "" || record.Snapshot != filepath.Base(root) {
+		t.Fatalf("record identity = %#v", record)
+	}
+}
+
+func TestRunExperimentRejectsSuggestedArtifactBeforeExecutorOrOutput(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, filepath.Join(root, "cache", "concepts.jsonl"), `{"slug":"coffee","title":"Coffee"}`+"\n")
+	writeTestFile(t, filepath.Join(root, "cache", "suggested_queries.json"), `{"version":1}`)
+	var output bytes.Buffer
+	called := false
+	configCalled := false
+	outputOpened := false
+	err := runExperiment(context.Background(), experimentOptions{snapshotPath: root, suggestedQueryMode: "wiki", runs: 1}, dependencies{
+		loadConfig: func(string) (config.Config, error) { configCalled = true; return config.Config{}, nil },
+		newExecutor: func(*cache.Cache, config.Config) (query.Executor, error) {
+			called = true
+			return &recordingExecutor{}, nil
+		},
+		openOutput: func(string, io.Writer) (recordSink, error) { outputOpened = true; return nil, nil },
+		now:        time.Now, stdout: &output,
+	})
+	if err == nil || called || configCalled || outputOpened || output.Len() != 0 {
+		t.Fatalf("err=%v executor_called=%v config_called=%v output_opened=%v output=%q", err, called, configCalled, outputOpened, output.String())
 	}
 }
 
