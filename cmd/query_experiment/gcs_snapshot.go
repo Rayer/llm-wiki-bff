@@ -9,9 +9,11 @@ import (
 	"net/url"
 	"path"
 	"strings"
+	"sync"
 
 	"github.com/rayer/llm-wiki-bff/internal/cache"
 	"github.com/rayer/llm-wiki-bff/internal/gcs"
+	"github.com/rayer/llm-wiki-bff/internal/generation"
 	"github.com/rayer/llm-wiki-bff/internal/suggestedqueries"
 )
 
@@ -82,18 +84,27 @@ func loadGCSSnapshot(ctx context.Context, root string, newClient func(string) (*
 	if err != nil {
 		return preparedSnapshot{}, fmt.Errorf("create GCS client: %w", err)
 	}
-	defer client.Close()
+	var closeOnce sync.Once
+	var closeErr error
+	cleanup := func() error {
+		closeOnce.Do(func() { closeErr = client.Close() })
+		return closeErr
+	}
 	pinned, snapshot, err := client.WithScope(parsed.userID, parsed.project).PinCurrentGeneration(ctx)
 	if err != nil {
+		_ = cleanup()
 		return preparedSnapshot{}, err
 	}
 	prepared := prepareRemoteSnapshot(pinned, snapshot, sanitizedProjectRoot())
+	prepared.cleanup = cleanup
 	prepared, err = readRemoteArtifacts(ctx, pinned, prepared)
 	if err != nil {
+		_ = cleanup()
 		return preparedSnapshot{}, err
 	}
 	prepared.cache = cache.New()
-	if _, err := prepared.cache.All(ctx, pinned); err != nil {
+	if _, err := prepared.cache.All(ctx, prepared.reader); err != nil {
+		_ = cleanup()
 		return preparedSnapshot{}, fmt.Errorf("snapshot corpus: %w", err)
 	}
 	return prepared, nil
@@ -115,12 +126,19 @@ func prepareRemoteSnapshot(reader gcsSnapshotSource, snapshot gcs.GenerationSnap
 }
 
 func readRemoteArtifacts(ctx context.Context, reader gcsSnapshotSource, snapshot preparedSnapshot) (preparedSnapshot, error) {
-	concepts, err := reader.ReadFile(ctx, conceptsPath)
+	concepts, err := readRemoteArtifact(ctx, reader, conceptsPath, generation.MaxFileBytes)
 	if err != nil {
 		return preparedSnapshot{}, fmt.Errorf("snapshot corpus: %w", err)
 	}
-	suggested, err := reader.ReadFile(ctx, suggestedPath)
+	suggested, err := readRemoteArtifact(ctx, reader, suggestedPath, suggestedqueries.MaxArtifactBytes)
 	if err != nil {
+		return preparedSnapshot{}, fmt.Errorf("snapshot suggested queries: %w", err)
+	}
+	artifact, err := suggestedqueries.Decode(suggested)
+	if err != nil {
+		return preparedSnapshot{}, fmt.Errorf("snapshot suggested queries: %w", err)
+	}
+	if err := suggestedqueries.ValidatePublishedArtifact(artifact); err != nil {
 		return preparedSnapshot{}, fmt.Errorf("snapshot suggested queries: %w", err)
 	}
 	digest := sha256.Sum256(concepts)
@@ -129,5 +147,72 @@ func readRemoteArtifacts(ctx context.Context, reader gcsSnapshotSource, snapshot
 	suggestedDigest := sha256.Sum256(suggested)
 	prepared.suggestedDigest = hex.EncodeToString(suggestedDigest[:])
 	prepared.suggestedData = suggested
+	prepared.suggestedDataSet = true
+	prepared.reader = &frozenSnapshotReader{Reader: reader, concepts: concepts, suggested: suggested}
 	return prepared, nil
+}
+
+func readRemoteArtifact(ctx context.Context, reader gcsSnapshotSource, relPath string, limit int) ([]byte, error) {
+	var (
+		data []byte
+		err  error
+	)
+	if bounded, ok := reader.(interface {
+		ReadFileLimited(context.Context, string, int64) ([]byte, error)
+	}); ok {
+		data, err = bounded.ReadFileLimited(ctx, relPath, int64(limit))
+	} else {
+		data, err = reader.ReadFile(ctx, relPath)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > limit {
+		return nil, fmt.Errorf("snapshot artifact %s exceeds %d-byte limit", relPath, limit)
+	}
+	return data, nil
+}
+
+type frozenSnapshotReader struct {
+	cache.Reader
+	concepts  []byte
+	suggested []byte
+}
+
+func (r *frozenSnapshotReader) ViewToken() string {
+	if tokenized, ok := r.Reader.(interface{ ViewToken() string }); ok {
+		return tokenized.ViewToken()
+	}
+	return ""
+}
+
+func (r *frozenSnapshotReader) ReadFile(ctx context.Context, relPath string) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	switch relPath {
+	case conceptsPath:
+		return r.concepts, nil
+	case suggestedPath:
+		return r.suggested, nil
+	default:
+		return r.Reader.(interface {
+			ReadFile(context.Context, string) ([]byte, error)
+		}).ReadFile(ctx, relPath)
+	}
+}
+
+func (r *frozenSnapshotReader) ReadFileLimited(ctx context.Context, relPath string, limit int64) ([]byte, error) {
+	if data, err := r.ReadFile(ctx, relPath); err == nil {
+		if int64(len(data)) > limit {
+			return nil, fmt.Errorf("snapshot artifact %s exceeds %d-byte limit", relPath, limit)
+		}
+		return data, nil
+	} else if bounded, ok := r.Reader.(interface {
+		ReadFileLimited(context.Context, string, int64) ([]byte, error)
+	}); ok {
+		return bounded.ReadFileLimited(ctx, relPath, limit)
+	} else {
+		return nil, err
+	}
 }

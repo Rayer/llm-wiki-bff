@@ -1500,8 +1500,10 @@ type searchableField struct {
 }
 
 type searchableEntry struct {
-	Fields     []searchableField
-	Identities []string
+	Fields          []searchableField
+	Identities      []string
+	RawIdentities   []string
+	CanonicalProofs []string
 }
 
 var searchableFrontmatterKeys = []string{"title", "name", "aliases", "tags", "keywords", "category", "categories", "type", "location"}
@@ -1519,7 +1521,19 @@ func prepareSearchableEntry(entry cache.Entry) searchableEntry {
 		identities = append(identities, entry.Slug)
 	}
 	identities = append(identities, frontmatterIdentityAliases(entry.Frontmatter)...)
-	return searchableEntry{Fields: []searchableField{{Name: "title", Value: entry.Title}, {Name: "frontmatter", Value: strings.Join(values, " ")}, {Name: "body", Value: entry.Body}}, Identities: identities}
+	proofs := []string{entry.Title}
+	for _, key := range []string{"title", "name", "slug"} {
+		value, _ := entry.Frontmatter[key].(string)
+		if value = strings.TrimSpace(value); value != "" {
+			proofs = append(proofs, value)
+		}
+	}
+	return searchableEntry{
+		Fields:          []searchableField{{Name: "title", Value: entry.Title}, {Name: "frontmatter", Value: strings.Join(values, " ")}, {Name: "body", Value: entry.Body}},
+		Identities:      identities,
+		RawIdentities:   []string{entry.Title, entry.Slug},
+		CanonicalProofs: proofs,
+	}
 }
 
 func appendSearchableValues(values []string, value interface{}) []string {
@@ -1673,13 +1687,13 @@ func hasExactRawQueryIdentity(plan QueryPlan, candidate searchableEntry) bool {
 	if rawQuery == "" {
 		return false
 	}
-	for _, identity := range candidate.Identities {
+	for _, identity := range candidate.RawIdentities {
 		identity = normalizeIdentity(identity)
 		if identity == "" || !containsNormalizedPhrase(rawQuery, identity) {
 			continue
 		}
-		for _, field := range candidate.Fields {
-			if (field.Name == "title" || field.Name == "frontmatter") && containsNormalizedPhrase(field.Value, identity) {
+		for _, proof := range candidate.CanonicalProofs {
+			if normalizeIdentity(proof) == identity {
 				return true
 			}
 		}

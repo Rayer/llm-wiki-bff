@@ -191,6 +191,35 @@ func TestRawQueryCorpusIdentityRequiresTitleOrFrontmatterProof(t *testing.T) {
 	}
 }
 
+func TestRawQueryCorpusIdentityUsesOnlyExactCanonicalTitleOrSlugProof(t *testing.T) {
+	tests := []struct {
+		name      string
+		query     string
+		entry     cache.Entry
+		wantExact bool
+	}{
+		{name: "slug substring in title", query: "coffee", entry: cache.Entry{Slug: "coffee", Title: "Coffee Guide"}},
+		{name: "alias only", query: "coffee", entry: cache.Entry{Slug: "guide", Title: "Guide", Frontmatter: map[string]interface{}{"aliases": []string{"coffee"}}}},
+		{name: "body only", query: "coffee", entry: cache.Entry{Slug: "guide", Title: "Guide", Body: "coffee"}},
+		{name: "generic title substring", query: "coffee", entry: cache.Entry{Slug: "guide", Title: "Best Coffee Guide"}},
+		{name: "exact title", query: "coffee guide", entry: cache.Entry{Slug: "coffee-guide", Title: "Coffee Guide"}, wantExact: true},
+		{name: "safely proven slug", query: "coffee", entry: cache.Entry{Slug: "coffee", Title: "Coffee"}, wantExact: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := queryquality.NewLexicalMatcher(nil).Match(context.Background(), queryquality.MatchRequest{
+				Plan: queryquality.QueryPlan{RawQuery: test.query}, CorpusEntries: []cache.Entry{test.entry}, EvidenceThreshold: 2, EvidenceThresholdSet: true,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.Candidates[0].ExactIdentityEvidence != test.wantExact {
+				t.Fatalf("candidate=%#v want exact=%v", got.Candidates[0], test.wantExact)
+			}
+		})
+	}
+}
+
 func TestFrontmatterMatchingIsAllowlistedAndDeterministic(t *testing.T) {
 	plan := queryquality.QueryPlan{RawQuery: "coffee", Preferred: []queryquality.Criterion{{Kind: "topic", Value: "coffee", Terms: []string{"coffee"}, Proof: "lexical"}}, KeywordSupport: []queryquality.KeywordSupport{{Role: "preferred", Kind: "topic", Value: "coffee", Keyword: "coffee", SupportCount: 1, AttemptIndexes: []int{1}}}}
 	entries := []cache.Entry{

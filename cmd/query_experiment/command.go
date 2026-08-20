@@ -77,6 +77,7 @@ type dependencies struct {
 	openOutput                func(string, io.Writer) (recordSink, error)
 	queryRetrievalSeed        func(string) int64
 	newGCSClient              func(string) (*gcs.Client, error)
+	loadGCSSnapshot           func(context.Context, string, func(string) (*gcs.Client, error)) (preparedSnapshot, error)
 }
 
 type preparedSnapshot struct {
@@ -91,6 +92,8 @@ type preparedSnapshot struct {
 	inputFingerprint   string
 	suggestedDigest    string
 	suggestedData      []byte
+	suggestedDataSet   bool
+	cleanup            func() error
 }
 
 type resultIdentity struct {
@@ -332,6 +335,13 @@ func preflightSnapshot(ctx context.Context, root string) (preparedSnapshot, erro
 		return preparedSnapshot{}, fmt.Errorf("snapshot corpus: %w", err)
 	}
 	digest := sha256.Sum256(corpus)
+	reader.freezeConcepts(corpus)
+	suggested, suggestedErr := reader.ReadFile(ctx, suggestedPath)
+	if suggestedErr == nil {
+		reader.freezeSuggested(suggested)
+	} else if !errors.Is(suggestedErr, errSnapshotPathNotFound) {
+		return preparedSnapshot{}, fmt.Errorf("snapshot suggested queries: %w", suggestedErr)
+	}
 	conceptCache := cache.New()
 	if _, err := conceptCache.All(ctx, reader); err != nil {
 		return preparedSnapshot{}, fmt.Errorf("snapshot corpus: %w", err)
@@ -341,11 +351,17 @@ func preflightSnapshot(ctx context.Context, root string) (preparedSnapshot, erro
 		label = "snapshot"
 	}
 	prepared := preparedSnapshot{
-		label:      label,
-		digest:     hex.EncodeToString(digest[:]),
-		reader:     reader,
-		cache:      conceptCache,
-		sourceRoot: cleanRoot,
+		label:            label,
+		digest:           hex.EncodeToString(digest[:]),
+		reader:           reader,
+		cache:            conceptCache,
+		sourceRoot:       cleanRoot,
+		suggestedData:    suggested,
+		suggestedDataSet: suggestedErr == nil,
+	}
+	if suggestedErr == nil {
+		suggestedDigest := sha256.Sum256(suggested)
+		prepared.suggestedDigest = hex.EncodeToString(suggestedDigest[:])
 	}
 	return prepared, nil
 }
@@ -372,7 +388,7 @@ func validateOutputPath(path string) error {
 	return nil
 }
 
-func runExperiment(ctx context.Context, options experimentOptions, deps dependencies) error {
+func runExperiment(ctx context.Context, options experimentOptions, deps dependencies) (runErr error) {
 	root, err := resolveSnapshotLocator(options)
 	if err != nil {
 		return err
@@ -408,15 +424,26 @@ func runExperiment(ctx context.Context, options experimentOptions, deps dependen
 	}
 	var prepared preparedSnapshot
 	if strings.HasPrefix(root, "gs://") {
-		prepared, err = loadGCSSnapshot(ctx, root, deps.newGCSClient)
+		load := deps.loadGCSSnapshot
+		if load == nil {
+			load = loadGCSSnapshot
+		}
+		prepared, err = load(ctx, root, deps.newGCSClient)
 	} else {
 		prepared, err = preflightSnapshot(ctx, root)
 	}
 	if err != nil {
 		return err
 	}
+	if prepared.cleanup != nil {
+		defer func() {
+			if cleanupErr := prepared.cleanup(); runErr == nil && cleanupErr != nil {
+				runErr = fmt.Errorf("close GCS client: %w", cleanupErr)
+			}
+		}()
+	}
 	if options.suggestedQueryMode != "" {
-		if len(prepared.suggestedData) == 0 {
+		if !prepared.suggestedDataSet {
 			reader, ok := prepared.reader.(interface {
 				ReadFile(context.Context, string) ([]byte, error)
 			})
@@ -429,6 +456,7 @@ func runExperiment(ctx context.Context, options experimentOptions, deps dependen
 			}
 			digest := sha256.Sum256(prepared.suggestedData)
 			prepared.suggestedDigest = hex.EncodeToString(digest[:])
+			prepared.suggestedDataSet = true
 		}
 		generated, err := suggestedCases(prepared.suggestedData, options.suggestedQueryMode, cases)
 		if err != nil {
