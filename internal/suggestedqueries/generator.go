@@ -414,8 +414,9 @@ func ValidatePublishedCandidates(candidates []Candidate) error {
 }
 
 func ValidatePublishedArtifact(artifact Artifact) error {
-	if artifact.Version != 2 || len(artifact.Queries) != RequiredQueries || len(artifact.Candidates) != RequiredQueries {
-		return fmt.Errorf("%w: artifact must contain exactly %d queries and candidates", ErrInvalidCandidates, RequiredQueries)
+	count := len(artifact.Candidates)
+	if artifact.Version != 2 || len(artifact.Queries) != count || !((count >= MinQueries && count <= MaxLegacyQueries) || count == RequiredQueries) {
+		return fmt.Errorf("%w: artifact must contain %d..%d or exactly %d queries and candidates", ErrInvalidCandidates, MinQueries, MaxLegacyQueries, RequiredQueries)
 	}
 	if strings.TrimSpace(artifact.UpdatedAt) == "" {
 		return fmt.Errorf("%w: artifact updated_at is required", ErrInvalidCandidates)
