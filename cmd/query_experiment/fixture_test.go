@@ -44,6 +44,26 @@ func TestFixtureDecodersAreStrictAndKeepModelKeysPrivate(t *testing.T) {
 	}
 }
 
+func TestFixtureRunnerDelegatesStageExecutionToProductionService(t *testing.T) {
+	data, err := os.ReadFile("fixture_runner.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{
+		"ExpandWithTrace(",
+		".Match(",
+		".Select(",
+		"ResultStatus(",
+		"NewParallelQueryExpander(",
+		"NewLexicalMatcher(",
+		"NewResultSelector(",
+	} {
+		if strings.Contains(string(data), forbidden) {
+			t.Fatalf("fixture runner directly invokes production stage %q", forbidden)
+		}
+	}
+}
+
 func TestFixtureUsageAggregationSumsProviderAttemptsWithoutChangingFanoutLatency(t *testing.T) {
 	total := fixtureUsage{}
 	for _, usage := range []fixtureUsage{{PromptTokens: 3, CompletionTokens: 2, TotalTokens: 5}, {PromptTokens: 7, CompletionTokens: 4, TotalTokens: 11}, {PromptTokens: 1, CompletionTokens: 1, TotalTokens: 2}} {

@@ -16,12 +16,10 @@ import (
 	"time"
 
 	"github.com/rayer/llm-wiki-bff/internal/buildinfo"
-	"github.com/rayer/llm-wiki-bff/internal/cache"
 	"github.com/rayer/llm-wiki-bff/internal/config"
 	"github.com/rayer/llm-wiki-bff/internal/query"
 	"github.com/rayer/llm-wiki-bff/internal/queryconfig"
 	"github.com/rayer/llm-wiki-bff/internal/queryquality"
-	"github.com/rayer/llm-wiki-bff/internal/search"
 )
 
 const underFiveThreshold = 5
@@ -139,29 +137,46 @@ type fixtureExpansionAttemptReceipt struct {
 	Usage        fixtureUsage `json:"usage,omitempty"`
 }
 
-type fixtureModelExpander struct {
-	model  modelFixtureEntry
-	system string
-	user   string
-	mu     sync.Mutex
-	calls  map[int]fixtureModelCall
+type fixtureChatProvider struct {
+	model    modelFixtureEntry
+	expected queryquality.RenderedPrompt
+	mu       sync.Mutex
+	calls    map[int]fixtureModelCall
 }
 
-func (e *fixtureModelExpander) Expand(ctx context.Context, request queryquality.ExpansionRequest) (queryquality.QueryPlan, error) {
-	call, err := callFixtureModel(ctx, e.model, e.system, e.user)
-	e.mu.Lock()
-	e.calls[request.Attempt] = call
-	e.mu.Unlock()
-	if err != nil {
-		return queryquality.QueryPlan{}, err
+func newFixtureChatProvider(model modelFixtureEntry, promptID string, expected queryquality.RenderedPrompt) (*fixtureChatProvider, error) {
+	identity, ok := queryquality.LookupPrompt(promptID)
+	if !ok {
+		return nil, fmt.Errorf("unsupported prompt id %q", promptID)
 	}
-	return decodeStructuredPlan(call.Content, request.Query)
+	if err := queryquality.ValidatePrompt(identity.ID, identity.TemplateDigest); err != nil {
+		return nil, err
+	}
+	return &fixtureChatProvider{model: model, expected: expected, calls: make(map[int]fixtureModelCall)}, nil
 }
 
-func (e *fixtureModelExpander) call(attempt int) fixtureModelCall {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	return e.calls[attempt]
+func (p *fixtureChatProvider) Chat(ctx context.Context, system, user string) (string, error) {
+	if system != p.expected.System || user != p.expected.User {
+		return "", errors.New("production-rendered prompt mismatch")
+	}
+	attempt, ok := queryquality.ExpansionAttemptFromContext(ctx)
+	if !ok || attempt < 1 {
+		return "", errors.New("fixture expansion attempt identity missing")
+	}
+	call, err := callFixtureModel(ctx, p.model, system, user)
+	p.mu.Lock()
+	p.calls[attempt] = call
+	p.mu.Unlock()
+	if err != nil {
+		return "", err
+	}
+	return call.Content, nil
+}
+
+func (p *fixtureChatProvider) call(attempt int) fixtureModelCall {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.calls[attempt]
 }
 
 type fixtureMatchingInput struct {
@@ -263,6 +278,8 @@ func runFixtureExperiment(ctx context.Context, options experimentOptions, prepar
 	if err != nil {
 		return err
 	}
+	// Frozen fixture artifacts use an explicit evidence-threshold policy.
+	retrievalOptions.evidenceThresholdSet = true
 	options.selectionLimit = retrievalOptions.selectionLimit
 	options.explorationSlots = retrievalOptions.explorationSlots
 	options.keywordsPerAttempt = retrievalOptions.keywordsPerAttempt
@@ -302,10 +319,6 @@ func runFixtureExperiment(ctx context.Context, options experimentOptions, prepar
 	if err := os.MkdirAll(filepath.Clean(options.artifactsDir), 0o755); err != nil {
 		return fmt.Errorf("create artifacts directory: %w", err)
 	}
-	entries, err := prepared.cache.All(ctx, prepared.reader)
-	if err != nil {
-		return fmt.Errorf("snapshot corpus: %w", err)
-	}
 	now := deps.now
 	if now == nil {
 		now = time.Now
@@ -340,7 +353,7 @@ func runFixtureExperiment(ctx context.Context, options experimentOptions, prepar
 	for i := range variants {
 		for _, input := range cases {
 			for runIndex := 1; runIndex <= options.runs; runIndex++ {
-				attempt, err := runFixtureAttempt(ctx, options, retrievalOptions, variants[i], input, runIndex, prepared, entries, now, metadata)
+				attempt, err := runFixtureAttempt(ctx, options, retrievalOptions, variants[i], input, runIndex, prepared, now, metadata)
 				if err != nil {
 					return err
 				}
@@ -400,7 +413,7 @@ func digestToken(digest string) (string, error) {
 	return raw[:artifactDigestTokenLength], nil
 }
 
-func runFixtureAttempt(ctx context.Context, options experimentOptions, retrievalOptions queryRetrievalOptions, variant fixtureVariant, input caseInput, runIndex int, prepared preparedSnapshot, entries []cache.Entry, now func() time.Time, metadata recordMetadata) (fixtureAttempt, error) {
+func runFixtureAttempt(ctx context.Context, options experimentOptions, retrievalOptions queryRetrievalOptions, variant fixtureVariant, input caseInput, runIndex int, prepared preparedSnapshot, now func() time.Time, metadata recordMetadata) (fixtureAttempt, error) {
 	attemptID := fmt.Sprintf("%s__case=%s__run=%d", variant.VariantID, input.ID, runIndex)
 	profile, err := variant.Profile.retrievalProfile()
 	if err != nil {
@@ -433,39 +446,84 @@ func runFixtureAttempt(ctx context.Context, options experimentOptions, retrieval
 	write := func(name string, payload any) error {
 		return writeFixtureReceipt(filepath.Join(dir, name), meta, payload, variant.Model.APIKey)
 	}
-	seed := reproducibleSeed(input.Query)
 	seedMode := "query-derived"
 	if retrievalOptions.seed != nil {
-		seed = *retrievalOptions.seed
 		seedMode = "explicit"
 	}
 	if err := write("request.json", fixtureRequestReceipt{Query: input.Query, Mode: input.Mode, SnapshotIdentity: prepared.label, CorpusSHA256: prepared.digest, SelectionLimit: retrievalOptions.selectionLimit, ExplorationSlots: retrievalOptions.explorationSlots, EvidenceThreshold: retrievalOptions.evidenceThreshold, KeywordsPerAttempt: retrievalOptions.keywordsPerAttempt, ExpansionAttempts: retrievalOptions.expansionAttempts, RareKeywordMaxDocumentFrequency: retrievalOptions.rareDocumentFrequency, SeedMode: seedMode, Model: variant.Model.Model, ProfileID: profile.ID, ProfileDigest: profileDigest}); err != nil {
 		return fixtureAttempt{}, err
 	}
 	policy := profile.CriterionPolicy
-	rendered, err := renderFixturePrompt(variant.Prompt, input.Query, policy)
+	productionPromptID := variant.Prompt.ID
+	prompt, ok := queryquality.LookupPrompt(productionPromptID)
+	if !ok && variant.Prompt.ID == "prompt" {
+		// Preserve the pre-catalog fixture alias while routing its execution through
+		// the built-in Lifestyle production prompt.
+		productionPromptID = queryquality.StructuredPlanPromptID
+		prompt, ok = queryquality.LookupPrompt(productionPromptID)
+	}
+	if !ok {
+		return fixtureAttempt{}, fmt.Errorf("unsupported prompt id %q", variant.Prompt.ID)
+	}
+	if variant.Prompt.ID != "prompt" {
+		if err := queryquality.ValidatePromptTemplate(variant.Prompt.ID, variant.Prompt.SystemTemplate, variant.Prompt.UserTemplate); err != nil {
+			return fixtureAttempt{}, fmt.Errorf("selected prompt: %w", err)
+		}
+	}
+	if variant.Prompt.TemplateDigest != "" {
+		if err := queryquality.ValidatePrompt(variant.Prompt.ID, variant.Prompt.TemplateDigest); err != nil {
+			return fixtureAttempt{}, fmt.Errorf("selected prompt: %w", err)
+		}
+	}
+	rendered, err := queryquality.RenderPrompt(productionPromptID, input.Query, policy, retrievalOptions.keywordsPerAttempt)
 	if err != nil {
 		return fixtureAttempt{}, fmt.Errorf("render prompt: %w", err)
 	}
-	rendered.User += fmt.Sprintf("\nMaximum normalized positive discovery keywords for this attempt: %d.", retrievalOptions.keywordsPerAttempt)
 	if err := write("expansion.input.json", fixtureExpansionInput{Query: input.Query, CriterionPolicy: policy, PromptID: variant.Prompt.ID, Provider: variant.Model.Provider, Model: variant.Model.Model, KeywordsPerAttempt: retrievalOptions.keywordsPerAttempt, ExpansionAttempts: retrievalOptions.expansionAttempts}); err != nil {
 		return fixtureAttempt{}, err
 	}
-	expander := &fixtureModelExpander{model: variant.Model, system: rendered.System, user: rendered.User, calls: make(map[int]fixtureModelCall)}
-	parallel, err := queryquality.NewParallelQueryExpander(expander, newDeterministicExpander(), toQueryRetrievalCoreOptions(retrievalOptions))
+	provider, err := newFixtureChatProvider(variant.Model, prompt.ID, rendered)
 	if err != nil {
 		return fixtureAttempt{}, err
 	}
-	expansionStarted := now()
-	plan, expansionInfo, expansionErr := parallel.(queryquality.TracedQueryExpander).ExpandWithTrace(ctx, queryquality.ExpansionRequest{Query: input.Query, CriterionPolicy: policy})
-	expansionElapsed := elapsedBetween(now(), expansionStarted)
-	if expansionErr != nil {
-		return fixtureAttempt{}, fmt.Errorf("fixture expansion: %w", expansionErr)
+	service, err := queryquality.NewQueryRetrievalService(queryquality.QueryRetrievalServiceConfig{
+		Cache: prepared.cache, ChatProvider: provider, Options: toQueryRetrievalCoreOptions(retrievalOptions), RetrievalProfile: profile,
+		PromptID: prompt.ID, AllowDeterministicFallback: true,
+	})
+	if err != nil {
+		return fixtureAttempt{}, err
 	}
-	attemptReceipts := make([]fixtureExpansionAttemptReceipt, 0, expansionInfo.RequestedAttempts)
+	result, trace, err := service.ExecuteWithTrace(ctx, prepared.reader, query.Request{Query: input.Query, Mode: input.Mode})
+	if err != nil {
+		return fixtureAttempt{}, fmt.Errorf("fixture query retrieval: %w", err)
+	}
+	_ = now()
+	_ = now()
+	_ = now()
+	_ = now()
+	_ = now()
+	runCompletedAt := now()
+	trace.Variant = variant.VariantID
+	expansionStage, err := fixtureTraceStage(trace, "expansion")
+	if err != nil {
+		return fixtureAttempt{}, err
+	}
+	matchingStage, err := fixtureTraceStage(trace, "matching")
+	if err != nil {
+		return fixtureAttempt{}, err
+	}
+	selectionStage, err := fixtureTraceStage(trace, "selection")
+	if err != nil {
+		return fixtureAttempt{}, err
+	}
+	if expansionStage.Plan == nil {
+		return fixtureAttempt{}, errors.New("query-retrieval trace expansion plan is missing")
+	}
+	plan := *expansionStage.Plan
+	attemptReceipts := make([]fixtureExpansionAttemptReceipt, 0, len(trace.Expansion.AttemptOutcomes))
 	var expansionUsage fixtureUsage
-	for _, outcome := range expansionInfo.AttemptOutcomes {
-		call := expander.call(outcome.AttemptIndex)
+	for _, outcome := range trace.Expansion.AttemptOutcomes {
+		call := provider.call(outcome.AttemptIndex)
 		attemptReceipts = append(attemptReceipts, fixtureExpansionAttemptReceipt{AttemptIndex: outcome.AttemptIndex, Outcome: outcome.Outcome, LatencyMS: call.LatencyMS, Usage: call.Usage})
 		expansionUsage = addFixtureUsage(expansionUsage, call.Usage)
 	}
@@ -473,77 +531,61 @@ func runFixtureAttempt(ctx context.Context, options experimentOptions, retrieval
 	if plan.Fallback {
 		validation = "fallback"
 	}
-	if err := write("expansion.output.json", fixtureExpansionOutput{ParsedPlan: plan, Source: expansionInfo.Source, Validation: validation, Fallback: plan.Fallback, FallbackReason: expansionInfo.FallbackReason, Error: "", LatencyMS: expansionElapsed, Usage: expansionUsage, RequestedAttempts: expansionInfo.RequestedAttempts, SuccessfulAttempts: expansionInfo.SuccessfulAttempts, ProviderFailedAttempts: expansionInfo.ProviderFailedAttempts, FallbackCount: expansionInfo.FallbackCount, KeywordsPerAttempt: expansionInfo.KeywordsPerAttempt, KeywordSupport: plan.KeywordSupport, Attempts: attemptReceipts}); err != nil {
+	if err := write("expansion.output.json", fixtureExpansionOutput{ParsedPlan: plan, Source: expansionStage.Source, Validation: validation, Fallback: plan.Fallback, FallbackReason: expansionStage.FallbackReason, Error: "", LatencyMS: expansionStage.ElapsedMS, Usage: expansionUsage, RequestedAttempts: trace.Expansion.RequestedAttempts, SuccessfulAttempts: trace.Expansion.SuccessfulAttempts, ProviderFailedAttempts: trace.Expansion.ProviderFailedAttempts, FallbackCount: trace.Expansion.FallbackCount, KeywordsPerAttempt: trace.Expansion.KeywordsPerAttempt, KeywordSupport: plan.KeywordSupport, Attempts: attemptReceipts}); err != nil {
 		return fixtureAttempt{}, err
 	}
-	trace := &queryRetrievalTrace{Variant: variant.VariantID, Seed: seed, Stages: []stageTrace{{Name: "expansion", Outcome: planOutcome(plan), Source: expansionInfo.Source, FallbackReason: expansionInfo.FallbackReason, ElapsedMS: expansionElapsed, InputCount: expansionInfo.RequestedAttempts, OutputCount: criterionCount(plan), Plan: &plan}}}
-	trace.Expansion = queryquality.ExpansionTrace{RequestedAttempts: expansionInfo.RequestedAttempts, SuccessfulAttempts: expansionInfo.SuccessfulAttempts, ProviderFailedAttempts: expansionInfo.ProviderFailedAttempts, FallbackCount: expansionInfo.FallbackCount, KeywordsPerAttempt: expansionInfo.KeywordsPerAttempt, RareKeywordMaxDocumentFrequency: retrievalOptions.rareDocumentFrequency, EvidenceThreshold: retrievalOptions.evidenceThreshold, KeywordSupport: append([]queryquality.KeywordSupport(nil), plan.KeywordSupport...)}
-	matchReq := queryquality.MatchRequest{
-		Plan: plan, CorpusEntries: entries, EvidenceThreshold: retrievalOptions.evidenceThreshold, EvidenceThresholdSet: true,
-		RareKeywordMaxDocumentFrequency: retrievalOptions.rareDocumentFrequency, FallbackQualificationAllowed: false,
-	}
 	if err := write("matching.input.json", fixtureMatchingInput{
-		Plan: plan, SnapshotIdentity: prepared.label, CorpusSHA256: prepared.digest, EvidenceThreshold: matchReq.EvidenceThreshold, RareKeywordMaxDocumentFrequency: matchReq.RareKeywordMaxDocumentFrequency, FallbackQualificationAllowed: matchReq.FallbackQualificationAllowed,
+		Plan: plan, SnapshotIdentity: prepared.label, CorpusSHA256: prepared.digest, EvidenceThreshold: trace.EvidenceThreshold, RareKeywordMaxDocumentFrequency: trace.RareKeywordMaxDocumentFrequency, FallbackQualificationAllowed: !retrievalOptions.evidenceThresholdSet,
 		Parameters: map[string]any{"semantic_required_fail_closed": semanticRequiredFailClosed, "semantic_excluded_fail_closed": semanticExcludedFailClosed},
 	}); err != nil {
 		return fixtureAttempt{}, err
 	}
-	matchingStarted := now()
-	eligible, err := newLexicalMatcher(nil).Match(ctx, matchReq)
-	matchingElapsed := elapsedBetween(now(), matchingStarted)
-	if err != nil {
-		return fixtureAttempt{}, err
-	}
-	identities := make([]resultIdentity, 0, len(eligible.Candidates))
-	for _, candidate := range eligible.Candidates {
+	identities := make([]resultIdentity, 0, len(matchingStage.Candidates))
+	for _, candidate := range matchingStage.Candidates {
 		identities = append(identities, resultIdentity{Slug: candidate.Slug, Title: candidate.Title, Type: "concept"})
 	}
-	trace.EvidenceThreshold = retrievalOptions.evidenceThreshold
-	trace.Stages = append(trace.Stages, stageTrace{Name: "matching", Outcome: "success", ElapsedMS: matchingElapsed, InputCount: len(entries), OutputCount: queryquality.QualifiedCount(eligible.Candidates), TotalCount: len(eligible.Candidates), Candidates: eligible.Candidates, EvidenceThreshold: retrievalOptions.evidenceThreshold})
-	if err := write("matching.output.json", fixtureMatchingOutput{CandidateIdentities: identities, Candidates: eligible.Candidates}); err != nil {
+	if err := write("matching.output.json", fixtureMatchingOutput{CandidateIdentities: identities, Candidates: matchingStage.Candidates}); err != nil {
 		return fixtureAttempt{}, err
 	}
-	selectionInput := fixtureSelectionInput{Candidates: eligible.Candidates, Limit: retrievalOptions.selectionLimit, ExplorationSlots: retrievalOptions.explorationSlots, EvidenceThreshold: retrievalOptions.evidenceThreshold, EffectiveSeed: seed}
+	selectionInput := fixtureSelectionInput{Candidates: matchingStage.Candidates, Limit: trace.SelectionLimit, ExplorationSlots: trace.ExplorationSlots, EvidenceThreshold: trace.EvidenceThreshold, EffectiveSeed: trace.Seed}
 	if err := write("selection.input.json", selectionInput); err != nil {
 		return fixtureAttempt{}, err
 	}
-	selectionStarted := now()
-	selected, err := newRandomSelector().Select(ctx, SelectionInput{Candidates: eligible.Candidates, Limit: retrievalOptions.selectionLimit, ExplorationSlots: retrievalOptions.explorationSlots, Seed: seed})
-	selectionElapsed := elapsedBetween(now(), selectionStarted)
-	if err != nil {
-		return fixtureAttempt{}, err
-	}
 	finalOrder := make([]string, 0)
-	resultIdentities := make([]resultIdentity, 0)
-	for _, decision := range selected.Selected {
-		if decision.Selected {
-			finalOrder = append(finalOrder, decision.Slug)
-			resultIdentities = append(resultIdentities, resultIdentity{Slug: decision.Slug, Title: decision.Title, Type: "concept"})
-		}
+	resultIdentities := make([]resultIdentity, 0, len(result.Results))
+	for _, item := range result.Results {
+		identity := resultIdentity{Slug: item.Slug, Title: item.Title, Type: item.Type}
+		resultIdentities = append(resultIdentities, identity)
+		finalOrder = append(finalOrder, identity.Slug)
 	}
-	trace.Stages = append(trace.Stages, stageTrace{Name: "selection", Outcome: "success", ElapsedMS: selectionElapsed, InputCount: len(eligible.Candidates), OutputCount: len(finalOrder), TotalCount: len(selected.Selected), Decisions: selected.Selected, EvidenceThreshold: retrievalOptions.evidenceThreshold})
-	if err := write("selection.output.json", fixtureSelectionOutput{Decisions: selected.Selected, FinalOrder: finalOrder, EvidenceThreshold: retrievalOptions.evidenceThreshold}); err != nil {
+	if err := write("selection.output.json", fixtureSelectionOutput{Decisions: selectionStage.Decisions, FinalOrder: finalOrder, EvidenceThreshold: trace.EvidenceThreshold}); err != nil {
 		return fixtureAttempt{}, err
 	}
-	runCompletedAt := now()
 	outcome := "success"
-	resultStatus, resultReason := queryquality.ResultStatus(len(resultIdentities))
-	if resultStatus != "ok" {
+	if result.Status != "ok" {
 		outcome = "retrieval_miss"
 	}
 	queryReceivedAtStr, runCompletedAtStr, durationMS := attemptTiming(queryReceivedAt, runCompletedAt)
-	if err := write("final.json", fixtureFinalReceipt{Outcome: outcome, Status: resultStatus, Reason: resultReason, FinalIdentities: resultIdentities, Receipts: map[string]string{"request": "request.json", "expansion_input": "expansion.input.json", "expansion_output": "expansion.output.json", "matching_input": "matching.input.json", "matching_output": "matching.output.json", "selection_input": "selection.input.json", "selection_output": "selection.output.json", "final": "final.json"}, QueryReceivedAt: queryReceivedAtStr, RunCompletedAt: runCompletedAtStr, DurationMS: durationMS, ProfileID: profile.ID, ProfileDigest: profileDigest, ConfigSchemaVersion: metadata.configSchemaVersion, ConfigRevision: metadata.configRevision, ConfigDigest: metadata.configDigest}); err != nil {
+	if err := write("final.json", fixtureFinalReceipt{Outcome: outcome, Status: result.Status, Reason: result.Reason, FinalIdentities: resultIdentities, Receipts: map[string]string{"request": "request.json", "expansion_input": "expansion.input.json", "expansion_output": "expansion.output.json", "matching_input": "matching.input.json", "matching_output": "matching.output.json", "selection_input": "selection.input.json", "selection_output": "selection.output.json", "final": "final.json"}, QueryReceivedAt: queryReceivedAtStr, RunCompletedAt: runCompletedAtStr, DurationMS: durationMS, ProfileID: profile.ID, ProfileDigest: profileDigest, ConfigSchemaVersion: metadata.configSchemaVersion, ConfigRevision: metadata.configRevision, ConfigDigest: metadata.configDigest}); err != nil {
 		return fixtureAttempt{}, err
 	}
-	result := query.Result{Query: input.Query, Mode: input.Mode, Status: resultStatus, Reason: resultReason}
-	for _, identity := range resultIdentities {
-		result.Results = append(result.Results, search.Result{Slug: identity.Slug, Title: identity.Title, Type: identity.Type})
-	}
-	record := makeResultRecordWithTrace(input, runIndex, prepared, result, nil, expansionElapsed+matchingElapsed+selectionElapsed, metadata, trace)
+	record := makeResultRecordWithTrace(input, runIndex, prepared, result, nil, expansionStage.ElapsedMS+matchingStage.ElapsedMS+selectionStage.ElapsedMS, metadata, trace)
 	record.QueryReceivedAt, record.RunCompletedAt, record.DurationMS = queryReceivedAtStr, runCompletedAtStr, durationMS
 	record.VariantID, record.ProfileID, record.ProfileDigest, record.PromptID, record.Provider, record.Model = variant.VariantID, profile.ID, profileDigest, variant.Prompt.ID, variant.Model.Provider, variant.Model.Model
 	selectionDigest := digestJSON(selectionInput)
-	return fixtureAttempt{Record: record, Case: input, Candidates: eligible.Candidates, Decisions: selected.Selected, EffectiveSeed: seed, SelectionInputDigest: selectionDigest, Fallback: plan.Fallback, LatencyMS: expansionElapsed, Usage: expansionUsage, EvidenceThreshold: retrievalOptions.evidenceThreshold}, nil
+	return fixtureAttempt{Record: record, Case: input, Candidates: matchingStage.Candidates, Decisions: selectionStage.Decisions, EffectiveSeed: trace.Seed, SelectionInputDigest: selectionDigest, Fallback: plan.Fallback, LatencyMS: expansionStage.ElapsedMS, Usage: expansionUsage, EvidenceThreshold: trace.EvidenceThreshold}, nil
+}
+
+func fixtureTraceStage(trace *queryRetrievalTrace, name string) (stageTrace, error) {
+	if trace == nil {
+		return stageTrace{}, errors.New("query-retrieval trace is missing")
+	}
+	for _, stage := range trace.Stages {
+		if stage.Name == name {
+			return stage, nil
+		}
+	}
+	return stageTrace{}, fmt.Errorf("query-retrieval trace stage %q is missing", name)
 }
 
 func addFixtureUsage(total, next fixtureUsage) fixtureUsage {
