@@ -133,6 +133,7 @@ type resultRecord struct {
 	Model                  string               `json:"model,omitempty"`
 	VariantID              string               `json:"variant_id,omitempty"`
 	ProfileID              string               `json:"profile_id,omitempty"`
+	ProfileDigest          string               `json:"profile_digest,omitempty"`
 	PromptID               string               `json:"prompt_id,omitempty"`
 	EvidenceThreshold      int                  `json:"evidence_threshold,omitempty"`
 	QueryRetrievalTrace    *queryRetrievalTrace `json:"three_host_trace,omitempty"`

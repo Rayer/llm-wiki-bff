@@ -24,6 +24,10 @@ import (
 )
 
 const underFiveThreshold = 5
+const artifactDigestTokenLength = 32
+const maxPortablePathSegmentBytes = 200
+const maxPOSIXPathSegmentBytes = 255
+const fixtureVariantIDPrefix = "v-"
 
 func (options experimentOptions) fixtureFlagsSet() bool {
 	return options.modelFixturePath != "" || options.models != "" || options.profileFixturePath != "" || options.profiles != "" || options.promptFixturePath != "" || options.prompts != "" || options.artifactsDir != "" || options.summaryPath != ""
@@ -43,6 +47,7 @@ type fixtureReceiptMeta struct {
 	AttemptID              string `json:"attempt_id"`
 	VariantID              string `json:"variant_id"`
 	ProfileID              string `json:"profile_id"`
+	ProfileDigest          string `json:"profile_digest"`
 	PromptID               string `json:"prompt_id"`
 	Provider               string `json:"provider"`
 	Model                  string `json:"model"`
@@ -71,6 +76,8 @@ type fixtureRequestReceipt struct {
 	RareKeywordMaxDocumentFrequency int    `json:"rare_keyword_max_document_frequency"`
 	SeedMode                        string `json:"seed_mode"`
 	Model                           string `json:"model"`
+	ProfileID                       string `json:"profile_id"`
+	ProfileDigest                   string `json:"profile_digest"`
 }
 
 type fixtureExpansionInput struct {
@@ -175,6 +182,8 @@ type fixtureFinalReceipt struct {
 	QueryReceivedAt string            `json:"query_received_at"`
 	RunCompletedAt  string            `json:"run_completed_at"`
 	DurationMS      int64             `json:"duration_ms"`
+	ProfileID       string            `json:"profile_id"`
+	ProfileDigest   string            `json:"profile_digest"`
 	Error           string            `json:"error,omitempty"`
 }
 
@@ -236,6 +245,13 @@ func runFixtureExperiment(ctx context.Context, options experimentOptions, prepar
 	options.keywordsPerAttempt = retrievalOptions.keywordsPerAttempt
 	options.expansionAttempts = retrievalOptions.expansionAttempts
 	options.rareDocumentFrequency = retrievalOptions.rareDocumentFrequency
+	for i := range variants {
+		variantID, err := fixtureVariantID(variants[i].VariantID, options, prepared)
+		if err != nil {
+			return err
+		}
+		variants[i].VariantID = variantID
+	}
 	if len(prepared.suggestedData) == 0 {
 		reader, ok := prepared.reader.(interface {
 			ReadFile(context.Context, string) ([]byte, error)
@@ -284,7 +300,6 @@ func runFixtureExperiment(ctx context.Context, options experimentOptions, prepar
 	metadata.sourceRevision = buildinfo.Current().Commit
 	attempts := make([]fixtureAttempt, 0, len(variants)*len(cases)*options.runs)
 	for i := range variants {
-		variants[i].VariantID = fixtureVariantID(variants[i].VariantID, options, prepared)
 		for _, input := range cases {
 			for runIndex := 1; runIndex <= options.runs; runIndex++ {
 				attempt, err := runFixtureAttempt(ctx, options, retrievalOptions, variants[i], input, runIndex, prepared, entries, now, metadata)
@@ -310,7 +325,10 @@ func runFixtureExperiment(ctx context.Context, options experimentOptions, prepar
 	return nil
 }
 
-func fixtureVariantID(base string, options experimentOptions, prepared preparedSnapshot) string {
+func fixtureVariantID(base string, options experimentOptions, prepared preparedSnapshot) (string, error) {
+	if strings.TrimSpace(base) == "" {
+		return "", errors.New("fixture variant identity base is empty")
+	}
 	seed := "auto"
 	if options.seed != nil {
 		seed = fmt.Sprintf("%d", *options.seed)
@@ -319,12 +337,34 @@ func fixtureVariantID(base string, options experimentOptions, prepared preparedS
 	if !options.evidenceThresholdSet {
 		threshold = queryquality.DefaultEvidenceThreshold
 	}
-	return fmt.Sprintf("%s__limit=%d__exploration=%d__threshold=%d__keywords=%d__attempts=%d__rare-df=%d__seed=%s__corpus=%s", base, options.selectionLimit, options.explorationSlots, threshold, options.keywordsPerAttempt, options.expansionAttempts, options.rareDocumentFrequency, seed, prepared.digest)
+	corpusToken, err := digestToken(prepared.digest)
+	if err != nil {
+		return "", fmt.Errorf("corpus digest: %w", err)
+	}
+	material := fmt.Sprintf("base=%s|limit=%d|exploration=%d|threshold=%d|keywords=%d|attempts=%d|rare_df=%d|seed=%s|corpus=%s", base, options.selectionLimit, options.explorationSlots, threshold, options.keywordsPerAttempt, options.expansionAttempts, options.rareDocumentFrequency, seed, corpusToken)
+	hash := sha256.Sum256([]byte(material))
+	return fixtureVariantIDPrefix + hex.EncodeToString(hash[:])[:artifactDigestTokenLength], nil
+}
+
+func digestToken(digest string) (string, error) {
+	raw := strings.TrimPrefix(digest, "sha256:")
+	if len(raw) != 64 {
+		return "", fmt.Errorf("invalid sha256 digest length")
+	}
+	if _, err := hex.DecodeString(raw); err != nil {
+		return "", fmt.Errorf("invalid sha256 digest: %w", err)
+	}
+	return raw[:artifactDigestTokenLength], nil
 }
 
 func runFixtureAttempt(ctx context.Context, options experimentOptions, retrievalOptions queryRetrievalOptions, variant fixtureVariant, input caseInput, runIndex int, prepared preparedSnapshot, entries []cache.Entry, now func() time.Time, metadata recordMetadata) (fixtureAttempt, error) {
 	attemptID := fmt.Sprintf("%s__case=%s__run=%d", variant.VariantID, input.ID, runIndex)
-	meta := fixtureReceiptMeta{AttemptID: attemptID, VariantID: variant.VariantID, ProfileID: variant.Profile.ID, PromptID: variant.Prompt.ID, Provider: variant.Model.Provider, Model: variant.Model.Model, CaseID: input.ID, RunIndex: runIndex, EvidenceThreshold: retrievalOptions.evidenceThreshold}
+	profile, err := variant.Profile.retrievalProfile()
+	if err != nil {
+		return fixtureAttempt{}, err
+	}
+	profileDigest := variant.ProfileDigest
+	meta := fixtureReceiptMeta{AttemptID: attemptID, VariantID: variant.VariantID, ProfileID: profile.ID, ProfileDigest: profileDigest, PromptID: variant.Prompt.ID, Provider: variant.Model.Provider, Model: variant.Model.Model, CaseID: input.ID, RunIndex: runIndex, EvidenceThreshold: retrievalOptions.evidenceThreshold}
 	meta.SnapshotIdentity = prepared.label
 	meta.CorpusSHA256 = prepared.digest
 	meta.ManifestGeneration = prepared.manifestGeneration
@@ -346,10 +386,10 @@ func runFixtureAttempt(ctx context.Context, options experimentOptions, retrieval
 		seed = *retrievalOptions.seed
 		seedMode = "explicit"
 	}
-	if err := write("request.json", fixtureRequestReceipt{Query: input.Query, Mode: input.Mode, SnapshotIdentity: prepared.label, CorpusSHA256: prepared.digest, SelectionLimit: retrievalOptions.selectionLimit, ExplorationSlots: retrievalOptions.explorationSlots, EvidenceThreshold: retrievalOptions.evidenceThreshold, KeywordsPerAttempt: retrievalOptions.keywordsPerAttempt, ExpansionAttempts: retrievalOptions.expansionAttempts, RareKeywordMaxDocumentFrequency: retrievalOptions.rareDocumentFrequency, SeedMode: seedMode, Model: variant.Model.Model}); err != nil {
+	if err := write("request.json", fixtureRequestReceipt{Query: input.Query, Mode: input.Mode, SnapshotIdentity: prepared.label, CorpusSHA256: prepared.digest, SelectionLimit: retrievalOptions.selectionLimit, ExplorationSlots: retrievalOptions.explorationSlots, EvidenceThreshold: retrievalOptions.evidenceThreshold, KeywordsPerAttempt: retrievalOptions.keywordsPerAttempt, ExpansionAttempts: retrievalOptions.expansionAttempts, RareKeywordMaxDocumentFrequency: retrievalOptions.rareDocumentFrequency, SeedMode: seedMode, Model: variant.Model.Model, ProfileID: profile.ID, ProfileDigest: profileDigest}); err != nil {
 		return fixtureAttempt{}, err
 	}
-	policy := CriterionPolicy{RequiredWhenExplicit: append([]string(nil), variant.Profile.RequiredWhenExplicit...), PreferredByDefault: append([]string(nil), variant.Profile.PreferredByDefault...), GoalsToExpand: append([]string(nil), variant.Profile.GoalsToExpand...)}
+	policy := profile.CriterionPolicy
 	rendered, err := renderFixturePrompt(variant.Prompt, input.Query, policy)
 	if err != nil {
 		return fixtureAttempt{}, fmt.Errorf("render prompt: %w", err)
@@ -446,7 +486,7 @@ func runFixtureAttempt(ctx context.Context, options experimentOptions, retrieval
 		outcome = "retrieval_miss"
 	}
 	queryReceivedAtStr, runCompletedAtStr, durationMS := attemptTiming(queryReceivedAt, runCompletedAt)
-	if err := write("final.json", fixtureFinalReceipt{Outcome: outcome, Status: resultStatus, Reason: resultReason, FinalIdentities: resultIdentities, Receipts: map[string]string{"request": "request.json", "expansion_input": "expansion.input.json", "expansion_output": "expansion.output.json", "matching_input": "matching.input.json", "matching_output": "matching.output.json", "selection_input": "selection.input.json", "selection_output": "selection.output.json", "final": "final.json"}, QueryReceivedAt: queryReceivedAtStr, RunCompletedAt: runCompletedAtStr, DurationMS: durationMS}); err != nil {
+	if err := write("final.json", fixtureFinalReceipt{Outcome: outcome, Status: resultStatus, Reason: resultReason, FinalIdentities: resultIdentities, Receipts: map[string]string{"request": "request.json", "expansion_input": "expansion.input.json", "expansion_output": "expansion.output.json", "matching_input": "matching.input.json", "matching_output": "matching.output.json", "selection_input": "selection.input.json", "selection_output": "selection.output.json", "final": "final.json"}, QueryReceivedAt: queryReceivedAtStr, RunCompletedAt: runCompletedAtStr, DurationMS: durationMS, ProfileID: profile.ID, ProfileDigest: profileDigest}); err != nil {
 		return fixtureAttempt{}, err
 	}
 	result := query.Result{Query: input.Query, Mode: input.Mode, Status: resultStatus, Reason: resultReason}
@@ -455,7 +495,7 @@ func runFixtureAttempt(ctx context.Context, options experimentOptions, retrieval
 	}
 	record := makeResultRecordWithTrace(input, runIndex, prepared, result, nil, expansionElapsed+matchingElapsed+selectionElapsed, metadata, trace)
 	record.QueryReceivedAt, record.RunCompletedAt, record.DurationMS = queryReceivedAtStr, runCompletedAtStr, durationMS
-	record.VariantID, record.ProfileID, record.PromptID, record.Provider, record.Model = variant.VariantID, variant.Profile.ID, variant.Prompt.ID, variant.Model.Provider, variant.Model.Model
+	record.VariantID, record.ProfileID, record.ProfileDigest, record.PromptID, record.Provider, record.Model = variant.VariantID, profile.ID, profileDigest, variant.Prompt.ID, variant.Model.Provider, variant.Model.Model
 	selectionDigest := digestJSON(selectionInput)
 	return fixtureAttempt{Record: record, Case: input, Candidates: eligible.Candidates, Decisions: selected.Selected, EffectiveSeed: seed, SelectionInputDigest: selectionDigest, Fallback: plan.Fallback, LatencyMS: expansionElapsed, Usage: expansionUsage, EvidenceThreshold: retrievalOptions.evidenceThreshold}, nil
 }
@@ -538,6 +578,8 @@ type summaryDocument struct {
 
 type variantSummary struct {
 	VariantID         string         `json:"variant_id"`
+	ProfileID         string         `json:"profile_id"`
+	ProfileDigest     string         `json:"profile_digest"`
 	EvidenceThreshold int            `json:"evidence_threshold"`
 	Cases             []caseSummary  `json:"cases"`
 	Totals            summaryMetrics `json:"totals"`
@@ -632,6 +674,8 @@ func writeFixtureSummary(path string, attempts []fixtureAttempt) error {
 		variant := variantSummary{VariantID: id, Cases: make([]caseSummary, 0, len(caseIDs)), Totals: aggregateSummaryMetrics(group)}
 		if len(group) > 0 {
 			variant.EvidenceThreshold = group[0].EvidenceThreshold
+			variant.ProfileID = group[0].Record.ProfileID
+			variant.ProfileDigest = group[0].Record.ProfileDigest
 		}
 		for _, caseID := range caseIDs {
 			variant.Cases = append(variant.Cases, caseSummary{CaseID: caseID, Metrics: aggregateSummaryMetrics(casesByID[caseID])})

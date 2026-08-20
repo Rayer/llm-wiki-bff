@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"sync"
@@ -259,6 +260,91 @@ func TestSelectorPreservesHardIneligibilityRejection(t *testing.T) {
 	}
 }
 
+func TestSelectorPrioritizesExactCandidatesOverExploration(t *testing.T) {
+	input := queryquality.SelectionInput{
+		Candidates: []queryquality.CandidateEvidence{
+			{Slug: "exact", Title: "Exact", Eligible: true, Qualified: true, Score: 1, ExactIdentityEvidence: true},
+			{Slug: "generic", Title: "Generic", Eligible: true, Qualified: true, Score: 10},
+		},
+		Limit:            1,
+		ExplorationSlots: 1,
+		Seed:             3,
+	}
+	result, err := queryquality.NewResultSelector().Select(context.Background(), input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exactDecision, ok := selectedBySlug(result.Selected, "exact")
+	if !ok || !exactDecision.Selected || exactDecision.Exploration {
+		t.Fatalf("exact decision=%#v", exactDecision)
+	}
+	genericDecision, _ := selectedBySlug(result.Selected, "generic")
+	if genericDecision.Selected {
+		t.Fatalf("non-exact candidate selected unexpectedly: %#v", genericDecision)
+	}
+}
+
+func TestSelectorDeterministicallyPrioritizesExactCandidatesWhenExactExceedsLimit(t *testing.T) {
+	input := queryquality.SelectionInput{
+		Candidates: []queryquality.CandidateEvidence{
+			{Slug: "first", Title: "First", Eligible: true, Qualified: true, Score: 5, ExactIdentityEvidence: true},
+			{Slug: "third", Title: "Third", Eligible: true, Qualified: true, Score: 5, ExactIdentityEvidence: true},
+			{Slug: "second", Title: "Second", Eligible: true, Qualified: true, Score: 4, ExactIdentityEvidence: true},
+		},
+		Limit:            2,
+		ExplorationSlots: 1,
+		Seed:             11,
+	}
+	result, err := queryquality.NewResultSelector().Select(context.Background(), input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, slug := range []string{"first", "third"} {
+		decision, ok := selectedBySlug(result.Selected, slug)
+		if !ok || !decision.Selected || decision.Exploration {
+			t.Fatalf("exact candidate %s decision=%#v", slug, decision)
+		}
+	}
+	if decision, _ := selectedBySlug(result.Selected, "second"); decision.Selected {
+		t.Fatalf("non-top exact candidate selected: %#v", decision)
+	}
+}
+
+func TestSelectorAllocatesRankedAndExplorationCandidatesWithoutExact(t *testing.T) {
+	input := queryquality.SelectionInput{
+		Candidates: []queryquality.CandidateEvidence{
+			{Slug: "high", Title: "High", Eligible: true, Qualified: true, Score: 10},
+			{Slug: "low", Title: "Low", Eligible: true, Qualified: true, Score: 1},
+			{Slug: "mid", Title: "Mid", Eligible: true, Qualified: true, Score: 5},
+			{Slug: "middle", Title: "Middle", Eligible: true, Qualified: true, Score: 4},
+		},
+		Limit:            3,
+		ExplorationSlots: 1,
+		Seed:             5,
+	}
+	result, err := queryquality.NewResultSelector().Select(context.Background(), input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	high, ok := selectedBySlug(result.Selected, "high")
+	if !ok || !high.Selected || high.Exploration {
+		t.Fatalf("top ranked omitted or explored: %#v", high)
+	}
+	explored := 0
+	selectedCount := 0
+	for _, decision := range result.Selected {
+		if decision.Selected {
+			selectedCount++
+		}
+		if decision.Exploration {
+			explored++
+		}
+	}
+	if selectedCount != 3 || explored != 1 {
+		t.Fatalf("selected=%d explored=%d, want 3 and 1", selectedCount, explored)
+	}
+}
+
 func TestEvidenceThresholdsChangeQualificationCausally(t *testing.T) {
 	plan := queryquality.QueryPlan{Preferred: []queryquality.Criterion{
 		{Kind: "venue_type", Value: "cafe", Terms: []string{"cafe"}, Proof: "lexical"},
@@ -454,6 +540,9 @@ func TestQueryPlanValidationRejectsWhitespaceTermsAndCannotMatchAllCandidates(t 
 
 func TestDefaultCriterionPolicyIsPlatformOwnedLifestyleV1(t *testing.T) {
 	policy := queryquality.DefaultCriterionPolicy
+	if !reflect.DeepEqual(policy, queryquality.DefaultRetrievalProfile().CriterionPolicy) {
+		t.Fatalf("exported default policy=%#v, profile default=%#v", policy, queryquality.DefaultRetrievalProfile().CriterionPolicy)
+	}
 	if !sameStrings(policy.RequiredWhenExplicit, []string{"location", "explicit_exclusion"}) {
 		t.Fatalf("required policy = %v", policy.RequiredWhenExplicit)
 	}
@@ -799,6 +888,15 @@ func containsSelected(values []queryquality.SelectedCandidate, slug string) bool
 		}
 	}
 	return false
+}
+
+func selectedBySlug(values []queryquality.SelectedCandidate, slug string) (queryquality.SelectedCandidate, bool) {
+	for _, value := range values {
+		if value.Slug == slug {
+			return value, true
+		}
+	}
+	return queryquality.SelectedCandidate{}, false
 }
 
 func sameStrings(got, want []string) bool {

@@ -220,6 +220,70 @@ func TestRawQueryCorpusIdentityUsesOnlyExactCanonicalTitleOrSlugProof(t *testing
 	}
 }
 
+func TestQualificationRequiresLocalDiscriminativeConsensus(t *testing.T) {
+	plan := queryquality.QueryPlan{
+		RawQuery: "Firestore Pipeline Cloud Run Worker distributed locking",
+		Preferred: []queryquality.Criterion{
+			{Kind: "technology", Value: "firestore", Terms: []string{"firestore"}, Proof: "lexical"},
+			{Kind: "technology", Value: "pipeline", Terms: []string{"pipeline"}, Proof: "lexical"},
+			{Kind: "technology", Value: "cloud run", Terms: []string{"cloud run"}, Proof: "lexical"},
+			{Kind: "role", Value: "worker", Terms: []string{"worker"}, Proof: "lexical"},
+			{Kind: "topic", Value: "distributed locking", Terms: []string{"distributed locking"}, Proof: "lexical"},
+		},
+		KeywordSupport: []queryquality.KeywordSupport{
+			{Role: "preferred", Kind: "technology", Value: "firestore", Keyword: "firestore", SupportCount: 2, AttemptIndexes: []int{1, 2}},
+			{Role: "preferred", Kind: "technology", Value: "pipeline", Keyword: "pipeline", SupportCount: 2, AttemptIndexes: []int{1, 2}},
+			{Role: "preferred", Kind: "technology", Value: "cloud run", Keyword: "cloud run", SupportCount: 2, AttemptIndexes: []int{1, 2}},
+			{Role: "preferred", Kind: "role", Value: "worker", Keyword: "worker", SupportCount: 2, AttemptIndexes: []int{1, 2}},
+			{Role: "preferred", Kind: "topic", Value: "distributed locking", Keyword: "distributed locking", SupportCount: 2, AttemptIndexes: []int{1, 2}},
+		},
+	}
+	entries := []cache.Entry{
+		{Slug: "firestore", Title: "Firestore"},
+		{Slug: "pipeline", Title: "Pipeline"},
+		{Slug: "cloud-run-worker", Title: "Cloud Run Worker"},
+		{Slug: "pipeline-worker", Title: "Pipeline Worker"},
+		{Slug: "bff", Title: "BFF", Body: "pipeline cloud run worker distributed locking"},
+		{Slug: "jwt", Title: "JWT", Body: "pipeline"},
+	}
+	matched, err := queryquality.NewLexicalMatcher(nil).Match(context.Background(), queryquality.MatchRequest{
+		Plan: plan, CorpusEntries: entries, EvidenceThreshold: 2, EvidenceThresholdSet: true, RareKeywordMaxDocumentFrequency: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bySlug := make(map[string]queryquality.CandidateEvidence, len(matched.Candidates))
+	for _, candidate := range matched.Candidates {
+		bySlug[candidate.Slug] = candidate
+	}
+	for _, slug := range []string{"firestore", "pipeline", "cloud-run-worker", "pipeline-worker"} {
+		if !bySlug[slug].Qualified {
+			t.Fatalf("candidate %q = %#v, want qualified", slug, bySlug[slug])
+		}
+	}
+	for _, slug := range []string{"bff", "jwt"} {
+		if bySlug[slug].Qualified {
+			t.Fatalf("candidate %q = %#v, want unqualified", slug, bySlug[slug])
+		}
+	}
+}
+
+func TestSelectorIncludesExactIdentityBeforeHigherScoringGenericCandidate(t *testing.T) {
+	selected, err := queryquality.NewResultSelector().Select(context.Background(), queryquality.SelectionInput{
+		Candidates: []queryquality.CandidateEvidence{
+			{Slug: "generic", Title: "Generic", Eligible: true, Qualified: true, Score: 5},
+			{Slug: "named", Title: "Named", Eligible: true, Qualified: true, ExactIdentityEvidence: true, Score: 0},
+		},
+		Limit: 1, ExplorationSlots: 0,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !selected.Selected[1].Selected || selected.Selected[1].Slug != "named" {
+		t.Fatalf("selection = %#v, want exact identity selected within limit", selected.Selected)
+	}
+}
+
 func TestFrontmatterMatchingIsAllowlistedAndDeterministic(t *testing.T) {
 	plan := queryquality.QueryPlan{RawQuery: "coffee", Preferred: []queryquality.Criterion{{Kind: "topic", Value: "coffee", Terms: []string{"coffee"}, Proof: "lexical"}}, KeywordSupport: []queryquality.KeywordSupport{{Role: "preferred", Kind: "topic", Value: "coffee", Keyword: "coffee", SupportCount: 1, AttemptIndexes: []int{1}}}}
 	entries := []cache.Entry{

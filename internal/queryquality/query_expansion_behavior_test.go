@@ -260,8 +260,16 @@ func TestKeywordConsensusUsesFixedSupportAndNormalizedIdentity(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			plan := base
-			plan.KeywordSupport = []queryquality.KeywordSupport{{Role: "preferred", Kind: "topic", Value: "cafe", Keyword: "cafe", SupportCount: test.support, AttemptIndexes: []int{1, 2}}}
-			got, err := matcher.Match(context.Background(), queryquality.MatchRequest{Plan: plan, CorpusEntries: []cache.Entry{{Slug: "one", Title: "Cafe Guide", Body: ""}, {Slug: "two", Title: "Cafe Guide", Body: ""}}, EvidenceThreshold: test.threshold, EvidenceThresholdSet: true, RareKeywordMaxDocumentFrequency: 1})
+			attempts := []int{1}
+			if test.support == 2 {
+				attempts = []int{1, 2}
+			}
+			plan.KeywordSupport = []queryquality.KeywordSupport{{Role: "preferred", Kind: "topic", Value: "cafe", Keyword: "cafe", SupportCount: test.support, AttemptIndexes: attempts}}
+			other := "Other Guide"
+			if test.support == 1 {
+				other = "Cafe Place"
+			}
+			got, err := matcher.Match(context.Background(), queryquality.MatchRequest{Plan: plan, CorpusEntries: []cache.Entry{{Slug: "one", Title: "Cafe Guide", Body: ""}, {Slug: "two", Title: other, Body: ""}}, EvidenceThreshold: test.threshold, EvidenceThresholdSet: true, RareKeywordMaxDocumentFrequency: 1})
 			wantPath := "keyword_support_below_threshold"
 			if test.want {
 				wantPath = "keyword_consensus"

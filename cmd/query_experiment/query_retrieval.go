@@ -71,7 +71,9 @@ type resultSelector = queryquality.ResultSelector
 type queryRetrievalTrace = queryquality.Trace
 type stageTrace = queryquality.StageTrace
 
-var defaultCriterionPolicy = queryquality.DefaultCriterionPolicy
+func defaultCriterionPolicy() CriterionPolicy {
+	return queryquality.DefaultRetrievalProfile().CriterionPolicy
+}
 
 type expansionInfo struct {
 	source         string

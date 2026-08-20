@@ -104,6 +104,14 @@ type CriterionPolicy struct {
 	GoalsToExpand        []string `json:"goals_to_expand"`
 }
 
+func cloneCriterionPolicy(policy CriterionPolicy) CriterionPolicy {
+	return CriterionPolicy{
+		RequiredWhenExplicit: append([]string(nil), policy.RequiredWhenExplicit...),
+		PreferredByDefault:   append([]string(nil), policy.PreferredByDefault...),
+		GoalsToExpand:        append([]string(nil), policy.GoalsToExpand...),
+	}
+}
+
 var DefaultCriterionPolicy = CriterionPolicy{
 	RequiredWhenExplicit: []string{"location", "explicit_exclusion"},
 	PreferredByDefault:   []string{"venue_type", "activity", "audience", "setting"},
@@ -1016,20 +1024,48 @@ type QueryRetrievalPipeline struct {
 	seedFor                    func(string) int64
 	options                    Options
 	allowDeterministicFallback bool
+	profile                    RetrievalProfile
+	profileDigest              string
 }
 
 func NewQueryRetrievalPipeline(queryExpander QueryExpander, candidateMatcher CandidateMatcher, resultSelector ResultSelector, seedFor func(string) int64) *QueryRetrievalPipeline {
+	pipeline, _ := NewQueryRetrievalPipelineWithProfile(queryExpander, candidateMatcher, resultSelector, seedFor, DefaultRetrievalProfile())
+	return pipeline
+}
+
+func NewQueryRetrievalPipelineWithProfile(queryExpander QueryExpander, candidateMatcher CandidateMatcher, resultSelector ResultSelector, seedFor func(string) int64, profile RetrievalProfile) (*QueryRetrievalPipeline, error) {
+	validatedProfile, err := profile.ValidatedCopy()
+	if err != nil {
+		return nil, err
+	}
 	if seedFor == nil {
 		seedFor = ReproducibleSeed
 	}
-	return &QueryRetrievalPipeline{cache: cache.New(), queryExpander: queryExpander, candidateMatcher: candidateMatcher, resultSelector: resultSelector, seedFor: seedFor, options: DefaultOptions()}
+	profileDigest, err := validatedProfile.Digest()
+	if err != nil {
+		return nil, err
+	}
+	return &QueryRetrievalPipeline{cache: cache.New(), queryExpander: queryExpander, candidateMatcher: candidateMatcher, resultSelector: resultSelector, seedFor: seedFor, options: DefaultOptions(), profile: validatedProfile, profileDigest: profileDigest}, nil
 }
 
 func NewQueryRetrievalPipelineWithOptions(queryExpander QueryExpander, candidateMatcher CandidateMatcher, resultSelector ResultSelector, seedFor func(string) int64, options Options) *QueryRetrievalPipeline {
+	pipeline, _ := NewQueryRetrievalPipelineWithOptionsAndProfile(queryExpander, candidateMatcher, resultSelector, seedFor, options, DefaultRetrievalProfile())
+	return pipeline
+}
+
+func NewQueryRetrievalPipelineWithOptionsAndProfile(queryExpander QueryExpander, candidateMatcher CandidateMatcher, resultSelector ResultSelector, seedFor func(string) int64, options Options, profile RetrievalProfile) (*QueryRetrievalPipeline, error) {
+	validatedProfile, err := profile.ValidatedCopy()
+	if err != nil {
+		return nil, err
+	}
 	if seedFor == nil {
 		seedFor = ReproducibleSeed
 	}
-	return &QueryRetrievalPipeline{cache: cache.New(), queryExpander: queryExpander, candidateMatcher: candidateMatcher, resultSelector: resultSelector, seedFor: seedFor, options: options}
+	profileDigest, err := validatedProfile.Digest()
+	if err != nil {
+		return nil, err
+	}
+	return &QueryRetrievalPipeline{cache: cache.New(), queryExpander: queryExpander, candidateMatcher: candidateMatcher, resultSelector: resultSelector, seedFor: seedFor, options: options, profile: validatedProfile, profileDigest: profileDigest}, nil
 }
 
 func NewExperimentExecutor(conceptCache *cache.Cache, provider ChatProvider, options Options) (query.Executor, error) {
@@ -1048,7 +1084,10 @@ func NewExperimentExecutor(conceptCache *cache.Cache, provider ChatProvider, opt
 	if err != nil {
 		return nil, err
 	}
-	service := NewQueryRetrievalPipelineWithOptions(expander, NewLexicalMatcher(nil), NewResultSelector(), seedFor, options)
+	service, err := NewQueryRetrievalPipelineWithOptionsAndProfile(expander, NewLexicalMatcher(nil), NewResultSelector(), seedFor, options, DefaultRetrievalProfile())
+	if err != nil {
+		return nil, err
+	}
 	service.cache = conceptCache
 	service.allowDeterministicFallback = true
 	return service, nil
@@ -1079,6 +1118,7 @@ func (s *QueryRetrievalPipeline) validate() error {
 
 func (s *QueryRetrievalPipeline) execute(ctx context.Context, reader cache.Reader, request query.Request, trace *Trace) (query.Result, error) {
 	if recorder := query.ReceiptRecorderFromContext(ctx); recorder != nil {
+		recorder.SetRetrievalProfile(s.profile.ID, s.profileDigest)
 		recorder.SetRetrievalConfig(s.options.SelectionLimit, s.options.ExplorationSlots, resolvedEvidenceThreshold(s.options))
 		recorder.SetExpansionConfig(s.options.ExpansionAttempts, 0, 0, s.options.KeywordsPerAttempt, resolvedEvidenceThreshold(s.options), s.options.RareDocumentFrequency, MinimumKeywordConsensusSupport, nil)
 	}
@@ -1097,7 +1137,7 @@ func (s *QueryRetrievalPipeline) execute(ctx context.Context, reader cache.Reade
 	started := time.Now()
 	var plan QueryPlan
 	info := ExpansionInfo{}
-	requestWithPolicy := ExpansionRequest{Query: request.Query, CriterionPolicy: DefaultCriterionPolicy}
+	requestWithPolicy := ExpansionRequest{Query: request.Query, CriterionPolicy: cloneCriterionPolicy(s.profile.CriterionPolicy)}
 	stageCtx := ctx
 	if recorder := query.ReceiptRecorderFromContext(ctx); recorder != nil {
 		provider, model, reasoning := providerIdentity(s.queryExpander)
@@ -1947,10 +1987,18 @@ func qualifyCandidate(candidate CandidateEvidence, threshold int, rawQuery strin
 		return false, "unresolved_semantic_evidence", "semantic_unresolved"
 	}
 	if len(candidate.KeywordEvidence) > 0 {
+		localConsensusConcepts := 0
 		for _, evidence := range candidate.KeywordEvidence {
-			if evidence.SupportCount >= MinimumKeywordConsensusSupport {
+			if evidence.SupportCount < MinimumKeywordConsensusSupport || !keywordEvidenceLocal(evidence) {
+				continue
+			}
+			if evidence.DocumentFrequency <= rareDocumentFrequency {
 				return true, "keyword_consensus", "keyword_consensus"
 			}
+			localConsensusConcepts++
+		}
+		if localConsensusConcepts >= 2 {
+			return true, "local_keyword_consensus", "local_keyword_consensus"
 		}
 		raw := normalizeKeyword(rawQuery)
 		for _, evidence := range candidate.KeywordEvidence {
@@ -1983,6 +2031,10 @@ func qualifyCandidate(candidate CandidateEvidence, threshold int, rawQuery strin
 		return true, "evidence_threshold_met", "legacy_positive_evidence"
 	}
 	return false, "evidence_below_threshold", "legacy_positive_evidence"
+}
+
+func keywordEvidenceLocal(evidence KeywordEvidence) bool {
+	return containsString(evidence.MatchedFields, "title") || containsString(evidence.MatchedFields, "frontmatter")
 }
 
 func containsNormalizedPhrase(value, phrase string) bool {
@@ -2074,40 +2126,78 @@ func (randomSelector) Select(ctx context.Context, input SelectionInput) (Selecti
 			sortCanceled = true
 			return false
 		}
-		if eligible[i].Score != eligible[j].Score {
-			return eligible[i].Score > eligible[j].Score
-		}
 		if eligible[i].ExactIdentityEvidence != eligible[j].ExactIdentityEvidence {
 			return eligible[i].ExactIdentityEvidence
+		}
+		if eligible[i].Score != eligible[j].Score {
+			return eligible[i].Score > eligible[j].Score
 		}
 		return eligible[i].Slug < eligible[j].Slug
 	})
 	if sortCanceled {
 		return SelectionResult{}, ctx.Err()
 	}
-	selected := make(map[string]SelectedCandidate)
-	if len(eligible) <= limit {
-		for _, candidate := range eligible {
-			if err := ctx.Err(); err != nil {
-				return SelectionResult{}, err
-			}
-			selected[candidate.Slug] = selectionDecision(candidate, true, "selected", false)
-		}
-	} else {
-		exploitCount := limit - slots
-		for _, candidate := range eligible[:exploitCount] {
-			if err := ctx.Err(); err != nil {
-				return SelectionResult{}, err
-			}
-			selected[candidate.Slug] = selectionDecision(candidate, true, "selected", false)
-		}
-		remaining := eligible[exploitCount:]
-		explorationCount := minInt(slots, len(remaining))
-		if err := appendExplorationSelections(ctx, rand.New(rand.NewSource(input.Seed)), remaining, explorationCount, selected); err != nil {
-			return SelectionResult{}, err
+	decisions := make([]SelectedCandidate, 0, len(input.Candidates))
+	exactCandidates := make([]CandidateEvidence, 0, len(eligible))
+	genericCandidates := make([]CandidateEvidence, 0, len(eligible))
+	for _, candidate := range eligible {
+		if candidate.ExactIdentityEvidence {
+			exactCandidates = append(exactCandidates, candidate)
+		} else {
+			genericCandidates = append(genericCandidates, candidate)
 		}
 	}
-	decisions := make([]SelectedCandidate, 0, len(input.Candidates))
+	selected := make(map[string]SelectedCandidate)
+	exactCount := minInt(len(exactCandidates), limit)
+	for _, candidate := range exactCandidates[:exactCount] {
+		if err := ctx.Err(); err != nil {
+			return SelectionResult{}, err
+		}
+		selected[candidate.Slug] = selectionDecision(candidate, true, "selected", false)
+	}
+	remaining := limit - exactCount
+	if remaining <= 0 {
+		for _, candidate := range input.Candidates {
+			if err := ctx.Err(); err != nil {
+				return SelectionResult{}, err
+			}
+			if decision, ok := selected[candidate.Slug]; ok {
+				decisions = append(decisions, decision)
+				continue
+			}
+			reason := "selection_omission"
+			if !candidate.Eligible {
+				reason = candidate.Rejection
+				if reason == "" {
+					reason = "ineligible"
+				}
+			} else if !candidate.Qualified {
+				reason = candidate.QualificationReason
+			}
+			decisions = append(decisions, selectionDecision(candidate, false, reason, false))
+		}
+		return SelectionResult{Selected: decisions}, nil
+	}
+
+	explorationSlots := minInt(slots, len(genericCandidates))
+	rankedSlots := remaining - minInt(explorationSlots, remaining)
+	rankedSlots = minInt(rankedSlots, len(genericCandidates))
+	if remaining-rankedSlots < explorationSlots {
+		explorationSlots = remaining - rankedSlots
+	}
+	rankedLimit := minInt(rankedSlots, len(genericCandidates))
+	for _, candidate := range genericCandidates[:rankedLimit] {
+		if err := ctx.Err(); err != nil {
+			return SelectionResult{}, err
+		}
+		selected[candidate.Slug] = selectionDecision(candidate, true, "selected", false)
+	}
+	explorationCandidates := genericCandidates[rankedLimit:]
+	explorationCount := minInt(explorationSlots, remaining)
+	explorationCount = minInt(explorationCount, len(explorationCandidates))
+	if err := appendExplorationSelections(ctx, rand.New(rand.NewSource(input.Seed)), explorationCandidates, explorationCount, selected); err != nil {
+		return SelectionResult{}, err
+	}
 	for _, candidate := range input.Candidates {
 		if err := ctx.Err(); err != nil {
 			return SelectionResult{}, err
