@@ -57,6 +57,10 @@ type experimentOptions struct {
 	prompts               string
 	artifactsDir          string
 	summaryPath           string
+	stageConfigOutput     string
+	configRevision        string
+	generationID          string
+	conceptsDigest        string
 }
 
 type caseInput struct {
@@ -135,6 +139,10 @@ type resultRecord struct {
 	ProfileID              string               `json:"profile_id,omitempty"`
 	ProfileDigest          string               `json:"profile_digest,omitempty"`
 	PromptID               string               `json:"prompt_id,omitempty"`
+	PromptDigest           string               `json:"prompt_digest,omitempty"`
+	ConfigSchemaVersion    int                  `json:"config_schema_version,omitempty"`
+	ConfigRevision         string               `json:"config_revision,omitempty"`
+	ConfigDigest           string               `json:"config_digest,omitempty"`
 	EvidenceThreshold      int                  `json:"evidence_threshold,omitempty"`
 	QueryRetrievalTrace    *queryRetrievalTrace `json:"three_host_trace,omitempty"`
 }
@@ -390,6 +398,12 @@ func validateOutputPath(path string) error {
 }
 
 func runExperiment(ctx context.Context, options experimentOptions, deps dependencies) (runErr error) {
+	if options.service == "" {
+		options.service = serviceProduction
+	}
+	if err := options.validateStageConfigFlags(); err != nil {
+		return err
+	}
 	root, err := resolveSnapshotLocator(options)
 	if err != nil {
 		return err
@@ -402,9 +416,6 @@ func runExperiment(ctx context.Context, options experimentOptions, deps dependen
 	}
 	if options.suggestedQueryMode != "" && options.suggestedQueryMode != "wiki" && options.suggestedQueryMode != "full" {
 		return fmt.Errorf("unsupported suggested-query-mode %q", options.suggestedQueryMode)
-	}
-	if options.service == "" {
-		options.service = serviceProduction
 	}
 	if options.service != serviceProduction && options.service != serviceQueryRetrieval && options.service != serviceQueryRetrievalLegacy {
 		return fmt.Errorf("unsupported service %q", options.service)
@@ -425,6 +436,11 @@ func runExperiment(ctx context.Context, options experimentOptions, deps dependen
 	}
 	var prepared preparedSnapshot
 	if strings.HasPrefix(root, "gs://") {
+		if options.projectID == "" {
+			if parsed, parseErr := parseGCSProjectRoot(root); parseErr == nil {
+				options.projectID = parsed.project
+			}
+		}
 		load := deps.loadGCSSnapshot
 		if load == nil {
 			load = loadGCSSnapshot
@@ -432,6 +448,9 @@ func runExperiment(ctx context.Context, options experimentOptions, deps dependen
 		prepared, err = load(ctx, root, deps.newGCSClient)
 	} else {
 		prepared, err = preflightSnapshot(ctx, root)
+		if err == nil && options.generationID != "" {
+			prepared.generationID = options.generationID
+		}
 	}
 	if err != nil {
 		return err
@@ -568,10 +587,15 @@ func executeExperiment(executor query.Executor, ctx context.Context, reader cach
 }
 
 type recordMetadata struct {
-	sourceRevision string
-	provider       string
-	model          string
-	apiKey         string
+	sourceRevision      string
+	provider            string
+	model               string
+	apiKey              string
+	configSchemaVersion int
+	configRevision      string
+	configDigest        string
+	promptID            string
+	promptDigest        string
 }
 
 func buildRecordMetadata(cfg config.Config) recordMetadata {
@@ -630,6 +654,11 @@ func makeResultRecordWithTrace(input caseInput, runIndex int, snapshot preparedS
 		SourceRevision:         metadata.sourceRevision,
 		Provider:               metadata.provider,
 		Model:                  metadata.model,
+		ConfigSchemaVersion:    metadata.configSchemaVersion,
+		ConfigRevision:         metadata.configRevision,
+		ConfigDigest:           metadata.configDigest,
+		PromptID:               metadata.promptID,
+		PromptDigest:           metadata.promptDigest,
 		QueryRetrievalTrace:    trace,
 	}
 	if trace != nil {

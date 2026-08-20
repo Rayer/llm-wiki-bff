@@ -42,6 +42,7 @@ type promptFixtureEntry struct {
 	ID             string `json:"id"`
 	SystemTemplate string `json:"system_template"`
 	UserTemplate   string `json:"user_template"`
+	TemplateDigest string `json:"template_digest,omitempty"`
 }
 
 type fixtureVariant struct {
@@ -422,7 +423,7 @@ func decodePrompt(raw json.RawMessage) (promptFixtureEntry, error) {
 	if err != nil {
 		return promptFixtureEntry{}, err
 	}
-	allowed := map[string]bool{"id": true, "system_template": true, "user_template": true}
+	allowed := map[string]bool{"id": true, "system_template": true, "user_template": true, "template_digest": true}
 	for key := range object {
 		if !allowed[key] {
 			return promptFixtureEntry{}, fmt.Errorf("unknown field %q", key)
@@ -432,6 +433,14 @@ func decodePrompt(raw json.RawMessage) (promptFixtureEntry, error) {
 	for key, target := range map[string]*string{"id": &prompt.ID, "system_template": &prompt.SystemTemplate, "user_template": &prompt.UserTemplate} {
 		if err := unmarshalString(object, key, target); err != nil {
 			return promptFixtureEntry{}, err
+		}
+	}
+	if raw, ok := object["template_digest"]; ok {
+		if isJSONNull(raw) {
+			return promptFixtureEntry{}, errors.New("template_digest must not be null")
+		}
+		if err := json.Unmarshal(raw, &prompt.TemplateDigest); err != nil {
+			return promptFixtureEntry{}, fmt.Errorf("template_digest: %w", err)
 		}
 	}
 	if err := validateFixtureID(prompt.ID); err != nil {

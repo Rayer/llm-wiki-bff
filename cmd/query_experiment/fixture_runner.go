@@ -19,6 +19,7 @@ import (
 	"github.com/rayer/llm-wiki-bff/internal/cache"
 	"github.com/rayer/llm-wiki-bff/internal/config"
 	"github.com/rayer/llm-wiki-bff/internal/query"
+	"github.com/rayer/llm-wiki-bff/internal/queryconfig"
 	"github.com/rayer/llm-wiki-bff/internal/queryquality"
 	"github.com/rayer/llm-wiki-bff/internal/search"
 )
@@ -30,7 +31,23 @@ const maxPOSIXPathSegmentBytes = 255
 const fixtureVariantIDPrefix = "v-"
 
 func (options experimentOptions) fixtureFlagsSet() bool {
-	return options.modelFixturePath != "" || options.models != "" || options.profileFixturePath != "" || options.profiles != "" || options.promptFixturePath != "" || options.prompts != "" || options.artifactsDir != "" || options.summaryPath != ""
+	return options.modelFixturePath != "" || options.models != "" || options.profileFixturePath != "" || options.profiles != "" || options.promptFixturePath != "" || options.prompts != "" || options.artifactsDir != "" || options.summaryPath != "" || options.stageConfigOutput != ""
+}
+
+func (options experimentOptions) validateStageConfigFlags() error {
+	if options.stageConfigOutput == "" {
+		return nil
+	}
+	if options.service != serviceQueryRetrieval {
+		return errors.New("--stage-config-output requires --service query-retrieval")
+	}
+	if strings.TrimSpace(options.configRevision) == "" {
+		return errors.New("--config-revision is required with --stage-config-output")
+	}
+	if err := validateOutputPath(options.stageConfigOutput); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (options experimentOptions) validateFixtureFlags() error {
@@ -49,6 +66,7 @@ type fixtureReceiptMeta struct {
 	ProfileID              string `json:"profile_id"`
 	ProfileDigest          string `json:"profile_digest"`
 	PromptID               string `json:"prompt_id"`
+	PromptDigest           string `json:"prompt_digest"`
 	Provider               string `json:"provider"`
 	Model                  string `json:"model"`
 	CaseID                 string `json:"case_id"`
@@ -61,6 +79,9 @@ type fixtureReceiptMeta struct {
 	GenerationID           string `json:"generation_id,omitempty"`
 	InputFingerprint       string `json:"input_fingerprint,omitempty"`
 	SuggestedQueriesSHA256 string `json:"suggested_queries_sha256"`
+	ConfigSchemaVersion    int    `json:"config_schema_version,omitempty"`
+	ConfigRevision         string `json:"config_revision,omitempty"`
+	ConfigDigest           string `json:"config_digest,omitempty"`
 }
 
 type fixtureRequestReceipt struct {
@@ -78,6 +99,9 @@ type fixtureRequestReceipt struct {
 	Model                           string `json:"model"`
 	ProfileID                       string `json:"profile_id"`
 	ProfileDigest                   string `json:"profile_digest"`
+	ConfigSchemaVersion             int    `json:"config_schema_version,omitempty"`
+	ConfigRevision                  string `json:"config_revision,omitempty"`
+	ConfigDigest                    string `json:"config_digest,omitempty"`
 }
 
 type fixtureExpansionInput struct {
@@ -86,15 +110,11 @@ type fixtureExpansionInput struct {
 	PromptID           string          `json:"prompt_id"`
 	Provider           string          `json:"provider"`
 	Model              string          `json:"model"`
-	BaseURL            string          `json:"base_url"`
-	SystemPrompt       string          `json:"system_prompt"`
-	UserPrompt         string          `json:"user_prompt"`
 	KeywordsPerAttempt int             `json:"keywords_per_attempt"`
 	ExpansionAttempts  int             `json:"expansion_attempts"`
 }
 
 type fixtureExpansionOutput struct {
-	RawModelResponse       string                           `json:"raw_model_response,omitempty"`
 	ParsedPlan             QueryPlan                        `json:"parsed_plan"`
 	Source                 string                           `json:"source"`
 	Validation             string                           `json:"validation"`
@@ -174,17 +194,20 @@ type fixtureSelectionOutput struct {
 }
 
 type fixtureFinalReceipt struct {
-	Outcome         string            `json:"outcome"`
-	Status          string            `json:"status"`
-	Reason          string            `json:"reason"`
-	FinalIdentities []resultIdentity  `json:"final_identities"`
-	Receipts        map[string]string `json:"receipts"`
-	QueryReceivedAt string            `json:"query_received_at"`
-	RunCompletedAt  string            `json:"run_completed_at"`
-	DurationMS      int64             `json:"duration_ms"`
-	ProfileID       string            `json:"profile_id"`
-	ProfileDigest   string            `json:"profile_digest"`
-	Error           string            `json:"error,omitempty"`
+	Outcome             string            `json:"outcome"`
+	Status              string            `json:"status"`
+	Reason              string            `json:"reason"`
+	FinalIdentities     []resultIdentity  `json:"final_identities"`
+	Receipts            map[string]string `json:"receipts"`
+	QueryReceivedAt     string            `json:"query_received_at"`
+	RunCompletedAt      string            `json:"run_completed_at"`
+	DurationMS          int64             `json:"duration_ms"`
+	ProfileID           string            `json:"profile_id"`
+	ProfileDigest       string            `json:"profile_digest"`
+	ConfigSchemaVersion int               `json:"config_schema_version,omitempty"`
+	ConfigRevision      string            `json:"config_revision,omitempty"`
+	ConfigDigest        string            `json:"config_digest,omitempty"`
+	Error               string            `json:"error,omitempty"`
 }
 
 type fixtureAttempt struct {
@@ -252,6 +275,16 @@ func runFixtureExperiment(ctx context.Context, options experimentOptions, prepar
 		}
 		variants[i].VariantID = variantID
 	}
+	var stageConfig queryconfig.Config
+	if options.stageConfigOutput != "" {
+		if len(variants) != 1 {
+			return fmt.Errorf("--stage-config-output requires exactly one selected profile, prompt, and model variant; got %d", len(variants))
+		}
+		stageConfig, err = buildStageConfig(options, variants[0], prepared, retrievalOptions)
+		if err != nil {
+			return err
+		}
+	}
 	if len(prepared.suggestedData) == 0 {
 		reader, ok := prepared.reader.(interface {
 			ReadFile(context.Context, string) ([]byte, error)
@@ -298,6 +331,11 @@ func runFixtureExperiment(ctx context.Context, options experimentOptions, prepar
 	}()
 	metadata := buildRecordMetadata(config.Config{})
 	metadata.sourceRevision = buildinfo.Current().Commit
+	if options.stageConfigOutput != "" {
+		metadata.configSchemaVersion = stageConfig.SchemaVersion
+		metadata.configRevision = stageConfig.ConfigRevision
+		metadata.configDigest = stageConfig.ConfigDigest
+	}
 	attempts := make([]fixtureAttempt, 0, len(variants)*len(cases)*options.runs)
 	for i := range variants {
 		for _, input := range cases {
@@ -317,6 +355,11 @@ func runFixtureExperiment(ctx context.Context, options experimentOptions, prepar
 		return fmt.Errorf("finalize output: %w", err)
 	}
 	finished = true
+	if options.stageConfigOutput != "" {
+		if err := writeStageConfig(options.stageConfigOutput, stageConfig); err != nil {
+			return fmt.Errorf("write stage config: %w", err)
+		}
+	}
 	if options.summaryPath != "" {
 		if err := writeFixtureSummary(options.summaryPath, attempts); err != nil {
 			return err
@@ -365,6 +408,9 @@ func runFixtureAttempt(ctx context.Context, options experimentOptions, retrieval
 	}
 	profileDigest := variant.ProfileDigest
 	meta := fixtureReceiptMeta{AttemptID: attemptID, VariantID: variant.VariantID, ProfileID: profile.ID, ProfileDigest: profileDigest, PromptID: variant.Prompt.ID, Provider: variant.Model.Provider, Model: variant.Model.Model, CaseID: input.ID, RunIndex: runIndex, EvidenceThreshold: retrievalOptions.evidenceThreshold}
+	if promptIdentity, ok := queryquality.LookupPrompt(variant.Prompt.ID); ok {
+		meta.PromptDigest = promptIdentity.TemplateDigest
+	}
 	meta.SnapshotIdentity = prepared.label
 	meta.CorpusSHA256 = prepared.digest
 	meta.ManifestGeneration = prepared.manifestGeneration
@@ -372,6 +418,13 @@ func runFixtureAttempt(ctx context.Context, options experimentOptions, retrieval
 	meta.GenerationID = prepared.generationID
 	meta.InputFingerprint = prepared.inputFingerprint
 	meta.SuggestedQueriesSHA256 = prepared.suggestedDigest
+	if metadata.configDigest != "" {
+		meta.ConfigSchemaVersion = metadata.configSchemaVersion
+		meta.ConfigRevision = metadata.configRevision
+		meta.ConfigDigest = metadata.configDigest
+	}
+	metadata.promptID = variant.Prompt.ID
+	metadata.promptDigest = meta.PromptDigest
 	dir := filepath.Join(filepath.Clean(options.artifactsDir), variant.VariantID, receiptSegment(input.ID), fmt.Sprintf("run-%d", runIndex))
 	queryReceivedAt := now()
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -395,7 +448,7 @@ func runFixtureAttempt(ctx context.Context, options experimentOptions, retrieval
 		return fixtureAttempt{}, fmt.Errorf("render prompt: %w", err)
 	}
 	rendered.User += fmt.Sprintf("\nMaximum normalized positive discovery keywords for this attempt: %d.", retrievalOptions.keywordsPerAttempt)
-	if err := write("expansion.input.json", fixtureExpansionInput{Query: input.Query, CriterionPolicy: policy, PromptID: variant.Prompt.ID, Provider: variant.Model.Provider, Model: variant.Model.Model, BaseURL: variant.Model.BaseURL, SystemPrompt: rendered.System, UserPrompt: rendered.User, KeywordsPerAttempt: retrievalOptions.keywordsPerAttempt, ExpansionAttempts: retrievalOptions.expansionAttempts}); err != nil {
+	if err := write("expansion.input.json", fixtureExpansionInput{Query: input.Query, CriterionPolicy: policy, PromptID: variant.Prompt.ID, Provider: variant.Model.Provider, Model: variant.Model.Model, KeywordsPerAttempt: retrievalOptions.keywordsPerAttempt, ExpansionAttempts: retrievalOptions.expansionAttempts}); err != nil {
 		return fixtureAttempt{}, err
 	}
 	expander := &fixtureModelExpander{model: variant.Model, system: rendered.System, user: rendered.User, calls: make(map[int]fixtureModelCall)}
@@ -409,13 +462,6 @@ func runFixtureAttempt(ctx context.Context, options experimentOptions, retrieval
 	if expansionErr != nil {
 		return fixtureAttempt{}, fmt.Errorf("fixture expansion: %w", expansionErr)
 	}
-	firstCall := fixtureModelCall{}
-	for attempt := 1; attempt <= expansionInfo.RequestedAttempts; attempt++ {
-		if call := expander.call(attempt); call.RawResponse != "" || call.Content != "" || call.LatencyMS != 0 {
-			firstCall = call
-			break
-		}
-	}
 	attemptReceipts := make([]fixtureExpansionAttemptReceipt, 0, expansionInfo.RequestedAttempts)
 	var expansionUsage fixtureUsage
 	for _, outcome := range expansionInfo.AttemptOutcomes {
@@ -427,7 +473,7 @@ func runFixtureAttempt(ctx context.Context, options experimentOptions, retrieval
 	if plan.Fallback {
 		validation = "fallback"
 	}
-	if err := write("expansion.output.json", fixtureExpansionOutput{RawModelResponse: scrubSecret(firstCall.RawResponse, variant.Model.APIKey), ParsedPlan: plan, Source: expansionInfo.Source, Validation: validation, Fallback: plan.Fallback, FallbackReason: expansionInfo.FallbackReason, Error: "", LatencyMS: expansionElapsed, Usage: expansionUsage, RequestedAttempts: expansionInfo.RequestedAttempts, SuccessfulAttempts: expansionInfo.SuccessfulAttempts, ProviderFailedAttempts: expansionInfo.ProviderFailedAttempts, FallbackCount: expansionInfo.FallbackCount, KeywordsPerAttempt: expansionInfo.KeywordsPerAttempt, KeywordSupport: plan.KeywordSupport, Attempts: attemptReceipts}); err != nil {
+	if err := write("expansion.output.json", fixtureExpansionOutput{ParsedPlan: plan, Source: expansionInfo.Source, Validation: validation, Fallback: plan.Fallback, FallbackReason: expansionInfo.FallbackReason, Error: "", LatencyMS: expansionElapsed, Usage: expansionUsage, RequestedAttempts: expansionInfo.RequestedAttempts, SuccessfulAttempts: expansionInfo.SuccessfulAttempts, ProviderFailedAttempts: expansionInfo.ProviderFailedAttempts, FallbackCount: expansionInfo.FallbackCount, KeywordsPerAttempt: expansionInfo.KeywordsPerAttempt, KeywordSupport: plan.KeywordSupport, Attempts: attemptReceipts}); err != nil {
 		return fixtureAttempt{}, err
 	}
 	trace := &queryRetrievalTrace{Variant: variant.VariantID, Seed: seed, Stages: []stageTrace{{Name: "expansion", Outcome: planOutcome(plan), Source: expansionInfo.Source, FallbackReason: expansionInfo.FallbackReason, ElapsedMS: expansionElapsed, InputCount: expansionInfo.RequestedAttempts, OutputCount: criterionCount(plan), Plan: &plan}}}
@@ -486,7 +532,7 @@ func runFixtureAttempt(ctx context.Context, options experimentOptions, retrieval
 		outcome = "retrieval_miss"
 	}
 	queryReceivedAtStr, runCompletedAtStr, durationMS := attemptTiming(queryReceivedAt, runCompletedAt)
-	if err := write("final.json", fixtureFinalReceipt{Outcome: outcome, Status: resultStatus, Reason: resultReason, FinalIdentities: resultIdentities, Receipts: map[string]string{"request": "request.json", "expansion_input": "expansion.input.json", "expansion_output": "expansion.output.json", "matching_input": "matching.input.json", "matching_output": "matching.output.json", "selection_input": "selection.input.json", "selection_output": "selection.output.json", "final": "final.json"}, QueryReceivedAt: queryReceivedAtStr, RunCompletedAt: runCompletedAtStr, DurationMS: durationMS, ProfileID: profile.ID, ProfileDigest: profileDigest}); err != nil {
+	if err := write("final.json", fixtureFinalReceipt{Outcome: outcome, Status: resultStatus, Reason: resultReason, FinalIdentities: resultIdentities, Receipts: map[string]string{"request": "request.json", "expansion_input": "expansion.input.json", "expansion_output": "expansion.output.json", "matching_input": "matching.input.json", "matching_output": "matching.output.json", "selection_input": "selection.input.json", "selection_output": "selection.output.json", "final": "final.json"}, QueryReceivedAt: queryReceivedAtStr, RunCompletedAt: runCompletedAtStr, DurationMS: durationMS, ProfileID: profile.ID, ProfileDigest: profileDigest, ConfigSchemaVersion: metadata.configSchemaVersion, ConfigRevision: metadata.configRevision, ConfigDigest: metadata.configDigest}); err != nil {
 		return fixtureAttempt{}, err
 	}
 	result := query.Result{Query: input.Query, Mode: input.Mode, Status: resultStatus, Reason: resultReason}
@@ -568,21 +614,27 @@ func digestJSON(value any) string {
 }
 
 type summaryDocument struct {
-	SchemaVersion     int               `json:"schema_version"`
-	EvidenceThreshold int               `json:"evidence_threshold"`
-	AttemptCount      int               `json:"attempt_count"`
-	Variants          []variantSummary  `json:"variants"`
-	Totals            summaryMetrics    `json:"totals"`
-	MetricDefinitions map[string]string `json:"metric_definitions"`
+	SchemaVersion       int               `json:"schema_version"`
+	EvidenceThreshold   int               `json:"evidence_threshold"`
+	AttemptCount        int               `json:"attempt_count"`
+	ConfigSchemaVersion int               `json:"config_schema_version,omitempty"`
+	ConfigRevision      string            `json:"config_revision,omitempty"`
+	ConfigDigest        string            `json:"config_digest,omitempty"`
+	Variants            []variantSummary  `json:"variants"`
+	Totals              summaryMetrics    `json:"totals"`
+	MetricDefinitions   map[string]string `json:"metric_definitions"`
 }
 
 type variantSummary struct {
-	VariantID         string         `json:"variant_id"`
-	ProfileID         string         `json:"profile_id"`
-	ProfileDigest     string         `json:"profile_digest"`
-	EvidenceThreshold int            `json:"evidence_threshold"`
-	Cases             []caseSummary  `json:"cases"`
-	Totals            summaryMetrics `json:"totals"`
+	VariantID           string         `json:"variant_id"`
+	ProfileID           string         `json:"profile_id"`
+	ProfileDigest       string         `json:"profile_digest"`
+	EvidenceThreshold   int            `json:"evidence_threshold"`
+	ConfigSchemaVersion int            `json:"config_schema_version,omitempty"`
+	ConfigRevision      string         `json:"config_revision,omitempty"`
+	ConfigDigest        string         `json:"config_digest,omitempty"`
+	Cases               []caseSummary  `json:"cases"`
+	Totals              summaryMetrics `json:"totals"`
 }
 
 type caseSummary struct {
@@ -657,6 +709,9 @@ func writeFixtureSummary(path string, attempts []fixtureAttempt) error {
 	}}
 	if len(attempts) > 0 {
 		document.EvidenceThreshold = attempts[0].EvidenceThreshold
+		document.ConfigSchemaVersion = attempts[0].Record.ConfigSchemaVersion
+		document.ConfigRevision = attempts[0].Record.ConfigRevision
+		document.ConfigDigest = attempts[0].Record.ConfigDigest
 	}
 	all := make([]fixtureAttempt, 0, len(attempts))
 	for _, id := range variantIDs {
@@ -676,6 +731,9 @@ func writeFixtureSummary(path string, attempts []fixtureAttempt) error {
 			variant.EvidenceThreshold = group[0].EvidenceThreshold
 			variant.ProfileID = group[0].Record.ProfileID
 			variant.ProfileDigest = group[0].Record.ProfileDigest
+			variant.ConfigSchemaVersion = group[0].Record.ConfigSchemaVersion
+			variant.ConfigRevision = group[0].Record.ConfigRevision
+			variant.ConfigDigest = group[0].Record.ConfigDigest
 		}
 		for _, caseID := range caseIDs {
 			variant.Cases = append(variant.Cases, caseSummary{CaseID: caseID, Metrics: aggregateSummaryMetrics(casesByID[caseID])})

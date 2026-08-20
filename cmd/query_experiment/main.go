@@ -60,6 +60,10 @@ func main() {
 	flag.StringVar(&options.prompts, "prompts", "", "comma-separated prompt fixture IDs")
 	flag.StringVar(&options.artifactsDir, "artifacts-dir", "", "trusted-local per-attempt receipt directory")
 	flag.StringVar(&options.summaryPath, "summary", "", "trusted-local quantitative JSON summary")
+	flag.StringVar(&options.stageConfigOutput, "stage-config-output", "", "sealed canonical query stage config regular file")
+	flag.StringVar(&options.configRevision, "config-revision", "", "immutable operator config revision required for stage config output")
+	flag.StringVar(&options.generationID, "generation-id", "", "explicit frozen local snapshot generation identity")
+	flag.StringVar(&options.conceptsDigest, "concepts-digest", "", "expected frozen concepts sha256 digest")
 	flag.Parse()
 	if seedSet {
 		options.seed = &seed

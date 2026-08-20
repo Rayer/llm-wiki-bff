@@ -56,6 +56,14 @@ quality evidence. A configured provider may make one structured expansion call;
 provider failure falls back with a short trace reason. No project ontology or
 semantic profile is loaded.
 
+To emit one sealed stage config for an exact frozen fixture variant, select one
+profile, prompt, and model and provide `--stage-config-output`,
+`--config-revision`, `--project-id`, and `--generation-id` (local snapshots)
+alongside the fixture flags. The selected expansion fixture must be the
+production-owned built-in prompt, `deepseek-v4-flash`, provider `deepseek`,
+reasoning `none`, and temperature `0`. The artifact is atomically written only
+after every run succeeds.
+
 The query-retrieval trace preserves the ordered `expansion`, `matching`, and
 `selection` stages. It may include plan criteria, lexical field/term evidence,
 eligibility reasons, selection reasons, exploration markers, and seed metadata,

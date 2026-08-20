@@ -696,22 +696,13 @@ func uniqueStrings(values []string) []string {
 	return result
 }
 
-const (
-	StructuredPlanPromptID     = "minimal-v1"
-	structuredPlanSystemPrompt = `You produce a retrieval plan for a frozen Lifestyle concept corpus. Return exactly one JSON object and no markdown. The object fields and exact types are: raw_query string; required array of Criterion; excluded array of Criterion; preferred array of Criterion; goals array of Criterion; supporting_dimensions array of Criterion; acceptable_alternatives array of Criterion; ambiguity array of strings; fallback boolean. Every Criterion is exactly {kind:string,value:string,terms:array of strings,proof:"lexical" or "semantic"}. Every lexical Criterion needs at least one discovery term. Never output a string where an array or object is required. Be conservative: only explicit user constraints may be required or excluded; absent never means excluded. In this minimal variant, supporting_dimensions and acceptable_alternatives must be empty arrays and fallback must be false.`
-	structuredPlanUserTemplate = "Raw query: {{raw_query}}\nCriterion policy: {{criterion_policy}}\nInterpret the query into required, excluded, preferred and goals. Preserve the raw query exactly in raw_query. Return the single JSON object only."
-)
-
 func structuredPlanUserPrompt(raw string, policy CriterionPolicy) string {
 	return structuredPlanUserPromptWithLimit(raw, policy, DefaultKeywordsPerAttempt)
 }
 
 func structuredPlanUserPromptWithLimit(raw string, policy CriterionPolicy, keywordsPerAttempt int) string {
-	rawJSON, _ := json.Marshal(raw)
-	policyJSON, _ := json.Marshal(policy)
-	result := strings.ReplaceAll(structuredPlanUserTemplate, "{{raw_query}}", string(rawJSON))
-	result = strings.ReplaceAll(result, "{{criterion_policy}}", string(policyJSON))
-	return result + fmt.Sprintf("\nMaximum normalized positive discovery keywords for this attempt: %d.", keywordsPerAttempt)
+	rendered, _ := RenderPrompt(StructuredPlanPromptID, raw, policy, keywordsPerAttempt)
+	return rendered.User
 }
 
 func ValidateQueryPlan(plan QueryPlan) error {
