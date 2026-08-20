@@ -31,6 +31,9 @@ const (
 
 type experimentOptions struct {
 	snapshotPath          string
+	gcsBucket             string
+	gcsUserID             string
+	projectID             string
 	casesPath             string
 	suggestedQueryMode    string
 	runs                  int
@@ -370,11 +373,12 @@ func validateOutputPath(path string) error {
 }
 
 func runExperiment(ctx context.Context, options experimentOptions, deps dependencies) error {
+	root, err := resolveSnapshotLocator(options)
+	if err != nil {
+		return err
+	}
 	if options.runs <= 0 || options.runs > maxExperimentRuns {
 		return fmt.Errorf("runs must be between 1 and %d", maxExperimentRuns)
-	}
-	if strings.TrimSpace(options.snapshotPath) == "" {
-		return errors.New("snapshot is required")
 	}
 	if strings.TrimSpace(options.casesPath) == "" && strings.TrimSpace(options.suggestedQueryMode) == "" {
 		return errors.New("cases is required")
@@ -395,7 +399,7 @@ func runExperiment(ctx context.Context, options experimentOptions, deps dependen
 		return err
 	}
 	cases := []caseInput{}
-	var err error
+	err = nil
 	if strings.TrimSpace(options.casesPath) != "" {
 		cases, err = readCases(options.casesPath)
 		if err != nil {
@@ -403,10 +407,10 @@ func runExperiment(ctx context.Context, options experimentOptions, deps dependen
 		}
 	}
 	var prepared preparedSnapshot
-	if strings.HasPrefix(strings.TrimSpace(options.snapshotPath), "gs://") {
-		prepared, err = loadGCSSnapshot(ctx, options.snapshotPath, deps.newGCSClient)
+	if strings.HasPrefix(root, "gs://") {
+		prepared, err = loadGCSSnapshot(ctx, root, deps.newGCSClient)
 	} else {
-		prepared, err = preflightSnapshot(ctx, options.snapshotPath)
+		prepared, err = preflightSnapshot(ctx, root)
 	}
 	if err != nil {
 		return err

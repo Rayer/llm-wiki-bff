@@ -40,11 +40,34 @@ func parseGCSProjectRoot(raw string) (gcsProjectRoot, error) {
 	if len(parts) != 4 || parts[0] != "users" || parts[2] != "projects" || !validURIComponent(parts[1]) || !validURIComponent(parts[3]) {
 		return gcsProjectRoot{}, errors.New("snapshot must be gs://<bucket>/users/<user-id>/projects/<project-id>")
 	}
+	if !validURIComponent(u.Host) {
+		return gcsProjectRoot{}, errors.New("snapshot must be a canonical gs:// Project-root URI")
+	}
 	return gcsProjectRoot{bucket: u.Host, userID: parts[1], project: parts[3]}, nil
 }
 
+func resolveSnapshotLocator(options experimentOptions) (string, error) {
+	snapshot := strings.TrimSpace(options.snapshotPath)
+	bucket := strings.TrimSpace(options.gcsBucket)
+	userID := strings.TrimSpace(options.gcsUserID)
+	projectID := strings.TrimSpace(options.projectID)
+	if snapshot != "" && (bucket != "" || userID != "" || projectID != "") {
+		return "", errors.New("snapshot and split GCS flags are mutually exclusive")
+	}
+	if snapshot == "" && bucket == "" && userID == "" && projectID == "" {
+		return "", errors.New("snapshot or all split GCS flags are required")
+	}
+	if snapshot == "" {
+		if !validURIComponent(bucket) || !validURIComponent(userID) || !validURIComponent(projectID) {
+			return "", errors.New("gcs bucket, user ID, and project ID must be non-empty safe components")
+		}
+		return "gs://" + bucket + "/users/" + userID + "/projects/" + projectID, nil
+	}
+	return snapshot, nil
+}
+
 func validURIComponent(value string) bool {
-	return value != "" && value != "." && value != ".." && path.Clean(value) == value && !strings.ContainsAny(value, `/\\`)
+	return value != "" && value != "." && value != ".." && !strings.ContainsAny(value, `%/\\`) && path.Clean(value) == value
 }
 
 func loadGCSSnapshot(ctx context.Context, root string, newClient func(string) (*gcs.Client, error)) (preparedSnapshot, error) {

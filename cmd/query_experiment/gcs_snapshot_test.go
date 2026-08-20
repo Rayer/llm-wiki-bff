@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/rayer/llm-wiki-bff/internal/config"
 	"github.com/rayer/llm-wiki-bff/internal/gcs"
 	"github.com/rayer/llm-wiki-bff/internal/suggestedqueries"
 )
@@ -33,6 +34,42 @@ func TestParseGCSProjectRootIsStrict(t *testing.T) {
 		if _, err := parseGCSProjectRoot(raw); err == nil {
 			t.Fatalf("parseGCSProjectRoot(%q) accepted malformed URI", raw)
 		}
+	}
+}
+
+func TestResolveSnapshotLocatorSplitForm(t *testing.T) {
+	got, err := resolveSnapshotLocator(experimentOptions{gcsBucket: "bucket", gcsUserID: "user-1", projectID: "project-1"})
+	if err != nil || got != "gs://bucket/users/user-1/projects/project-1" {
+		t.Fatalf("root = %q, err = %v", got, err)
+	}
+}
+
+func TestResolveSnapshotLocatorRejectsMissingConflictAndUnsafeValues(t *testing.T) {
+	tests := []experimentOptions{
+		{gcsUserID: "user", projectID: "project"},
+		{gcsBucket: "bucket", projectID: "project"},
+		{gcsBucket: "bucket", gcsUserID: "user"},
+		{snapshotPath: "./snapshot", gcsBucket: "bucket", gcsUserID: "user", projectID: "project"},
+		{gcsBucket: "bucket/../other", gcsUserID: "user", projectID: "project"},
+		{gcsBucket: "bucket", gcsUserID: "user%2Fpart", projectID: "project"},
+		{gcsBucket: "bucket", gcsUserID: "user", projectID: "../project"},
+	}
+	for _, options := range tests {
+		if _, err := resolveSnapshotLocator(options); err == nil {
+			t.Fatalf("accepted invalid locator: %#v", options)
+		}
+	}
+}
+
+func TestInvalidSplitLocatorHasZeroEffects(t *testing.T) {
+	called := false
+	err := runExperiment(context.Background(), experimentOptions{gcsBucket: "bucket", gcsUserID: "user"}, dependencies{
+		loadConfig:   func(string) (config.Config, error) { called = true; return config.Config{}, nil },
+		newGCSClient: func(string) (*gcs.Client, error) { called = true; return nil, nil },
+		stdout:       &bytes.Buffer{},
+	})
+	if err == nil || called {
+		t.Fatalf("err=%v effects=%v", err, called)
 	}
 }
 
