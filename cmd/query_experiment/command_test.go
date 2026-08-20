@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -260,16 +261,19 @@ func TestRunExperimentRejectsSuggestedArtifactBeforeExecutorOrOutput(t *testing.
 	writeTestFile(t, filepath.Join(root, "cache", "suggested_queries.json"), `{"version":1}`)
 	var output bytes.Buffer
 	called := false
+	configCalled := false
+	outputOpened := false
 	err := runExperiment(context.Background(), experimentOptions{snapshotPath: root, suggestedQueryMode: "wiki", runs: 1}, dependencies{
-		loadConfig: func(string) (config.Config, error) { return config.Config{}, nil },
+		loadConfig: func(string) (config.Config, error) { configCalled = true; return config.Config{}, nil },
 		newExecutor: func(*cache.Cache, config.Config) (query.Executor, error) {
 			called = true
 			return &recordingExecutor{}, nil
 		},
-		now: time.Now, stdout: &output,
+		openOutput: func(string, io.Writer) (recordSink, error) { outputOpened = true; return nil, nil },
+		now:        time.Now, stdout: &output,
 	})
-	if err == nil || called || output.Len() != 0 {
-		t.Fatalf("err=%v executor_called=%v output=%q", err, called, output.String())
+	if err == nil || called || configCalled || outputOpened || output.Len() != 0 {
+		t.Fatalf("err=%v executor_called=%v config_called=%v output_opened=%v output=%q", err, called, configCalled, outputOpened, output.String())
 	}
 }
 
