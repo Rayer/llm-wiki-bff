@@ -456,6 +456,30 @@ func TestCIWorkflowPushesAndPRsMainAndDevelop(t *testing.T) {
 	}
 }
 
+func TestCIMainFastForwardEligibilityGate(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/ci.yml")
+	job := workflowSection(t, contents, "  main-fast-forward-eligible:", "\n\n")
+	for _, want := range []string{
+		"if: github.event_name == 'push' && github.ref == 'refs/heads/develop'",
+		"needs: test",
+		"actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4",
+		"fetch-depth: 0",
+		"persist-credentials: false",
+		"git fetch --no-tags origin main develop",
+		`test "$(git rev-parse origin/develop)" = "$GITHUB_SHA"`,
+		"git merge-base --is-ancestor origin/main \"$GITHUB_SHA\"",
+	} {
+		if !strings.Contains(job, want) {
+			t.Errorf("main fast-forward gate is missing %q", want)
+		}
+	}
+	for _, forbidden := range []string{"git push", "git update-ref", "statuses", "GH_TOKEN", "github.token", "http.extraheader"} {
+		if strings.Contains(job, forbidden) {
+			t.Errorf("main fast-forward gate must not mutate refs/statuses or use credentials: found %q", forbidden)
+		}
+	}
+}
+
 func TestBFFDevWorkflowPushesMainOnlyAndSupportsManualDispatch(t *testing.T) {
 	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
 	for _, want := range []string{
