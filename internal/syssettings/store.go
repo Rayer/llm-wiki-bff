@@ -3,6 +3,8 @@ package syssettings
 import (
 	"context"
 	"fmt"
+	"sync"
+	"unicode/utf8"
 
 	"cloud.google.com/go/firestore"
 	"google.golang.org/grpc/codes"
@@ -12,11 +14,20 @@ import (
 const (
 	settingsCollection = "system"
 	settingsDocID      = "settings"
+	maxMarkdownBytes   = 32 << 10
 )
 
 // Settings is the public system settings payload.
 type Settings struct {
-	RegistrationEnabled bool `json:"registration_enabled"`
+	RegistrationEnabled           bool   `json:"registration_enabled"`
+	AnnouncementDraftMarkdown     string `json:"announcement_draft_markdown"`
+	AnnouncementPublishedMarkdown string `json:"announcement_published_markdown"`
+}
+
+// PublicSettings is the deliberately metadata-free anonymous response.
+type PublicSettings struct {
+	RegistrationEnabled  bool   `json:"registration_enabled"`
+	AnnouncementMarkdown string `json:"announcement_markdown"`
 }
 
 // RegistrationGate reports whether self-serve registration is allowed.
@@ -24,6 +35,8 @@ type RegistrationGate interface {
 	IsRegistrationEnabled(ctx context.Context) (bool, error)
 	GetSettings(ctx context.Context) (Settings, error)
 	SetRegistrationEnabled(ctx context.Context, enabled bool) (Settings, error)
+	SetAnnouncementDraft(ctx context.Context, markdown string) (Settings, error)
+	PublishAnnouncement(ctx context.Context) (Settings, error)
 }
 
 // Store resolves and persists registration settings in Firestore with env fallback.
@@ -75,7 +88,58 @@ func (s *Store) GetSettings(ctx context.Context) (Settings, error) {
 	if err != nil {
 		return Settings{}, err
 	}
-	return Settings{RegistrationEnabled: Resolve(docExists, firestoreValue, s.envValue)}, nil
+	settings := Settings{RegistrationEnabled: Resolve(docExists, firestoreValue, s.envValue)}
+	if docExists {
+		data, err := s.settingsRef().Get(ctx)
+		if err != nil {
+			return Settings{}, fmt.Errorf("get system settings: %w", err)
+		}
+		settings.AnnouncementDraftMarkdown, _ = data.Data()["announcement_draft_markdown"].(string)
+		settings.AnnouncementPublishedMarkdown, _ = data.Data()["announcement_published_markdown"].(string)
+	}
+	return settings, nil
+}
+
+func validateMarkdown(markdown string) error {
+	if !utf8.ValidString(markdown) {
+		return fmt.Errorf("announcement markdown is not valid UTF-8")
+	}
+	if len([]byte(markdown)) > maxMarkdownBytes {
+		return fmt.Errorf("announcement markdown exceeds %d bytes", maxMarkdownBytes)
+	}
+	return nil
+}
+
+func (s *Store) SetAnnouncementDraft(ctx context.Context, markdown string) (Settings, error) {
+	if err := validateMarkdown(markdown); err != nil {
+		return Settings{}, err
+	}
+	if s.fs == nil {
+		return Settings{}, fmt.Errorf("Firestore client is not configured")
+	}
+	if _, err := s.settingsRef().Set(ctx, map[string]interface{}{"announcement_draft_markdown": markdown}, firestore.MergeAll); err != nil {
+		return Settings{}, fmt.Errorf("set system settings: %w", err)
+	}
+	return s.GetSettings(ctx)
+}
+
+func (s *Store) PublishAnnouncement(ctx context.Context) (Settings, error) {
+	if s.fs == nil {
+		return Settings{}, fmt.Errorf("Firestore client is not configured")
+	}
+	var published string
+	err := s.fs.RunTransaction(ctx, func(ctx context.Context, tx *firestore.Transaction) error {
+		doc, err := tx.Get(s.settingsRef())
+		if err != nil {
+			return err
+		}
+		published, _ = doc.Data()["announcement_draft_markdown"].(string)
+		return tx.Set(s.settingsRef(), map[string]interface{}{"announcement_published_markdown": published}, firestore.MergeAll)
+	})
+	if err != nil {
+		return Settings{}, fmt.Errorf("publish announcement: %w", err)
+	}
+	return s.GetSettings(ctx)
 }
 
 // SetRegistrationEnabled persists registration_enabled to Firestore system/settings.
@@ -89,7 +153,7 @@ func (s *Store) SetRegistrationEnabled(ctx context.Context, enabled bool) (Setti
 	if err != nil {
 		return Settings{}, fmt.Errorf("set system settings: %w", err)
 	}
-	return Settings{RegistrationEnabled: enabled}, nil
+	return s.GetSettings(ctx)
 }
 
 // FakeStore is an in-memory RegistrationGate for tests.
@@ -100,9 +164,16 @@ type FakeStore struct {
 	GetCalls     int
 	SetCalls     int
 	LastSetValue bool
+	Draft        string
+	Published    string
+	DraftErr     error
+	PublishErr   error
+	mu           sync.RWMutex
 }
 
 func (f *FakeStore) IsRegistrationEnabled(ctx context.Context) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.GetCalls++
 	if f.Err != nil {
 		return false, f.Err
@@ -118,7 +189,32 @@ func (f *FakeStore) GetSettings(ctx context.Context) (Settings, error) {
 	if err != nil {
 		return Settings{}, err
 	}
-	return Settings{RegistrationEnabled: enabled}, nil
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return Settings{RegistrationEnabled: enabled, AnnouncementDraftMarkdown: f.Draft, AnnouncementPublishedMarkdown: f.Published}, nil
+}
+
+func (f *FakeStore) SetAnnouncementDraft(ctx context.Context, markdown string) (Settings, error) {
+	if err := validateMarkdown(markdown); err != nil {
+		return Settings{}, err
+	}
+	if f.DraftErr != nil {
+		return Settings{}, f.DraftErr
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.Draft = markdown
+	return Settings{RegistrationEnabled: f.Enabled, AnnouncementDraftMarkdown: f.Draft, AnnouncementPublishedMarkdown: f.Published}, nil
+}
+
+func (f *FakeStore) PublishAnnouncement(ctx context.Context) (Settings, error) {
+	if f.PublishErr != nil {
+		return Settings{}, f.PublishErr
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.Published = f.Draft
+	return Settings{RegistrationEnabled: f.Enabled, AnnouncementDraftMarkdown: f.Draft, AnnouncementPublishedMarkdown: f.Published}, nil
 }
 
 func (f *FakeStore) SetRegistrationEnabled(ctx context.Context, enabled bool) (Settings, error) {
@@ -127,7 +223,9 @@ func (f *FakeStore) SetRegistrationEnabled(ctx context.Context, enabled bool) (S
 	if f.Err != nil {
 		return Settings{}, f.Err
 	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.Persisted = &enabled
 	f.Enabled = enabled
-	return Settings{RegistrationEnabled: enabled}, nil
+	return Settings{RegistrationEnabled: enabled, AnnouncementDraftMarkdown: f.Draft, AnnouncementPublishedMarkdown: f.Published}, nil
 }

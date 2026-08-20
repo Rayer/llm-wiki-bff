@@ -467,6 +467,48 @@ const docTemplate = `{
                 }
             }
         },
+        "/api/v1/admin/settings/announcement/publish": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin"
+                ],
+                "summary": "Publish announcement (admin)",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/syssettings.Settings"
+                        }
+                    },
+                    "401": {
+                        "description": "Unauthorized",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
         "/api/v1/admin/users": {
             "get": {
                 "security": [
@@ -1298,7 +1340,7 @@ const docTemplate = `{
         },
         "/api/v1/public/config": {
             "get": {
-                "description": "Returns public feature flags such as registration_enabled.",
+                "description": "Returns the registration flag and currently published announcement Markdown.",
                 "produces": [
                     "application/json"
                 ],
@@ -1310,7 +1352,7 @@ const docTemplate = `{
                     "200": {
                         "description": "OK",
                         "schema": {
-                            "$ref": "#/definitions/syssettings.Settings"
+                            "$ref": "#/definitions/syssettings.PublicSettings"
                         }
                     }
                 }
@@ -2405,9 +2447,26 @@ const docTemplate = `{
                 }
             }
         },
+        "syssettings.PublicSettings": {
+            "type": "object",
+            "properties": {
+                "announcement_markdown": {
+                    "type": "string"
+                },
+                "registration_enabled": {
+                    "type": "boolean"
+                }
+            }
+        },
         "syssettings.Settings": {
             "type": "object",
             "properties": {
+                "announcement_draft_markdown": {
+                    "type": "string"
+                },
+                "announcement_published_markdown": {
+                    "type": "string"
+                },
                 "registration_enabled": {
                     "type": "boolean"
                 }
@@ -2416,6 +2475,9 @@ const docTemplate = `{
         "syssettings.patchSettingsRequest": {
             "type": "object",
             "properties": {
+                "announcement_draft_markdown": {
+                    "type": "string"
+                },
                 "registration_enabled": {
                     "type": "boolean"
                 }

@@ -475,13 +475,26 @@ definitions:
         description: '"source" or "concept"'
         type: string
     type: object
+  syssettings.PublicSettings:
+    properties:
+      announcement_markdown:
+        type: string
+      registration_enabled:
+        type: boolean
+    type: object
   syssettings.Settings:
     properties:
+      announcement_draft_markdown:
+        type: string
+      announcement_published_markdown:
+        type: string
       registration_enabled:
         type: boolean
     type: object
   syssettings.patchSettingsRequest:
     properties:
+      announcement_draft_markdown:
+        type: string
       registration_enabled:
         type: boolean
     type: object
@@ -797,6 +810,32 @@ paths:
       security:
       - BearerAuth: []
       summary: Update system settings (admin)
+      tags:
+      - admin
+  /api/v1/admin/settings/announcement/publish:
+    post:
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/syssettings.Settings'
+        "401":
+          description: Unauthorized
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Publish announcement (admin)
       tags:
       - admin
   /api/v1/admin/users:
@@ -1341,14 +1380,15 @@ paths:
       - projects
   /api/v1/public/config:
     get:
-      description: Returns public feature flags such as registration_enabled.
+      description: Returns the registration flag and currently published announcement
+        Markdown.
       produces:
       - application/json
       responses:
         "200":
           description: OK
           schema:
-            $ref: '#/definitions/syssettings.Settings'
+            $ref: '#/definitions/syssettings.PublicSettings'
       summary: Public runtime config
       tags:
       - public
