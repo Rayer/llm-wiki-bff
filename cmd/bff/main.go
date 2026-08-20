@@ -333,17 +333,8 @@ func newProductionRouter(
 
 func registerPublicRoutes(r *gin.Engine, settingsStore syssettings.RegistrationGate, authServiceURL string) {
 	// Public routes are registered on the root router, outside JWT and project middleware.
-	r.GET("/api/v1/public/config", func(c *gin.Context) {
-		settings, err := settingsStore.GetSettings(c.Request.Context())
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
-			return
-		}
-		c.JSON(http.StatusOK, gin.H{
-			"registration_enabled": settings.RegistrationEnabled,
-			"auth_service_url":     authServiceURL,
-		})
-	})
+	_ = authServiceURL
+	r.GET("/api/v1/public/config", syssettings.PublicConfigHandler(settingsStore))
 	r.GET("/api/v1/public/version", buildinfo.Handler())
 }
 
@@ -362,6 +353,7 @@ func registerAdminRoutes(r *gin.Engine, cfg config.Config, hV1 *handlerv1.Handle
 	{
 		admin.GET("/settings", syssettings.AdminGetSettingsHandler(settingsStore))
 		admin.PATCH("/settings", syssettings.AdminPatchSettingsHandler(settingsStore))
+		admin.POST("/settings/announcement/publish", syssettings.AdminPublishAnnouncementHandler(settingsStore))
 		admin.GET("/projects", hV1.AdminProjects)
 		admin.PATCH("/projects/:id", hV1.AdminRenameProject)
 		admin.DELETE("/projects/:id", hV1.AdminDeleteProject)
