@@ -78,6 +78,212 @@ func TestFixtureSelectorsPreserveRequestedCartesianOrder(t *testing.T) {
 	}
 }
 
+func TestFixtureVariantIdentityIncludesProfileDigest(t *testing.T) {
+	models := []modelFixtureEntry{{ID: "m"}}
+	prompts := []promptFixtureEntry{{ID: "p"}}
+	left := []profileFixtureEntry{{ID: "same", RequiredWhenExplicit: []string{"topic"}}}
+	right := []profileFixtureEntry{{ID: "same", RequiredWhenExplicit: []string{"location"}}}
+	leftVariants, err := selectFixtureMatrix(models, left, prompts, "", "same", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rightVariants, err := selectFixtureMatrix(models, right, prompts, "", "same", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if leftVariants[0].VariantID == rightVariants[0].VariantID {
+		t.Fatalf("variant IDs=%q,%q", leftVariants[0].VariantID, rightVariants[0].VariantID)
+	}
+	options := experimentOptions{
+		selectionLimit:        10,
+		explorationSlots:      1,
+		explorationSlotsSet:   true,
+		keywordsPerAttempt:    24,
+		expansionAttempts:     3,
+		rareDocumentFrequency: 1,
+		evidenceThreshold:     2,
+		evidenceThresholdSet:  true,
+	}
+	leftArtifact, err := fixtureVariantID(leftVariants[0].VariantID, options, preparedSnapshot{digest: strings.Repeat("a", 64)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rightArtifact, err := fixtureVariantID(rightVariants[0].VariantID, options, preparedSnapshot{digest: strings.Repeat("a", 64)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if leftArtifact == rightArtifact {
+		t.Fatalf("artifact identities not split by profile content: %q", leftArtifact)
+	}
+	repeatArtifact, err := fixtureVariantID(leftVariants[0].VariantID, options, preparedSnapshot{digest: strings.Repeat("a", 64)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if leftArtifact != repeatArtifact {
+		t.Fatalf("artifact identity is not deterministic: %q != %q", leftArtifact, repeatArtifact)
+	}
+}
+
+func TestFixtureVariantIDDiffersByPromptModelAndCorpusDigestInputs(t *testing.T) {
+	models := []modelFixtureEntry{{ID: "m1"}, {ID: "m2"}}
+	prompts := []promptFixtureEntry{{ID: "p1"}, {ID: "p2"}}
+	profiles := []profileFixtureEntry{{ID: "same", RequiredWhenExplicit: []string{"topic"}, PreferredByDefault: []string{"system"}, GoalsToExpand: []string{"discovery"}}}
+	profileVariants, err := selectFixtureMatrix(models, profiles, prompts, "", "same", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	options := experimentOptions{
+		selectionLimit:        10,
+		explorationSlots:      1,
+		explorationSlotsSet:   true,
+		keywordsPerAttempt:    24,
+		expansionAttempts:     3,
+		rareDocumentFrequency: 7,
+		seed:                  int64Ptr(123),
+		evidenceThreshold:     3,
+		evidenceThresholdSet:  true,
+	}
+	ids := map[string]string{
+		"profile-m1-p1-a": "",
+		"profile-m2-p1-a": "",
+		"profile-m1-p2-a": "",
+	}
+	first := profileVariants[0]
+	second := profileVariants[1]
+	third := profileVariants[2]
+	for name, variant := range map[string]fixtureVariant{"profile-m1-p1-a": first, "profile-m2-p1-a": second, "profile-m1-p2-a": third} {
+		variantID, err := fixtureVariantID(variant.VariantID, options, preparedSnapshot{digest: strings.Repeat("a", 64)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ids[name] == "" {
+			ids[name] = variantID
+		}
+	}
+	ids["profile-m1-p1-b"], err = fixtureVariantID(first.VariantID, options, preparedSnapshot{digest: strings.Repeat("b", 64)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ids["profile-m1-p1-a"] == ids["profile-m2-p1-a"] || ids["profile-m1-p1-a"] == ids["profile-m1-p2-a"] || ids["profile-m1-p1-a"] == ids["profile-m1-p1-b"] {
+		t.Fatalf("fixture identities not sensitive to all variant factors: %v", ids)
+	}
+}
+
+func TestFixtureVariantIDUsesBoundedDigestTokensAndSegmentSafePathIDs(t *testing.T) {
+	models := []modelFixtureEntry{{ID: "m"}}
+	prompts := []promptFixtureEntry{{ID: "p"}}
+	left := []profileFixtureEntry{{ID: "same", RequiredWhenExplicit: []string{"topic"}, PreferredByDefault: []string{"system"}, GoalsToExpand: []string{"discovery"}}}
+	right := []profileFixtureEntry{{ID: "same", RequiredWhenExplicit: []string{"location"}, PreferredByDefault: []string{"system"}, GoalsToExpand: []string{"discovery"}}}
+	leftVariants, err := selectFixtureMatrix(models, left, prompts, "", "same", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rightVariants, err := selectFixtureMatrix(models, right, prompts, "", "same", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	options := experimentOptions{
+		selectionLimit:        10,
+		explorationSlots:      1,
+		explorationSlotsSet:   true,
+		keywordsPerAttempt:    24,
+		expansionAttempts:     3,
+		rareDocumentFrequency: 7,
+		seed:                  int64Ptr(123),
+		evidenceThreshold:     3,
+		evidenceThresholdSet:  true,
+	}
+	leftCorpus, err := fixtureVariantID(leftVariants[0].VariantID, options, preparedSnapshot{digest: strings.Repeat("a", 64)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rightCorpus, err := fixtureVariantID(rightVariants[0].VariantID, options, preparedSnapshot{digest: strings.Repeat("a", 64)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	leftCorpusDifferent, err := fixtureVariantID(leftVariants[0].VariantID, options, preparedSnapshot{digest: strings.Repeat("b", 64)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if leftCorpus == rightCorpus || leftCorpus == leftCorpusDifferent {
+		t.Fatalf("variant IDs not separated by profile/corpus digest: %q / %q / %q", leftCorpus, rightCorpus, leftCorpusDifferent)
+	}
+	assertBoundedPathSegments(t, filepath.Join("artifacts", leftCorpus, receiptSegment("case/with/slash"), "run-1"))
+	assertBoundedPathSegments(t, filepath.Join("artifacts", rightCorpus, receiptSegment("case/with/slash"), "run-2"))
+	assertBoundedPathSegments(t, filepath.Join("artifacts", leftCorpusDifferent, receiptSegment("case/with/slash"), "run-3"))
+	if !strings.HasPrefix(leftCorpus, fixtureVariantIDPrefix) || len(leftCorpus) > maxPortablePathSegmentBytes {
+		t.Fatalf("variant identity not bounded/prefixed: %q", leftCorpus)
+	}
+}
+
+func TestFixtureVariantIDStaysBoundedWithLongValidInputsAndMaxOptions(t *testing.T) {
+	huge := strings.Repeat("x", 112)
+	models := []modelFixtureEntry{{ID: huge + "-model"}}
+	prompts := []promptFixtureEntry{{ID: huge + "-prompt"}}
+	profiles := []profileFixtureEntry{{ID: huge + "-profile", RequiredWhenExplicit: []string{"topic"}, PreferredByDefault: []string{"system"}, GoalsToExpand: []string{"discovery"}}}
+	variants, err := selectFixtureMatrix(models, profiles, prompts, "", huge+"-profile", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	options := experimentOptions{
+		selectionLimit:        1000,
+		explorationSlots:      1000,
+		explorationSlotsSet:   true,
+		keywordsPerAttempt:    100,
+		expansionAttempts:     10,
+		rareDocumentFrequency: 1000,
+		seed:                  int64Ptr(999),
+		evidenceThreshold:     10,
+		evidenceThresholdSet:  true,
+	}
+	id, err := fixtureVariantID(variants[0].VariantID, options, preparedSnapshot{digest: strings.Repeat("a", 64)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertBoundedPathSegments(t, filepath.Join("artifacts", id, "case", "run-1"))
+}
+
+func TestDigestTokenRejectsMalformedSHA256(t *testing.T) {
+	if _, err := digestToken("sha256:not-hex"); err == nil {
+		t.Fatal("malformed digest accepted")
+	}
+	if _, err := digestToken(strings.Repeat("a", 63)); err == nil {
+		t.Fatal("short digest accepted")
+	}
+	if got, err := digestToken(strings.Repeat("a", 64)); err != nil || got != strings.Repeat("a", artifactDigestTokenLength) {
+		t.Fatalf("digest token=%q err=%v", got, err)
+	}
+}
+
+func TestFixtureProfileUsesProductionProfileDigest(t *testing.T) {
+	fixture := profileFixtureEntry{ID: "corpus-derived-tech-document-v1", RequiredWhenExplicit: []string{"topic"}, PreferredByDefault: []string{"system"}, GoalsToExpand: []string{"discovery"}}
+	path := filepath.Join(t.TempDir(), "profiles.json")
+	writeTestFile(t, path, `{"profiles":[{"id":"corpus-derived-tech-document-v1","required_when_explicit":["topic"],"preferred_by_default":["system"],"goals_to_expand":["discovery"]}]}`)
+	loaded, err := readProfileFixture(path)
+	if err != nil || len(loaded) != 1 {
+		t.Fatalf("loaded profiles=%#v err=%v", loaded, err)
+	}
+	production, err := loaded[0].retrievalProfile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest, err := production.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := production.ValidatedCopy()
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherDigest, err := other.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if digest != otherDigest || production.ID != fixture.ID || production.CriterionPolicy.RequiredWhenExplicit[0] != "topic" {
+		t.Fatalf("fixture/production profile mismatch: fixture=%+v production=%+v digests=%q/%q", fixture, production, digest, otherDigest)
+	}
+}
+
 func TestFixturePromptRenderingUsesOnlyNarrowPlaceholders(t *testing.T) {
 	prompt := promptFixtureEntry{ID: "p", SystemTemplate: "sys {{raw_query}}", UserTemplate: "user {{criterion_policy}} / {{raw_query}}"}
 	policy := CriterionPolicy{RequiredWhenExplicit: []string{"location"}, PreferredByDefault: []string{"topic"}, GoalsToExpand: []string{"discovery"}}
@@ -156,8 +362,8 @@ func TestFixtureRunWritesEightReceiptsAndSummaryWithoutKey(t *testing.T) {
 	if record.VariantID == "" || record.ProfileID != "profile" || record.PromptID != "prompt" || record.Provider != "fake" || record.Model != "selected" {
 		t.Fatalf("record identity=%#v", record)
 	}
-	if record.EvidenceThreshold != 2 || !strings.Contains(record.VariantID, "threshold=2") || !strings.Contains(record.VariantID, "keywords=24") || !strings.Contains(record.VariantID, "attempts=3") {
-		t.Fatalf("record threshold=%d variant=%q, want resolved parallel expansion config in identity", record.EvidenceThreshold, record.VariantID)
+	if record.EvidenceThreshold != 2 || !strings.HasPrefix(record.VariantID, fixtureVariantIDPrefix) {
+		t.Fatalf("record evidence=%d variant=%q, want hashed bounded variant identity with prefix", record.EvidenceThreshold, record.VariantID)
 	}
 	variantDir := filepath.Join(artifacts, record.VariantID, "case", "run-1")
 	expansionData, err := os.ReadFile(filepath.Join(variantDir, "expansion.output.json"))
@@ -508,4 +714,20 @@ func writeFixture(t *testing.T, dir, name, contents string) string {
 	path := filepath.Join(dir, name)
 	writeTestFile(t, path, contents)
 	return path
+}
+
+func assertBoundedPathSegments(t *testing.T, value string) {
+	t.Helper()
+	for _, segment := range strings.Split(filepath.Clean(value), string(filepath.Separator)) {
+		if segment == "" || segment == "." || segment == ".." {
+			continue
+		}
+		limit := len([]byte(segment))
+		if limit > maxPOSIXPathSegmentBytes {
+			t.Fatalf("path segment too long for POSIX portability: segment=%q bytes=%d", segment, limit)
+		}
+		if limit > maxPortablePathSegmentBytes {
+			t.Fatalf("path segment too long for portable production use: segment=%q bytes=%d", segment, limit)
+		}
+	}
 }

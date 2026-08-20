@@ -13,6 +13,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/rayer/llm-wiki-bff/internal/queryquality"
 )
 
 type modelFixtureEntry struct {
@@ -32,6 +34,10 @@ type profileFixtureEntry struct {
 	GoalsToExpand        []string `json:"goals_to_expand"`
 }
 
+func (p profileFixtureEntry) retrievalProfile() (queryquality.RetrievalProfile, error) {
+	return queryquality.RetrievalProfile{ID: p.ID, CriterionPolicy: queryquality.CriterionPolicy{RequiredWhenExplicit: p.RequiredWhenExplicit, PreferredByDefault: p.PreferredByDefault, GoalsToExpand: p.GoalsToExpand}}.ValidatedCopy()
+}
+
 type promptFixtureEntry struct {
 	ID             string `json:"id"`
 	SystemTemplate string `json:"system_template"`
@@ -39,10 +45,11 @@ type promptFixtureEntry struct {
 }
 
 type fixtureVariant struct {
-	Profile   profileFixtureEntry
-	Prompt    promptFixtureEntry
-	Model     modelFixtureEntry
-	VariantID string
+	Profile       profileFixtureEntry
+	ProfileDigest string
+	Prompt        promptFixtureEntry
+	Model         modelFixtureEntry
+	VariantID     string
 }
 
 type renderedFixturePrompt struct {
@@ -208,6 +215,13 @@ func readProfileFixture(path string) ([]profileFixtureEntry, error) {
 		if _, ok := seen[profile.ID]; ok {
 			return nil, fmt.Errorf("duplicate profile id %q", profile.ID)
 		}
+		validated, err := profile.retrievalProfile()
+		if err != nil {
+			return nil, fmt.Errorf("profile %d: %w", i+1, err)
+		}
+		profile.RequiredWhenExplicit = validated.CriterionPolicy.RequiredWhenExplicit
+		profile.PreferredByDefault = validated.CriterionPolicy.PreferredByDefault
+		profile.GoalsToExpand = validated.CriterionPolicy.GoalsToExpand
 		seen[profile.ID] = struct{}{}
 		profiles = append(profiles, profile)
 	}
@@ -476,11 +490,23 @@ func selectFixtureMatrix(models []modelFixtureEntry, profiles []profileFixtureEn
 	for _, profile := range selectedProfiles {
 		for _, prompt := range selectedPrompts {
 			for _, model := range selectedModels {
-				variants = append(variants, fixtureVariant{Profile: profile, Prompt: prompt, Model: model, VariantID: "p=" + profile.ID + "__pr=" + prompt.ID + "__m=" + model.ID})
+				validated, err := profile.retrievalProfile()
+				if err != nil {
+					return nil, fmt.Errorf("profile %q: %w", profile.ID, err)
+				}
+				digest, err := validated.Digest()
+				if err != nil {
+					return nil, fmt.Errorf("profile %q digest: %w", profile.ID, err)
+				}
+				variants = append(variants, fixtureVariant{Profile: profile, ProfileDigest: digest, Prompt: prompt, Model: model, VariantID: makeFixtureVariantBase(profile.ID, digest, prompt.ID, model.ID)})
 			}
 		}
 	}
 	return variants, nil
+}
+
+func makeFixtureVariantBase(profileID, profileDigest, promptID, modelID string) string {
+	return fmt.Sprintf("profile=%q|prompt=%q|model=%q|digest=%q", profileID, promptID, modelID, profileDigest)
 }
 
 func selectFixtureIDs[T any](values []T, selector string, id func(T) string) ([]T, error) {

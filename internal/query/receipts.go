@@ -35,6 +35,8 @@ type Receipt struct {
 	KeywordConsensusMinimum         int                       `json:"keyword_consensus_minimum"`
 	KeywordSupport                  []KeywordSupportReceipt   `json:"keyword_support,omitempty"`
 	ExpansionAttemptOutcomes        []ExpansionAttemptReceipt `json:"expansion_attempt_outcomes,omitempty"`
+	RetrievalProfileID              string                    `json:"retrieval_profile_id,omitempty"`
+	RetrievalProfileDigest          string                    `json:"retrieval_profile_digest,omitempty"`
 	runStartedMono                  time.Time
 }
 
@@ -63,6 +65,13 @@ func (r *ReceiptRecorder) SetRetrievalConfig(selectionLimit, explorationSlots, e
 	r.receipt.SelectionLimit = selectionLimit
 	r.receipt.ExplorationSlots = explorationSlots
 	r.receipt.EvidenceThreshold = evidenceThreshold
+}
+
+func (r *ReceiptRecorder) SetRetrievalProfile(id, digest string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.receipt.RetrievalProfileID = id
+	r.receipt.RetrievalProfileDigest = digest
 }
 
 func (r *ReceiptRecorder) SetExpansionConfig(attempts, successful, providerFailed, keywordsPerAttempt, evidenceThreshold, rareDocumentFrequency, keywordConsensusMinimum int, support []KeywordSupportReceipt) {

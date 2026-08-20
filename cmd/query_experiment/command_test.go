@@ -24,7 +24,7 @@ import (
 
 func TestDeterministicFallbackIsGenericAndOptionalEvidenceDoesNotGate(t *testing.T) {
 	for _, raw := range []string{"台北適合工作的咖啡廳", "小孩想玩水，有什麼室外戲水景點嗎", "unrelated astronomy query"} {
-		plan, err := newDeterministicExpander().Expand(context.Background(), queryquality.ExpansionRequest{Query: raw, CriterionPolicy: defaultCriterionPolicy})
+		plan, err := newDeterministicExpander().Expand(context.Background(), queryquality.ExpansionRequest{Query: raw, CriterionPolicy: defaultCriterionPolicy()})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -107,13 +107,13 @@ func TestSemanticEvaluatorIsExplicitAndStillNeverScores(t *testing.T) {
 func TestStructuredExpansionUsesOneCallAndSimpleFallback(t *testing.T) {
 	provider := &recordingChatProvider{responses: []string{`{"raw_query":"coffee","required":[],"excluded":[],"preferred":[{"kind":"topic","value":"coffee","terms":["coffee"],"proof":"lexical"}],"goals":[],"supporting_dimensions":[],"acceptable_alternatives":[],"ambiguity":[],"fallback":false}`}}
 	expander := newQueryPlanExpander(provider, newDeterministicExpander()).(queryPlanAdapter)
-	plan, info, err := expander.ExpandWithTrace(context.Background(), queryquality.ExpansionRequest{Query: "coffee", CriterionPolicy: defaultCriterionPolicy})
+	plan, info, err := expander.ExpandWithTrace(context.Background(), queryquality.ExpansionRequest{Query: "coffee", CriterionPolicy: defaultCriterionPolicy()})
 	if err != nil || plan.Fallback || info.source != "structured-llm" || len(provider.prompts) != 1 {
 		t.Fatalf("plan=%#v info=%#v calls=%d err=%v", plan, info, len(provider.prompts), err)
 	}
 	for _, response := range []string{`{"unknown":1}`, `{"raw_query":"coffee","required":[],"excluded":[],"preferred":[{"kind":"topic","value":"coffee","terms":["coffee"],"proof":"lexical"}],"goals":[],"supporting_dimensions":[],"acceptable_alternatives":[],"ambiguity":[],"fallback":false} {}`} {
 		provider := fixedChatProvider{response: response}
-		plan, info, err := newQueryPlanExpander(provider, newDeterministicExpander()).(queryPlanAdapter).ExpandWithTrace(context.Background(), queryquality.ExpansionRequest{Query: "coffee", CriterionPolicy: defaultCriterionPolicy})
+		plan, info, err := newQueryPlanExpander(provider, newDeterministicExpander()).(queryPlanAdapter).ExpandWithTrace(context.Background(), queryquality.ExpansionRequest{Query: "coffee", CriterionPolicy: defaultCriterionPolicy()})
 		if err != nil || !plan.Fallback || info.source != "deterministic-fallback" || info.fallbackReason != "invalid_plan" {
 			t.Fatalf("response=%q plan=%#v info=%#v err=%v", response, plan, info, err)
 		}
