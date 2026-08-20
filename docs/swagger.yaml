@@ -484,19 +484,31 @@ definitions:
     type: object
   syssettings.Settings:
     properties:
-      announcement_draft_markdown:
-        type: string
-      announcement_published_markdown:
+      announcement_markdown:
         type: string
       registration_enabled:
         type: boolean
     type: object
   syssettings.patchSettingsRequest:
     properties:
-      announcement_draft_markdown:
-        type: string
       registration_enabled:
         type: boolean
+    type: object
+  syssettings.publishAnnouncementRequest:
+    properties:
+      announcement_markdown:
+        type: string
+    required:
+    - announcement_markdown
+    type: object
+  v1.adminRenameProjectResponse:
+    properties:
+      id:
+        type: string
+      name:
+        type: string
+      user_id:
+        type: string
     type: object
   v1.pipelineStatusResponse:
     properties:
@@ -814,6 +826,15 @@ paths:
       - admin
   /api/v1/admin/settings/announcement/publish:
     post:
+      consumes:
+      - application/json
+      parameters:
+      - description: Announcement Markdown
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/syssettings.publishAnnouncementRequest'
       produces:
       - application/json
       responses:
@@ -821,6 +842,12 @@ paths:
           description: OK
           schema:
             $ref: '#/definitions/syssettings.Settings'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
         "401":
           description: Unauthorized
           schema:
