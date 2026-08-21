@@ -22,10 +22,11 @@ type Executor struct {
 	resolver            *queryconfig.Resolver
 	services            map[string]query.Executor
 	compositionServices map[string]query.Executor
+	readback            query.RuntimeConfigReadback
 }
 
 func NewExecutor(config queryconfig.Config, conceptCache *cache.Cache, expansionProvider queryquality.ChatProvider, legacy query.Executor, synthesizer query.Synthesizer) (*Executor, error) {
-	return newExecutor(config, conceptCache, expansionProvider, legacy, synthesizer, queryquality.NewProductionExecutorWithQueryServiceConfig)
+	return newExecutor(config, conceptCache, expansionProvider, legacy, synthesizer, queryquality.NewStrictProductionExecutorWithQueryServiceConfig)
 }
 
 type productionExecutorFactory func(*cache.Cache, queryquality.ChatProvider, query.Executor, query.Synthesizer, queryquality.RetrievalProfile, string, queryquality.Options, query.RuntimeConfigIdentity) (query.Executor, error)
@@ -58,7 +59,26 @@ func newExecutor(config queryconfig.Config, conceptCache *cache.Cache, expansion
 		}
 		services[effective.EffectiveConfigDigest] = service
 	}
-	return &Executor{resolver: resolver, services: services, compositionServices: compositionServices}, nil
+	defaultConfig := effectiveConfigs[0]
+	return &Executor{
+		resolver: resolver, services: services, compositionServices: compositionServices,
+		readback: query.RuntimeConfigReadback{
+			SchemaVersion: defaultConfig.SchemaVersion, ConfigRevision: defaultConfig.ConfigRevision, ConfigDigest: defaultConfig.ConfigDigest,
+			QueryServiceImplementation: defaultConfig.QueryServiceImplementation,
+			DefaultProfileID:           defaultConfig.Profile.ID, DefaultProfileDigest: defaultConfig.ProfileDigest,
+			DefaultPromptID: defaultConfig.PromptID, DefaultPromptDigest: defaultConfig.PromptDigest,
+			ExpansionProvider: defaultConfig.ExpansionProvider, ExpansionModel: defaultConfig.ExpansionModel,
+			ExpansionReasoning: defaultConfig.ExpansionReasoning, ExpansionTemperature: defaultConfig.ExpansionTemperature,
+			SynthesisProvider: defaultConfig.SynthesisProvider, SynthesisModel: defaultConfig.SynthesisModel,
+			SynthesisReasoning: defaultConfig.SynthesisReasoning, SynthesisTemperature: defaultConfig.SynthesisTemperature,
+			Options: query.RuntimeQueryOptions{
+				SelectionLimit: defaultConfig.Options.SelectionLimit, ExplorationSlots: defaultConfig.Options.ExplorationSlots,
+				EvidenceThreshold: defaultConfig.Options.EvidenceThreshold, KeywordsPerAttempt: defaultConfig.Options.KeywordsPerAttempt,
+				ExpansionAttempts: defaultConfig.Options.ExpansionAttempts, RareDocumentFrequency: defaultConfig.Options.RareDocumentFrequency,
+			},
+			BindingCount: len(config.ProjectBindings), DistinctServiceCompositionCount: len(compositionServices),
+		},
+	}, nil
 }
 
 func validateIdentities(effective queryconfig.EffectiveConfig, expansionProvider queryquality.ChatProvider, synthesizer query.Synthesizer) error {
@@ -95,6 +115,13 @@ func (e *Executor) ServiceCount() int {
 		return 0
 	}
 	return len(e.services)
+}
+
+func (e *Executor) Readback() query.RuntimeConfigReadback {
+	if e == nil {
+		return query.RuntimeConfigReadback{}
+	}
+	return e.readback
 }
 
 func (e *Executor) Execute(ctx context.Context, reader cache.Reader, request query.Request) (query.Result, error) {

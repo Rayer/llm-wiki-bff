@@ -81,6 +81,44 @@ type RuntimeConfigIdentity struct {
 	SynthesisProvider          string  `json:"synthesis_provider"`
 }
 
+// RuntimeConfigReadback is the sanitized global identity of a sealed runtime.
+// It deliberately has no project, generation, corpus, request, or prompt-body fields.
+type RuntimeConfigReadback struct {
+	SchemaVersion                   int                 `json:"schema_version"`
+	ConfigRevision                  string              `json:"config_revision"`
+	ConfigDigest                    string              `json:"config_digest"`
+	QueryServiceImplementation      string              `json:"query_service_implementation"`
+	DefaultProfileID                string              `json:"default_profile_id"`
+	DefaultProfileDigest            string              `json:"default_profile_digest"`
+	DefaultPromptID                 string              `json:"default_prompt_id"`
+	DefaultPromptDigest             string              `json:"default_prompt_digest"`
+	ExpansionProvider               string              `json:"expansion_provider"`
+	ExpansionModel                  string              `json:"expansion_model"`
+	ExpansionReasoning              string              `json:"expansion_reasoning"`
+	ExpansionTemperature            float64             `json:"expansion_temperature"`
+	SynthesisProvider               string              `json:"synthesis_provider"`
+	SynthesisModel                  string              `json:"synthesis_model"`
+	SynthesisReasoning              string              `json:"synthesis_reasoning"`
+	SynthesisTemperature            float64             `json:"synthesis_temperature"`
+	Options                         RuntimeQueryOptions `json:"options"`
+	BindingCount                    int                 `json:"binding_count"`
+	DistinctServiceCompositionCount int                 `json:"distinct_service_composition_count"`
+}
+
+type RuntimeQueryOptions struct {
+	SelectionLimit        int `json:"selection_limit"`
+	ExplorationSlots      int `json:"exploration_slots"`
+	EvidenceThreshold     int `json:"evidence_threshold"`
+	KeywordsPerAttempt    int `json:"keywords_per_attempt"`
+	ExpansionAttempts     int `json:"expansion_attempts"`
+	RareDocumentFrequency int `json:"rare_document_frequency"`
+}
+
+// RuntimeReadbackProvider is implemented only by the configured immutable runtime.
+type RuntimeReadbackProvider interface {
+	Readback() RuntimeConfigReadback
+}
+
 func CloneRuntimeConfigIdentity(identity *RuntimeConfigIdentity) *RuntimeConfigIdentity {
 	if identity == nil {
 		return nil

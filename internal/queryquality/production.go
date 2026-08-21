@@ -72,6 +72,7 @@ type ProductionExecutor struct {
 	legacy                 query.Executor
 	synthesizer            query.Synthesizer
 	identity               query.RuntimeConfigIdentity
+	allowLegacyFallback    bool
 }
 
 func NewProductionExecutor(conceptCache *cache.Cache, provider ChatProvider, legacy query.Executor, synthesizer query.Synthesizer, options Options) (query.Executor, error) {
@@ -82,7 +83,17 @@ func NewProductionExecutor(conceptCache *cache.Cache, provider ChatProvider, leg
 // constructor for a sealed profile/prompt/options composition. Retrieval is
 // always built through NewQueryRetrievalService, the shared composition point.
 func NewProductionExecutorWithQueryServiceConfig(conceptCache *cache.Cache, provider ChatProvider, legacy query.Executor, synthesizer query.Synthesizer, profile RetrievalProfile, promptID string, options Options, identity query.RuntimeConfigIdentity) (query.Executor, error) {
-	if legacy == nil {
+	return newProductionExecutorWithQueryServiceConfig(conceptCache, provider, legacy, synthesizer, profile, promptID, options, identity, true)
+}
+
+// NewStrictProductionExecutorWithQueryServiceConfig builds configured runtime
+// composition without the legacy Lifestyle fallback.
+func NewStrictProductionExecutorWithQueryServiceConfig(conceptCache *cache.Cache, provider ChatProvider, legacy query.Executor, synthesizer query.Synthesizer, profile RetrievalProfile, promptID string, options Options, identity query.RuntimeConfigIdentity) (query.Executor, error) {
+	return newProductionExecutorWithQueryServiceConfig(conceptCache, provider, legacy, synthesizer, profile, promptID, options, identity, false)
+}
+
+func newProductionExecutorWithQueryServiceConfig(conceptCache *cache.Cache, provider ChatProvider, legacy query.Executor, synthesizer query.Synthesizer, profile RetrievalProfile, promptID string, options Options, identity query.RuntimeConfigIdentity, allowLegacyFallback bool) (query.Executor, error) {
+	if allowLegacyFallback && legacy == nil {
 		return nil, errors.New("legacy query executor is nil")
 	}
 	queryRetrievalPipeline, err := NewQueryRetrievalService(QueryRetrievalServiceConfig{
@@ -95,7 +106,7 @@ func NewProductionExecutorWithQueryServiceConfig(conceptCache *cache.Cache, prov
 	if identity.ProfileID != "" && (identity.ProfileID != queryRetrievalPipeline.profile.ID || identity.ProfileDigest != queryRetrievalPipeline.profileDigest || identity.PromptID != queryRetrievalPipeline.prompt.ID || identity.PromptDigest != queryRetrievalPipeline.prompt.TemplateDigest) {
 		return nil, errors.New("runtime query service identity mismatch")
 	}
-	return &ProductionExecutor{queryRetrievalPipeline: queryRetrievalPipeline, legacy: legacy, synthesizer: synthesizer, identity: identity}, nil
+	return &ProductionExecutor{queryRetrievalPipeline: queryRetrievalPipeline, legacy: legacy, synthesizer: synthesizer, identity: identity, allowLegacyFallback: allowLegacyFallback}, nil
 }
 
 func (e *ProductionExecutor) Execute(ctx context.Context, reader cache.Reader, request query.Request) (query.Result, error) {
@@ -111,7 +122,7 @@ func (e *ProductionExecutor) Execute(ctx context.Context, reader cache.Reader, r
 	result, err := e.queryRetrievalPipeline.Execute(receiptCtx, reader, request)
 	if err != nil {
 		var expansionErr *ExpansionError
-		if errors.As(err, &expansionErr) && ctx.Err() == nil {
+		if e.allowLegacyFallback && errors.As(err, &expansionErr) && ctx.Err() == nil {
 			result, err = e.legacy.Execute(receiptCtx, reader, request)
 			if err == nil && identity.ProfileID != "" {
 				result.RuntimeConfigIdentity = query.CloneRuntimeConfigIdentity(&identity)

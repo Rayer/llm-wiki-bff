@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 
@@ -34,6 +35,8 @@ const (
 	MaxQuerySelectionEvidenceThreshold                                = 100
 	MaxQueryMatchingRareKeywordDocumentFrequency                      = 1000
 )
+
+var ErrMixedQueryConfigAuthority = errors.New("query stage config path cannot be combined with explicit legacy query settings")
 
 var defaultAllowedOrigins = []string{
 	"https://wiki.rayer.idv.tw",
@@ -76,6 +79,9 @@ type Config struct {
 	// AuthServiceURL is the public URL of the dedicated auth service (LWC-258).
 	// Env: AUTH_SERVICE_URL. Default: https://auth.dev.rayer.idv.tw
 	AuthServiceURL string
+
+	// QueryStageConfigPath selects the immutable external query composition.
+	QueryStageConfigPath string
 
 	// Query retrieval contract. Env: QUERY_SELECTION_LIMIT,
 	// QUERY_SELECTION_EXPLORATION_SLOTS, QUERY_SELECTION_EVIDENCE_THRESHOLD,
@@ -129,6 +135,7 @@ func Load(path string) (Config, error) {
 	v.BindEnv("pipeline_demo_user_ids", "PIPELINE_DEMO_USER_IDS")
 	v.BindEnv("registration_enabled", "REGISTRATION_ENABLED")
 	v.BindEnv("auth_service_url", "AUTH_SERVICE_URL")
+	v.BindEnv("query_stage_config_path", "QUERY_STAGE_CONFIG_PATH")
 	v.BindEnv("query_expansion_model", "QUERY_EXPANSION_MODEL")
 	v.BindEnv("query_expansion_reasoning", "QUERY_EXPANSION_REASONING")
 	v.BindEnv("answer_synthesis_model", "ANSWER_SYNTHESIS_MODEL")
@@ -148,6 +155,10 @@ func Load(path string) (Config, error) {
 	}
 	if err := validateKnownQuerySettings(v); err != nil {
 		return Config{}, err
+	}
+	queryStageConfigPath := strings.TrimSpace(v.GetString("query_stage_config_path"))
+	if queryStageConfigPath != "" && explicitLegacyQuerySetting(v) {
+		return Config{}, ErrMixedQueryConfigAuthority
 	}
 
 	dailyLimit := v.GetInt("pipeline_daily_limit")
@@ -256,6 +267,7 @@ func Load(path string) (Config, error) {
 		PipelineDemoUserIDs:              splitCommaList(v.GetString("pipeline_demo_user_ids")),
 		RegistrationEnabled:              registrationEnabled,
 		AuthServiceURL:                   authServiceURL,
+		QueryStageConfigPath:             queryStageConfigPath,
 		QuerySelectionLimit:              selectionLimit,
 		QuerySelectionExplorationSlots:   explorationSlots,
 		QuerySelectionEvidenceThreshold:  evidenceThreshold,
@@ -264,6 +276,25 @@ func Load(path string) (Config, error) {
 		QueryMatchingRareKeywordMaxDocumentFrequency: rareKeywordMaxDocumentFrequency,
 	}
 	return cfg, nil
+}
+
+func explicitLegacyQuerySetting(v *viper.Viper) bool {
+	settings := map[string]string{
+		"query_expansion_model": "QUERY_EXPANSION_MODEL", "query_expansion_reasoning": "QUERY_EXPANSION_REASONING",
+		"answer_synthesis_model": "ANSWER_SYNTHESIS_MODEL", "answer_synthesis_reasoning": "ANSWER_SYNTHESIS_REASONING",
+		"query_selection_limit": "QUERY_SELECTION_LIMIT", "query_selection_exploration_slots": "QUERY_SELECTION_EXPLORATION_SLOTS",
+		"query_selection_evidence_threshold": "QUERY_SELECTION_EVIDENCE_THRESHOLD", "query_expansion_keywords_per_attempt": "QUERY_EXPANSION_KEYWORDS_PER_ATTEMPT",
+		"query_expansion_attempts": "QUERY_EXPANSION_ATTEMPTS", "query_matching_rare_keyword_max_document_frequency": "QUERY_MATCHING_RARE_KEYWORD_MAX_DOCUMENT_FREQUENCY",
+	}
+	for key, env := range settings {
+		if v.InConfig(key) {
+			return true
+		}
+		if value, ok := os.LookupEnv(env); ok && strings.TrimSpace(value) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func validateKnownQuerySettings(v *viper.Viper) error {

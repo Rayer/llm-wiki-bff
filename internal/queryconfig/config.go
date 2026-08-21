@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"regexp"
 	"sort"
 	"strings"
@@ -38,6 +39,8 @@ const (
 var safeID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 
 var ErrSchemaV1Unsupported = errors.New("query config schema v1 is unsupported")
+
+const MaxFileBytes int64 = 1 << 20
 
 type Config struct {
 	SchemaVersion              int              `json:"schema_version"`
@@ -148,6 +151,45 @@ func DecodeStrict(data []byte) (Config, error) {
 		return Config{}, err
 	}
 	return decodeConfig(object)
+}
+
+// LoadFile reads one bounded, regular, non-symlink sealed artifact. The path
+// is intentionally absent from errors so startup logs cannot disclose mounts.
+func LoadFile(path string) (Config, error) {
+	if strings.TrimSpace(path) == "" {
+		return Config{}, errors.New("query config file path is empty")
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return Config{}, errors.New("query config file is unavailable")
+	}
+	if !info.Mode().IsRegular() {
+		return Config{}, errors.New("query config file must be a regular file")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return Config{}, errors.New("query config file is unavailable")
+	}
+	defer file.Close()
+	openedInfo, err := file.Stat()
+	if err != nil || !openedInfo.Mode().IsRegular() {
+		return Config{}, errors.New("query config file must be a regular file")
+	}
+	data, err := io.ReadAll(io.LimitReader(file, MaxFileBytes+1))
+	if err != nil {
+		return Config{}, errors.New("query config file cannot be read")
+	}
+	if int64(len(data)) > MaxFileBytes {
+		return Config{}, errors.New("query config file is too large")
+	}
+	config, err := DecodeStrict(data)
+	if err != nil {
+		return Config{}, err
+	}
+	if err := ValidateSealed(config); err != nil {
+		return Config{}, err
+	}
+	return Normalize(config)
 }
 
 func ValidateSealed(config Config) error {

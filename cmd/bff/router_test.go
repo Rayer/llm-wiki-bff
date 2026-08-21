@@ -95,16 +95,25 @@ func TestProductionRouterKeepsAuthCompatibilityLane(t *testing.T) {
 		t.Fatalf("legacy compatibility logout cookie attributes: count=%d name=%q domain=%q path=%q secure=%v httpOnly=%v sameSite=%v maxAge=%d", len(cookies), cookies[0].Name, cookies[0].Domain, cookies[0].Path, cookies[0].Secure, cookies[0].HttpOnly, cookies[0].SameSite, cookies[0].MaxAge)
 	}
 
-	for _, path := range []string{"/api/v1/public/config", "/api/v1/public/version"} {
+	for _, path := range []string{"/api/v1/public/config", "/api/v1/public/version", "/api/v1/query/config"} {
 		if !hasRoute(router, http.MethodGet, path) {
 			t.Fatalf("BFF production router is missing GET %s", path)
 		}
+	}
+	if got := serveGet(router, "/api/v1/query/config").Code; got != http.StatusServiceUnavailable {
+		t.Fatalf("legacy public query config status=%d, want %d", got, http.StatusServiceUnavailable)
 	}
 }
 
 func servePost(router *gin.Engine, path string) *httptest.ResponseRecorder {
 	recorder := httptest.NewRecorder()
 	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, path, nil))
+	return recorder
+}
+
+func serveGet(router *gin.Engine, path string) *httptest.ResponseRecorder {
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, path, nil))
 	return recorder
 }
 

@@ -44,6 +44,16 @@ type countingProvider struct {
 	system, user string
 }
 
+type failingProvider struct{}
+
+func (failingProvider) Chat(context.Context, string, string) (string, error) {
+	return "", errors.New("provider failed")
+}
+
+func (failingProvider) ModelIdentity() (llm.ModelIdentity, bool) {
+	return llm.ModelIdentity{Provider: queryconfig.ProviderDeepSeek, Model: "deepseek-v4-flash", Reasoning: "none", Temperature: 0}, true
+}
+
 func (p *countingProvider) Chat(_ context.Context, system, user string) (string, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -120,6 +130,21 @@ func TestRuntimeMismatchAndUnknownReaderHaveZeroPipelineEffects(t *testing.T) {
 	}
 	if _, err := runtime.Execute(context.Background(), &unknownReader{}, query.Request{Query: "private-query"}); !errors.Is(err, queryruntime.ErrIdentityProviderRequired) {
 		t.Fatalf("unknown reader err=%v", err)
+	}
+}
+
+func TestConfiguredRuntimeExpansionFailureDoesNotCallLegacyExecutor(t *testing.T) {
+	legacy := &countingLegacy{}
+	runtime, err := queryruntime.NewExecutor(runtimeConfig(t), cache.New(), failingProvider{}, legacy, runtimeSynthesizer())
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := &runtimeReader{identity: storage.QueryGenerationIdentity{ProjectID: "project-a", GenerationID: "generation-7", ConceptsDigest: "sha256:" + strings.Repeat("a", 64)}}
+	if _, err := runtime.Execute(context.Background(), reader, query.Request{Query: "deploy docs", Mode: "wiki"}); err != nil {
+		t.Fatal(err)
+	}
+	if legacy.calls != 0 {
+		t.Fatalf("legacy calls=%d, want zero", legacy.calls)
 	}
 }
 

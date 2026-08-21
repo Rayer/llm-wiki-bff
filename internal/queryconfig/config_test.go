@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -109,6 +111,51 @@ func TestSealDecodeStrictAndValidateSealed(t *testing.T) {
 	}
 	if !bytes.Equal(data, mustJSON(decoded)) {
 		t.Fatalf("sealed JSON is not stable:\n%s\n%s", data, mustJSON(decoded))
+	}
+}
+
+func TestLoadFileRejectsUnsafeFilesAndBadDocuments(t *testing.T) {
+	dir := t.TempDir()
+	valid, err := json.Marshal(mustSeal(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	validPath := filepath.Join(dir, "valid.json")
+	if err := os.WriteFile(validPath, valid, 0o444); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := queryconfig.LoadFile(validPath)
+	if err != nil || loaded.ConfigDigest == "" {
+		t.Fatalf("valid load=%+v err=%v", loaded, err)
+	}
+	for _, test := range []struct {
+		name string
+		path string
+		data []byte
+	}{
+		{"missing", filepath.Join(dir, "missing.json"), nil},
+		{"directory", dir, nil},
+		{"oversized", filepath.Join(dir, "large.json"), bytes.Repeat([]byte("x"), int(queryconfig.MaxFileBytes)+1)},
+		{"duplicate", filepath.Join(dir, "duplicate.json"), append(valid[:len(valid)-1], []byte(`,"schema_version":2}`)...)},
+		{"trailing", filepath.Join(dir, "trailing.json"), append(valid, []byte(` {}`)...)},
+	} {
+		if test.data != nil {
+			if err := os.WriteFile(test.path, test.data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := queryconfig.LoadFile(test.path); err == nil {
+				t.Fatal("accepted invalid file")
+			}
+		})
+	}
+	symlink := filepath.Join(dir, "link.json")
+	if err := os.Symlink(validPath, symlink); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := queryconfig.LoadFile(symlink); err == nil {
+		t.Fatal("accepted symlink")
 	}
 }
 

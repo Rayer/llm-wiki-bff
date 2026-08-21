@@ -3,8 +3,20 @@ package handler
 import (
 	"github.com/rayer/llm-wiki-bff/internal/gcs"
 	"github.com/rayer/llm-wiki-bff/internal/llm"
+	"github.com/rayer/llm-wiki-bff/internal/query"
 	"github.com/rayer/llm-wiki-bff/internal/search"
 )
+
+type QueryConfigResponse struct {
+	QueryConfig query.RuntimeConfigReadback `json:"query_config"`
+	Build       QueryConfigBuildInfo        `json:"build"`
+}
+
+type QueryConfigBuildInfo struct {
+	Commit   string `json:"commit"`
+	Service  string `json:"service"`
+	Revision string `json:"revision"`
+}
 
 // ErrorResponse is returned on errors.
 type ErrorResponse struct {

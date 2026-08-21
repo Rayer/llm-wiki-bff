@@ -26,6 +26,7 @@ import (
 	"github.com/rayer/llm-wiki-bff/internal/middleware"
 	"github.com/rayer/llm-wiki-bff/internal/query"
 	"github.com/rayer/llm-wiki-bff/internal/queryquality"
+	"github.com/rayer/llm-wiki-bff/internal/queryruntime"
 	"github.com/rayer/llm-wiki-bff/internal/syssettings"
 	"gopkg.in/yaml.v3"
 )
@@ -37,6 +38,24 @@ func TestDefaultProductionQueryCompositionUsesProductionExecutor(t *testing.T) {
 	}
 	if _, ok := executor.(*queryquality.ProductionExecutor); !ok {
 		t.Fatalf("production executor = %T, want queryquality.ProductionExecutor", executor)
+	}
+}
+
+func TestConfiguredProductionQueryCompositionLoadsImmutableRuntime(t *testing.T) {
+	executor, err := newProductionQueryExecutor(config.Config{
+		QueryStageConfigPath: "../../configs/query/dev/query-dev-2026-08-21.1.json",
+		DeepSeekAPIKey:       "test-key",
+	}, conceptcache.New())
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime, ok := executor.(*queryruntime.Executor)
+	if !ok {
+		t.Fatalf("configured executor=%T, want *queryruntime.Executor", executor)
+	}
+	readback := runtime.Readback()
+	if readback.SchemaVersion != 2 || readback.ConfigRevision != "query-dev-2026-08-21.1" || readback.ConfigDigest != "sha256:46511d0cacf5a33b7c81cac771fbdcc9b7f5a14aaf4f1a5fcb39c0b28e550694" || readback.DefaultProfileID != "platform-owned-lifestyle-v1" || readback.DefaultPromptID != "minimal-v1" || readback.ExpansionModel != "deepseek-v4-flash" || readback.SynthesisModel != "deepseek-v4-pro" || readback.Options.SelectionLimit != 10 || readback.BindingCount != 1 || readback.DistinctServiceCompositionCount != 2 {
+		t.Fatalf("readback=%+v", readback)
 	}
 }
 
