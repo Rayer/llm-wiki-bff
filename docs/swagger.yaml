@@ -655,9 +655,7 @@ paths:
     patch:
       consumes:
       - application/json
-      description: Updates the name field on a Firestore project document. The JSON
-        body is limited to 1024 bytes; name is trimmed and must be 1-64 Unicode code
-        points.
+      description: Updates the name field on a Firestore project document. The JSON body is limited to 1024 bytes; name is trimmed and must be 1-64 Unicode code points.
       parameters:
       - description: Project doc ID ({userID}_{projectID})
         in: path
@@ -1628,8 +1626,7 @@ paths:
       - status
 securityDefinitions:
   BearerAuth:
-    description: 'JWT Bearer token issued by the standalone Auth service. Format:
-      \"Bearer <token>\".'
+    description: 'JWT Bearer token issued by the standalone Auth service. Format: \"Bearer <token>\".'
     in: header
     name: Authorization
     type: apiKey
