@@ -481,6 +481,7 @@ func TestMainFastForwardEligibilityFollowsReadiness(t *testing.T) {
 	checkout := strings.Index(job, "- name: Checkout exact event SHA")
 	fresh := strings.Index(job, "- name: Verify exact candidate and main fast-forward eligibility")
 	success := strings.Index(job, "- name: Publish successful main fast-forward eligibility status")
+	cleanup := strings.Index(job, "- name: Publish failure cleanup for main fast-forward eligibility")
 	steps := strings.Index(job, "    steps:")
 	if steps < 0 {
 		t.Fatal("main fast-forward job is missing steps")
@@ -516,7 +517,8 @@ func TestMainFastForwardEligibilityFollowsReadiness(t *testing.T) {
 			t.Fatal("executable gate scripts must consume env-bound workflow expressions")
 		}
 	}
-	if strings.Contains(freshBlock, "\n        if:") || strings.Contains(job[success:], "\n        if:") {
+	successBlock := job[success:cleanup]
+	if strings.Contains(freshBlock, "\n        if:") || strings.Contains(successBlock, "\n        if:") {
 		t.Fatal("verify and final success steps must use default success semantics")
 	}
 }
@@ -1874,12 +1876,14 @@ func TestMainFastForwardEligibilityPublishesExactCommitStatus(t *testing.T) {
 	pending := strings.Index(job, "- name: Publish pending main fast-forward eligibility status")
 	fresh := strings.Index(job, "- name: Verify exact candidate and main fast-forward eligibility")
 	success := strings.Index(job, "- name: Publish successful main fast-forward eligibility status")
-	if pending < 0 || fresh < 0 || success < 0 || !(pending < fresh && fresh < success) {
-		t.Fatal("pending status must precede fresh eligibility gates and final status publication")
+	cleanup := strings.Index(job, "- name: Publish failure cleanup for main fast-forward eligibility")
+	if pending < 0 || fresh < 0 || success < 0 || cleanup < 0 || !(pending < fresh && fresh < success && success < cleanup) {
+		t.Fatal("pending status must precede fresh eligibility gates, final status publication, and failure cleanup")
 	}
 	pendingRun := workflowRunBlock(contents, "Publish pending main fast-forward eligibility status")
 	freshRun := workflowRunBlock(contents, "Verify exact candidate and main fast-forward eligibility")
 	final := workflowRunBlock(contents, "Publish successful main fast-forward eligibility status")
+	cleanupRun := workflowRunBlock(contents, "Publish failure cleanup for main fast-forward eligibility")
 	for _, want := range []string{
 		"EVENT_SHA: ${{ github.sha }}",
 		"GH_TOKEN: ${{ github.token }}",
@@ -1903,8 +1907,35 @@ func TestMainFastForwardEligibilityPublishesExactCommitStatus(t *testing.T) {
 			t.Errorf("final status action is missing %q", want)
 		}
 	}
-	if strings.Contains(job[success:], "if:") {
+	successSection := job[success:cleanup]
+	if strings.Contains(successSection, "if:") {
 		t.Fatal("success publication must use default success semantics")
+	}
+	cleanupSection := job[cleanup:]
+	if next := strings.Index(cleanupSection, "\n      - "); next >= 0 {
+		cleanupSection = cleanupSection[:next]
+	}
+	if !strings.Contains(cleanupSection, "if: ${{ failure() || cancelled() }}") {
+		t.Fatal("failure cleanup must run exactly on failure or cancellation")
+	}
+	for _, want := range []string{
+		"statuses/$EVENT_SHA",
+		`^[0-9a-f]{40}$`,
+		"-f state=failure",
+		"-f context=main-fast-forward-eligible",
+		"-f description=\"validation failed or was cancelled\"",
+	} {
+		if !strings.Contains(cleanupRun, want) {
+			t.Errorf("failure cleanup contract is missing %q", want)
+		}
+	}
+	for _, want := range []string{"EVENT_SHA: ${{ github.sha }}", "GH_TOKEN: ${{ github.token }}"} {
+		if !strings.Contains(cleanupSection, want) {
+			t.Errorf("failure cleanup environment is missing %q", want)
+		}
+	}
+	if strings.Contains(cleanupSection, "continue-on-error") {
+		t.Fatal("failure cleanup must preserve the job failure conclusion")
 	}
 	finalPost := strings.Index(final, "gh api --method POST")
 	if finalPost < 0 || strings.Contains(final[finalPost:], "|") || strings.Contains(final[finalPost:], "jq") {
@@ -1931,33 +1962,36 @@ func TestMainFastForwardEligibilityNegativePathsDoNotPublishSuccess(t *testing.T
 	pending := workflowRunBlock(contents, "Publish pending main fast-forward eligibility status")
 	fresh := workflowRunBlock(contents, "Verify exact candidate and main fast-forward eligibility")
 	final := workflowRunBlock(contents, "Publish successful main fast-forward eligibility status")
-	if pending == "" || fresh == "" || final == "" {
+	cleanup := workflowRunBlock(contents, "Publish failure cleanup for main fast-forward eligibility")
+	if pending == "" || fresh == "" || final == "" || cleanup == "" {
 		t.Fatal("could not extract main fast-forward status run blocks")
 	}
 
 	const event = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	const other = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 	tests := []struct {
-		name         string
-		candidate    string
-		head         string
-		develop      string
-		ancestry     string
-		ghMode       string
-		upstream     string
-		wantAccepted string
-		wantFreshRun bool
-		wantFinalRun bool
+		name           string
+		candidate      string
+		head           string
+		develop        string
+		ancestry       string
+		ghMode         string
+		upstream       string
+		wantAccepted   string
+		wantFreshRun   bool
+		wantFinalRun   bool
+		wantCleanupRun bool
 	}{
 		{name: "positive", candidate: event, head: event, develop: event, upstream: "success", wantAccepted: "pending,success", wantFreshRun: true, wantFinalRun: true},
-		{name: "upstream failure", candidate: event, head: event, develop: event, upstream: "failure", wantAccepted: "pending", wantFreshRun: true},
-		{name: "upstream skipped", candidate: event, head: event, develop: event, upstream: "skipped", wantAccepted: "pending", wantFreshRun: true},
-		{name: "stale develop", candidate: event, head: event, develop: other, upstream: "success", wantAccepted: "pending", wantFreshRun: true},
-		{name: "wrong candidate", candidate: other, head: event, develop: event, upstream: "success", wantAccepted: "pending", wantFreshRun: true},
-		{name: "malformed candidate", candidate: "not-a-sha", head: event, develop: event, upstream: "success", wantAccepted: "pending", wantFreshRun: true},
-		{name: "ancestry failure", candidate: event, head: event, develop: event, ancestry: "fail", upstream: "success", wantAccepted: "pending", wantFreshRun: true},
-		{name: "pending API failure", candidate: event, head: event, develop: event, ghMode: "fail_pending", upstream: "success", wantAccepted: ""},
-		{name: "success API failure", candidate: event, head: event, develop: event, ghMode: "fail_success", upstream: "success", wantAccepted: "pending", wantFreshRun: true, wantFinalRun: true},
+		{name: "upstream failure", candidate: event, head: event, develop: event, upstream: "failure", wantAccepted: "pending,failure", wantFreshRun: true, wantCleanupRun: true},
+		{name: "upstream skipped", candidate: event, head: event, develop: event, upstream: "skipped", wantAccepted: "pending,failure", wantFreshRun: true, wantCleanupRun: true},
+		{name: "stale develop", candidate: event, head: event, develop: other, upstream: "success", wantAccepted: "pending,failure", wantFreshRun: true, wantCleanupRun: true},
+		{name: "wrong candidate", candidate: other, head: event, develop: event, upstream: "success", wantAccepted: "pending,failure", wantFreshRun: true, wantCleanupRun: true},
+		{name: "malformed candidate", candidate: "not-a-sha", head: event, develop: event, upstream: "success", wantAccepted: "pending,failure", wantFreshRun: true, wantCleanupRun: true},
+		{name: "ancestry failure", candidate: event, head: event, develop: event, ancestry: "fail", upstream: "success", wantAccepted: "pending,failure", wantFreshRun: true, wantCleanupRun: true},
+		{name: "pending API failure", candidate: event, head: event, develop: event, ghMode: "fail_pending", upstream: "success", wantAccepted: "failure", wantCleanupRun: true},
+		{name: "cleanup API failure", candidate: event, head: event, develop: event, ghMode: "fail_failure", upstream: "failure", wantAccepted: "pending", wantFreshRun: true, wantCleanupRun: true},
+		{name: "success API failure", candidate: event, head: event, develop: event, ghMode: "fail_success", upstream: "success", wantAccepted: "pending,failure", wantFreshRun: true, wantFinalRun: true, wantCleanupRun: true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1981,6 +2015,7 @@ done
 case "${GH_MODE:-}" in
   fail_pending) [[ "$state" != pending ]] || exit 1 ;;
   fail_success) [[ "$state" != success ]] || exit 1 ;;
+  fail_failure) [[ "$state" != failure ]] || exit 1 ;;
 esac
 printf '%s\n' "$state" >> "$GH_ACCEPTED_LOG"
 `)
@@ -2001,13 +2036,24 @@ printf '%s\n' "$state" >> "$GH_ACCEPTED_LOG"
 			pendingErr := runWorkflowBlock(t, pending, env)
 			freshRan := false
 			finalRan := false
+			cleanupNeeded := pendingErr != nil
 			if pendingErr == nil {
 				freshRan = true
 				pendingErr = runWorkflowBlock(t, fresh, env)
+				cleanupNeeded = pendingErr != nil
 				if pendingErr == nil {
 					finalRan = true
 					pendingErr = runWorkflowBlock(t, final, env)
+					cleanupNeeded = pendingErr != nil
 				}
+			}
+			if cleanupNeeded {
+				if err := runWorkflowBlock(t, cleanup, env); err != nil && tc.ghMode != "fail_failure" {
+					t.Fatalf("failure cleanup failed unexpectedly: %v", err)
+				}
+			}
+			if cleanupNeeded != tc.wantCleanupRun {
+				t.Fatalf("cleanup execution = %t, want %t", cleanupNeeded, tc.wantCleanupRun)
 			}
 			if freshRan != tc.wantFreshRun || finalRan != tc.wantFinalRun {
 				t.Fatalf("fresh/final execution = %t/%t, want %t/%t", freshRan, finalRan, tc.wantFreshRun, tc.wantFinalRun)

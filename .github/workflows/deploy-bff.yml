@@ -913,3 +913,19 @@ jobs:
             -f state=success \
             -f context=main-fast-forward-eligible \
             -f description="exact candidate is eligible for a main fast-forward"
+
+      - name: Publish failure cleanup for main fast-forward eligibility
+        if: ${{ failure() || cancelled() }}
+        env:
+          EVENT_SHA: ${{ github.sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$EVENT_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "event SHA must be a 40-character lowercase commit SHA"
+            exit 1
+          fi
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/$EVENT_SHA" \
+            -f state=failure \
+            -f context=main-fast-forward-eligible \
+            -f description="validation failed or was cancelled"
