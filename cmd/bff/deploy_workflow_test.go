@@ -25,9 +25,9 @@ func TestDeployBFFWorkflowUsesOnlyImmutableStageConfig(t *testing.T) {
 	}
 
 	for _, declaration := range []string{
-		"QUERY_STAGE_CONFIG_PATH: /app/configs/query/dev/query-dev-2026-08-21.1.json",
-		"QUERY_STAGE_CONFIG_REVISION: query-dev-2026-08-21.1",
-		"QUERY_STAGE_CONFIG_DIGEST: sha256:a35955fe4a451c740e6252cae8087f114fbac6b4162245d3de7818c1ad37a5c6",
+		"QUERY_STAGE_CONFIG_PATH: /app/configs/query/dev/query-dev-2026-08-21.2.json",
+		"QUERY_STAGE_CONFIG_REVISION: query-dev-2026-08-21.2",
+		"QUERY_STAGE_CONFIG_DIGEST: sha256:75e4f76de991b496c503b42fd893d34408ddae726fe99003365a5c89b8e46642",
 	} {
 		if strings.Count(workflow, declaration) != 1 {
 			t.Fatalf("workflow declaration %q count = %d", declaration, strings.Count(workflow, declaration))
@@ -110,9 +110,9 @@ func TestReleaseBFFWorkflowPromotesImmutableStageConfig(t *testing.T) {
 	}
 
 	for _, declaration := range []string{
-		"QUERY_STAGE_CONFIG_PATH: /app/configs/query/dev/query-dev-2026-08-21.1.json",
-		"QUERY_STAGE_CONFIG_REVISION: query-dev-2026-08-21.1",
-		"QUERY_STAGE_CONFIG_DIGEST: sha256:a35955fe4a451c740e6252cae8087f114fbac6b4162245d3de7818c1ad37a5c6",
+		"QUERY_STAGE_CONFIG_PATH: /app/configs/query/dev/query-dev-2026-08-21.2.json",
+		"QUERY_STAGE_CONFIG_REVISION: query-dev-2026-08-21.2",
+		"QUERY_STAGE_CONFIG_DIGEST: sha256:75e4f76de991b496c503b42fd893d34408ddae726fe99003365a5c89b8e46642",
 	} {
 		if strings.Count(workflow, declaration) != 1 {
 			t.Fatalf("production workflow declaration %q count = %d", declaration, strings.Count(workflow, declaration))
