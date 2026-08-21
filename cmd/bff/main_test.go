@@ -54,7 +54,7 @@ func TestConfiguredProductionQueryCompositionLoadsImmutableRuntime(t *testing.T)
 		t.Fatalf("configured executor=%T, want *queryruntime.Executor", executor)
 	}
 	readback := runtime.Readback()
-	if readback.SchemaVersion != 2 || readback.ConfigRevision != "query-dev-2026-08-21.1" || readback.ConfigDigest != "sha256:46511d0cacf5a33b7c81cac771fbdcc9b7f5a14aaf4f1a5fcb39c0b28e550694" || readback.DefaultProfileID != "platform-owned-lifestyle-v1" || readback.DefaultPromptID != "minimal-v1" || readback.ExpansionModel != "deepseek-v4-flash" || readback.SynthesisModel != "deepseek-v4-pro" || readback.Options.SelectionLimit != 10 || readback.BindingCount != 1 || readback.DistinctServiceCompositionCount != 2 {
+	if readback.SchemaVersion != 2 || readback.ConfigRevision != "query-dev-2026-08-21.1" || readback.ConfigDigest != "sha256:a35955fe4a451c740e6252cae8087f114fbac6b4162245d3de7818c1ad37a5c6" || readback.DefaultProfileID != "platform-owned-lifestyle-v1" || readback.DefaultPromptID != "minimal-v1" || readback.ExpansionModel != "deepseek-v4-flash" || readback.SynthesisModel != "deepseek-v4-pro" || readback.Options.SelectionLimit != 10 || readback.BindingCount != 1 || readback.DistinctServiceCompositionCount != 2 {
 		t.Fatalf("readback=%+v", readback)
 	}
 }
