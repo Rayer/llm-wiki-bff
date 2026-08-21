@@ -498,9 +498,10 @@ func TestMainFastForwardEligibilityFollowsReadiness(t *testing.T) {
 	}
 	freshBlock := job[fresh:success]
 	for _, want := range []string{
-		"if: ${{ needs.test-and-deploy.result == 'success' && needs.production-promotion-ready.result == 'success' }}",
 		"EVENT_SHA: ${{ github.sha }}",
 		"CANDIDATE_SHA: ${{ needs.test-and-deploy.outputs.candidate_sha }}",
+		"TEST_DEPLOY_RESULT: ${{ needs.test-and-deploy.result }}",
+		"READINESS_RESULT: ${{ needs.production-promotion-ready.result }}",
 	} {
 		if !strings.Contains(freshBlock, want) {
 			t.Errorf("fresh eligibility gate is missing %q", want)
@@ -515,6 +516,9 @@ func TestMainFastForwardEligibilityFollowsReadiness(t *testing.T) {
 			t.Fatal("executable gate scripts must consume env-bound workflow expressions")
 		}
 	}
+	if strings.Contains(freshBlock, "\n        if:") || strings.Contains(job[success:], "\n        if:") {
+		t.Fatal("verify and final success steps must use default success semantics")
+	}
 }
 
 func TestMainFastForwardCandidateProducerIsDirectNeed(t *testing.T) {
@@ -523,8 +527,20 @@ func TestMainFastForwardCandidateProducerIsDirectNeed(t *testing.T) {
 	if strings.Count(fresh, "CANDIDATE_SHA: ${{ needs.test-and-deploy.outputs.candidate_sha }}") != 1 {
 		t.Fatal("fresh verification must bind exactly to the test-and-deploy candidate output")
 	}
-	if !strings.Contains(fresh, "needs.test-and-deploy.result == 'success'") || !strings.Contains(fresh, "needs.production-promotion-ready.result == 'success'") {
-		t.Fatal("fresh verification must bind both upstream results")
+	for _, want := range []string{
+		"TEST_DEPLOY_RESULT: ${{ needs.test-and-deploy.result }}",
+		"READINESS_RESULT: ${{ needs.production-promotion-ready.result }}",
+		`if [[ "$TEST_DEPLOY_RESULT" != "success" || "$READINESS_RESULT" != "success" ]]; then`,
+	} {
+		if !strings.Contains(fresh, want) {
+			t.Fatalf("fresh verification must bind and check upstream result %q", want)
+		}
+	}
+	resultCheck := strings.Index(fresh, `if [[ "$TEST_DEPLOY_RESULT" != "success" || "$READINESS_RESULT" != "success" ]]; then`)
+	candidateCheck := strings.Index(fresh, `if [[ ! "$CANDIDATE_SHA" =~`)
+	remoteCheck := strings.Index(fresh, "git fetch --no-tags origin main develop")
+	if resultCheck < 0 || candidateCheck < 0 || remoteCheck < 0 || !(resultCheck < candidateCheck && resultCheck < remoteCheck) {
+		t.Fatal("fresh verification must check upstream results before candidate and remote gates")
 	}
 }
 
@@ -1887,8 +1903,8 @@ func TestMainFastForwardEligibilityPublishesExactCommitStatus(t *testing.T) {
 			t.Errorf("final status action is missing %q", want)
 		}
 	}
-	if !strings.Contains(job[success:], "if: ${{ success() && needs.test-and-deploy.result == 'success' && needs.production-promotion-ready.result == 'success' }}") {
-		t.Fatal("success publication must require successful upstream jobs and the fresh gate")
+	if strings.Contains(job[success:], "if:") {
+		t.Fatal("success publication must use default success semantics")
 	}
 	finalPost := strings.Index(final, "gh api --method POST")
 	if finalPost < 0 || strings.Contains(final[finalPost:], "|") || strings.Contains(final[finalPost:], "jq") {
@@ -1934,8 +1950,8 @@ func TestMainFastForwardEligibilityNegativePathsDoNotPublishSuccess(t *testing.T
 		wantFinalRun bool
 	}{
 		{name: "positive", candidate: event, head: event, develop: event, upstream: "success", wantAccepted: "pending,success", wantFreshRun: true, wantFinalRun: true},
-		{name: "upstream failure", candidate: event, head: event, develop: event, upstream: "failure", wantAccepted: "pending"},
-		{name: "upstream skipped", candidate: event, head: event, develop: event, upstream: "skipped", wantAccepted: "pending"},
+		{name: "upstream failure", candidate: event, head: event, develop: event, upstream: "failure", wantAccepted: "pending", wantFreshRun: true},
+		{name: "upstream skipped", candidate: event, head: event, develop: event, upstream: "skipped", wantAccepted: "pending", wantFreshRun: true},
 		{name: "stale develop", candidate: event, head: event, develop: other, upstream: "success", wantAccepted: "pending", wantFreshRun: true},
 		{name: "wrong candidate", candidate: other, head: event, develop: event, upstream: "success", wantAccepted: "pending", wantFreshRun: true},
 		{name: "malformed candidate", candidate: "not-a-sha", head: event, develop: event, upstream: "success", wantAccepted: "pending", wantFreshRun: true},
@@ -1973,6 +1989,8 @@ printf '%s\n' "$state" >> "$GH_ACCEPTED_LOG"
 				"PATH="+bin+":"+os.Getenv("PATH"),
 				"EVENT_SHA="+event,
 				"CANDIDATE_SHA="+tc.candidate,
+				"TEST_DEPLOY_RESULT="+tc.upstream,
+				"READINESS_RESULT="+tc.upstream,
 				"FAKE_HEAD="+tc.head,
 				"FAKE_DEVELOP="+tc.develop,
 				"FAKE_ANCESTRY="+tc.ancestry,
@@ -1983,7 +2001,7 @@ printf '%s\n' "$state" >> "$GH_ACCEPTED_LOG"
 			pendingErr := runWorkflowBlock(t, pending, env)
 			freshRan := false
 			finalRan := false
-			if pendingErr == nil && tc.upstream == "success" {
+			if pendingErr == nil {
 				freshRan = true
 				pendingErr = runWorkflowBlock(t, fresh, env)
 				if pendingErr == nil {

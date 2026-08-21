@@ -855,12 +855,17 @@ jobs:
           persist-credentials: false
 
       - name: Verify exact candidate and main fast-forward eligibility
-        if: ${{ needs.test-and-deploy.result == 'success' && needs.production-promotion-ready.result == 'success' }}
         env:
           EVENT_SHA: ${{ github.sha }}
           CANDIDATE_SHA: ${{ needs.test-and-deploy.outputs.candidate_sha }}
+          TEST_DEPLOY_RESULT: ${{ needs.test-and-deploy.result }}
+          READINESS_RESULT: ${{ needs.production-promotion-ready.result }}
         run: |
           set -euo pipefail
+          if [[ "$TEST_DEPLOY_RESULT" != "success" || "$READINESS_RESULT" != "success" ]]; then
+            echo "upstream jobs did not both succeed"
+            exit 1
+          fi
           if [[ ! "$EVENT_SHA" =~ ^[0-9a-f]{40}$ ]]; then
             echo "event SHA must be a 40-character lowercase commit SHA"
             exit 1
@@ -885,7 +890,6 @@ jobs:
           git merge-base --is-ancestor origin/main "$EVENT_SHA"
 
       - name: Publish successful main fast-forward eligibility status
-        if: ${{ success() && needs.test-and-deploy.result == 'success' && needs.production-promotion-ready.result == 'success' }}
         env:
           EVENT_SHA: ${{ github.sha }}
           GH_TOKEN: ${{ github.token }}
