@@ -2107,17 +2107,11 @@ const docTemplate = `{
                 "query": {
                     "type": "string"
                 },
-                "reason": {
-                    "type": "string"
-                },
                 "results": {
                     "type": "array",
                     "items": {
                         "$ref": "#/definitions/search.Result"
                     }
-                },
-                "status": {
-                    "type": "string"
                 }
             }
         },
