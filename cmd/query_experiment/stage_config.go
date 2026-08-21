@@ -35,12 +35,19 @@ func buildStageConfig(options experimentOptions, variant fixtureVariant, prepare
 	if !ok {
 		return queryconfig.Config{}, errors.New("selected prompt is not built in")
 	}
-	if variant.Prompt.TemplateDigest != "" && variant.Prompt.TemplateDigest != prompt.TemplateDigest {
+	if variant.Prompt.TemplateDigest == "" || variant.Prompt.TemplateDigest != prompt.TemplateDigest {
 		return queryconfig.Config{}, errors.New("selected prompt template digest mismatch")
 	}
 	profile, err := variant.Profile.retrievalProfile()
 	if err != nil {
 		return queryconfig.Config{}, fmt.Errorf("selected profile: %w", err)
+	}
+	if profile.ID == queryquality.DefaultRetrievalProfile().ID {
+		defaultDigest, digestErr := queryquality.DefaultRetrievalProfile().Digest()
+		profileDigest, profileErr := profile.Digest()
+		if digestErr != nil || profileErr != nil || profileDigest != defaultDigest {
+			return queryconfig.Config{}, errors.New("selected immutable lifestyle default profile mismatch")
+		}
 	}
 	profileDigest, err := profile.Digest()
 	if err != nil {

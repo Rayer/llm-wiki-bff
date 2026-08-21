@@ -524,12 +524,8 @@ func (e parallelQueryExpander) ExpandWithTrace(ctx context.Context, request Expa
 		}(index)
 	}
 	for completed := 0; completed < e.options.ExpansionAttempts; completed++ {
-		select {
-		case outcome := <-outcomes:
-			results[outcome.index] = outcome.value
-		case <-ctx.Done():
-			return QueryPlan{}, ExpansionInfo{}, ctx.Err()
-		}
+		outcome := <-outcomes
+		results[outcome.index] = outcome.value
 	}
 	if err := ctx.Err(); err != nil {
 		return QueryPlan{}, ExpansionInfo{}, err
@@ -1227,6 +1223,18 @@ func (s *QueryRetrievalPipeline) execute(ctx context.Context, reader cache.Reade
 		matchCtx = recorder.StartStage(ctx, "candidate_matching", "", "", "")
 	}
 	matchReq := MatchRequest{Plan: plan, CorpusEntries: entries, EvidenceThreshold: s.options.EvidenceThreshold, EvidenceThresholdSet: s.options.EvidenceThresholdSet, RareKeywordMaxDocumentFrequency: s.options.RareDocumentFrequency, FallbackQualificationAllowed: !s.options.EvidenceThresholdSet}
+	if matchReq.RareKeywordMaxDocumentFrequency == 0 {
+		matchReq.RareKeywordMaxDocumentFrequency = DefaultRareDocumentFrequency
+	}
+	if trace != nil {
+		trace.MatchingPolicy = MatchingPolicy{
+			EvidenceThreshold:               resolvedEvidenceThreshold(s.options),
+			RareKeywordMaxDocumentFrequency: matchReq.RareKeywordMaxDocumentFrequency,
+			FallbackQualificationAllowed:    matchReq.FallbackQualificationAllowed,
+			SemanticRequiredFailClosed:      semanticRequiredFailClosed,
+			SemanticExcludedFailClosed:      semanticExcludedFailClosed,
+		}
+	}
 	eligible, err := s.candidateMatcher.Match(matchCtx, matchReq)
 	if err != nil {
 		query.FinishStage(matchCtx, "failure")
@@ -1327,8 +1335,17 @@ type Trace struct {
 	KeywordsPerAttempt              int            `json:"keywords_per_attempt"`
 	RareKeywordMaxDocumentFrequency int            `json:"rare_keyword_max_document_frequency"`
 	EvidenceThreshold               int            `json:"evidence_threshold"`
+	MatchingPolicy                  MatchingPolicy `json:"matching_policy"`
 	Expansion                       ExpansionTrace `json:"expansion"`
 	Stages                          []StageTrace   `json:"stages"`
+}
+
+type MatchingPolicy struct {
+	EvidenceThreshold               int  `json:"evidence_threshold"`
+	RareKeywordMaxDocumentFrequency int  `json:"rare_keyword_max_document_frequency"`
+	FallbackQualificationAllowed    bool `json:"fallback_qualification_allowed"`
+	SemanticRequiredFailClosed      bool `json:"semantic_required_fail_closed"`
+	SemanticExcludedFailClosed      bool `json:"semantic_excluded_fail_closed"`
 }
 
 type ExpansionTrace struct {

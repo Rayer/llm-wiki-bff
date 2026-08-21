@@ -71,6 +71,9 @@ func TestQueryRetrievalServiceComposesAllStagesOnceAndCarriesPromptIdentity(t *t
 	if trace.ProfileID != profile.ID || trace.ProfileDigest != profileDigest || trace.PromptID != prompt.ID || trace.PromptDigest != prompt.TemplateDigest || trace.Seed != 9 {
 		t.Fatalf("trace identity/config=%#v", trace)
 	}
+	if got := trace.MatchingPolicy; got.EvidenceThreshold != 2 || got.RareKeywordMaxDocumentFrequency != 1 || got.FallbackQualificationAllowed || !got.SemanticRequiredFailClosed || !got.SemanticExcludedFailClosed {
+		t.Fatalf("matching policy=%#v", got)
+	}
 	expected, err := queryquality.RenderPrompt(prompt.ID, "deploy docs", profile.CriterionPolicy, options.KeywordsPerAttempt)
 	if err != nil {
 		t.Fatal(err)

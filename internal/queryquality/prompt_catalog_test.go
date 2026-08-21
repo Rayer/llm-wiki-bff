@@ -27,3 +27,15 @@ func TestBuiltInPromptCatalogHasLifestyleAndTechnicalIdentities(t *testing.T) {
 		t.Fatalf("rendered prompt = %#v", rendered)
 	}
 }
+
+func TestRenderPromptReplacesPlaceholdersOnce(t *testing.T) {
+	query := "literal {{criterion_policy}}"
+	policy := queryquality.CriterionPolicy{RequiredWhenExplicit: []string{"literal {{raw_query}}"}}
+	rendered, err := queryquality.RenderPrompt(queryquality.StructuredPlanPromptID, query, policy, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(rendered.User, query) || !strings.Contains(rendered.User, `literal {{raw_query}}`) {
+		t.Fatalf("rendered prompt rewrote inserted placeholders: %q", rendered.User)
+	}
+}

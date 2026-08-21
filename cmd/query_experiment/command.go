@@ -21,6 +21,7 @@ import (
 	"github.com/rayer/llm-wiki-bff/internal/gcs"
 	"github.com/rayer/llm-wiki-bff/internal/llm"
 	"github.com/rayer/llm-wiki-bff/internal/query"
+	"github.com/rayer/llm-wiki-bff/internal/queryquality"
 	"github.com/rayer/llm-wiki-bff/internal/search"
 )
 
@@ -82,6 +83,7 @@ type dependencies struct {
 	queryRetrievalSeed        func(string) int64
 	newGCSClient              func(string) (*gcs.Client, error)
 	loadGCSSnapshot           func(context.Context, string, func(string) (*gcs.Client, error)) (preparedSnapshot, error)
+	newFixtureQueryService    func(queryquality.QueryRetrievalServiceConfig) (fixtureQueryService, error)
 }
 
 type preparedSnapshot struct {

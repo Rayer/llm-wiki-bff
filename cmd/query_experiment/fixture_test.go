@@ -12,6 +12,11 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/rayer/llm-wiki-bff/internal/cache"
+	"github.com/rayer/llm-wiki-bff/internal/query"
+	"github.com/rayer/llm-wiki-bff/internal/queryquality"
+	"github.com/rayer/llm-wiki-bff/internal/search"
 )
 
 func TestFixtureDecodersAreStrictAndKeepModelKeysPrivate(t *testing.T) {
@@ -41,6 +46,22 @@ func TestFixtureDecodersAreStrictAndKeepModelKeysPrivate(t *testing.T) {
 	}
 	if _, err := os.Stat(modelPath); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestFixturePromptCatalogRejectsLegacyAlias(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "prompts.json")
+	writeTestFile(t, path, `{"prompts":[{"id":"prompt","system_template":"x","user_template":"y","template_digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}`)
+	if _, err := readPromptFixture(path); err == nil {
+		t.Fatal("accepted legacy prompt alias")
+	}
+}
+
+func TestFixtureProfileCatalogRejectsChangedImmutableDefault(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "profiles.json")
+	writeTestFile(t, path, `{"profiles":[{"id":"platform-owned-lifestyle-v1","required_when_explicit":["changed"],"preferred_by_default":[],"goals_to_expand":[]}]}`)
+	if _, err := readProfileFixture(path); err == nil {
+		t.Fatal("accepted changed immutable default profile")
 	}
 }
 
@@ -305,15 +326,78 @@ func TestFixtureProfileUsesProductionProfileDigest(t *testing.T) {
 }
 
 func TestFixturePromptRenderingUsesOnlyNarrowPlaceholders(t *testing.T) {
-	prompt := promptFixtureEntry{ID: "p", SystemTemplate: "sys {{raw_query}}", UserTemplate: "user {{criterion_policy}} / {{raw_query}}"}
+	system, user, ok := queryquality.LookupPromptTemplate(queryquality.StructuredPlanPromptID)
+	if !ok {
+		t.Fatal("missing production prompt")
+	}
+	identity, _ := queryquality.LookupPrompt(queryquality.StructuredPlanPromptID)
+	prompt := promptFixtureEntry{ID: identity.ID, SystemTemplate: system, UserTemplate: user, TemplateDigest: identity.TemplateDigest}
 	policy := CriterionPolicy{RequiredWhenExplicit: []string{"location"}, PreferredByDefault: []string{"topic"}, GoalsToExpand: []string{"discovery"}}
 	rendered, err := renderFixturePrompt(prompt, "coffee shops", policy)
-	if err != nil || rendered.System != "sys coffee shops" || !strings.Contains(rendered.User, `"required_when_explicit":["location"]`) || !strings.Contains(rendered.User, "coffee shops") {
+	if err != nil || !strings.Contains(rendered.System, "frozen Lifestyle concept corpus") || !strings.Contains(rendered.User, `"required_when_explicit":["location"]`) || !strings.Contains(rendered.User, "coffee shops") {
 		t.Fatalf("rendered=%#v err=%v", rendered, err)
 	}
 	prompt.UserTemplate = "{{unknown}}"
 	if _, err := renderFixturePrompt(prompt, "coffee", policy); err == nil {
 		t.Fatal("unknown prompt placeholder accepted")
+	}
+}
+
+func writeProductionPromptFixture(t *testing.T, dir, id string) string {
+	t.Helper()
+	system, user, ok := queryquality.LookupPromptTemplate(id)
+	if !ok {
+		t.Fatalf("missing production prompt %q", id)
+	}
+	identity, _ := queryquality.LookupPrompt(id)
+	data, err := json.Marshal(map[string]any{"prompts": []promptFixtureEntry{{ID: id, SystemTemplate: system, UserTemplate: user, TemplateDigest: identity.TemplateDigest}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return writeFixture(t, dir, "prompts.json", string(data))
+}
+
+type tracedFixtureService struct {
+	calls  int
+	trace  queryquality.Trace
+	result query.Result
+}
+
+func (s *tracedFixtureService) ExecuteWithTrace(context.Context, cache.Reader, query.Request) (query.Result, *queryquality.Trace, error) {
+	s.calls++
+	trace := s.trace
+	return s.result, &trace, nil
+}
+
+func TestFixtureRunnerUsesOneInjectedTracedServiceResult(t *testing.T) {
+	dir := t.TempDir()
+	modelPath := writeFixture(t, dir, "models.json", `{"models":[{"id":"m","provider":"fake","base_url":"http://127.0.0.1:1","model":"selected","api_key":"secret"}]}`)
+	profilePath := writeFixture(t, dir, "profiles.json", `{"profiles":[{"id":"profile","required_when_explicit":[],"preferred_by_default":["topic"],"goals_to_expand":[]}]}`)
+	promptPath := writeProductionPromptFixture(t, dir, queryquality.StructuredPlanPromptID)
+	var output strings.Builder
+	plan := queryquality.QueryPlan{RawQuery: "coffee", Preferred: []queryquality.Criterion{{Kind: "topic", Value: "coffee", Terms: []string{"coffee"}, Proof: "lexical"}}}
+	candidate := queryquality.CandidateEvidence{Slug: "from-service", Title: "From service", Eligible: true, Qualified: true}
+	decision := queryquality.SelectedCandidate{Slug: candidate.Slug, Title: candidate.Title, Selected: true, Reason: "service decision"}
+	trace := queryquality.Trace{
+		ProfileID: "profile", PromptID: queryquality.StructuredPlanPromptID, Seed: 11,
+		SelectionLimit: 1, MatchingPolicy: queryquality.MatchingPolicy{EvidenceThreshold: 2, RareKeywordMaxDocumentFrequency: 1, SemanticRequiredFailClosed: true, SemanticExcludedFailClosed: true},
+		Expansion: queryquality.ExpansionTrace{KeywordsPerAttempt: 24},
+		Stages:    []queryquality.StageTrace{{Name: "expansion", Outcome: "success", Plan: &plan}, {Name: "matching", Outcome: "success", Candidates: []queryquality.CandidateEvidence{candidate}}, {Name: "selection", Outcome: "success", Decisions: []queryquality.SelectedCandidate{decision}}},
+	}
+	service := &tracedFixtureService{trace: trace, result: query.Result{Query: "coffee", Mode: "wiki", Results: []search.Result{{Slug: candidate.Slug, Title: candidate.Title, Type: "concept"}}, Status: "ok", Reason: "qualified_evidence"}}
+	err := runFixtureExperiment(context.Background(), experimentOptions{modelFixturePath: modelPath, profileFixturePath: profilePath, promptFixturePath: promptPath, artifactsDir: filepath.Join(dir, "artifacts"), selectionLimit: 1, explorationSlots: 0, explorationSlotsSet: true, expansionAttempts: 1, runs: 1, service: serviceQueryRetrieval}, preparedSnapshot{label: "snapshot", digest: strings.Repeat("a", 64), cache: cache.New(), suggestedData: []byte("{}")}, []caseInput{{ID: "case", Query: "coffee", Mode: "wiki"}}, dependencies{now: time.Now, stdout: &output, newFixtureQueryService: func(queryquality.QueryRetrievalServiceConfig) (fixtureQueryService, error) { return service, nil }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if service.calls != 1 {
+		t.Fatalf("service calls=%d, want exactly one", service.calls)
+	}
+	var record resultRecord
+	if err := json.Unmarshal([]byte(strings.TrimSpace(output.String())), &record); err != nil {
+		t.Fatal(err)
+	}
+	if record.Status != "ok" || record.Reason != "qualified_evidence" || len(record.Results) != 1 || record.Results[0].Slug != candidate.Slug {
+		t.Fatalf("record=%#v", record)
 	}
 }
 
@@ -358,7 +442,7 @@ func TestFixtureRunWritesEightReceiptsAndSummaryWithoutKey(t *testing.T) {
 	dir := t.TempDir()
 	modelPath := writeFixture(t, dir, "models.json", `{"models":[{"id":"m","provider":"fake","base_url":"`+server.URL+`","model":"selected","api_key":"fixture-secret"}]}`)
 	profilePath := writeFixture(t, dir, "profiles.json", `{"profiles":[{"id":"profile","required_when_explicit":[],"preferred_by_default":["topic"],"goals_to_expand":[]}]}`)
-	promptPath := writeFixture(t, dir, "prompts.json", `{"prompts":[{"id":"prompt","system_template":"system {{raw_query}}","user_template":"user {{criterion_policy}} {{raw_query}}"}]}`)
+	promptPath := writeProductionPromptFixture(t, dir, queryquality.StructuredPlanPromptID)
 	casesPath := writeFixture(t, dir, "cases.jsonl", `{"id":"case","query":"coffee","mode":"wiki"}`+"\n")
 	artifacts := filepath.Join(dir, "artifacts")
 	summaryPath := filepath.Join(dir, "summary.json")
@@ -379,7 +463,7 @@ func TestFixtureRunWritesEightReceiptsAndSummaryWithoutKey(t *testing.T) {
 	if err := json.Unmarshal([]byte(strings.TrimSpace(output.String())), &record); err != nil {
 		t.Fatal(err)
 	}
-	if record.VariantID == "" || record.ProfileID != "profile" || record.PromptID != "prompt" || record.Provider != "fake" || record.Model != "selected" {
+	if record.VariantID == "" || record.ProfileID != "profile" || record.PromptID != queryquality.StructuredPlanPromptID || record.Provider != "fake" || record.Model != "selected" {
 		t.Fatalf("record identity=%#v", record)
 	}
 	if record.EvidenceThreshold != 2 || !strings.HasPrefix(record.VariantID, fixtureVariantIDPrefix) {
@@ -393,6 +477,22 @@ func TestFixtureRunWritesEightReceiptsAndSummaryWithoutKey(t *testing.T) {
 	var expansion fixtureExpansionOutput
 	if err := json.Unmarshal(expansionData, &expansion); err != nil || expansion.Usage != (fixtureUsage{PromptTokens: 6, CompletionTokens: 9, TotalTokens: 15}) {
 		t.Fatalf("expansion aggregation=%#v err=%v", expansion, err)
+	}
+	inputData, err := os.ReadFile(filepath.Join(variantDir, "expansion.input.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var expansionInput fixtureExpansionInput
+	if err := json.Unmarshal(inputData, &expansionInput); err != nil || expansionInput.RenderedSystemPrompt == "" || !strings.Contains(expansionInput.RenderedUserPrompt, "Raw query: \"coffee\"") {
+		t.Fatalf("expansion input evidence=%#v err=%v", expansionInput, err)
+	}
+	if len(expansion.Attempts) != 3 {
+		t.Fatalf("attempt receipts=%#v", expansion.Attempts)
+	}
+	for _, attempt := range expansion.Attempts {
+		if attempt.AttemptIndex < 1 || attempt.LatencyMS < 0 || attempt.RawResponse == "" || !attempt.UsagePresent || attempt.Error != "" {
+			t.Fatalf("attempt evidence=%#v", attempt)
+		}
 	}
 	for _, name := range []string{"request.json", "expansion.input.json", "expansion.output.json", "matching.input.json", "matching.output.json", "selection.input.json", "selection.output.json", "final.json"} {
 		data, err := os.ReadFile(filepath.Join(variantDir, name))
@@ -462,7 +562,7 @@ func TestFixtureAttemptWritesTimingFieldsInRecordAndFinalReceipt(t *testing.T) {
 	dir := t.TempDir()
 	modelPath := writeFixture(t, dir, "models.json", `{"models":[{"id":"m","provider":"fake","base_url":"`+server.URL+`","model":"selected","api_key":"fixture-secret"}]}`)
 	profilePath := writeFixture(t, dir, "profiles.json", `{"profiles":[{"id":"profile","required_when_explicit":[],"preferred_by_default":["topic"],"goals_to_expand":[]}]}`)
-	promptPath := writeFixture(t, dir, "prompts.json", `{"prompts":[{"id":"prompt","system_template":"system {{raw_query}}","user_template":"user {{criterion_policy}} {{raw_query}}"}]}`)
+	promptPath := writeProductionPromptFixture(t, dir, queryquality.StructuredPlanPromptID)
 	casesPath := writeFixture(t, dir, "cases.jsonl", `{"id":"case","query":"coffee","mode":"wiki"}`+"\n")
 	artifacts := filepath.Join(dir, "artifacts")
 	var output strings.Builder
@@ -518,7 +618,7 @@ func TestFixtureZeroQualifiedAttemptWritesStatusReasonInResultsAndFinalReceipt(t
 	dir := t.TempDir()
 	modelPath := writeFixture(t, dir, "models.json", `{"models":[{"id":"m","provider":"fake","base_url":"`+server.URL+`","model":"selected","api_key":"fixture-secret"}]}`)
 	profilePath := writeFixture(t, dir, "profiles.json", `{"profiles":[{"id":"profile","required_when_explicit":[],"preferred_by_default":["topic"],"goals_to_expand":[]}]}`)
-	promptPath := writeFixture(t, dir, "prompts.json", `{"prompts":[{"id":"prompt","system_template":"system {{raw_query}}","user_template":"user {{criterion_policy}} {{raw_query}}"}]}`)
+	promptPath := writeProductionPromptFixture(t, dir, queryquality.StructuredPlanPromptID)
 	casesPath := writeFixture(t, dir, "cases.jsonl", `{"id":"case","query":"coffee","mode":"wiki"}`+"\n")
 	artifacts := filepath.Join(dir, "artifacts")
 	var output strings.Builder
@@ -572,7 +672,7 @@ func TestFixtureNonemptyAttemptWritesOkAndQualifiedEvidenceInReceipts(t *testing
 	dir := t.TempDir()
 	modelPath := writeFixture(t, dir, "models.json", `{"models":[{"id":"m","provider":"fake","base_url":"`+server.URL+`","model":"selected","api_key":"fixture-secret"}]}`)
 	profilePath := writeFixture(t, dir, "profiles.json", `{"profiles":[{"id":"profile","required_when_explicit":[],"preferred_by_default":["topic"],"goals_to_expand":[]}]}`)
-	promptPath := writeFixture(t, dir, "prompts.json", `{"prompts":[{"id":"prompt","system_template":"system {{raw_query}}","user_template":"user {{criterion_policy}} {{raw_query}}"}]}`)
+	promptPath := writeProductionPromptFixture(t, dir, queryquality.StructuredPlanPromptID)
 	casesPath := writeFixture(t, dir, "cases.jsonl", `{"id":"case","query":"coffee","mode":"wiki"}`+"\n")
 	artifacts := filepath.Join(dir, "artifacts")
 	var output strings.Builder

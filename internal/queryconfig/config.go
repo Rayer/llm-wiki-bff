@@ -236,7 +236,7 @@ func normalizeWithoutDigest(input Config) (Config, error) {
 		if err := validateBinding(*binding, profiles); err != nil {
 			return Config{}, fmt.Errorf("project binding %d: %w", i+1, err)
 		}
-		key := binding.ProjectID + "\x00" + binding.GenerationID + "\x00" + binding.ConceptsDigest + "\x00" + binding.ProfileID + "\x00" + binding.ProfileDigest + "\x00" + binding.PromptID + "\x00" + binding.PromptDigest + "\x00" + binding.Source
+		key := bindingScopeKey(*binding)
 		if _, exists := seenBindings[key]; exists {
 			return Config{}, errors.New("duplicate project binding")
 		}
@@ -321,6 +321,10 @@ func samePolicy(a, b queryquality.CriterionPolicy) bool {
 
 func bindingKey(binding ProjectBinding) string {
 	return binding.ProjectID + "\x00" + binding.GenerationID + "\x00" + binding.ConceptsDigest + "\x00" + binding.ProfileID + "\x00" + binding.PromptID + "\x00" + binding.Source
+}
+
+func bindingScopeKey(binding ProjectBinding) string {
+	return binding.ProjectID + "\x00" + binding.GenerationID + "\x00" + binding.ConceptsDigest
 }
 
 func canonicalWithoutDigest(config Config) ([]byte, error) {

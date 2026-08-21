@@ -104,16 +104,21 @@ func RenderPrompt(id, rawQuery string, policy CriterionPolicy, keywordsPerAttemp
 		encoded, _ := json.Marshal(rawQuery)
 		raw = string(encoded)
 	}
-	replace := func(template string) string {
-		result := strings.ReplaceAll(template, "{{raw_query}}", raw)
-		result = strings.ReplaceAll(result, "{{criterion_policy}}", string(policyJSON))
-		return result
-	}
+	replace := strings.NewReplacer("{{raw_query}}", raw, "{{criterion_policy}}", string(policyJSON)).Replace
 	user := replace(prompt.userTemplate)
 	if keywordsPerAttempt > 0 {
 		user += fmt.Sprintf("\nMaximum normalized positive discovery keywords for this attempt: %d.", keywordsPerAttempt)
 	}
 	return RenderedPrompt{System: replace(prompt.systemTemplate), User: user}, nil
+}
+
+// LookupPromptTemplate returns the immutable production template pair.
+func LookupPromptTemplate(id string) (system, user string, ok bool) {
+	prompt, ok := builtInPrompts[id]
+	if !ok {
+		return "", "", false
+	}
+	return prompt.systemTemplate, prompt.userTemplate, true
 }
 
 func renderPromptJSONQuery(id, rawQuery string, policy CriterionPolicy, keywordsPerAttempt int) (RenderedPrompt, error) {

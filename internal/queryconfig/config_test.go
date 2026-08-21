@@ -154,6 +154,16 @@ func TestSealRejectsReferencesRangesAndUnsafeIDs(t *testing.T) {
 	}
 }
 
+func TestSealRejectsDuplicateBindingResolutionScope(t *testing.T) {
+	config := validConfig(t)
+	binding := config.ProjectBindings[0]
+	binding.Source = queryconfig.SourceLegacyCompatibility
+	config.ProjectBindings = append(config.ProjectBindings, binding)
+	if _, err := queryconfig.Seal(config); err == nil {
+		t.Fatal("accepted duplicate binding resolution scope")
+	}
+}
+
 func TestNormalizeIsDeterministicAndSemanticChangesAlterDigest(t *testing.T) {
 	left := mustSeal(t)
 	right := validConfig(t)

@@ -105,8 +105,9 @@ logs, or summaries.
 
 Profile fixture entries map directly to the narrow policy fields
 `required_when_explicit`, `preferred_by_default`, and `goals_to_expand`.
-Prompt entries contain `system_template` and `user_template`; the only
-placeholders are `{{raw_query}}` and `{{criterion_policy}}`.
+Prompt fixtures must identify a production-owned built-in prompt with its exact
+`system_template`, `user_template`, and `template_digest`; the only placeholders
+are `{{raw_query}}` and `{{criterion_policy}}`.
 Selectors are comma-separated and preserve selector order. Empty selectors
 select every entry in fixture order, producing the profile × prompt × model
 Cartesian product.
@@ -117,9 +118,11 @@ Each attempt is written below
 `matching.output.json`, `selection.input.json`, `selection.output.json`, and
 `final.json`. Inputs contain the exact prompts, full plan/policy, frozen corpus
 identity and digest, resolved evidence threshold, candidate qualification evidence, and effective selection seed. Outputs
-contain the raw model response, parsed/fallback plan, all candidate evidence,
-all selection decisions, and final identities. Bodies and snippets are never
-written.
+contain the exact rendered expansion prompts, per-attempt raw model
+response/error, parsed/fallback plan, all candidate evidence, all selection
+decisions, and final identities. API keys, credentials, base URLs, and token
+values are scrubbed; bodies and snippets are never written. The production
+query trace retains no raw prompts or provider responses.
 
 The summary reports attempt denominators for zero-result and under-five rates
 (the threshold is recorded as `under_5`), recoverable and always-under-five

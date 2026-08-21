@@ -35,7 +35,24 @@ type profileFixtureEntry struct {
 }
 
 func (p profileFixtureEntry) retrievalProfile() (queryquality.RetrievalProfile, error) {
-	return queryquality.RetrievalProfile{ID: p.ID, CriterionPolicy: queryquality.CriterionPolicy{RequiredWhenExplicit: p.RequiredWhenExplicit, PreferredByDefault: p.PreferredByDefault, GoalsToExpand: p.GoalsToExpand}}.ValidatedCopy()
+	profile, err := queryquality.RetrievalProfile{ID: p.ID, CriterionPolicy: queryquality.CriterionPolicy{RequiredWhenExplicit: p.RequiredWhenExplicit, PreferredByDefault: p.PreferredByDefault, GoalsToExpand: p.GoalsToExpand}}.ValidatedCopy()
+	if err != nil {
+		return queryquality.RetrievalProfile{}, err
+	}
+	if profile.ID == queryquality.DefaultRetrievalProfile().ID {
+		want, err := queryquality.DefaultRetrievalProfile().Digest()
+		if err != nil {
+			return queryquality.RetrievalProfile{}, err
+		}
+		got, err := profile.Digest()
+		if err != nil {
+			return queryquality.RetrievalProfile{}, err
+		}
+		if got != want {
+			return queryquality.RetrievalProfile{}, errors.New("immutable lifestyle default profile mismatch")
+		}
+	}
+	return profile, nil
 }
 
 type promptFixtureEntry struct {
@@ -65,10 +82,12 @@ type fixtureUsage struct {
 }
 
 type fixtureModelCall struct {
-	Content     string
-	RawResponse string
-	Usage       fixtureUsage
-	LatencyMS   int64
+	Content      string
+	RawResponse  string
+	Error        string
+	Usage        fixtureUsage
+	UsagePresent bool
+	LatencyMS    int64
 }
 
 type publicModelFixture struct {
@@ -86,27 +105,14 @@ func marshalPublicJSON(model modelFixtureEntry) string {
 }
 
 func renderFixturePrompt(prompt promptFixtureEntry, rawQuery string, policy CriterionPolicy) (renderedFixturePrompt, error) {
-	policyJSON, err := json.Marshal(policy)
+	if err := queryquality.ValidatePromptTemplate(prompt.ID, prompt.SystemTemplate, prompt.UserTemplate); err != nil {
+		return renderedFixturePrompt{}, err
+	}
+	rendered, err := queryquality.RenderPrompt(prompt.ID, rawQuery, policy, 0)
 	if err != nil {
 		return renderedFixturePrompt{}, err
 	}
-	replace := func(template string) (string, error) {
-		result := strings.ReplaceAll(template, "{{raw_query}}", rawQuery)
-		result = strings.ReplaceAll(result, "{{criterion_policy}}", string(policyJSON))
-		if strings.Contains(result, "{{") || strings.Contains(result, "}}") {
-			return "", errors.New("unsupported prompt placeholder")
-		}
-		return result, nil
-	}
-	system, err := replace(prompt.SystemTemplate)
-	if err != nil {
-		return renderedFixturePrompt{}, err
-	}
-	user, err := replace(prompt.UserTemplate)
-	if err != nil {
-		return renderedFixturePrompt{}, err
-	}
-	return renderedFixturePrompt{System: system, User: user}, nil
+	return renderedFixturePrompt{System: rendered.System, User: rendered.User}, nil
 }
 
 func callFixtureModel(ctx context.Context, model modelFixtureEntry, system, user string) (fixtureModelCall, error) {
@@ -151,7 +157,7 @@ func callFixtureModel(ctx context.Context, model modelFixtureEntry, system, user
 			Usage fixtureUsage `json:"usage"`
 		}
 		_ = json.Unmarshal(responseBytes, &failed)
-		return fixtureModelCall{LatencyMS: latency, RawResponse: string(responseBytes), Usage: failed.Usage}, fmt.Errorf("model request returned HTTP %d", response.StatusCode)
+		return fixtureModelCall{LatencyMS: latency, RawResponse: string(responseBytes), Usage: failed.Usage, UsagePresent: strings.Contains(string(responseBytes), `"usage"`)}, fmt.Errorf("model request returned HTTP %d", response.StatusCode)
 	}
 	var decoded struct {
 		Choices []struct {
@@ -165,9 +171,9 @@ func callFixtureModel(ctx context.Context, model modelFixtureEntry, system, user
 		return fixtureModelCall{LatencyMS: latency, RawResponse: string(responseBytes)}, errors.New("decode model response")
 	}
 	if len(decoded.Choices) == 0 || decoded.Choices[0].Message.Content == "" {
-		return fixtureModelCall{LatencyMS: latency, RawResponse: string(responseBytes), Usage: decoded.Usage}, errors.New("model response has no content")
+		return fixtureModelCall{LatencyMS: latency, RawResponse: string(responseBytes), Usage: decoded.Usage, UsagePresent: strings.Contains(string(responseBytes), `"usage"`)}, errors.New("model response has no content")
 	}
-	return fixtureModelCall{Content: decoded.Choices[0].Message.Content, RawResponse: string(responseBytes), Usage: decoded.Usage, LatencyMS: latency}, nil
+	return fixtureModelCall{Content: decoded.Choices[0].Message.Content, RawResponse: string(responseBytes), Usage: decoded.Usage, UsagePresent: strings.Contains(string(responseBytes), `"usage"`), LatencyMS: latency}, nil
 }
 
 func readModelFixture(path string) ([]modelFixtureEntry, error) {
@@ -248,6 +254,19 @@ func readPromptFixture(path string) ([]promptFixtureEntry, error) {
 		}
 		if _, ok := seen[prompt.ID]; ok {
 			return nil, fmt.Errorf("duplicate prompt id %q", prompt.ID)
+		}
+		identity, ok := queryquality.LookupPrompt(prompt.ID)
+		if !ok {
+			return nil, fmt.Errorf("prompt %d: unsupported prompt id %q", i+1, prompt.ID)
+		}
+		if err := queryquality.ValidatePromptTemplate(prompt.ID, prompt.SystemTemplate, prompt.UserTemplate); err != nil {
+			return nil, fmt.Errorf("prompt %d: %w", i+1, err)
+		}
+		if prompt.TemplateDigest == "" {
+			return nil, fmt.Errorf("prompt %d: template_digest is required", i+1)
+		}
+		if prompt.TemplateDigest != identity.TemplateDigest {
+			return nil, fmt.Errorf("prompt %d: prompt template digest mismatch", i+1)
 		}
 		seen[prompt.ID] = struct{}{}
 		prompts = append(prompts, prompt)

@@ -10,12 +10,14 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/rayer/llm-wiki-bff/internal/buildinfo"
+	"github.com/rayer/llm-wiki-bff/internal/cache"
 	"github.com/rayer/llm-wiki-bff/internal/config"
 	"github.com/rayer/llm-wiki-bff/internal/query"
 	"github.com/rayer/llm-wiki-bff/internal/queryconfig"
@@ -27,6 +29,9 @@ const artifactDigestTokenLength = 32
 const maxPortablePathSegmentBytes = 200
 const maxPOSIXPathSegmentBytes = 255
 const fixtureVariantIDPrefix = "v-"
+
+var sensitiveFixtureJSONValue = regexp.MustCompile(`(?i)("(?:api_key|authorization|access_token|token)"\s*:\s*)"[^"]*"`)
+var bearerCredential = regexp.MustCompile(`(?i)\bBearer\s+[^\s,;]+`)
 
 func (options experimentOptions) fixtureFlagsSet() bool {
 	return options.modelFixturePath != "" || options.models != "" || options.profileFixturePath != "" || options.profiles != "" || options.promptFixturePath != "" || options.prompts != "" || options.artifactsDir != "" || options.summaryPath != "" || options.stageConfigOutput != ""
@@ -103,13 +108,15 @@ type fixtureRequestReceipt struct {
 }
 
 type fixtureExpansionInput struct {
-	Query              string          `json:"query"`
-	CriterionPolicy    CriterionPolicy `json:"criterion_policy"`
-	PromptID           string          `json:"prompt_id"`
-	Provider           string          `json:"provider"`
-	Model              string          `json:"model"`
-	KeywordsPerAttempt int             `json:"keywords_per_attempt"`
-	ExpansionAttempts  int             `json:"expansion_attempts"`
+	Query                string          `json:"query"`
+	CriterionPolicy      CriterionPolicy `json:"criterion_policy"`
+	PromptID             string          `json:"prompt_id"`
+	Provider             string          `json:"provider"`
+	Model                string          `json:"model"`
+	KeywordsPerAttempt   int             `json:"keywords_per_attempt"`
+	ExpansionAttempts    int             `json:"expansion_attempts"`
+	RenderedSystemPrompt string          `json:"rendered_system_prompt"`
+	RenderedUserPrompt   string          `json:"rendered_user_prompt"`
 }
 
 type fixtureExpansionOutput struct {
@@ -135,6 +142,13 @@ type fixtureExpansionAttemptReceipt struct {
 	Outcome      string       `json:"outcome"`
 	LatencyMS    int64        `json:"latency_ms"`
 	Usage        fixtureUsage `json:"usage,omitempty"`
+	UsagePresent bool         `json:"usage_present"`
+	RawResponse  string       `json:"raw_response,omitempty"`
+	Error        string       `json:"error,omitempty"`
+}
+
+type fixtureQueryService interface {
+	ExecuteWithTrace(context.Context, cache.Reader, query.Request) (query.Result, *queryquality.Trace, error)
 }
 
 type fixtureChatProvider struct {
@@ -164,6 +178,9 @@ func (p *fixtureChatProvider) Chat(ctx context.Context, system, user string) (st
 		return "", errors.New("fixture expansion attempt identity missing")
 	}
 	call, err := callFixtureModel(ctx, p.model, system, user)
+	if err != nil {
+		call.Error = err.Error()
+	}
 	p.mu.Lock()
 	p.calls[attempt] = call
 	p.mu.Unlock()
@@ -180,13 +197,13 @@ func (p *fixtureChatProvider) call(attempt int) fixtureModelCall {
 }
 
 type fixtureMatchingInput struct {
-	Plan                            QueryPlan      `json:"plan"`
-	SnapshotIdentity                string         `json:"snapshot_identity"`
-	CorpusSHA256                    string         `json:"corpus_sha256"`
-	Parameters                      map[string]any `json:"parameters"`
-	EvidenceThreshold               int            `json:"evidence_threshold"`
-	RareKeywordMaxDocumentFrequency int            `json:"rare_keyword_max_document_frequency"`
-	FallbackQualificationAllowed    bool           `json:"fallback_qualification_allowed"`
+	Plan                            QueryPlan                   `json:"plan"`
+	SnapshotIdentity                string                      `json:"snapshot_identity"`
+	CorpusSHA256                    string                      `json:"corpus_sha256"`
+	Parameters                      queryquality.MatchingPolicy `json:"parameters"`
+	EvidenceThreshold               int                         `json:"evidence_threshold"`
+	RareKeywordMaxDocumentFrequency int                         `json:"rare_keyword_max_document_frequency"`
+	FallbackQualificationAllowed    bool                        `json:"fallback_qualification_allowed"`
 }
 
 type fixtureMatchingOutput struct {
@@ -353,7 +370,7 @@ func runFixtureExperiment(ctx context.Context, options experimentOptions, prepar
 	for i := range variants {
 		for _, input := range cases {
 			for runIndex := 1; runIndex <= options.runs; runIndex++ {
-				attempt, err := runFixtureAttempt(ctx, options, retrievalOptions, variants[i], input, runIndex, prepared, now, metadata)
+				attempt, err := runFixtureAttempt(ctx, options, retrievalOptions, variants[i], input, runIndex, prepared, now, metadata, deps)
 				if err != nil {
 					return err
 				}
@@ -413,11 +430,21 @@ func digestToken(digest string) (string, error) {
 	return raw[:artifactDigestTokenLength], nil
 }
 
-func runFixtureAttempt(ctx context.Context, options experimentOptions, retrievalOptions queryRetrievalOptions, variant fixtureVariant, input caseInput, runIndex int, prepared preparedSnapshot, now func() time.Time, metadata recordMetadata) (fixtureAttempt, error) {
+func runFixtureAttempt(ctx context.Context, options experimentOptions, retrievalOptions queryRetrievalOptions, variant fixtureVariant, input caseInput, runIndex int, prepared preparedSnapshot, now func() time.Time, metadata recordMetadata, deps dependencies) (fixtureAttempt, error) {
 	attemptID := fmt.Sprintf("%s__case=%s__run=%d", variant.VariantID, input.ID, runIndex)
 	profile, err := variant.Profile.retrievalProfile()
 	if err != nil {
 		return fixtureAttempt{}, err
+	}
+	prompt, ok := queryquality.LookupPrompt(variant.Prompt.ID)
+	if !ok {
+		return fixtureAttempt{}, fmt.Errorf("unsupported prompt id %q", variant.Prompt.ID)
+	}
+	if err := queryquality.ValidatePromptTemplate(variant.Prompt.ID, variant.Prompt.SystemTemplate, variant.Prompt.UserTemplate); err != nil {
+		return fixtureAttempt{}, fmt.Errorf("selected prompt: %w", err)
+	}
+	if variant.Prompt.TemplateDigest == "" || variant.Prompt.TemplateDigest != prompt.TemplateDigest {
+		return fixtureAttempt{}, errors.New("selected prompt template digest mismatch")
 	}
 	profileDigest := variant.ProfileDigest
 	meta := fixtureReceiptMeta{AttemptID: attemptID, VariantID: variant.VariantID, ProfileID: profile.ID, ProfileDigest: profileDigest, PromptID: variant.Prompt.ID, Provider: variant.Model.Provider, Model: variant.Model.Model, CaseID: input.ID, RunIndex: runIndex, EvidenceThreshold: retrievalOptions.evidenceThreshold}
@@ -444,7 +471,7 @@ func runFixtureAttempt(ctx context.Context, options experimentOptions, retrieval
 		return fixtureAttempt{}, fmt.Errorf("create attempt artifacts: %w", err)
 	}
 	write := func(name string, payload any) error {
-		return writeFixtureReceipt(filepath.Join(dir, name), meta, payload, variant.Model.APIKey)
+		return writeFixtureReceipt(filepath.Join(dir, name), meta, payload, variant.Model.APIKey, variant.Model.BaseURL)
 	}
 	seedMode := "query-derived"
 	if retrievalOptions.seed != nil {
@@ -454,42 +481,28 @@ func runFixtureAttempt(ctx context.Context, options experimentOptions, retrieval
 		return fixtureAttempt{}, err
 	}
 	policy := profile.CriterionPolicy
-	productionPromptID := variant.Prompt.ID
-	prompt, ok := queryquality.LookupPrompt(productionPromptID)
-	if !ok && variant.Prompt.ID == "prompt" {
-		// Preserve the pre-catalog fixture alias while routing its execution through
-		// the built-in Lifestyle production prompt.
-		productionPromptID = queryquality.StructuredPlanPromptID
-		prompt, ok = queryquality.LookupPrompt(productionPromptID)
-	}
-	if !ok {
-		return fixtureAttempt{}, fmt.Errorf("unsupported prompt id %q", variant.Prompt.ID)
-	}
-	if variant.Prompt.ID != "prompt" {
-		if err := queryquality.ValidatePromptTemplate(variant.Prompt.ID, variant.Prompt.SystemTemplate, variant.Prompt.UserTemplate); err != nil {
-			return fixtureAttempt{}, fmt.Errorf("selected prompt: %w", err)
-		}
-	}
-	if variant.Prompt.TemplateDigest != "" {
-		if err := queryquality.ValidatePrompt(variant.Prompt.ID, variant.Prompt.TemplateDigest); err != nil {
-			return fixtureAttempt{}, fmt.Errorf("selected prompt: %w", err)
-		}
-	}
-	rendered, err := queryquality.RenderPrompt(productionPromptID, input.Query, policy, retrievalOptions.keywordsPerAttempt)
+	rendered, err := queryquality.RenderPrompt(variant.Prompt.ID, input.Query, policy, retrievalOptions.keywordsPerAttempt)
 	if err != nil {
 		return fixtureAttempt{}, fmt.Errorf("render prompt: %w", err)
 	}
-	if err := write("expansion.input.json", fixtureExpansionInput{Query: input.Query, CriterionPolicy: policy, PromptID: variant.Prompt.ID, Provider: variant.Model.Provider, Model: variant.Model.Model, KeywordsPerAttempt: retrievalOptions.keywordsPerAttempt, ExpansionAttempts: retrievalOptions.expansionAttempts}); err != nil {
+	if err := write("expansion.input.json", fixtureExpansionInput{Query: input.Query, CriterionPolicy: policy, PromptID: variant.Prompt.ID, Provider: variant.Model.Provider, Model: variant.Model.Model, KeywordsPerAttempt: retrievalOptions.keywordsPerAttempt, ExpansionAttempts: retrievalOptions.expansionAttempts, RenderedSystemPrompt: rendered.System, RenderedUserPrompt: rendered.User}); err != nil {
 		return fixtureAttempt{}, err
 	}
 	provider, err := newFixtureChatProvider(variant.Model, prompt.ID, rendered)
 	if err != nil {
 		return fixtureAttempt{}, err
 	}
-	service, err := queryquality.NewQueryRetrievalService(queryquality.QueryRetrievalServiceConfig{
+	serviceConfig := queryquality.QueryRetrievalServiceConfig{
 		Cache: prepared.cache, ChatProvider: provider, Options: toQueryRetrievalCoreOptions(retrievalOptions), RetrievalProfile: profile,
 		PromptID: prompt.ID, AllowDeterministicFallback: true,
-	})
+	}
+	newService := deps.newFixtureQueryService
+	if newService == nil {
+		newService = func(config queryquality.QueryRetrievalServiceConfig) (fixtureQueryService, error) {
+			return queryquality.NewQueryRetrievalService(config)
+		}
+	}
+	service, err := newService(serviceConfig)
 	if err != nil {
 		return fixtureAttempt{}, err
 	}
@@ -524,7 +537,7 @@ func runFixtureAttempt(ctx context.Context, options experimentOptions, retrieval
 	var expansionUsage fixtureUsage
 	for _, outcome := range trace.Expansion.AttemptOutcomes {
 		call := provider.call(outcome.AttemptIndex)
-		attemptReceipts = append(attemptReceipts, fixtureExpansionAttemptReceipt{AttemptIndex: outcome.AttemptIndex, Outcome: outcome.Outcome, LatencyMS: call.LatencyMS, Usage: call.Usage})
+		attemptReceipts = append(attemptReceipts, fixtureExpansionAttemptReceipt{AttemptIndex: outcome.AttemptIndex, Outcome: outcome.Outcome, LatencyMS: call.LatencyMS, Usage: call.Usage, UsagePresent: call.UsagePresent, RawResponse: scrubFixtureEvidence(call.RawResponse, variant.Model), Error: scrubFixtureEvidence(call.Error, variant.Model)})
 		expansionUsage = addFixtureUsage(expansionUsage, call.Usage)
 	}
 	validation := "valid"
@@ -535,8 +548,8 @@ func runFixtureAttempt(ctx context.Context, options experimentOptions, retrieval
 		return fixtureAttempt{}, err
 	}
 	if err := write("matching.input.json", fixtureMatchingInput{
-		Plan: plan, SnapshotIdentity: prepared.label, CorpusSHA256: prepared.digest, EvidenceThreshold: trace.EvidenceThreshold, RareKeywordMaxDocumentFrequency: trace.RareKeywordMaxDocumentFrequency, FallbackQualificationAllowed: !retrievalOptions.evidenceThresholdSet,
-		Parameters: map[string]any{"semantic_required_fail_closed": semanticRequiredFailClosed, "semantic_excluded_fail_closed": semanticExcludedFailClosed},
+		Plan: plan, SnapshotIdentity: prepared.label, CorpusSHA256: prepared.digest, EvidenceThreshold: trace.MatchingPolicy.EvidenceThreshold, RareKeywordMaxDocumentFrequency: trace.MatchingPolicy.RareKeywordMaxDocumentFrequency, FallbackQualificationAllowed: trace.MatchingPolicy.FallbackQualificationAllowed,
+		Parameters: trace.MatchingPolicy,
 	}); err != nil {
 		return fixtureAttempt{}, err
 	}
@@ -603,7 +616,7 @@ func elapsedBetween(end, start time.Time) int64 {
 	return value
 }
 
-func writeFixtureReceipt(path string, meta fixtureReceiptMeta, payload any, secret string) error {
+func writeFixtureReceipt(path string, meta fixtureReceiptMeta, payload any, secret, baseURL string) error {
 	data, err := json.Marshal(payload)
 	if err != nil {
 		return err
@@ -622,9 +635,18 @@ func writeFixtureReceipt(path string, meta fixtureReceiptMeta, payload any, secr
 	if err != nil {
 		return err
 	}
-	data = []byte(scrubSecret(string(data), secret))
+	data = []byte(scrubFixtureEvidence(string(data), modelFixtureEntry{APIKey: secret, BaseURL: baseURL}))
 	data = append(data, '\n')
 	return os.WriteFile(filepath.Clean(path), data, 0o644)
+}
+
+func scrubFixtureEvidence(value string, model modelFixtureEntry) string {
+	value = scrubSecret(value, model.APIKey)
+	if model.BaseURL != "" {
+		value = strings.ReplaceAll(value, model.BaseURL, "[redacted-base-url]")
+	}
+	value = sensitiveFixtureJSONValue.ReplaceAllString(value, `$1"[redacted]"`)
+	return bearerCredential.ReplaceAllString(value, "Bearer [redacted]")
 }
 
 func scrubSecret(value, secret string) string {
