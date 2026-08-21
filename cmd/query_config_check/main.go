@@ -17,7 +17,7 @@ func main() {
 	if *path == "" || *revision == "" || *digest == "" {
 		fail("path, revision, and digest are required")
 	}
-	config, err := queryconfig.LoadFile(*path)
+	config, raw, err := queryconfig.LoadFileCanonicalBytes(*path)
 	if err != nil {
 		fail("load artifact: %v", err)
 	}
@@ -27,10 +27,6 @@ func main() {
 	canonical, err := queryconfig.CanonicalJSON(config)
 	if err != nil {
 		fail("canonicalize artifact: %v", err)
-	}
-	raw, err := os.ReadFile(*path)
-	if err != nil {
-		fail("read artifact: %v", err)
 	}
 	if bytes.HasSuffix(raw, []byte{'\n'}) || !bytes.Equal(raw, canonical) {
 		fail("artifact is not canonical newline-free JSON")

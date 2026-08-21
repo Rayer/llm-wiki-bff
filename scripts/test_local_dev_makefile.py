@@ -87,6 +87,41 @@ class LocalDevMakefileTests(unittest.TestCase):
         self.assertIn("PORT=18080", bff)
         self.assertIn("--port 13000", frontend)
 
+    def test_deploy_dev_recipe_is_parseable_and_removes_legacy_query_env(self):
+        output = self.make_dry_run("deploy-dev")
+        self.assertEqual(output.count("gcloud run deploy"), 1)
+        subprocess.run(["sh", "-n"], input=output, cwd=ROOT, check=True, text=True)
+
+        legacy = [
+            "QUERY_EXPANSION_MODEL", "QUERY_EXPANSION_REASONING", "ANSWER_SYNTHESIS_MODEL",
+            "ANSWER_SYNTHESIS_REASONING", "QUERY_SELECTION_LIMIT", "QUERY_SELECTION_EXPLORATION_SLOTS",
+            "QUERY_SELECTION_EVIDENCE_THRESHOLD", "QUERY_EXPANSION_KEYWORDS_PER_ATTEMPT",
+            "QUERY_EXPANSION_ATTEMPTS", "QUERY_MATCHING_RARE_KEYWORD_MAX_DOCUMENT_FREQUENCY",
+        ]
+        remove_start = output.index('--remove-env-vars "')
+        update_start = output.index('--update-env-vars "')
+        remove_block = output[remove_start:update_start]
+        update_block = output[update_start:]
+        for name in legacy:
+            self.assertEqual(output.count(name), 1)
+            self.assertIn(name, remove_block)
+            self.assertNotIn(name, update_block)
+        self.assertIn(
+            'QUERY_STAGE_CONFIG_PATH=/app/configs/query/dev/query-dev-2026-08-21.1.json',
+            update_block,
+        )
+        self.assertEqual(update_block.count("QUERY_STAGE_CONFIG_PATH="), 1)
+        self.assertEqual(update_block.count("QUERY_"), 1)
+        self.assertIn(
+            '--update-secrets "JWT_SECRET=jwt-secret-dev:latest,DEEPSEEK_API_KEY=deepseek-apikey:***"',
+            output,
+        )
+        for value in [
+            "GCP_PROJECT=llm-wiki-cloud", "BUCKET=llm-wiki-data-dev",
+            "FIRESTORE_DATABASE_ID=llm-wiki-cloud-dev", "DEV_JWT=false",
+        ]:
+            self.assertIn(value, update_block)
+
     @staticmethod
     def free_port():
         with socket.socket() as listener:

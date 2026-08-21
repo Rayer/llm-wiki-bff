@@ -206,6 +206,38 @@ func TestLoadFileModeBoundaryAndSpecialFileRejection(t *testing.T) {
 	}
 }
 
+func TestLoadFileCanonicalBytesRemainBoundToOpenedArtifact(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	movedPath := filepath.Join(dir, "moved.json")
+	want := mustJSON(mustSeal(t))
+	if err := os.WriteFile(path, want, 0o444); err != nil {
+		t.Fatal(err)
+	}
+	loaded, raw, err := queryconfig.LoadFileCanonicalBytes(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.ConfigRevision != "operator-2026-08-20" || !bytes.Equal(raw, want) {
+		t.Fatal("canonical bytes did not match the opened artifact")
+	}
+	if err := os.Rename(path, movedPath); err != nil {
+		t.Fatal(err)
+	}
+	attacker := validConfig(t)
+	attacker.ConfigRevision = "attacker-revision"
+	attackerBytes, err := json.Marshal(mustSealConfig(t, attacker))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, attackerBytes, 0o444); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(raw, want) || loaded.ConfigRevision == "attacker-revision" {
+		t.Fatal("returned config or bytes changed after pathname replacement")
+	}
+}
+
 func TestLoadFileSymlinkSwapNeverLoadsSymlinkTarget(t *testing.T) {
 	dir := t.TempDir()
 	safe, err := json.Marshal(mustSeal(t))
@@ -385,8 +417,12 @@ func TestSealInputAndOutputAreMutationIsolated(t *testing.T) {
 }
 
 func mustSeal(t *testing.T) queryconfig.Config {
+	return mustSealConfig(t, validConfig(t))
+}
+
+func mustSealConfig(t *testing.T, config queryconfig.Config) queryconfig.Config {
 	t.Helper()
-	sealed, err := queryconfig.Seal(validConfig(t))
+	sealed, err := queryconfig.Seal(config)
 	if err != nil {
 		t.Fatal(err)
 	}

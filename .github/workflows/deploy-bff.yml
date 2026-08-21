@@ -521,8 +521,8 @@ jobs:
             --project "${{ env.PROJECT_ID }}" \
             --format='value(status.url)' \
             --quiet)
-          if [[ ! "$SERVICE_URL" =~ ^https:// ]]; then
-            echo "Cloud Run returned an invalid public service URL; refusing to verify readback."
+          if [[ ! "$SERVICE_URL" =~ ^https://llm-wiki-bff-dev-[a-z0-9-]+\.a\.run\.app$ ]]; then
+            echo "Cloud Run returned an invalid public service URL or host; refusing to verify readback."
             exit 1
           fi
           BODY_FILE=$(mktemp)
@@ -534,7 +534,7 @@ jobs:
           while (( SECONDS < READBACK_DEADLINE )); do
             : > "$BODY_FILE"
             : > "$HEADER_FILE"
-            HTTP_STATUS=$(curl --silent --show-error --location \
+            HTTP_STATUS=$(curl --silent --show-error --proto '=https' \
               --connect-timeout 5 --max-time 10 \
               --dump-header "$HEADER_FILE" --output "$BODY_FILE" \
               --write-out '%{http_code}' \
@@ -547,6 +547,7 @@ jobs:
                 --arg cloud_revision "$EXPECTED_REVISION" \
                 --arg service "${{ env.SERVICE_NAME }}" '
                   ((. | keys | sort) == ["build", "query_config"])
+                  and ((.build | keys | sort) == ["commit", "revision", "service"])
                   and ((.query_config | keys | sort) == ["config_digest", "config_revision", "default_profile_digest", "default_profile_id", "default_prompt_digest", "default_prompt_id", "expansion_model", "expansion_provider", "expansion_reasoning", "expansion_temperature", "options", "query_service_implementation", "schema_version", "synthesis_model", "synthesis_provider", "synthesis_reasoning", "synthesis_temperature"])
                   and ((.query_config.options | keys | sort) == ["evidence_threshold", "expansion_attempts", "exploration_slots", "keywords_per_attempt", "rare_document_frequency", "selection_limit"])
                   and .query_config.schema_version == 2
@@ -578,7 +579,7 @@ jobs:
             sleep 10
           done
           if [[ "$HTTP_STATUS" != "200" || "$READBACK_VALID" != "1" ]]; then
-            echo "public query config readback did not return HTTP 200 (last status: ${HTTP_STATUS:-empty})"
+            echo "public query config readback identity/schema is invalid or did not return HTTP 200 (last status: ${HTTP_STATUS:-empty})"
             exit 1
           fi
           if ! grep -Eiq '^cache-control:[[:space:]]*no-store([[:space:]]*;.*)?[[:space:]]*$' "$HEADER_FILE"; then
@@ -656,7 +657,7 @@ jobs:
             --format="value(status.url)"
 
       - name: Restore BFF traffic on post-cutover failure
-        if: ${{ always() && failure() && steps.build.outputs.traffic_mutated == 'true' }}
+        if: ${{ always() && (failure() || cancelled()) && steps.build.outputs.traffic_mutated == 'true' }}
         run: |
           set -euo pipefail
           PREVIOUS_REVISION="${{ steps.build.outputs.previous_revision }}"

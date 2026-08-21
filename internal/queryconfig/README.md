@@ -26,3 +26,7 @@ because startup is load-once and the sealed digest is validated, while
 rejecting group- or other-writable, non-regular, empty, and oversized files.
 The runtime image copies reviewed query artifacts with mode `0444`; local
 repository artifacts may remain owner-owned `0644`.
+
+`LoadFileCanonicalBytes` returns the validated config and a defensive copy of
+the exact bytes read through that same descriptor. Prebuild canonical checks
+must compare those bytes with `CanonicalJSON` instead of reopening the path.

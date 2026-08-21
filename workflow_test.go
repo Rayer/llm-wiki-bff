@@ -1203,10 +1203,23 @@ func TestBFFDevWorkflowUsesCanonicalRevisionTransaction(t *testing.T) {
 		"--remove-env-vars",
 		"--update-env-vars",
 		"QUERY_STAGE_CONFIG_PATH=${{ env.QUERY_STAGE_CONFIG_PATH }}",
+		"--proto '=https'",
+		"((.build | keys | sort) == [\"commit\", \"revision\", \"service\"])",
+		"public query config readback identity/schema is invalid",
 	} {
 		if !strings.Contains(contents, want) {
 			t.Errorf("BFF workflow missing contract %q", want)
 		}
+	}
+	readback := workflowSection(t, contents, "      - name: Verify deployed query config readback", "      - name: Persist build image digest")
+	if strings.Contains(readback, "--location") {
+		t.Fatal("BFF readback must not follow redirects")
+	}
+	if !strings.Contains(readback, `^https://llm-wiki-bff-dev-[a-z0-9-]+\.a\.run\.app$`) {
+		t.Fatal("BFF readback must restrict the Cloud Run host")
+	}
+	if strings.Count(readback, "--proto '=https'") != 1 || strings.Count(readback, "HTTP_STATUS") < 2 || !strings.Contains(readback, `[[ "$HTTP_STATUS" != "200" || "$READBACK_VALID" != "1" ]]`) {
+		t.Fatal("BFF readback must use HTTPS-only no-redirect requests and reject non-200/schema-invalid responses")
 	}
 
 	previousCreatedAt := strings.Index(build, `PREVIOUS_CREATED_REVISION=$(jq -r '.status.latestCreatedRevisionName // empty'`)
@@ -1319,7 +1332,7 @@ func TestBFFDevWorkflowUsesCanonicalRevisionTransaction(t *testing.T) {
 
 	cleanup := contents[cleanupAt:]
 	for _, want := range []string{
-		"if: ${{ always() && failure() && steps.build.outputs.traffic_mutated == 'true' }}",
+		"if: ${{ always() && (failure() || cancelled()) && steps.build.outputs.traffic_mutated == 'true' }}",
 		"PREVIOUS_REVISION=\"${{ steps.build.outputs.previous_revision }}\"",
 		"NEW_REVISION=\"${{ steps.build.outputs.new_revision }}\"",
 		"gcloud run services update-traffic \"${{ env.SERVICE_NAME }}\"",

@@ -10,13 +10,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"regexp"
 	"sort"
 	"strings"
 
 	"github.com/rayer/llm-wiki-bff/internal/queryquality"
-	"golang.org/x/sys/unix"
 )
 
 const (
@@ -157,53 +155,65 @@ func DecodeStrict(data []byte) (Config, error) {
 // LoadFile reads one bounded, regular, non-symlink sealed artifact. The path
 // is intentionally absent from errors so startup logs cannot disclose mounts.
 func LoadFile(path string) (Config, error) {
+	config, _, err := loadFileCanonicalBytes(path)
+	return config, err
+}
+
+// LoadFileCanonicalBytes reads and validates one bounded, regular, non-symlink
+// sealed artifact and returns a defensive copy of the exact bytes read from
+// the securely-opened descriptor. Callers that verify a prebuild artifact's
+// canonical representation should compare these bytes without reopening path.
+func LoadFileCanonicalBytes(path string) (Config, []byte, error) {
+	return loadFileCanonicalBytes(path)
+}
+
+func loadFileCanonicalBytes(path string) (Config, []byte, error) {
 	if strings.TrimSpace(path) == "" {
-		return Config{}, errors.New("query config file path is empty")
+		return Config{}, nil, errors.New("query config file path is empty")
 	}
-	// O_NONBLOCK keeps special files such as FIFOs from blocking before fstat.
-	// O_NOFOLLOW closes the pathname symlink race; all subsequent checks and reads
-	// use this same descriptor.
-	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
+	file, err := openSecureQueryConfig(path)
 	if err != nil {
-		return Config{}, errors.New("query config file is unavailable")
-	}
-	file := os.NewFile(uintptr(fd), "")
-	if file == nil {
-		_ = unix.Close(fd)
-		return Config{}, errors.New("query config file is unavailable")
+		if errors.Is(err, errSecureQueryConfigUnsupported) {
+			return Config{}, nil, err
+		}
+		return Config{}, nil, errors.New("query config file is unavailable")
 	}
 	defer file.Close()
 	openedInfo, err := file.Stat()
 	if err != nil || !openedInfo.Mode().IsRegular() {
-		return Config{}, errors.New("query config file must be a regular file")
+		return Config{}, nil, errors.New("query config file must be a regular file")
 	}
 	if openedInfo.Mode().Perm()&0o022 != 0 {
-		return Config{}, errors.New("query config file must not be group or other writable")
+		return Config{}, nil, errors.New("query config file must not be group or other writable")
 	}
 	if openedInfo.Size() <= 0 {
-		return Config{}, errors.New("query config file must not be empty")
+		return Config{}, nil, errors.New("query config file must not be empty")
 	}
 	if openedInfo.Size() > MaxFileBytes {
-		return Config{}, errors.New("query config file is too large")
+		return Config{}, nil, errors.New("query config file is too large")
 	}
 	data, err := io.ReadAll(io.LimitReader(file, MaxFileBytes+1))
 	if err != nil {
-		return Config{}, errors.New("query config file cannot be read")
+		return Config{}, nil, errors.New("query config file cannot be read")
 	}
 	if int64(len(data)) > MaxFileBytes {
-		return Config{}, errors.New("query config file is too large")
+		return Config{}, nil, errors.New("query config file is too large")
 	}
 	if len(data) == 0 {
-		return Config{}, errors.New("query config file must not be empty")
+		return Config{}, nil, errors.New("query config file must not be empty")
 	}
 	config, err := DecodeStrict(data)
 	if err != nil {
-		return Config{}, err
+		return Config{}, nil, err
 	}
 	if err := ValidateSealed(config); err != nil {
-		return Config{}, err
+		return Config{}, nil, err
 	}
-	return Normalize(config)
+	config, err = Normalize(config)
+	if err != nil {
+		return Config{}, nil, err
+	}
+	return config, append([]byte(nil), data...), nil
 }
 
 func ValidateSealed(config Config) error {
