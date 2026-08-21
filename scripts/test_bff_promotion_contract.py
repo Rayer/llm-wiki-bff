@@ -59,6 +59,7 @@ class BFFPromotionContractTest(unittest.TestCase):
             "--expected-branch", "develop",
             "--expected-event", "workflow_dispatch",
             "--component", "lwc-bff",
+            "--repository", "Rayer/llm-wiki-bff",
             "--ar-repo", AR_REPO,
             "--query-config-revision", "query-dev-2026-08-21.1",
             "--query-config-digest", CONFIG_DIGEST,
@@ -68,15 +69,21 @@ class BFFPromotionContractTest(unittest.TestCase):
             command.extend([f"--{key.replace('_', '-')}", str(value)])
         return subprocess.run(command, capture_output=True, text=True)
 
-    def invoke_traffic(self, document, path="traffic", recognized=REVISION):
+    def invoke_traffic(self, document, path="traffic", recognized=REVISION, mode="artifact", expected=None, compare_path=None):
         source = self.root / "traffic.json"
         source.write_text(json.dumps(document))
-        return subprocess.run([
+        command = [
             "python3", str(SCRIPT), "validate-traffic",
             "--traffic-file", str(source),
             "--traffic-path", path,
+            "--traffic-mode", mode,
             "--recognized-revision", recognized,
-        ], capture_output=True, text=True)
+        ]
+        if expected:
+            command.extend(["--expected-revision", expected])
+        if compare_path:
+            command.extend(["--compare-path", compare_path])
+        return subprocess.run(command, capture_output=True, text=True)
 
     def test_real_receipt_shape_normalizes_exact_identity(self):
         result = self.invoke_receipt()
@@ -93,6 +100,13 @@ class BFFPromotionContractTest(unittest.TestCase):
             "image_reference": f"{AR_REPO}/llm-wiki-bff@{DIGEST}",
         })
 
+    def test_output_integrity_and_atomic_readiness_receipt(self):
+        github_output = self.root / "github-output"
+        result = self.invoke_receipt(github_output=github_output)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("dev_run_url=https://github.com/Rayer/llm-wiki-bff/actions/runs/123\n", github_output.read_text())
+        self.assertEqual(self.output.read_text().count("\n"), 1)
+
     def test_receipt_rejects_unknown_missing_trailing_duplicate_ambiguous_and_identity_fields(self):
         cases = {
             "unknown": receipt().replace("component=lwc-bff\n", "unknown=value\n"),
@@ -100,41 +114,102 @@ class BFFPromotionContractTest(unittest.TestCase):
             "trailing": receipt() + "trailing=value\n",
             "duplicate": receipt() + f"source_sha={SHA}\n",
             "flattened": receipt().replace("\n", " "),
+            "unicode": receipt().replace("component=lwc-bff", "component=lwc-bff☃"),
+            "newline": receipt().replace("component=lwc-bff", "component=lwc-bff\nextra=value"),
             "wrong sha": receipt().replace(SHA, "d" * 40),
             "wrong run": receipt().replace(f"dev_run_id={RUN_ID}", "dev_run_id=456"),
             "wrong component": receipt().replace("component=lwc-bff", "component=worker"),
-            "tag image": receipt().replace(f"image_reference={AR_REPO}/llm-wiki-bff@{DIGEST}", "image_reference=repo/lwc-bff:latest"),
+            "tag image": receipt().replace(f"image_reference={AR_REPO}/llm-wiki-bff@{DIGEST}", "repo/lwc-bff:latest"),
             "invalid digest": receipt().replace(DIGEST, "sha256:bad"),
             "schema": receipt().replace("receipt_schema_version=1", "receipt_schema_version=2"),
         }
         for name, value in cases.items():
             with self.subTest(name=name):
                 path = self.root / f"{name}.txt"
-                path.write_text(value)
-                result = self.invoke_receipt(path)
-                self.assertNotEqual(result.returncode, 0)
+                path.write_bytes(value.encode())
+                self.assertNotEqual(self.invoke_receipt(path).returncode, 0)
 
-    def test_traffic_accepts_explicit_and_resolved_latest_forms(self):
-        explicit = self.invoke_traffic({"traffic": [{"revision_name": REVISION, "percent": 100}]})
-        latest = self.invoke_traffic({"status": {"traffic": [{"latestRevision": True, "revisionName": REVISION, "percent": 100}]}}, path="status.traffic")
+    def test_receipt_rejects_noncanonical_run_url_without_writing_output(self):
+        original = json.loads(self.run_path.read_text())
+        for url in (
+            "https://github.com/Rayer/llm-wiki-bff/actions/runs/123?x=1",
+            "https://github.com/Rayer/llm-wiki-bff/actions/runs/123\r\nX-Injected: yes",
+        ):
+            with self.subTest(url=url):
+                self.run_path.write_text(json.dumps({**original, "html_url": url}))
+                output = self.root / "rejected-output"
+                self.assertNotEqual(self.invoke_receipt(github_output=output).returncode, 0)
+                self.assertFalse(output.exists())
+
+    def test_traffic_accepts_pre_mutation_explicit_and_resolved_latest_forms(self):
+        explicit = self.invoke_traffic({"traffic": [{"revisionName": REVISION, "percent": 100}]}, mode="provider-pre-mutation")
+        latest = self.invoke_traffic({"status": {"traffic": [{"latestRevision": True, "revisionName": REVISION, "percent": 100}]}}, path="status.traffic", mode="provider-pre-mutation")
         self.assertEqual(explicit.returncode, 0, explicit.stderr)
         self.assertEqual(latest.returncode, 0, latest.stderr)
 
+    def test_post_rollback_requires_explicit_frozen_revision(self):
+        explicit = self.invoke_traffic({"status": {"traffic": [{"revisionName": REVISION, "percent": 100}]}}, path="status.traffic", mode="provider-post-rollback", expected=REVISION)
+        false_latest = self.invoke_traffic({"status": {"traffic": [{"latestRevision": False, "revisionName": REVISION, "percent": 100}]}}, path="status.traffic", mode="provider-post-rollback", expected=REVISION)
+        latest = self.invoke_traffic({"status": {"traffic": [{"latestRevision": True, "revisionName": REVISION, "percent": 100}]}}, path="status.traffic", mode="provider-post-rollback", expected=REVISION)
+        self.assertEqual(explicit.returncode, 0, explicit.stderr)
+        self.assertEqual(false_latest.returncode, 0, false_latest.stderr)
+        self.assertNotEqual(latest.returncode, 0)
+
+    def test_dev_status_spec_convergence_is_stronger_than_production_preflight(self):
+        converged = {
+            "status": {"traffic": [{"revisionName": REVISION, "percent": 100}]},
+            "spec": {"traffic": [{"revisionName": REVISION, "percent": 100}]},
+        }
+        latest = {
+            "status": {"traffic": [{"latestRevision": True, "revisionName": REVISION, "percent": 100}]},
+            "spec": {"traffic": [{"latestRevision": True, "revisionName": REVISION, "percent": 100}]},
+        }
+        source = self.root / "service.json"
+        for document, expected in ((converged, 0), (latest, 1)):
+            source.write_text(json.dumps(document))
+            result = subprocess.run([
+                "python3", str(SCRIPT), "validate-traffic", "--traffic-file", str(source),
+                "--traffic-path", "status.traffic", "--compare-path", "spec.traffic",
+                "--traffic-mode", "provider-dev-convergence", "--recognized-revision", REVISION,
+            ], capture_output=True, text=True)
+            self.assertEqual(result.returncode, expected, result.stderr)
+
     def test_traffic_rejects_split_tagged_mixed_unresolved_and_malformed_forms(self):
         cases = [
-            [{"revision_name": REVISION, "percent": 50}, {"revision_name": "llm-wiki-bff-00002-new", "percent": 50}],
-            [{"revision_name": REVISION, "percent": 100, "tag": "stable"}],
-            [{"revision_name": REVISION, "latestRevision": True, "percent": 100}],
+            [{"revisionName": REVISION, "percent": 50}, {"revisionName": "llm-wiki-bff-00002-new", "percent": 50}],
+            [{"revisionName": REVISION, "percent": 100, "tag": "stable"}],
+            [{"revisionName": REVISION, "latestRevision": True, "percent": 100, "revision_name": REVISION}],
             [{"latestRevision": True, "revisionName": "llm-wiki-bff-00002-new", "percent": 100}],
-            [{"latestRevision": False, "revisionName": REVISION, "percent": 100}],
-            [{"revision_name": REVISION, "percent": 100, "unexpected": True}],
-            [{"revision_name": REVISION, "percent": 99}],
-            [{"revision_name": "bff:latest", "percent": 100}],
+            [{"revisionName": REVISION, "percent": 100, "unexpected": True}],
+            [{"revisionName": REVISION, "percent": 99}],
+            [{"revisionName": "bff:latest", "percent": 100}],
         ]
         for traffic in cases:
             with self.subTest(traffic=traffic):
-                result = self.invoke_traffic({"traffic": traffic})
-                self.assertNotEqual(result.returncode, 0)
+                self.assertNotEqual(self.invoke_traffic({"traffic": traffic}, mode="provider-pre-mutation").returncode, 0)
+
+    def test_traffic_rejects_dialect_duplicate_trailing_and_ambiguous_artifacts(self):
+        for document in (
+            {"traffic": [{"revisionName": REVISION, "percent": 100}]},
+            {"traffic": [{"revision_name": REVISION, "percent": 100, "latest_revision": "true"}]},
+            {"traffic": [{"revision_name": REVISION, "percent": 100, "tag": "stable"}]},
+            {"traffic": [{"revision_name": REVISION, "percent": 100, "extra": False}]},
+        ):
+            with self.subTest(document=document):
+                self.assertNotEqual(self.invoke_traffic(document, mode="artifact").returncode, 0)
+        duplicate = self.root / "duplicate.json"
+        duplicate.write_text('{"traffic":[{"revisionName":"%s","percent":100}],"traffic":[{"revisionName":"%s","percent":100}]}' % (REVISION, REVISION))
+        self.assertNotEqual(self.invoke_traffic_from_path(duplicate, "provider-pre-mutation").returncode, 0)
+        trailing = self.root / "trailing.json"
+        trailing.write_text('{"traffic":[]} {}')
+        self.assertNotEqual(self.invoke_traffic_from_path(trailing, "provider-pre-mutation").returncode, 0)
+
+    def invoke_traffic_from_path(self, source, mode):
+        return subprocess.run([
+            "python3", str(SCRIPT), "validate-traffic", "--traffic-file", str(source),
+            "--traffic-path", "traffic", "--traffic-mode", mode,
+            "--recognized-revision", REVISION,
+        ], capture_output=True, text=True)
 
 
 if __name__ == "__main__":

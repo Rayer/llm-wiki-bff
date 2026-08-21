@@ -1147,7 +1147,7 @@ func TestDeployWorkflowUsesImmutableCloudBuildResultDigest(t *testing.T) {
 		"status.imageDigest",
 		`verify_revision "$CREATED_REVISION" "$IMMUTABLE_IMAGE"`,
 		`(.status.imageDigest // "") == $image`,
-		`validate_exact_traffic "$CREATED_REVISION" "$SERVICE_JSON"`,
+		`validate_dev_service_traffic "$CREATED_REVISION" "$SERVICE_JSON"`,
 	} {
 		if !strings.Contains(contents, want) {
 			t.Errorf("deploy workflow is missing immutable build provenance contract %q", want)
@@ -1187,11 +1187,9 @@ func TestBFFDevWorkflowUsesCanonicalRevisionTransaction(t *testing.T) {
 	build := workflowSection(t, contents, "      - name: Build and deploy to Cloud Run", "      - name: Persist build image digest")
 	for _, want := range []string{
 		"concurrency:\n  group: deploy-bff-dev\n  cancel-in-progress: false",
-		"validate_exact_traffic() {",
-		".status.traffic as $status",
-		".spec.traffic as $spec",
-		"latestRevision // false",
-		"(($status[0].revisionName // \"\") == ($spec[0].revisionName // \"\"))",
+		"validate_dev_service_traffic() {",
+		"--compare-path spec.traffic",
+		"--traffic-mode provider-dev-convergence",
 		"PREVIOUS_ROLLBACK_REVISION_JSON=$(gcloud run revisions describe \"$PREVIOUS_ROLLBACK_REVISION\"",
 		"PREVIOUS_ROLLBACK_IMAGE=$(jq -er '.status.imageDigest // empty' <<<\"$PREVIOUS_ROLLBACK_REVISION_JSON\")",
 		"EXPECTED_IMAGE_PREFIX=\"${{ env.AR_REPO }}/llm-wiki-bff@\"",
@@ -1261,7 +1259,7 @@ func TestBFFDevWorkflowUsesCanonicalRevisionTransaction(t *testing.T) {
 		t.Fatal("BFF workflow must not fetch the remote late in the deploy step")
 	}
 	preCutoverReadAt := strings.LastIndex(build[:cutoverAt], `SERVICE_JSON=$(gcloud run services describe "${{ env.SERVICE_NAME }}"`)
-	preCutoverCheckAt := strings.LastIndex(build[:cutoverAt], `validate_exact_traffic "$PREVIOUS_ROLLBACK_REVISION" "$SERVICE_JSON"`)
+	preCutoverCheckAt := strings.LastIndex(build[:cutoverAt], `validate_dev_service_traffic "$PREVIOUS_ROLLBACK_REVISION" "$SERVICE_JSON"`)
 	if preCutoverReadAt < 0 || preCutoverCheckAt < 0 || !(preCutoverReadAt < preCutoverCheckAt && preCutoverCheckAt < contextAt) {
 		t.Fatal("BFF workflow must revalidate OLD traffic immediately before arming rollback and cutting over")
 	}
@@ -1352,19 +1350,20 @@ func TestBFFDevWorkflowUsesCanonicalRevisionTransaction(t *testing.T) {
 		"NEW_REVISION=\"${{ steps.build.outputs.new_revision }}\"",
 		"gcloud run services update-traffic \"${{ env.SERVICE_NAME }}\"",
 		"--to-revisions \"${PREVIOUS_REVISION}=100\"",
-		"validate_exact_traffic() {",
-		".status.traffic as $status",
+		"validate_dev_service_traffic() {",
+		"--compare-path spec.traffic",
+		"--traffic-mode provider-dev-convergence",
 		`SERVICE_JSON=$(gcloud run services describe "${{ env.SERVICE_NAME }}"`,
-		`validate_exact_traffic "$PREVIOUS_REVISION" "$SERVICE_JSON"`,
-		`validate_exact_traffic "$NEW_REVISION" "$SERVICE_JSON"`,
+		`validate_dev_service_traffic "$PREVIOUS_REVISION" "$SERVICE_JSON"`,
+		`validate_dev_service_traffic "$NEW_REVISION" "$SERVICE_JSON"`,
 	} {
 		if !strings.Contains(cleanup, want) {
 			t.Errorf("BFF cleanup step missing contract %q", want)
 		}
 	}
 	cleanupReadAt := strings.Index(cleanup, `SERVICE_JSON=$(gcloud run services describe "${{ env.SERVICE_NAME }}"`)
-	oldCheckAt := strings.Index(cleanup, `validate_exact_traffic "$PREVIOUS_REVISION" "$SERVICE_JSON"`)
-	newCheckAt := strings.Index(cleanup, `validate_exact_traffic "$NEW_REVISION" "$SERVICE_JSON"`)
+	oldCheckAt := strings.Index(cleanup, `validate_dev_service_traffic "$PREVIOUS_REVISION" "$SERVICE_JSON"`)
+	newCheckAt := strings.Index(cleanup, `validate_dev_service_traffic "$NEW_REVISION" "$SERVICE_JSON"`)
 	cleanupMutationAt := strings.Index(cleanup, "gcloud run services update-traffic")
 	if cleanupReadAt < 0 || oldCheckAt < 0 || newCheckAt < 0 || cleanupMutationAt < 0 || !(cleanupReadAt < oldCheckAt && oldCheckAt < newCheckAt && newCheckAt < cleanupMutationAt) {
 		t.Fatal("BFF cleanup must read and validate OLD/NEW traffic before mutation")
@@ -1564,6 +1563,7 @@ func TestReleaseWorkflowValidatesAndPersistsFrozenLiveRevisionBeforeMutation(t *
 		`.status.latestReadyRevisionName == $ready_revision`,
 		"scripts/validate_bff_promotion_contract.py validate-traffic",
 		"--traffic-path status.traffic",
+		"--traffic-mode provider-pre-mutation",
 		"--recognized-revision \"$FROZEN_READY_REVISION\"",
 		`echo "FROZEN_CREATED_REVISION=$FROZEN_CREATED_REVISION" >> "$GITHUB_ENV"`,
 	} {
@@ -1631,6 +1631,8 @@ func TestReleaseWorkflowReconcilesFrozenRestoreRegardlessOfUpdateTrafficStatus(t
 		"validate_restored_effective_traffic \"$SERVICE_JSON\"",
 		"scripts/validate_bff_promotion_contract.py validate-traffic",
 		"--traffic-path status.traffic",
+		"--traffic-mode provider-post-rollback",
+		"--expected-revision \"$FROZEN_READY_REVISION\"",
 		"--recognized-revision \"$FROZEN_READY_REVISION\"",
 		"echo \"frozen production traffic was not authoritative within timeout (update exit $ROLLBACK_EXIT)\"",
 		"echo \"restored effective routing: ${RESTORED_EFFECTIVE_REVISION}=${RESTORED_EFFECTIVE_PERCENT} (update exit $ROLLBACK_EXIT); preserving workflow failure\"",
@@ -1650,6 +1652,7 @@ func TestCIWorkflowValidatesProductVersion(t *testing.T) {
 	for _, want := range []string{
 		"Validate product version",
 		"APP_VERSION=$(go run ./cmd/versioncheck VERSION)",
+		"python3 scripts/test_bff_promotion_contract.py",
 	} {
 		if !strings.Contains(contents, want) {
 			t.Errorf("CI workflow is missing VERSION validation contract %q", want)
@@ -1658,38 +1661,49 @@ func TestCIWorkflowValidatesProductVersion(t *testing.T) {
 	assertWorkflowUsesCentralizedVersioncheck(t, contents)
 }
 
-func TestPromotionReadyWorkflowIsExactAndReadOnly(t *testing.T) {
-	contents := readWorkflow(t, ".github/workflows/production-promotion-ready.yml")
+func TestPromotionReadyJobIsSameRunExactAndReadOnly(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
+	jobStart := strings.Index(contents, "  production-promotion-ready:")
+	if jobStart < 0 {
+		t.Fatal("deploy workflow is missing production-promotion-ready job")
+	}
+	job := contents[jobStart:]
 	var document map[string]any
 	if err := yaml.Unmarshal([]byte(contents), &document); err != nil {
-		t.Fatalf("production-promotion-ready workflow is not valid YAML: %v", err)
+		t.Fatalf("deploy workflow is not valid YAML: %v", err)
 	}
 	for _, want := range []string{
-		"workflow_run:",
-		"workflow_dispatch:",
-		"commit_sha:",
-		"dev_run_id:",
-		"actions/runs/${DEV_RUN_ID}",
+		"name: production-promotion-ready",
+		"needs: test-and-deploy",
+		"github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/develop'",
+		"needs.test-and-deploy.result == 'success'",
+		"[[ \"$GITHUB_REF\" != \"refs/heads/develop\" ]]",
+		"DEVELOP_SHA=$(gh api \"repos/${GITHUB_REPOSITORY}/git/ref/heads/develop\" --jq .object.sha)",
+		"if [[ \"$DEVELOP_SHA\" != \"$CANDIDATE_SHA\" ]]",
+		"gh run download \"$DEV_RUN_ID\"",
 		"bff-image-digest-$CANDIDATE_SHA",
 		"scripts/validate_bff_promotion_contract.py validate-dev-receipt",
-		"scripts/validate_bff_promotion_contract.py validate-traffic",
+		"--repository \"$GITHUB_REPOSITORY\"",
+		"--traffic-mode artifact",
 		"bff-production-promotion-ready-",
 		"actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
 	} {
-		if !strings.Contains(contents, want) {
-			t.Errorf("readiness workflow is missing exact contract %q", want)
+		if !strings.Contains(job, want) {
+			t.Errorf("same-run readiness job is missing exact contract %q", want)
 		}
 	}
 	for _, forbidden := range []string{
+		"workflow_run:",
 		"environment: production",
 		"google-github-actions/auth",
 		"gcloud run deploy",
 		"gcloud run services update-traffic",
 		"gcloud run services describe",
 		"id-token: write",
+		"checks.create",
 	} {
-		if strings.Contains(contents, forbidden) {
-			t.Errorf("readiness workflow must remain read-only and non-Production: found %q", forbidden)
+		if strings.Contains(job, forbidden) {
+			t.Errorf("readiness job must remain read-only and same-run: found %q", forbidden)
 		}
 	}
 }
@@ -1711,8 +1725,8 @@ func TestDevReceiptProducerIsVersionedAndSelfBound(t *testing.T) {
 	}
 }
 
-func TestPromotionReadyWorkflowRunBlocksAreExecutable(t *testing.T) {
-	contents := readWorkflow(t, ".github/workflows/production-promotion-ready.yml")
+func TestDeployWorkflowRunBlocksAreExecutable(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
 	var document any
 	if err := yaml.Unmarshal([]byte(contents), &document); err != nil {
 		t.Fatalf("readiness workflow is not valid YAML: %v", err)

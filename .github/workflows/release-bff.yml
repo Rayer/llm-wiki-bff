@@ -128,6 +128,7 @@ jobs:
             --expected-branch main \
             --expected-event push \
             --component lwc-bff \
+            --repository "$GITHUB_REPOSITORY" \
             --ar-repo "$AR_REPO" \
             --query-config-revision "$QUERY_STAGE_CONFIG_REVISION" \
             --query-config-digest "$QUERY_STAGE_CONFIG_DIGEST" \
@@ -250,6 +251,7 @@ jobs:
           if ! python3 scripts/validate_bff_promotion_contract.py validate-traffic \
             --traffic-file "$ROLLBACK_CONTRACT" \
             --traffic-path traffic \
+            --traffic-mode artifact \
             --recognized-revision "$FROZEN_READY_REVISION"; then
             echo "frozen rollback traffic is not one recognized immutable 100-percent target"
             exit 1
@@ -268,6 +270,7 @@ jobs:
           if ! printf '%s\n' "$SERVICE_JSON" | python3 scripts/validate_bff_promotion_contract.py validate-traffic \
             --traffic-file - \
             --traffic-path status.traffic \
+            --traffic-mode provider-pre-mutation \
             --recognized-revision "$FROZEN_READY_REVISION"; then
             echo "live rollback traffic is not one recognized immutable 100-percent target"
             exit 1
@@ -413,20 +416,33 @@ jobs:
             python3 scripts/validate_bff_promotion_contract.py validate-traffic \
               --traffic-file "$ROLLBACK_CONTRACT" \
               --traffic-path traffic \
+              --traffic-mode artifact \
               --recognized-revision "$FROZEN_READY_REVISION"
           }
           validate_restored_effective_traffic() {
             printf '%s\n' "$1" | python3 scripts/validate_bff_promotion_contract.py validate-traffic \
               --traffic-file - \
               --traffic-path status.traffic \
-              --recognized-revision "$FROZEN_READY_REVISION"
+              --traffic-mode provider-post-rollback \
+              --recognized-revision "$FROZEN_READY_REVISION" \
+              --expected-revision "$FROZEN_READY_REVISION"
           }
           validate_effective_traffic() {
             local revision
-            revision=$(jq -er '.status.traffic[0].revisionName | select(type == "string" and length > 0)' <<<"$1") || return 1
+            revision=$(jq -er '
+              .status as $status
+              | if ($status.latestReadyRevisionName | type) == "string"
+                and ($status.traffic | type) == "array"
+                and ($status.traffic | length) == 1
+                and $status.traffic[0].revisionName == $status.latestReadyRevisionName
+                then $status.latestReadyRevisionName
+                else empty
+                end
+            ' <<<"$1") || return 1
             printf '%s\n' "$1" | python3 scripts/validate_bff_promotion_contract.py validate-traffic \
               --traffic-file - \
               --traffic-path status.traffic \
+              --traffic-mode provider-pre-mutation \
               --recognized-revision "$revision"
           }
           validate_frozen_effective_traffic() {
