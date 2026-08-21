@@ -347,12 +347,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          echo "deploy_started=true" >> "$GITHUB_OUTPUT"
           MAIN_SHA=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq .object.sha)
           if [[ "$MAIN_SHA" != "$COMMIT_SHA" ]]; then
             echo "current main changed before deploy; refusing to mutate production"
             exit 1
           fi
+          echo "deploy_started=true" >> "$GITHUB_OUTPUT"
           gcloud run deploy "$SERVICE_NAME" \
             --project "$PROJECT_ID" \
             --image "$IMMUTABLE_IMAGE" \

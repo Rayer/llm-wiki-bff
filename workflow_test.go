@@ -1534,9 +1534,10 @@ func TestReleaseWorkflowRereadsMainImmediatelyBeforeDeploy(t *testing.T) {
 	section := contents[start:]
 	read := strings.Index(section, `MAIN_SHA=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq .object.sha)`)
 	check := strings.Index(section, `if [[ "$MAIN_SHA" != "$COMMIT_SHA" ]]; then`)
+	marker := strings.Index(section, `echo "deploy_started=true" >> "$GITHUB_OUTPUT"`)
 	deploy := strings.Index(section, `gcloud run deploy "$SERVICE_NAME"`)
-	if read < 0 || check < 0 || deploy < 0 || !(read < check && check < deploy) {
-		t.Fatal("deploy step must reread and verify main immediately before its Cloud Run mutation")
+	if read < 0 || check < 0 || marker < 0 || deploy < 0 || !(read < check && check < marker && marker < deploy) {
+		t.Fatal("deploy step must reread and verify main before marking and performing its Cloud Run mutation")
 	}
 }
 
