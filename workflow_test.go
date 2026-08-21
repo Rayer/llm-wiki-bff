@@ -467,7 +467,7 @@ func TestMainFastForwardEligibilityFollowsReadiness(t *testing.T) {
 main-fast-forward-eligible:
   name: main-fast-forward-eligible
   if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/develop' && needs.production-promotion-ready.result == 'success'
-  needs: production-promotion-ready
+  needs: [test-and-deploy, production-promotion-ready]
   runs-on: ubuntu-latest
   permissions:
     contents: read
@@ -489,6 +489,17 @@ main-fast-forward-eligible:
 `)
 	if got := normalizeWorkflowContract(job); got != want {
 		t.Errorf("main fast-forward gate contract changed\n got:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+func TestMainFastForwardCandidateProducerIsDirectNeed(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
+	job := workflowSection(t, contents, "  main-fast-forward-eligible:", "\n\n")
+	if !strings.Contains(job, "CANDIDATE_SHA: ${{ needs.test-and-deploy.outputs.candidate_sha }}") {
+		t.Fatal("main fast-forward gate must use the test-and-deploy candidate output")
+	}
+	if !strings.Contains(job, "needs: [test-and-deploy, production-promotion-ready]") {
+		t.Fatal("main fast-forward candidate producer must be a direct dependency")
 	}
 }
 
@@ -1806,6 +1817,21 @@ func TestPromotionReadyJobIsSameRunExactAndReadOnly(t *testing.T) {
 	}
 	if strings.Count(contents, "QUERY_STAGE_CONFIG_REVISION:") != 1 || strings.Count(contents, "QUERY_STAGE_CONFIG_DIGEST:") != 1 {
 		t.Fatal("query config identity must have one workflow-level authority")
+	}
+}
+
+func TestPromotionReadyUsesWorkflowQueryConfigAuthority(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
+	job := workflowSection(t, contents, "  production-promotion-ready:", "  main-fast-forward-eligible:")
+	for _, name := range []string{"QUERY_STAGE_CONFIG_REVISION", "QUERY_STAGE_CONFIG_DIGEST"} {
+		if strings.Count(contents, name+":") != 1 || strings.Count(job, "$"+name) != 1 {
+			t.Fatalf("readiness query config reference must resolve to the one workflow-level %s", name)
+		}
+	}
+	for _, forbidden := range []string{"QUERY_CONFIG_REVISION", "QUERY_CONFIG_DIGEST"} {
+		if strings.Contains(job, forbidden) {
+			t.Fatalf("readiness must not use undefined query config alias %s", forbidden)
+		}
 	}
 }
 

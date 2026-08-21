@@ -802,8 +802,8 @@ jobs:
             --component lwc-bff \
             --repository "$GITHUB_REPOSITORY" \
             --ar-repo "$AR_REPO" \
-            --query-config-revision "$QUERY_CONFIG_REVISION" \
-            --query-config-digest "$QUERY_CONFIG_DIGEST" \
+            --query-config-revision "$QUERY_STAGE_CONFIG_REVISION" \
+            --query-config-digest "$QUERY_STAGE_CONFIG_DIGEST" \
             --output "$RUNNER_TEMP/bff-production-promotion-ready.json"
 
       - name: Validate canonical rollback artifact
@@ -826,7 +826,7 @@ jobs:
   main-fast-forward-eligible:
     name: main-fast-forward-eligible
     if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/develop' && needs.production-promotion-ready.result == 'success'
-    needs: production-promotion-ready
+    needs: [test-and-deploy, production-promotion-ready]
     runs-on: ubuntu-latest
     permissions:
       contents: read
