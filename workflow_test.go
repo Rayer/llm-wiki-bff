@@ -462,57 +462,88 @@ func TestMainFastForwardEligibilityFollowsReadiness(t *testing.T) {
 		t.Fatal("CI must not publish the protected main gate")
 	}
 	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
-	job := workflowSection(t, contents, "  main-fast-forward-eligible:", "\n\n")
-	want := normalizeWorkflowContract(`
-main-fast-forward-eligible:
-  name: main-fast-forward-eligible
-  if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/develop' && needs.production-promotion-ready.result == 'success'
-  needs: [test-and-deploy, production-promotion-ready]
-  runs-on: ubuntu-latest
-  permissions:
-    contents: read
-  steps:
-    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      with:
-        fetch-depth: 0
-        persist-credentials: false
-    - name: Verify main fast-forward eligibility
-      env:
-        CANDIDATE_SHA: ${{ needs.test-and-deploy.outputs.candidate_sha }}
-      run: |
-        set -euo pipefail
-        [[ "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]]
-        git fetch --no-tags origin main develop
-	        test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
-	        test "$(git rev-parse origin/develop)" = "$CANDIDATE_SHA"
-	        git merge-base --is-ancestor origin/main "$CANDIDATE_SHA"
-`)
-	if got := normalizeWorkflowContract(job); got != want {
-		t.Errorf("main fast-forward gate contract changed\n got:\n%s\nwant:\n%s", got, want)
+	jobStart := strings.Index(contents, "  main-fast-forward-eligible:")
+	if jobStart < 0 {
+		t.Fatal("workflow is missing main-fast-forward-eligible job")
+	}
+	job := contents[jobStart:]
+	for _, want := range []string{
+		"if: ${{ always() && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/develop' }}",
+		"needs: [test-and-deploy, production-promotion-ready]",
+		"contents: read",
+		"statuses: write",
+	} {
+		if !strings.Contains(job, want) {
+			t.Errorf("main fast-forward gate is missing %q", want)
+		}
+	}
+	pending := strings.Index(job, "- name: Publish pending main fast-forward eligibility status")
+	checkout := strings.Index(job, "- name: Checkout exact event SHA")
+	fresh := strings.Index(job, "- name: Verify exact candidate and main fast-forward eligibility")
+	success := strings.Index(job, "- name: Publish successful main fast-forward eligibility status")
+	cleanup := strings.Index(job, "- name: Publish failure cleanup for main fast-forward eligibility")
+	steps := strings.Index(job, "    steps:")
+	if steps < 0 {
+		t.Fatal("main fast-forward job is missing steps")
+	}
+	firstStep := strings.Index(job[steps:], "- name: Publish pending main fast-forward eligibility status")
+	if pending < 0 || checkout < 0 || fresh < 0 || success < 0 || firstStep < 0 || steps+firstStep != pending || !(pending < checkout && checkout < fresh && fresh < success) {
+		t.Fatal("pending must precede checkout, fresh gates, and success publication")
+	}
+	pendingBlock := job[pending:checkout]
+	if strings.Contains(pendingBlock, "needs.test-and-deploy.outputs.candidate_sha") || !strings.Contains(pendingBlock, "EVENT_SHA: ${{ github.sha }}") || !strings.Contains(pendingBlock, "GH_TOKEN: ${{ github.token }}") {
+		t.Fatal("pending publication must use only the trusted event SHA and workflow token")
+	}
+	if !strings.Contains(job[checkout:fresh], "ref: ${{ github.sha }}") || !strings.Contains(job[checkout:fresh], "fetch-depth: 0") || !strings.Contains(job[checkout:fresh], "persist-credentials: false") {
+		t.Fatal("checkout must use the exact event SHA without persisted credentials")
+	}
+	freshBlock := job[fresh:success]
+	for _, want := range []string{
+		"EVENT_SHA: ${{ github.sha }}",
+		"CANDIDATE_SHA: ${{ needs.test-and-deploy.outputs.candidate_sha }}",
+		"TEST_DEPLOY_RESULT: ${{ needs.test-and-deploy.result }}",
+		"READINESS_RESULT: ${{ needs.production-promotion-ready.result }}",
+	} {
+		if !strings.Contains(freshBlock, want) {
+			t.Errorf("fresh eligibility gate is missing %q", want)
+		}
+	}
+	for _, run := range []string{
+		workflowRunBlock(contents, "Publish pending main fast-forward eligibility status"),
+		workflowRunBlock(contents, "Verify exact candidate and main fast-forward eligibility"),
+		workflowRunBlock(contents, "Publish successful main fast-forward eligibility status"),
+	} {
+		if strings.Contains(run, "${{") {
+			t.Fatal("executable gate scripts must consume env-bound workflow expressions")
+		}
+	}
+	successBlock := job[success:cleanup]
+	if strings.Contains(freshBlock, "\n        if:") || strings.Contains(successBlock, "\n        if:") {
+		t.Fatal("verify and final success steps must use default success semantics")
 	}
 }
 
 func TestMainFastForwardCandidateProducerIsDirectNeed(t *testing.T) {
 	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
-	job := workflowSection(t, contents, "  main-fast-forward-eligible:", "\n\n")
-	if !strings.Contains(job, "CANDIDATE_SHA: ${{ needs.test-and-deploy.outputs.candidate_sha }}") {
-		t.Fatal("main fast-forward gate must use the test-and-deploy candidate output")
+	fresh := workflowSection(t, contents, "      - name: Verify exact candidate and main fast-forward eligibility", "      - name: Publish successful main fast-forward eligibility status")
+	if strings.Count(fresh, "CANDIDATE_SHA: ${{ needs.test-and-deploy.outputs.candidate_sha }}") != 1 {
+		t.Fatal("fresh verification must bind exactly to the test-and-deploy candidate output")
 	}
-	if !strings.Contains(job, "needs: [test-and-deploy, production-promotion-ready]") {
-		t.Fatal("main fast-forward candidate producer must be a direct dependency")
-	}
-}
-
-func normalizeWorkflowContract(contents string) string {
-	lines := strings.Split(strings.ReplaceAll(contents, "\r\n", "\n"), "\n")
-	normalized := lines[:0]
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line != "" {
-			normalized = append(normalized, line)
+	for _, want := range []string{
+		"TEST_DEPLOY_RESULT: ${{ needs.test-and-deploy.result }}",
+		"READINESS_RESULT: ${{ needs.production-promotion-ready.result }}",
+		`if [[ "$TEST_DEPLOY_RESULT" != "success" || "$READINESS_RESULT" != "success" ]]; then`,
+	} {
+		if !strings.Contains(fresh, want) {
+			t.Fatalf("fresh verification must bind and check upstream result %q", want)
 		}
 	}
-	return strings.Join(normalized, "\n")
+	resultCheck := strings.Index(fresh, `if [[ "$TEST_DEPLOY_RESULT" != "success" || "$READINESS_RESULT" != "success" ]]; then`)
+	candidateCheck := strings.Index(fresh, `if [[ ! "$CANDIDATE_SHA" =~`)
+	remoteCheck := strings.Index(fresh, "git fetch --no-tags origin main develop")
+	if resultCheck < 0 || candidateCheck < 0 || remoteCheck < 0 || !(resultCheck < candidateCheck && resultCheck < remoteCheck) {
+		t.Fatal("fresh verification must check upstream results before candidate and remote gates")
+	}
 }
 
 func TestBFFDevWorkflowPushesDevelopAndSupportsManualDispatch(t *testing.T) {
@@ -1833,6 +1864,246 @@ func TestPromotionReadyUsesWorkflowQueryConfigAuthority(t *testing.T) {
 			t.Fatalf("readiness must not use undefined query config alias %s", forbidden)
 		}
 	}
+}
+
+func TestMainFastForwardEligibilityPublishesExactCommitStatus(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
+	jobStart := strings.Index(contents, "  main-fast-forward-eligible:")
+	if jobStart < 0 {
+		t.Fatal("workflow is missing main-fast-forward-eligible job")
+	}
+	job := contents[jobStart:]
+	pending := strings.Index(job, "- name: Publish pending main fast-forward eligibility status")
+	fresh := strings.Index(job, "- name: Verify exact candidate and main fast-forward eligibility")
+	success := strings.Index(job, "- name: Publish successful main fast-forward eligibility status")
+	cleanup := strings.Index(job, "- name: Publish failure cleanup for main fast-forward eligibility")
+	if pending < 0 || fresh < 0 || success < 0 || cleanup < 0 || !(pending < fresh && fresh < success && success < cleanup) {
+		t.Fatal("pending status must precede fresh eligibility gates, final status publication, and failure cleanup")
+	}
+	pendingRun := workflowRunBlock(contents, "Publish pending main fast-forward eligibility status")
+	freshRun := workflowRunBlock(contents, "Verify exact candidate and main fast-forward eligibility")
+	final := workflowRunBlock(contents, "Publish successful main fast-forward eligibility status")
+	cleanupRun := workflowRunBlock(contents, "Publish failure cleanup for main fast-forward eligibility")
+	for _, want := range []string{
+		"EVENT_SHA: ${{ github.sha }}",
+		"GH_TOKEN: ${{ github.token }}",
+		"statuses/$EVENT_SHA",
+		"-f state=pending",
+	} {
+		if !strings.Contains(job[pending:], want) {
+			t.Errorf("pending status contract is missing %q", want)
+		}
+	}
+	for _, want := range []string{
+		"git fetch --no-tags origin main develop",
+		"git rev-parse HEAD",
+		"git rev-parse origin/develop",
+		"git merge-base --is-ancestor origin/main \"$EVENT_SHA\"",
+		"gh api --method POST \"repos/${GITHUB_REPOSITORY}/statuses/$EVENT_SHA\"",
+		"-f state=success",
+		"-f context=main-fast-forward-eligible",
+	} {
+		if !strings.Contains(final, want) {
+			t.Errorf("final status action is missing %q", want)
+		}
+	}
+	successSection := job[success:cleanup]
+	if strings.Contains(successSection, "if:") {
+		t.Fatal("success publication must use default success semantics")
+	}
+	cleanupSection := job[cleanup:]
+	if next := strings.Index(cleanupSection, "\n      - "); next >= 0 {
+		cleanupSection = cleanupSection[:next]
+	}
+	if !strings.Contains(cleanupSection, "if: ${{ failure() || cancelled() }}") {
+		t.Fatal("failure cleanup must run exactly on failure or cancellation")
+	}
+	for _, want := range []string{
+		"statuses/$EVENT_SHA",
+		`^[0-9a-f]{40}$`,
+		"-f state=failure",
+		"-f context=main-fast-forward-eligible",
+		"-f description=\"validation failed or was cancelled\"",
+	} {
+		if !strings.Contains(cleanupRun, want) {
+			t.Errorf("failure cleanup contract is missing %q", want)
+		}
+	}
+	for _, want := range []string{"EVENT_SHA: ${{ github.sha }}", "GH_TOKEN: ${{ github.token }}"} {
+		if !strings.Contains(cleanupSection, want) {
+			t.Errorf("failure cleanup environment is missing %q", want)
+		}
+	}
+	if strings.Contains(cleanupSection, "continue-on-error") {
+		t.Fatal("failure cleanup must preserve the job failure conclusion")
+	}
+	finalPost := strings.Index(final, "gh api --method POST")
+	if finalPost < 0 || strings.Contains(final[finalPost:], "|") || strings.Contains(final[finalPost:], "jq") {
+		t.Fatal("success publication must be one unvalidated gh API command")
+	}
+	for _, check := range []string{"git fetch --no-tags origin main develop", "git rev-parse HEAD", "git rev-parse origin/develop", "git merge-base --is-ancestor origin/main \"$EVENT_SHA\""} {
+		if strings.Index(final, check) > finalPost {
+			t.Fatalf("final remote or ancestry check %q must precede the success POST", check)
+		}
+	}
+	if !strings.HasSuffix(strings.TrimSpace(final), `-f description="exact candidate is eligible for a main fast-forward"`) {
+		t.Fatal("success POST must be the final shell action")
+	}
+	if strings.Contains(pendingRun, "jq") || strings.Contains(pendingRun, ".sha") || strings.Contains(freshRun, "gh api") {
+		t.Fatal("pending and fresh verification must not validate provider response schemas or publish status")
+	}
+	if strings.Count(contents, "statuses: write") != 1 || strings.Contains(contents[:strings.Index(contents, "  main-fast-forward-eligible:")], "statuses: write") {
+		t.Fatal("statuses: write must be limited to the main fast-forward job")
+	}
+}
+
+func TestMainFastForwardEligibilityNegativePathsDoNotPublishSuccess(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
+	pending := workflowRunBlock(contents, "Publish pending main fast-forward eligibility status")
+	fresh := workflowRunBlock(contents, "Verify exact candidate and main fast-forward eligibility")
+	final := workflowRunBlock(contents, "Publish successful main fast-forward eligibility status")
+	cleanup := workflowRunBlock(contents, "Publish failure cleanup for main fast-forward eligibility")
+	if pending == "" || fresh == "" || final == "" || cleanup == "" {
+		t.Fatal("could not extract main fast-forward status run blocks")
+	}
+
+	const event = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	const other = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	tests := []struct {
+		name           string
+		candidate      string
+		head           string
+		develop        string
+		ancestry       string
+		ghMode         string
+		upstream       string
+		wantAccepted   string
+		wantFreshRun   bool
+		wantFinalRun   bool
+		wantCleanupRun bool
+	}{
+		{name: "positive", candidate: event, head: event, develop: event, upstream: "success", wantAccepted: "pending,success", wantFreshRun: true, wantFinalRun: true},
+		{name: "upstream failure", candidate: event, head: event, develop: event, upstream: "failure", wantAccepted: "pending,failure", wantFreshRun: true, wantCleanupRun: true},
+		{name: "upstream skipped", candidate: event, head: event, develop: event, upstream: "skipped", wantAccepted: "pending,failure", wantFreshRun: true, wantCleanupRun: true},
+		{name: "stale develop", candidate: event, head: event, develop: other, upstream: "success", wantAccepted: "pending,failure", wantFreshRun: true, wantCleanupRun: true},
+		{name: "wrong candidate", candidate: other, head: event, develop: event, upstream: "success", wantAccepted: "pending,failure", wantFreshRun: true, wantCleanupRun: true},
+		{name: "malformed candidate", candidate: "not-a-sha", head: event, develop: event, upstream: "success", wantAccepted: "pending,failure", wantFreshRun: true, wantCleanupRun: true},
+		{name: "ancestry failure", candidate: event, head: event, develop: event, ancestry: "fail", upstream: "success", wantAccepted: "pending,failure", wantFreshRun: true, wantCleanupRun: true},
+		{name: "pending API failure", candidate: event, head: event, develop: event, ghMode: "fail_pending", upstream: "success", wantAccepted: "failure", wantCleanupRun: true},
+		{name: "cleanup API failure", candidate: event, head: event, develop: event, ghMode: "fail_failure", upstream: "failure", wantAccepted: "pending", wantFreshRun: true, wantCleanupRun: true},
+		{name: "success API failure", candidate: event, head: event, develop: event, ghMode: "fail_success", upstream: "success", wantAccepted: "pending,failure", wantFreshRun: true, wantFinalRun: true, wantCleanupRun: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			bin := t.TempDir()
+			writeExecutable(t, filepath.Join(bin, "git"), `#!/usr/bin/env bash
+set -euo pipefail
+case "$1 ${2:-}" in
+  fetch\ *) exit 0 ;;
+  rev-parse\ HEAD) printf '%s\n' "$FAKE_HEAD" ;;
+  rev-parse\ origin/develop) printf '%s\n' "$FAKE_DEVELOP" ;;
+  merge-base\ --is-ancestor) [[ "${FAKE_ANCESTRY:-}" != fail ]] ;;
+  *) echo "unexpected git invocation: $*" >&2; exit 2 ;;
+esac
+`)
+			writeExecutable(t, filepath.Join(bin, "gh"), `#!/usr/bin/env bash
+set -euo pipefail
+state=""
+for arg in "$@"; do
+  [[ "$arg" == state=* ]] && state="${arg#state=}"
+done
+case "${GH_MODE:-}" in
+  fail_pending) [[ "$state" != pending ]] || exit 1 ;;
+  fail_success) [[ "$state" != success ]] || exit 1 ;;
+  fail_failure) [[ "$state" != failure ]] || exit 1 ;;
+esac
+printf '%s\n' "$state" >> "$GH_ACCEPTED_LOG"
+`)
+			log := filepath.Join(t.TempDir(), "accepted-status.log")
+			env := append(os.Environ(),
+				"PATH="+bin+":"+os.Getenv("PATH"),
+				"EVENT_SHA="+event,
+				"CANDIDATE_SHA="+tc.candidate,
+				"TEST_DEPLOY_RESULT="+tc.upstream,
+				"READINESS_RESULT="+tc.upstream,
+				"FAKE_HEAD="+tc.head,
+				"FAKE_DEVELOP="+tc.develop,
+				"FAKE_ANCESTRY="+tc.ancestry,
+				"GH_MODE="+tc.ghMode,
+				"GH_ACCEPTED_LOG="+log,
+				"GITHUB_REPOSITORY=owner/repo",
+			)
+			pendingErr := runWorkflowBlock(t, pending, env)
+			freshRan := false
+			finalRan := false
+			cleanupNeeded := pendingErr != nil
+			if pendingErr == nil {
+				freshRan = true
+				pendingErr = runWorkflowBlock(t, fresh, env)
+				cleanupNeeded = pendingErr != nil
+				if pendingErr == nil {
+					finalRan = true
+					pendingErr = runWorkflowBlock(t, final, env)
+					cleanupNeeded = pendingErr != nil
+				}
+			}
+			if cleanupNeeded {
+				if err := runWorkflowBlock(t, cleanup, env); err != nil && tc.ghMode != "fail_failure" {
+					t.Fatalf("failure cleanup failed unexpectedly: %v", err)
+				}
+			}
+			if cleanupNeeded != tc.wantCleanupRun {
+				t.Fatalf("cleanup execution = %t, want %t", cleanupNeeded, tc.wantCleanupRun)
+			}
+			if freshRan != tc.wantFreshRun || finalRan != tc.wantFinalRun {
+				t.Fatalf("fresh/final execution = %t/%t, want %t/%t", freshRan, finalRan, tc.wantFreshRun, tc.wantFinalRun)
+			}
+			states, _ := os.ReadFile(log)
+			if got := strings.Trim(strings.ReplaceAll(string(states), "\n", ","), ",\n "); got != tc.wantAccepted {
+				t.Fatalf("accepted status states = %q, want %q", got, tc.wantAccepted)
+			}
+			if strings.Contains(string(states), "success") && tc.wantAccepted != "pending,success" {
+				t.Fatal("failed candidate must not publish accepted success")
+			}
+		})
+	}
+}
+
+func workflowRunBlock(contents, stepName string) string {
+	start := strings.Index(contents, "      - name: "+stepName)
+	if start < 0 {
+		return ""
+	}
+	section := contents[start:]
+	if next := strings.Index(section, "\n      - "); next >= 0 {
+		section = section[:next]
+	}
+	run := strings.Index(section, "        run: |\n")
+	if run < 0 {
+		return ""
+	}
+	body := section[run+len("        run: |\n"):]
+	lines := strings.Split(body, "\n")
+	for i, line := range lines {
+		if strings.HasPrefix(line, "          ") {
+			lines[i] = line[10:]
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+func writeExecutable(t *testing.T, path, contents string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(contents), 0o755); err != nil {
+		t.Fatalf("write fake executable %s: %v", path, err)
+	}
+}
+
+func runWorkflowBlock(t *testing.T, body string, env []string) error {
+	t.Helper()
+	cmd := exec.Command("bash", "-c", body)
+	cmd.Env = env
+	return cmd.Run()
 }
 
 func TestDevReceiptProducerIsVersionedAndSelfBound(t *testing.T) {
