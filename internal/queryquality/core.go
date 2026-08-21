@@ -1288,8 +1288,10 @@ func providerIdentity(expander QueryExpander) (string, string, string) {
 		return providerIdentity(parallel.expander)
 	}
 	if structured, ok := expander.(StructuredPlanExpander); ok {
-		if client, ok := structured.provider.(*llm.Client); ok {
-			return "deepseek", client.Model(), string(client.Reasoning())
+		if identityProvider, ok := structured.provider.(llm.ModelIdentityProvider); ok {
+			if identity, available := identityProvider.ModelIdentity(); available {
+				return identity.Provider, identity.Model, identity.Reasoning
+			}
 		}
 	}
 	return "", "", ""

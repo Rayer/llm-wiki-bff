@@ -81,14 +81,14 @@ func buildStageConfig(options experimentOptions, variant fixtureVariant, prepare
 		QueryServiceImplementation: queryconfig.QueryServiceImplementation,
 		Stages: queryconfig.Stages{
 			QueryExpander: queryconfig.QueryExpanderStage{
-				Implementation: queryconfig.QueryExpanderImplementation, Model: "deepseek-v4-flash", Reasoning: "none", Temperature: 0,
+				Provider: queryconfig.ProviderDeepSeek, Implementation: queryconfig.QueryExpanderImplementation, Model: "deepseek-v4-flash", Reasoning: "none", Temperature: 0,
 				DefaultProfileID: defaultProfile.ID, DefaultProfileDigest: defaultProfileDigest,
 				DefaultPromptID: queryquality.StructuredPlanPromptID, DefaultPromptDigest: lifestylePrompt.TemplateDigest,
 				KeywordsPerAttempt: retrievalOptions.keywordsPerAttempt, Attempts: retrievalOptions.expansionAttempts,
 			},
 			CandidateMatcher:  queryconfig.CandidateMatcherStage{Implementation: queryconfig.CandidateMatcherImplementation, EvidenceThreshold: retrievalOptions.evidenceThreshold, RareKeywordMaxDocumentFrequency: retrievalOptions.rareDocumentFrequency},
 			ResultSelector:    queryconfig.ResultSelectorStage{Implementation: queryconfig.ResultSelectorImplementation, Limit: retrievalOptions.selectionLimit, ExplorationSlots: retrievalOptions.explorationSlots, SeedPolicy: queryconfig.SeedPolicy},
-			AnswerSynthesizer: queryconfig.AnswerSynthesizerStage{Implementation: queryconfig.AnswerSynthesizerImplementation, Model: "deepseek-v4-pro", Reasoning: "none", NoEvidencePolicy: queryconfig.NoEvidencePolicy},
+			AnswerSynthesizer: queryconfig.AnswerSynthesizerStage{Provider: queryconfig.ProviderDeepSeek, Implementation: queryconfig.AnswerSynthesizerImplementation, Model: "deepseek-v4-pro", Reasoning: "none", Temperature: 0, NoEvidencePolicy: queryconfig.NoEvidencePolicy},
 		},
 		Profiles:        []queryconfig.Profile{{ID: defaultProfile.ID, CriterionPolicy: defaultProfile.CriterionPolicy, ProfileDigest: defaultProfileDigest}},
 		ProjectBindings: []queryconfig.ProjectBinding{{ProjectID: options.projectID, GenerationID: prepared.generationID, ConceptsDigest: conceptsDigest, ProfileID: profile.ID, ProfileDigest: profileDigest, PromptID: prompt.ID, PromptDigest: prompt.TemplateDigest, Source: queryconfig.SourceCorpusDerivedApproximation}},

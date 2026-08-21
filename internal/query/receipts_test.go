@@ -112,7 +112,7 @@ func TestReceiptDigestsSurfaceFormsWithoutPersistingThem(t *testing.T) {
 
 func TestReceiptStoresDefensiveRuntimeConfigIdentity(t *testing.T) {
 	_, recorder := WithReceipt(context.Background())
-	identity := RuntimeConfigIdentity{SchemaVersion: 1, ConfigRevision: "rev", ConfigDigest: "sha256:config", EffectiveConfigDigest: "sha256:effective", QueryServiceImplementation: "query-retrieval-pipeline-v2", ProfileID: "profile", ProfileDigest: "sha256:profile", PromptID: "prompt", PromptDigest: "sha256:prompt", BindingSource: "legacy_compatibility", GenerationID: "legacy", ConceptsDigest: ""}
+	identity := RuntimeConfigIdentity{SchemaVersion: 2, ConfigRevision: "rev", ConfigDigest: "sha256:config", EffectiveConfigDigest: "sha256:effective", QueryServiceImplementation: "query-retrieval-pipeline-v2", ProfileID: "profile", ProfileDigest: "sha256:profile", PromptID: "prompt", PromptDigest: "sha256:prompt", BindingSource: "legacy_compatibility", GenerationID: "legacy", ConceptsDigest: "", ExpansionProvider: "deepseek", SynthesisProvider: "deepseek"}
 	recorder.SetRuntimeConfigIdentity(identity)
 	identity.ProfileID = "mutated"
 	got := recorder.Receipt()

@@ -9,6 +9,7 @@ import (
 
 	"github.com/rayer/llm-wiki-bff/internal/cache"
 	"github.com/rayer/llm-wiki-bff/internal/gcs"
+	"github.com/rayer/llm-wiki-bff/internal/llm"
 	"github.com/rayer/llm-wiki-bff/internal/query"
 	"github.com/rayer/llm-wiki-bff/internal/queryconfig"
 	"github.com/rayer/llm-wiki-bff/internal/queryquality"
@@ -51,6 +52,10 @@ func (p *countingProvider) Chat(_ context.Context, system, user string) (string,
 	return `{"raw_query":"deploy docs","required":[],"excluded":[],"preferred":[{"kind":"topic","value":"deploy","terms":["deploy"],"proof":"lexical"}],"goals":[],"supporting_dimensions":[],"acceptable_alternatives":[],"ambiguity":[],"fallback":false}`, nil
 }
 
+func (p *countingProvider) ModelIdentity() (llm.ModelIdentity, bool) {
+	return llm.ModelIdentity{Provider: queryconfig.ProviderDeepSeek, Model: "deepseek-v4-flash", Reasoning: "none", Temperature: 0}, true
+}
+
 type countingLegacy struct {
 	mu    sync.Mutex
 	calls int
@@ -67,7 +72,7 @@ func TestRuntimePrebuildsAndRoutesExactAndDefault(t *testing.T) {
 	config := runtimeConfig(t)
 	provider := &countingProvider{}
 	legacy := &countingLegacy{}
-	runtime, err := queryruntime.NewExecutor(config, cache.New(), provider, legacy, nil)
+	runtime, err := queryruntime.NewExecutor(config, cache.New(), provider, legacy, runtimeSynthesizer())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,7 +104,7 @@ func TestRuntimePrebuildsAndRoutesExactAndDefault(t *testing.T) {
 }
 
 func TestRuntimeMismatchAndUnknownReaderHaveZeroPipelineEffects(t *testing.T) {
-	runtime, err := queryruntime.NewExecutor(runtimeConfig(t), cache.New(), &countingProvider{}, &countingLegacy{}, nil)
+	runtime, err := queryruntime.NewExecutor(runtimeConfig(t), cache.New(), &countingProvider{}, &countingLegacy{}, runtimeSynthesizer())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -129,7 +134,7 @@ func (*unknownReader) GetPage(context.Context, string, string) (*gcs.WikiPage, [
 func TestRuntimeTechnicalPromptMatchesSharedProductionRenderer(t *testing.T) {
 	config := runtimeConfig(t)
 	provider := &countingProvider{}
-	runtime, err := queryruntime.NewExecutor(config, cache.New(), provider, &countingLegacy{}, nil)
+	runtime, err := queryruntime.NewExecutor(config, cache.New(), provider, &countingLegacy{}, runtimeSynthesizer())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -147,6 +152,41 @@ func TestRuntimeTechnicalPromptMatchesSharedProductionRenderer(t *testing.T) {
 	}
 }
 
+func TestRuntimeConcurrentMixedGenerationAndRollbackRoutingIsRaceSafe(t *testing.T) {
+	provider := &countingProvider{}
+	runtime, err := queryruntime.NewExecutor(runtimeConfig(t), cache.New(), provider, &countingLegacy{}, runtimeSynthesizer())
+	if err != nil {
+		t.Fatal(err)
+	}
+	identities := []storage.QueryGenerationIdentity{
+		{ProjectID: "project-a", GenerationID: "generation-7", ConceptsDigest: "sha256:" + strings.Repeat("a", 64)},
+		{ProjectID: "unlisted", GenerationID: "legacy"},
+	}
+	var wg sync.WaitGroup
+	errs := make(chan error, 40)
+	for i := 0; i < 40; i++ {
+		identity := identities[i%len(identities)]
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			reader := &runtimeReader{identity: identity}
+			result, err := runtime.Execute(context.Background(), reader, query.Request{Query: "deploy docs", Mode: "wiki"})
+			if err != nil {
+				errs <- err
+				return
+			}
+			if result.RuntimeConfigIdentity == nil || result.RuntimeConfigIdentity.GenerationID != identity.GenerationID {
+				errs <- errors.New("concurrent route returned the wrong generation identity")
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+}
+
 func runtimeConfig(t *testing.T) queryconfig.Config {
 	t.Helper()
 	base := queryquality.DefaultRetrievalProfile()
@@ -155,11 +195,15 @@ func runtimeConfig(t *testing.T) queryconfig.Config {
 	technicalDigest, _ := technical.Digest()
 	lifestylePrompt, _ := queryquality.LookupPrompt(queryquality.StructuredPlanPromptID)
 	technicalPrompt, _ := queryquality.LookupPrompt(queryquality.DomainNeutralTechnicalPromptID)
-	sealed, err := queryconfig.Seal(queryconfig.Config{SchemaVersion: 1, ConfigRevision: "rev", QueryServiceImplementation: queryconfig.QueryServiceImplementation,
-		Stages:   queryconfig.Stages{QueryExpander: queryconfig.QueryExpanderStage{Implementation: queryconfig.QueryExpanderImplementation, Model: "deepseek-v4-flash", Reasoning: "none", Temperature: 0, DefaultProfileID: base.ID, DefaultProfileDigest: defaultDigest, DefaultPromptID: lifestylePrompt.ID, DefaultPromptDigest: lifestylePrompt.TemplateDigest, KeywordsPerAttempt: 24, Attempts: 3}, CandidateMatcher: queryconfig.CandidateMatcherStage{Implementation: queryconfig.CandidateMatcherImplementation, EvidenceThreshold: 2, RareKeywordMaxDocumentFrequency: 1}, ResultSelector: queryconfig.ResultSelectorStage{Implementation: queryconfig.ResultSelectorImplementation, Limit: 10, ExplorationSlots: 1, SeedPolicy: queryconfig.SeedPolicy}, AnswerSynthesizer: queryconfig.AnswerSynthesizerStage{Implementation: queryconfig.AnswerSynthesizerImplementation, Model: "deepseek-v4-pro", Reasoning: "none", NoEvidencePolicy: queryconfig.NoEvidencePolicy}},
+	sealed, err := queryconfig.Seal(queryconfig.Config{SchemaVersion: 2, ConfigRevision: "rev", QueryServiceImplementation: queryconfig.QueryServiceImplementation,
+		Stages:   queryconfig.Stages{QueryExpander: queryconfig.QueryExpanderStage{Provider: queryconfig.ProviderDeepSeek, Implementation: queryconfig.QueryExpanderImplementation, Model: "deepseek-v4-flash", Reasoning: "none", Temperature: 0, DefaultProfileID: base.ID, DefaultProfileDigest: defaultDigest, DefaultPromptID: lifestylePrompt.ID, DefaultPromptDigest: lifestylePrompt.TemplateDigest, KeywordsPerAttempt: 24, Attempts: 3}, CandidateMatcher: queryconfig.CandidateMatcherStage{Implementation: queryconfig.CandidateMatcherImplementation, EvidenceThreshold: 2, RareKeywordMaxDocumentFrequency: 1}, ResultSelector: queryconfig.ResultSelectorStage{Implementation: queryconfig.ResultSelectorImplementation, Limit: 10, ExplorationSlots: 1, SeedPolicy: queryconfig.SeedPolicy}, AnswerSynthesizer: queryconfig.AnswerSynthesizerStage{Provider: queryconfig.ProviderDeepSeek, Implementation: queryconfig.AnswerSynthesizerImplementation, Model: "deepseek-v4-pro", Reasoning: "none", Temperature: 0, NoEvidencePolicy: queryconfig.NoEvidencePolicy}},
 		Profiles: []queryconfig.Profile{{ID: base.ID, CriterionPolicy: base.CriterionPolicy, ProfileDigest: defaultDigest}, {ID: technical.ID, CriterionPolicy: technical.CriterionPolicy, ProfileDigest: technicalDigest}}, ProjectBindings: []queryconfig.ProjectBinding{{ProjectID: "project-a", GenerationID: "generation-7", ConceptsDigest: "sha256:" + strings.Repeat("a", 64), ProfileID: technical.ID, ProfileDigest: technicalDigest, PromptID: technicalPrompt.ID, PromptDigest: technicalPrompt.TemplateDigest, Source: queryconfig.SourceCorpusDerivedApproximation}}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	return sealed
+}
+
+func runtimeSynthesizer() *query.Service {
+	return query.NewService(cache.New(), nil, llm.NewClientWithOptions("test", llm.ClientOptions{Model: "deepseek-v4-pro", Reasoning: llm.ReasoningNone}))
 }

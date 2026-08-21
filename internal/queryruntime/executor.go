@@ -5,8 +5,10 @@ package queryruntime
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"github.com/rayer/llm-wiki-bff/internal/cache"
+	"github.com/rayer/llm-wiki-bff/internal/llm"
 	"github.com/rayer/llm-wiki-bff/internal/query"
 	"github.com/rayer/llm-wiki-bff/internal/queryconfig"
 	"github.com/rayer/llm-wiki-bff/internal/queryquality"
@@ -22,31 +24,69 @@ type Executor struct {
 	compositionServices map[string]query.Executor
 }
 
-func NewExecutor(config queryconfig.Config, conceptCache *cache.Cache, expansionProvider queryquality.ChatProvider, legacy query.Executor, synthesizer *query.Service) (*Executor, error) {
+func NewExecutor(config queryconfig.Config, conceptCache *cache.Cache, expansionProvider queryquality.ChatProvider, legacy query.Executor, synthesizer query.Synthesizer) (*Executor, error) {
+	return newExecutor(config, conceptCache, expansionProvider, legacy, synthesizer, queryquality.NewProductionExecutorWithQueryServiceConfig)
+}
+
+type productionExecutorFactory func(*cache.Cache, queryquality.ChatProvider, query.Executor, query.Synthesizer, queryquality.RetrievalProfile, string, queryquality.Options, query.RuntimeConfigIdentity) (query.Executor, error)
+
+func newExecutor(config queryconfig.Config, conceptCache *cache.Cache, expansionProvider queryquality.ChatProvider, legacy query.Executor, synthesizer query.Synthesizer, factory productionExecutorFactory) (*Executor, error) {
 	resolver, err := queryconfig.NewResolver(config)
 	if err != nil {
 		return nil, err
 	}
-	services := make(map[string]query.Executor)
-	compositionServices := make(map[string]query.Executor)
-	for _, effective := range resolver.EffectiveConfigs() {
-		if _, exists := services[effective.EffectiveConfigDigest]; exists {
-			continue
-		}
-		service, err := queryquality.NewProductionExecutorWithQueryServiceConfig(
-			conceptCache, expansionProvider, legacy, synthesizer,
-			effective.Profile, effective.PromptID, effective.Options, effective.RuntimeConfigIdentity(),
-		)
-		if err != nil {
+	effectiveConfigs := resolver.EffectiveConfigs()
+	for _, effective := range effectiveConfigs {
+		if err := validateIdentities(effective, expansionProvider, synthesizer); err != nil {
 			return nil, err
 		}
+	}
+	services := make(map[string]query.Executor)
+	compositionServices := make(map[string]query.Executor)
+	for _, effective := range effectiveConfigs {
+		composition := serviceKey(effective)
+		service, exists := compositionServices[composition]
+		if !exists {
+			service, err = factory(
+				conceptCache, expansionProvider, legacy, synthesizer,
+				effective.Profile, effective.PromptID, effective.Options, effective.RuntimeConfigIdentity(),
+			)
+			if err != nil {
+				return nil, err
+			}
+			compositionServices[composition] = service
+		}
 		services[effective.EffectiveConfigDigest] = service
-		compositionServices[serviceKey(effective)] = service
 	}
 	return &Executor{resolver: resolver, services: services, compositionServices: compositionServices}, nil
 }
 
-func New(config queryconfig.Config, conceptCache *cache.Cache, expansionProvider queryquality.ChatProvider, legacy query.Executor, synthesizer *query.Service) (*Executor, error) {
+func validateIdentities(effective queryconfig.EffectiveConfig, expansionProvider queryquality.ChatProvider, synthesizer query.Synthesizer) error {
+	provider, ok := expansionProvider.(llm.ModelIdentityProvider)
+	if !ok || provider == nil {
+		return fmt.Errorf("%w: expansion provider identity unavailable", ErrIdentityUnavailable)
+	}
+	expansion, ok := provider.ModelIdentity()
+	if !ok {
+		return fmt.Errorf("%w: expansion provider identity unavailable", ErrIdentityUnavailable)
+	}
+	if expansion.Provider != effective.ExpansionProvider || expansion.Model != effective.ExpansionModel || expansion.Reasoning != effective.ExpansionReasoning || expansion.Temperature != effective.ExpansionTemperature {
+		return fmt.Errorf("%w: expansion provider identity mismatch", ErrIdentityUnavailable)
+	}
+	if synthesizer == nil {
+		return fmt.Errorf("%w: synthesizer identity unavailable", ErrIdentityUnavailable)
+	}
+	synthesis, ok := synthesizer.ModelIdentity()
+	if !ok {
+		return fmt.Errorf("%w: synthesizer identity unavailable", ErrIdentityUnavailable)
+	}
+	if synthesis.Provider != effective.SynthesisProvider || synthesis.Model != effective.SynthesisModel || synthesis.Reasoning != effective.SynthesisReasoning || synthesis.Temperature != effective.SynthesisTemperature {
+		return fmt.Errorf("%w: synthesizer identity mismatch", ErrIdentityUnavailable)
+	}
+	return nil
+}
+
+func New(config queryconfig.Config, conceptCache *cache.Cache, expansionProvider queryquality.ChatProvider, legacy query.Executor, synthesizer query.Synthesizer) (*Executor, error) {
 	return NewExecutor(config, conceptCache, expansionProvider, legacy, synthesizer)
 }
 
@@ -91,8 +131,6 @@ func (e *Executor) Execute(ctx context.Context, reader cache.Reader, request que
 }
 
 func serviceKey(config queryconfig.EffectiveConfig) string {
-	config.InputGenerationIdentity = queryconfig.GenerationIdentity{}
-	// The production service is independent of the pinned corpus identity;
-	// generation identity remains in the effective/runtime identity.
+	// The production service is independent of pinned corpus and binding provenance.
 	return config.EffectiveConfigDigestWithoutGeneration()
 }

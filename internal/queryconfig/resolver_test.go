@@ -95,3 +95,59 @@ func TestResolverDefensivelyCopiesEffectiveConfig(t *testing.T) {
 		t.Fatalf("resolver was mutated: %+v err=%v", again, err)
 	}
 }
+
+func TestResolverSupportsMultipleImmutableGenerationsPerProject(t *testing.T) {
+	config := mustSeal(t)
+	second := config.ProjectBindings[0]
+	second.GenerationID = "generation-8"
+	second.ConceptsDigest = "sha256:" + strings.Repeat("b", 64)
+	third := second
+	third.GenerationID = "generation-9"
+	third.ConceptsDigest = "sha256:" + strings.Repeat("c", 64)
+	defaultProfile := config.Profiles[0]
+	third.ProfileID = defaultProfile.ID
+	third.ProfileDigest = defaultProfile.ProfileDigest
+	third.PromptID = config.Stages.QueryExpander.DefaultPromptID
+	third.PromptDigest = config.Stages.QueryExpander.DefaultPromptDigest
+	config.ProjectBindings = append(config.ProjectBindings, second, third)
+	config.ConfigDigest = ""
+	sealed, err := queryconfig.Seal(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolver, err := queryconfig.NewResolver(sealed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []struct {
+		generation, digest, profile, prompt string
+	}{
+		{"generation-7", "sha256:" + strings.Repeat("a", 64), "technical-v1", "domain-neutral-technical-v1"},
+		{"generation-8", "sha256:" + strings.Repeat("b", 64), "technical-v1", "domain-neutral-technical-v1"},
+		{"generation-9", "sha256:" + strings.Repeat("c", 64), defaultProfile.ID, config.Stages.QueryExpander.DefaultPromptID},
+	} {
+		got, err := resolver.Resolve(queryconfig.GenerationIdentity{ProjectID: "project-a", GenerationID: want.generation, ConceptsDigest: want.digest})
+		if err != nil || got.Profile.ID != want.profile || got.PromptID != want.prompt || !got.ExactBinding {
+			t.Fatalf("generation=%s got=%+v err=%v", want.generation, got, err)
+		}
+	}
+	for _, identity := range []queryconfig.GenerationIdentity{
+		{ProjectID: "project-a", GenerationID: "unknown", ConceptsDigest: "sha256:" + strings.Repeat("a", 64)},
+		{ProjectID: "project-a", GenerationID: "generation-8", ConceptsDigest: "sha256:" + strings.Repeat("d", 64)},
+	} {
+		if _, err := resolver.Resolve(identity); !errors.Is(err, queryconfig.ErrBindingMismatch) {
+			t.Fatalf("identity=%+v err=%v, want ErrBindingMismatch", identity, err)
+		}
+	}
+
+	reversed := sealed
+	reversed.ProjectBindings = append([]queryconfig.ProjectBinding(nil), sealed.ProjectBindings...)
+	for left, right := 0, len(reversed.ProjectBindings)-1; left < right; left, right = left+1, right-1 {
+		reversed.ProjectBindings[left], reversed.ProjectBindings[right] = reversed.ProjectBindings[right], reversed.ProjectBindings[left]
+	}
+	reversed.ConfigDigest = ""
+	reversed, err = queryconfig.Seal(reversed)
+	if err != nil || reversed.ConfigDigest != sealed.ConfigDigest {
+		t.Fatalf("binding order changed config digest: got=%q want=%q err=%v", reversed.ConfigDigest, sealed.ConfigDigest, err)
+	}
+}

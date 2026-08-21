@@ -43,12 +43,12 @@ func TestWriteStageConfigIsAtomicRegularJSONWithoutExperimentSecrets(t *testing.
 		t.Fatal("missing prompt")
 	}
 	config := queryconfig.Config{
-		SchemaVersion: 1, ConfigRevision: "rev", QueryServiceImplementation: queryconfig.QueryServiceImplementation,
+		SchemaVersion: 2, ConfigRevision: "rev", QueryServiceImplementation: queryconfig.QueryServiceImplementation,
 		Stages: queryconfig.Stages{
-			QueryExpander:     queryconfig.QueryExpanderStage{Implementation: queryconfig.QueryExpanderImplementation, Model: "deepseek-v4-flash", Reasoning: "none", DefaultProfileID: profile.ID, DefaultProfileDigest: profileDigest, DefaultPromptID: prompt.ID, DefaultPromptDigest: prompt.TemplateDigest, KeywordsPerAttempt: 24, Attempts: 3},
+			QueryExpander:     queryconfig.QueryExpanderStage{Provider: queryconfig.ProviderDeepSeek, Implementation: queryconfig.QueryExpanderImplementation, Model: "deepseek-v4-flash", Reasoning: "none", Temperature: 0, DefaultProfileID: profile.ID, DefaultProfileDigest: profileDigest, DefaultPromptID: prompt.ID, DefaultPromptDigest: prompt.TemplateDigest, KeywordsPerAttempt: 24, Attempts: 3},
 			CandidateMatcher:  queryconfig.CandidateMatcherStage{Implementation: queryconfig.CandidateMatcherImplementation, EvidenceThreshold: 2, RareKeywordMaxDocumentFrequency: 1},
 			ResultSelector:    queryconfig.ResultSelectorStage{Implementation: queryconfig.ResultSelectorImplementation, Limit: 10, ExplorationSlots: 1, SeedPolicy: queryconfig.SeedPolicy},
-			AnswerSynthesizer: queryconfig.AnswerSynthesizerStage{Implementation: queryconfig.AnswerSynthesizerImplementation, Model: "deepseek-v4-pro", Reasoning: "none", NoEvidencePolicy: queryconfig.NoEvidencePolicy},
+			AnswerSynthesizer: queryconfig.AnswerSynthesizerStage{Provider: queryconfig.ProviderDeepSeek, Implementation: queryconfig.AnswerSynthesizerImplementation, Model: "deepseek-v4-pro", Reasoning: "none", Temperature: 0, NoEvidencePolicy: queryconfig.NoEvidencePolicy},
 		},
 		Profiles:        []queryconfig.Profile{{ID: profile.ID, CriterionPolicy: profile.CriterionPolicy, ProfileDigest: profileDigest}},
 		ProjectBindings: []queryconfig.ProjectBinding{{ProjectID: "project", GenerationID: "generation", ConceptsDigest: "sha256:" + strings.Repeat("a", 64), ProfileID: profile.ID, ProfileDigest: profileDigest, PromptID: prompt.ID, PromptDigest: prompt.TemplateDigest, Source: queryconfig.SourceCorpusDerivedApproximation}},

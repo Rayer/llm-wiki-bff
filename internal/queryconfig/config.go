@@ -18,10 +18,11 @@ import (
 )
 
 const (
-	SchemaVersionMin           = 1
-	SchemaVersionMax           = 1
-	SchemaVersion              = 1
+	SchemaVersionMin           = 2
+	SchemaVersionMax           = 2
+	SchemaVersion              = 2
 	QueryServiceImplementation = "query-retrieval-pipeline-v2"
+	ProviderDeepSeek           = "deepseek"
 
 	QueryExpanderImplementation     = "parallel-minimal-structured-plan-v1"
 	CandidateMatcherImplementation  = "lexical-evidence-v1"
@@ -35,6 +36,8 @@ const (
 )
 
 var safeID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+
+var ErrSchemaV1Unsupported = errors.New("query config schema v1 is unsupported")
 
 type Config struct {
 	SchemaVersion              int              `json:"schema_version"`
@@ -58,6 +61,7 @@ type Stages struct {
 }
 
 type QueryExpanderStage struct {
+	Provider             string  `json:"provider"`
 	Implementation       string  `json:"implementation"`
 	Model                string  `json:"model"`
 	Reasoning            string  `json:"reasoning"`
@@ -84,10 +88,12 @@ type ResultSelectorStage struct {
 }
 
 type AnswerSynthesizerStage struct {
-	Implementation   string `json:"implementation"`
-	Model            string `json:"model"`
-	Reasoning        string `json:"reasoning"`
-	NoEvidencePolicy string `json:"no_evidence_policy"`
+	Provider         string  `json:"provider"`
+	Implementation   string  `json:"implementation"`
+	Model            string  `json:"model"`
+	Reasoning        string  `json:"reasoning"`
+	Temperature      float64 `json:"temperature"`
+	NoEvidencePolicy string  `json:"no_evidence_policy"`
 }
 
 type Profile struct {
@@ -145,6 +151,9 @@ func DecodeStrict(data []byte) (Config, error) {
 }
 
 func ValidateSealed(config Config) error {
+	if config.SchemaVersion == 1 {
+		return ErrSchemaV1Unsupported
+	}
 	if config.ConfigDigest == "" {
 		return errors.New("config digest is required")
 	}
@@ -175,6 +184,9 @@ func Digest(config Config) (string, error) {
 }
 
 func normalizeWithoutDigest(input Config) (Config, error) {
+	if input.SchemaVersion == 1 {
+		return Config{}, ErrSchemaV1Unsupported
+	}
 	if input.SchemaVersion < SchemaVersionMin || input.SchemaVersion > SchemaVersionMax {
 		return Config{}, fmt.Errorf("unsupported schema_version %d", input.SchemaVersion)
 	}
@@ -255,8 +267,8 @@ func normalizeWithoutDigest(input Config) (Config, error) {
 
 func validateStages(stages Stages) error {
 	expander := stages.QueryExpander
-	if expander.Implementation != QueryExpanderImplementation || expander.Model != "deepseek-v4-flash" || expander.Reasoning != "none" || expander.Temperature != 0 {
-		return errors.New("invalid query_expander implementation/model/reasoning/temperature")
+	if expander.Provider != ProviderDeepSeek || expander.Implementation != QueryExpanderImplementation || expander.Model != "deepseek-v4-flash" || expander.Reasoning != "none" || expander.Temperature != 0 {
+		return errors.New("invalid query_expander provider/implementation/model/reasoning/temperature")
 	}
 	if expander.KeywordsPerAttempt < 1 || expander.KeywordsPerAttempt > 100 || expander.Attempts < 1 || expander.Attempts > 10 {
 		return errors.New("invalid query_expander ranges")
@@ -270,8 +282,8 @@ func validateStages(stages Stages) error {
 		return errors.New("invalid result_selector")
 	}
 	synthesizer := stages.AnswerSynthesizer
-	if synthesizer.Implementation != AnswerSynthesizerImplementation || synthesizer.Model != "deepseek-v4-pro" || (synthesizer.Reasoning != "none" && synthesizer.Reasoning != "low" && synthesizer.Reasoning != "high" && synthesizer.Reasoning != "max") || synthesizer.NoEvidencePolicy != NoEvidencePolicy {
-		return errors.New("invalid answer_synthesizer")
+	if synthesizer.Provider != ProviderDeepSeek || synthesizer.Implementation != AnswerSynthesizerImplementation || synthesizer.Model != "deepseek-v4-pro" || (synthesizer.Reasoning != "none" && synthesizer.Reasoning != "low" && synthesizer.Reasoning != "high" && synthesizer.Reasoning != "max") || synthesizer.Temperature != 0 || synthesizer.NoEvidencePolicy != NoEvidencePolicy {
+		return errors.New("invalid answer_synthesizer provider/implementation/model/reasoning/temperature")
 	}
 	for name, value := range map[string]string{"default_profile_id": expander.DefaultProfileID, "default_prompt_id": expander.DefaultPromptID, "default_profile_digest": expander.DefaultProfileDigest, "default_prompt_digest": expander.DefaultPromptDigest} {
 		if strings.TrimSpace(value) == "" {
@@ -389,6 +401,9 @@ func decodeConfig(object map[string]json.RawMessage) (Config, error) {
 	if result.SchemaVersion, err = intField(object, "schema_version"); err != nil {
 		return Config{}, err
 	}
+	if result.SchemaVersion == 1 {
+		return Config{}, ErrSchemaV1Unsupported
+	}
 	if result.ConfigRevision, err = stringField(object, "config_revision"); err != nil {
 		return Config{}, err
 	}
@@ -442,10 +457,13 @@ func decodeQueryExpander(data json.RawMessage) (QueryExpanderStage, error) {
 	if err != nil {
 		return QueryExpanderStage{}, err
 	}
-	if err := fields(o, map[string]bool{"implementation": true, "model": true, "reasoning": true, "temperature": true, "default_profile_id": true, "default_profile_digest": true, "default_prompt_id": true, "default_prompt_digest": true, "keywords_per_attempt": true, "attempts": true}); err != nil {
+	if err := fields(o, map[string]bool{"provider": true, "implementation": true, "model": true, "reasoning": true, "temperature": true, "default_profile_id": true, "default_profile_digest": true, "default_prompt_id": true, "default_prompt_digest": true, "keywords_per_attempt": true, "attempts": true}); err != nil {
 		return QueryExpanderStage{}, err
 	}
 	result := QueryExpanderStage{}
+	if result.Provider, err = stringField(o, "provider"); err != nil {
+		return result, err
+	}
 	if result.Implementation, err = stringField(o, "implementation"); err != nil {
 		return result, err
 	}
@@ -527,10 +545,13 @@ func decodeAnswerSynthesizer(data json.RawMessage) (AnswerSynthesizerStage, erro
 	if err != nil {
 		return AnswerSynthesizerStage{}, err
 	}
-	if err := fields(o, map[string]bool{"implementation": true, "model": true, "reasoning": true, "no_evidence_policy": true}); err != nil {
+	if err := fields(o, map[string]bool{"provider": true, "implementation": true, "model": true, "reasoning": true, "temperature": true, "no_evidence_policy": true}); err != nil {
 		return AnswerSynthesizerStage{}, err
 	}
 	result := AnswerSynthesizerStage{}
+	if result.Provider, err = stringField(o, "provider"); err != nil {
+		return result, err
+	}
 	if result.Implementation, err = stringField(o, "implementation"); err != nil {
 		return result, err
 	}
@@ -538,6 +559,9 @@ func decodeAnswerSynthesizer(data json.RawMessage) (AnswerSynthesizerStage, erro
 		return result, err
 	}
 	if result.Reasoning, err = stringField(o, "reasoning"); err != nil {
+		return result, err
+	}
+	if result.Temperature, err = floatField(o, "temperature"); err != nil {
 		return result, err
 	}
 	if result.NoEvidencePolicy, err = stringField(o, "no_evidence_policy"); err != nil {

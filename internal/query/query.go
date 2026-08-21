@@ -63,6 +63,7 @@ type RuntimeConfigIdentity struct {
 	ExactBinding               bool    `json:"exact_binding"`
 	GenerationID               string  `json:"generation_id"`
 	ConceptsDigest             string  `json:"concepts_digest"`
+	ExpansionProvider          string  `json:"expansion_provider"`
 	ExpansionImplementation    string  `json:"expansion_implementation"`
 	ExpansionModel             string  `json:"expansion_model"`
 	ExpansionReasoning         string  `json:"expansion_reasoning"`
@@ -77,6 +78,7 @@ type RuntimeConfigIdentity struct {
 	KeywordsPerAttempt         int     `json:"keywords_per_attempt"`
 	ExpansionAttempts          int     `json:"expansion_attempts"`
 	RareDocumentFrequency      int     `json:"rare_document_frequency"`
+	SynthesisProvider          string  `json:"synthesis_provider"`
 }
 
 func CloneRuntimeConfigIdentity(identity *RuntimeConfigIdentity) *RuntimeConfigIdentity {
@@ -92,6 +94,11 @@ type Executor interface {
 	Execute(context.Context, cache.Reader, Request) (Result, error)
 }
 
+type Synthesizer interface {
+	SynthesizeWithError(context.Context, cache.Reader, Request, Result) (Result, error)
+	ModelIdentity() (llm.ModelIdentity, bool)
+}
+
 // Service runs query expansion, cache search, and optional citation synthesis.
 type Service struct {
 	cache    *cache.Cache
@@ -102,6 +109,13 @@ type Service struct {
 // NewService creates a query application service.
 func NewService(conceptCache *cache.Cache, expander *llm.QueryExpander, llmClient *llm.Client) *Service {
 	return &Service{cache: conceptCache, expander: expander, llm: llmClient}
+}
+
+func (s *Service) ModelIdentity() (llm.ModelIdentity, bool) {
+	if s == nil || s.llm == nil {
+		return llm.ModelIdentity{}, false
+	}
+	return s.llm.ModelIdentity()
 }
 
 // Execute runs the production query pipeline.

@@ -63,6 +63,30 @@ type Client struct {
 	reasoning   Reasoning
 }
 
+// ModelIdentity is the sanitized model identity used for sealed runtime
+// validation. It intentionally excludes credentials and endpoint details.
+type ModelIdentity struct {
+	Provider    string
+	Model       string
+	Reasoning   string
+	Temperature float64
+}
+
+type ModelIdentityProvider interface {
+	ModelIdentity() (ModelIdentity, bool)
+}
+
+func (c *Client) ModelIdentity() (ModelIdentity, bool) {
+	if c == nil {
+		return ModelIdentity{}, false
+	}
+	temperature := 0.0
+	if c.temperature != nil {
+		temperature = *c.temperature
+	}
+	return ModelIdentity{Provider: "deepseek", Model: c.model, Reasoning: string(c.reasoning), Temperature: temperature}, true
+}
+
 func (c *Client) Model() string {
 	if c == nil {
 		return ""

@@ -36,10 +36,12 @@ type EffectiveConfig struct {
 	PromptDigest               string
 	Options                    queryquality.Options
 	ExpansionImplementation    string
+	ExpansionProvider          string
 	ExpansionModel             string
 	ExpansionReasoning         string
 	ExpansionTemperature       float64
 	SynthesisImplementation    string
+	SynthesisProvider          string
 	SynthesisModel             string
 	SynthesisReasoning         string
 	SynthesisTemperature       float64
@@ -145,10 +147,12 @@ func (r *Resolver) effective(identity GenerationIdentity, exact bool, projectID 
 	source := SourceLegacyCompatibility
 	if exact {
 		bindings := r.bindings[projectID]
-		if len(bindings) != 1 {
-			return EffectiveConfig{}, ErrBindingMismatch
+		for _, binding := range bindings {
+			if binding.GenerationID == identity.GenerationID && binding.ConceptsDigest == identity.ConceptsDigest {
+				return r.effectiveForBinding(binding, identity), nil
+			}
 		}
-		return r.effectiveForBinding(bindings[0], identity), nil
+		return EffectiveConfig{}, ErrBindingMismatch
 	}
 	return r.makeEffective(identity, profile, promptID, promptDigest, source, false), nil
 }
@@ -172,10 +176,10 @@ func (r *Resolver) makeEffective(identity GenerationIdentity, profile queryquali
 		SchemaVersion: r.config.SchemaVersion, ConfigRevision: r.config.ConfigRevision, ConfigDigest: r.config.ConfigDigest,
 		QueryServiceImplementation: r.config.QueryServiceImplementation, Profile: profile, ProfileDigest: profileDigest,
 		PromptID: promptID, PromptDigest: promptDigest, Options: options,
-		ExpansionImplementation: stages.QueryExpander.Implementation, ExpansionModel: stages.QueryExpander.Model,
+		ExpansionImplementation: stages.QueryExpander.Implementation, ExpansionProvider: stages.QueryExpander.Provider, ExpansionModel: stages.QueryExpander.Model,
 		ExpansionReasoning: stages.QueryExpander.Reasoning, ExpansionTemperature: stages.QueryExpander.Temperature,
-		SynthesisImplementation: stages.AnswerSynthesizer.Implementation, SynthesisModel: stages.AnswerSynthesizer.Model,
-		SynthesisReasoning: stages.AnswerSynthesizer.Reasoning, SynthesisTemperature: 0,
+		SynthesisImplementation: stages.AnswerSynthesizer.Implementation, SynthesisProvider: stages.AnswerSynthesizer.Provider, SynthesisModel: stages.AnswerSynthesizer.Model,
+		SynthesisReasoning: stages.AnswerSynthesizer.Reasoning, SynthesisTemperature: stages.AnswerSynthesizer.Temperature,
 		BindingSource: source, ExactBinding: exact, InputGenerationIdentity: identity,
 	}
 	effective.EffectiveConfigDigest = digestEffective(effective)
@@ -196,9 +200,9 @@ func (e EffectiveConfig) RuntimeConfigIdentity() query.RuntimeConfigIdentity {
 		EffectiveConfigDigest: e.EffectiveConfigDigest, QueryServiceImplementation: e.QueryServiceImplementation,
 		ProfileID: e.Profile.ID, ProfileDigest: e.ProfileDigest, PromptID: e.PromptID, PromptDigest: e.PromptDigest,
 		BindingSource: e.BindingSource, ExactBinding: e.ExactBinding, GenerationID: e.InputGenerationIdentity.GenerationID,
-		ConceptsDigest: e.InputGenerationIdentity.ConceptsDigest, ExpansionImplementation: e.ExpansionImplementation,
+		ConceptsDigest: e.InputGenerationIdentity.ConceptsDigest, ExpansionProvider: e.ExpansionProvider, ExpansionImplementation: e.ExpansionImplementation,
 		ExpansionModel: e.ExpansionModel, ExpansionReasoning: e.ExpansionReasoning, ExpansionTemperature: e.ExpansionTemperature,
-		SynthesisImplementation: e.SynthesisImplementation, SynthesisModel: e.SynthesisModel, SynthesisReasoning: e.SynthesisReasoning,
+		SynthesisImplementation: e.SynthesisImplementation, SynthesisProvider: e.SynthesisProvider, SynthesisModel: e.SynthesisModel, SynthesisReasoning: e.SynthesisReasoning,
 		SynthesisTemperature: e.SynthesisTemperature, SelectionLimit: e.Options.SelectionLimit, ExplorationSlots: e.Options.ExplorationSlots,
 		EvidenceThreshold: e.Options.EvidenceThreshold, KeywordsPerAttempt: e.Options.KeywordsPerAttempt,
 		ExpansionAttempts: e.Options.ExpansionAttempts, RareDocumentFrequency: e.Options.RareDocumentFrequency,
@@ -209,22 +213,24 @@ func (e EffectiveConfig) RuntimeConfigIdentity() query.RuntimeConfigIdentity {
 // service composition; pinned corpus identity is tracked separately.
 func (e EffectiveConfig) EffectiveConfigDigestWithoutGeneration() string {
 	e.InputGenerationIdentity = GenerationIdentity{}
+	e.BindingSource = ""
+	e.ExactBinding = false
 	return digestEffective(e)
 }
 
 type effectiveDigestInput struct {
-	SchemaVersion                                               int `json:"schema_version"`
-	ConfigRevision, ConfigDigest, QueryServiceImplementation    string
-	Profile                                                     queryquality.RetrievalProfile
-	ProfileDigest, PromptID, PromptDigest                       string
-	Options                                                     struct{ SelectionLimit, ExplorationSlots, EvidenceThreshold, KeywordsPerAttempt, ExpansionAttempts, RareDocumentFrequency int } `json:"options"`
-	ExpansionImplementation, ExpansionModel, ExpansionReasoning string
-	ExpansionTemperature                                        float64
-	SynthesisImplementation, SynthesisModel, SynthesisReasoning string
-	SynthesisTemperature                                        float64
-	BindingSource                                               string
-	ExactBinding                                                bool
-	InputGenerationIdentity                                     GenerationIdentity
+	SchemaVersion                                                                  int `json:"schema_version"`
+	ConfigRevision, ConfigDigest, QueryServiceImplementation                       string
+	Profile                                                                        queryquality.RetrievalProfile
+	ProfileDigest, PromptID, PromptDigest                                          string
+	Options                                                                        struct{ SelectionLimit, ExplorationSlots, EvidenceThreshold, KeywordsPerAttempt, ExpansionAttempts, RareDocumentFrequency int } `json:"options"`
+	ExpansionImplementation, ExpansionProvider, ExpansionModel, ExpansionReasoning string
+	ExpansionTemperature                                                           float64
+	SynthesisImplementation, SynthesisProvider, SynthesisModel, SynthesisReasoning string
+	SynthesisTemperature                                                           float64
+	BindingSource                                                                  string
+	ExactBinding                                                                   bool
+	InputGenerationIdentity                                                        GenerationIdentity
 }
 
 func digestEffective(config EffectiveConfig) string {
@@ -232,8 +238,8 @@ func digestEffective(config EffectiveConfig) string {
 		SchemaVersion: config.SchemaVersion, ConfigRevision: config.ConfigRevision, ConfigDigest: config.ConfigDigest,
 		QueryServiceImplementation: config.QueryServiceImplementation, Profile: config.Profile, ProfileDigest: config.ProfileDigest,
 		PromptID: config.PromptID, PromptDigest: config.PromptDigest, ExpansionImplementation: config.ExpansionImplementation,
-		ExpansionModel: config.ExpansionModel, ExpansionReasoning: config.ExpansionReasoning, ExpansionTemperature: config.ExpansionTemperature,
-		SynthesisImplementation: config.SynthesisImplementation, SynthesisModel: config.SynthesisModel, SynthesisReasoning: config.SynthesisReasoning,
+		ExpansionProvider: config.ExpansionProvider, ExpansionModel: config.ExpansionModel, ExpansionReasoning: config.ExpansionReasoning, ExpansionTemperature: config.ExpansionTemperature,
+		SynthesisImplementation: config.SynthesisImplementation, SynthesisProvider: config.SynthesisProvider, SynthesisModel: config.SynthesisModel, SynthesisReasoning: config.SynthesisReasoning,
 		SynthesisTemperature: config.SynthesisTemperature, BindingSource: config.BindingSource, ExactBinding: config.ExactBinding,
 		InputGenerationIdentity: config.InputGenerationIdentity,
 	}

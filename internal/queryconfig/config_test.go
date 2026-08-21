@@ -3,6 +3,7 @@ package queryconfig_test
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
@@ -38,11 +39,12 @@ func validConfig(t *testing.T) queryconfig.Config {
 		t.Fatal("missing technical prompt")
 	}
 	return queryconfig.Config{
-		SchemaVersion:              1,
+		SchemaVersion:              2,
 		ConfigRevision:             "operator-2026-08-20",
 		QueryServiceImplementation: queryconfig.QueryServiceImplementation,
 		Stages: queryconfig.Stages{
 			QueryExpander: queryconfig.QueryExpanderStage{
+				Provider:             queryconfig.ProviderDeepSeek,
 				Implementation:       queryconfig.QueryExpanderImplementation,
 				Model:                "deepseek-v4-flash",
 				Reasoning:            "none",
@@ -66,9 +68,11 @@ func validConfig(t *testing.T) queryconfig.Config {
 				SeedPolicy:       queryconfig.SeedPolicy,
 			},
 			AnswerSynthesizer: queryconfig.AnswerSynthesizerStage{
+				Provider:         queryconfig.ProviderDeepSeek,
 				Implementation:   queryconfig.AnswerSynthesizerImplementation,
 				Model:            "deepseek-v4-pro",
 				Reasoning:        "none",
+				Temperature:      0,
 				NoEvidencePolicy: queryconfig.NoEvidencePolicy,
 			},
 		},
@@ -114,9 +118,12 @@ func TestStrictDecodeRejectsSchemaBoundariesUnknownFieldsAndTrailingJSON(t *test
 		name string
 		data string
 	}{
-		{"below minimum", strings.Replace(base, `"schema_version":1`, `"schema_version":0`, 1)},
-		{"above maximum", strings.Replace(base, `"schema_version":1`, `"schema_version":2`, 1)},
+		{"v1 unsupported", strings.Replace(base, `"schema_version":2`, `"schema_version":1`, 1)},
+		{"below minimum", strings.Replace(base, `"schema_version":2`, `"schema_version":0`, 1)},
+		{"above maximum", strings.Replace(base, `"schema_version":2`, `"schema_version":3`, 1)},
 		{"nested unknown", strings.Replace(base, `"implementation":"parallel-minimal-structured-plan-v1"`, `"extra":true,"implementation":"parallel-minimal-structured-plan-v1"`, 1)},
+		{"missing expansion provider", strings.Replace(base, `"provider":"deepseek","implementation":"parallel-minimal-structured-plan-v1",`, `"implementation":"parallel-minimal-structured-plan-v1",`, 1)},
+		{"missing synthesis temperature", strings.Replace(base, `"temperature":0,"no_evidence_policy"`, `"no_evidence_policy"`, 1)},
 		{"trailing JSON", base + " {}"},
 		{"secret-like field", strings.Replace(base, `"config_revision"`, `"api_key":"secret","config_revision"`, 1)},
 		{"missing query service revision", strings.Replace(base, `"query_service_implementation":"`+queryconfig.QueryServiceImplementation+`",`, "", 1)},
@@ -127,6 +134,9 @@ func TestStrictDecodeRejectsSchemaBoundariesUnknownFieldsAndTrailingJSON(t *test
 				t.Fatal("accepted invalid config")
 			}
 		})
+	}
+	if _, err := queryconfig.DecodeStrict([]byte(strings.Replace(base, `"schema_version":2`, `"schema_version":1`, 1))); !errors.Is(err, queryconfig.ErrSchemaV1Unsupported) {
+		t.Fatalf("v1 error=%v, want ErrSchemaV1Unsupported", err)
 	}
 }
 

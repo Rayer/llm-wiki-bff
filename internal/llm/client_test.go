@@ -65,6 +65,18 @@ func TestNewClientRejectsInvalidReasoning(t *testing.T) {
 	}
 }
 
+func TestClientModelIdentityIsSanitizedAndUnavailableWhenNil(t *testing.T) {
+	temperature := 0.0
+	client := NewClientWithOptions("secret-key", ClientOptions{Model: "deepseek-v4-flash", Temperature: &temperature, Reasoning: ReasoningNone})
+	identity, ok := client.ModelIdentity()
+	if !ok || identity.Provider != "deepseek" || identity.Model != "deepseek-v4-flash" || identity.Reasoning != string(ReasoningNone) || identity.Temperature != 0 {
+		t.Fatalf("identity=%+v ok=%v", identity, ok)
+	}
+	if _, ok := (*Client)(nil).ModelIdentity(); ok {
+		t.Fatal("nil client claimed an identity")
+	}
+}
+
 func TestChatReceiptUsesActualRequestURL(t *testing.T) {
 	transport := &countingRoundTripper{}
 	client := NewClient("key")

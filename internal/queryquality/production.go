@@ -70,18 +70,18 @@ func NewQueryRetrievalService(config QueryRetrievalServiceConfig) (*QueryRetriev
 type ProductionExecutor struct {
 	queryRetrievalPipeline *QueryRetrievalPipeline
 	legacy                 query.Executor
-	synthesizer            *query.Service
+	synthesizer            query.Synthesizer
 	identity               query.RuntimeConfigIdentity
 }
 
-func NewProductionExecutor(conceptCache *cache.Cache, provider ChatProvider, legacy query.Executor, synthesizer *query.Service, options Options) (query.Executor, error) {
+func NewProductionExecutor(conceptCache *cache.Cache, provider ChatProvider, legacy query.Executor, synthesizer query.Synthesizer, options Options) (query.Executor, error) {
 	return NewProductionExecutorWithQueryServiceConfig(conceptCache, provider, legacy, synthesizer, DefaultRetrievalProfile(), StructuredPlanPromptID, options, query.RuntimeConfigIdentity{})
 }
 
 // NewProductionExecutorWithQueryServiceConfig is the production runtime
 // constructor for a sealed profile/prompt/options composition. Retrieval is
 // always built through NewQueryRetrievalService, the shared composition point.
-func NewProductionExecutorWithQueryServiceConfig(conceptCache *cache.Cache, provider ChatProvider, legacy query.Executor, synthesizer *query.Service, profile RetrievalProfile, promptID string, options Options, identity query.RuntimeConfigIdentity) (query.Executor, error) {
+func NewProductionExecutorWithQueryServiceConfig(conceptCache *cache.Cache, provider ChatProvider, legacy query.Executor, synthesizer query.Synthesizer, profile RetrievalProfile, promptID string, options Options, identity query.RuntimeConfigIdentity) (query.Executor, error) {
 	if legacy == nil {
 		return nil, errors.New("legacy query executor is nil")
 	}
