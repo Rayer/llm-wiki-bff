@@ -2,6 +2,8 @@ package syssettings
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -64,8 +66,18 @@ func PublicConfigHandler(gate RegistrationGate) gin.HandlerFunc {
 		c.JSON(http.StatusOK, PublicSettings{
 			RegistrationEnabled:  settings.RegistrationEnabled,
 			AnnouncementMarkdown: settings.AnnouncementMarkdown,
+			AnnouncementDigest:   announcementDigest(settings.AnnouncementMarkdown),
 		})
 	}
+}
+
+func announcementDigest(markdown string) *string {
+	if markdown == "" {
+		return nil
+	}
+	digest := sha256.Sum256([]byte(markdown))
+	announcementDigest := "sha256:" + hex.EncodeToString(digest[:])
+	return &announcementDigest
 }
 
 // AdminGetSettingsHandler serves GET /api/v1/admin/settings.

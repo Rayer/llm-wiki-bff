@@ -290,10 +290,14 @@ definitions:
         type: string
       query:
         type: string
+      reason:
+        type: string
       results:
         items:
           $ref: '#/definitions/search.Result'
         type: array
+      status:
+        type: string
     type: object
   handler.ReadyResponse:
     properties:
@@ -500,6 +504,8 @@ definitions:
     type: object
   syssettings.PublicSettings:
     properties:
+      announcement_digest:
+        type: string
       announcement_markdown:
         type: string
       registration_enabled:
@@ -649,7 +655,9 @@ paths:
     patch:
       consumes:
       - application/json
-      description: Updates the name field on a Firestore project document. The JSON body is limited to 1024 bytes; name is trimmed and must be 1-64 Unicode code points.
+      description: Updates the name field on a Firestore project document. The JSON
+        body is limited to 1024 bytes; name is trimmed and must be 1-64 Unicode code
+        points.
       parameters:
       - description: Project doc ID ({userID}_{projectID})
         in: path
@@ -702,13 +710,19 @@ paths:
     post:
       consumes:
       - application/json
-      description: Invokes the Cloud Run worker job for the specified project, then rebuilds the search index.
+      description: Invokes the Cloud Run worker job for the specified project. Optional
+        body {"clean_rebuild":true} cold-starts Synto from raw without prior wiki/state.
       parameters:
       - description: Project doc ID ({userID}_{projectID})
         in: path
         name: id
         required: true
         type: string
+      - description: Optional flags
+        in: body
+        name: body
+        schema:
+          type: object
       produces:
       - application/json
       responses:
@@ -743,7 +757,7 @@ paths:
             $ref: '#/definitions/handler.ErrorResponse'
       security:
       - BearerAuth: []
-      summary: Trigger pipeline + rebuild for a project (admin)
+      summary: Trigger pipeline for a project (admin)
       tags:
       - admin
   /api/v1/admin/projects/{id}/rebuild-index:
@@ -1620,7 +1634,8 @@ paths:
       - status
 securityDefinitions:
   BearerAuth:
-    description: 'JWT Bearer token issued by the standalone Auth service. Format: \"Bearer <token>\".'
+    description: 'JWT Bearer token issued by the standalone Auth service. Format:
+      \"Bearer <token>\".'
     in: header
     name: Authorization
     type: apiKey

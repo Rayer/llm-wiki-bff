@@ -25,8 +25,9 @@ type Settings struct {
 
 // PublicSettings is the deliberately metadata-free anonymous response.
 type PublicSettings struct {
-	RegistrationEnabled  bool   `json:"registration_enabled"`
-	AnnouncementMarkdown string `json:"announcement_markdown"`
+	RegistrationEnabled  bool    `json:"registration_enabled"`
+	AnnouncementMarkdown string  `json:"announcement_markdown"`
+	AnnouncementDigest   *string `json:"announcement_digest"`
 }
 
 // RegistrationGate reports whether self-serve registration is allowed.
