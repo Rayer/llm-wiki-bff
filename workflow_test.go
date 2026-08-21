@@ -1616,7 +1616,7 @@ func TestReleaseWorkflowValidatesAndPersistsFrozenLiveRevisionBeforeMutation(t *
 		`.status.traffic | type == "array" and length == 1`,
 		`.status.traffic[0].revisionName == $ready_revision`,
 		`.status.traffic[0].percent == 100`,
-		`(.status.traffic[0].latestRevision? // false) == false`,
+		"((.status.traffic[0] | has(\"latestRevision\") | not) or\n                 (.status.traffic[0].latestRevision | type == \"boolean\" and . == true))",
 		`echo "FROZEN_CREATED_REVISION=$FROZEN_CREATED_REVISION" >> "$GITHUB_ENV"`,
 	} {
 		if !strings.Contains(validation, want) {
