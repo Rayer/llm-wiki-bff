@@ -22,6 +22,7 @@ SERVICE = "llm-wiki-bff"
 ARTIFACT = "bff-rollback-contract-" + "c" * 40
 EVIDENCE_ARTIFACT = "bff-deployment-evidence-" + "c" * 40
 QUERY_STAGE_CONFIG_PATH = "/app/configs/query/dev/query-dev-2026-08-21.2.json"
+PRIOR_QUERY_STAGE_CONFIG_PATH = "/app/configs/query/dev/query-dev-2026-08-21.1.json"
 LEGACY_QUERY_ENV_NAMES = [
     "QUERY_EXPANSION_MODEL", "QUERY_EXPANSION_REASONING", "ANSWER_SYNTHESIS_MODEL",
     "ANSWER_SYNTHESIS_REASONING", "QUERY_SELECTION_LIMIT", "QUERY_SELECTION_EXPLORATION_SLOTS",
@@ -195,6 +196,54 @@ class BFFDeploymentEvidenceTest(unittest.TestCase):
         self.assertEqual(document["config"]["network"]["vpc_egress"], "private-ranges-only")
         self.assertEqual(document["config"]["legacy_preserved"], [{"name": "PROJECT_ID", "value": "demo"}, {"name": "USER_ID", "value": "test-user"}])
 
+    def test_current_production_sealed_config_upgrade_is_accepted(self):
+        service_before = fixture("bff-service-before.json")
+        service_before["spec"]["template"]["spec"]["containers"][0]["env"].append({"name": "QUERY_STAGE_CONFIG_PATH", "value": PRIOR_QUERY_STAGE_CONFIG_PATH})
+        self.before.write_text(json.dumps(service_before))
+        prior_revision = fixture("bff-revision-before.json")
+        prior_revision["spec"]["containers"][0]["env"].append({"name": "QUERY_STAGE_CONFIG_PATH", "value": PRIOR_QUERY_STAGE_CONFIG_PATH})
+        self.prior_revision_path.write_text(json.dumps(prior_revision))
+
+        result, rollback = self.prepare()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            next(entry for entry in json.loads(rollback.read_text())["config"]["env"] if entry["name"] == "QUERY_STAGE_CONFIG_PATH")["value"],
+            PRIOR_QUERY_STAGE_CONFIG_PATH,
+        )
+
+    def test_prior_sealed_config_allowlist_and_saved_rollback_are_closed(self):
+        for value in (QUERY_STAGE_CONFIG_PATH, "/app/configs/query/dev/query-dev-2026-08-21.3.json"):
+            with self.subTest(value=value):
+                prior_revision = fixture("bff-revision-before.json")
+                prior_revision["spec"]["containers"][0]["env"].append({"name": "QUERY_STAGE_CONFIG_PATH", "value": value})
+                self.prior_revision_path.write_text(json.dumps(prior_revision))
+                result, _ = self.prepare()
+                self.assertEqual(result.returncode, 0 if value == QUERY_STAGE_CONFIG_PATH else 1, result.stderr)
+                if value != QUERY_STAGE_CONFIG_PATH:
+                    self.assertIn("config_mismatch", result.stderr)
+
+        prior_revision = fixture("bff-revision-before.json")
+        prior_revision["spec"]["containers"][0]["env"].append({"name": "QUERY_STAGE_CONFIG_PATH", "value": PRIOR_QUERY_STAGE_CONFIG_PATH})
+        prior_revision["spec"]["containers"][0]["env"].append({"name": "QUERY_STAGE_CONFIG_PATH", "value": PRIOR_QUERY_STAGE_CONFIG_PATH})
+        self.prior_revision_path.write_text(json.dumps(prior_revision))
+        result, _ = self.prepare()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("config_mismatch", result.stderr)
+
+        prior_revision["spec"]["containers"][0]["env"] = [entry for entry in prior_revision["spec"]["containers"][0]["env"] if entry["name"] != "QUERY_STAGE_CONFIG_PATH"]
+        prior_revision["spec"]["containers"][0]["env"].append({"name": "QUERY_STAGE_CONFIG_PATH", "value": PRIOR_QUERY_STAGE_CONFIG_PATH})
+        self.prior_revision_path.write_text(json.dumps(prior_revision))
+        prepared, rollback = self.prepare()
+        self.assertEqual(prepared.returncode, 0, prepared.stderr)
+        saved = json.loads(rollback.read_text())
+        next(entry for entry in saved["config"]["env"] if entry["name"] == "QUERY_STAGE_CONFIG_PATH")["value"] = "/app/configs/query/dev/arbitrary.json"
+        rollback.write_text(json.dumps(saved))
+        (self.root / "metadata.json").write_text(json.dumps(self.metadata()))
+        result = self.invoke("render-partial", "--rollback-contract", str(rollback), "--metadata", str(self.root / "metadata.json"), "--output", str(self.root / "deployment-evidence.json"), "--failure-output", str(self.root / "failure.json"))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("config_mismatch", result.stderr)
+
     def test_service_and_revision_effective_config_must_match(self):
         prepared, rollback = self.prepare()
         self.assertEqual(prepared.returncode, 0, prepared.stderr)
@@ -220,7 +269,7 @@ class BFFDeploymentEvidenceTest(unittest.TestCase):
         prepared, _ = self.prepare()
         self.assertEqual(prepared.returncode, 0, prepared.stderr)
         for location in ("service", "revision"):
-            for value in (None, "/app/configs/query/dev/wrong.json", "duplicate"):
+            for value in (None, PRIOR_QUERY_STAGE_CONFIG_PATH, "/app/configs/query/dev/wrong.json", "duplicate"):
                 with self.subTest(location=location, value=value):
                     observed_service = fixture("bff-service-after.json")
                     observed_revision = fixture("bff-revision-after.json")
