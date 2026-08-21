@@ -1,0 +1,119 @@
+name: BFF production-promotion-ready
+
+on:
+  workflow_run:
+    workflows: [Deploy BFF to Cloud Run (dev)]
+    types: [completed]
+    branches: [develop]
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: Full lowercase candidate SHA on canonical develop
+        required: true
+        type: string
+      dev_run_id:
+        description: Exact successful DEV deployment run ID for this SHA
+        required: true
+        type: string
+
+jobs:
+  production-promotion-ready:
+    if: >-
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_branch == 'develop') ||
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/develop')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    env:
+      CANDIDATE_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || inputs.commit_sha }}
+      DEV_RUN_ID: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.id || inputs.dev_run_id }}
+      AR_REPO: asia-east1-docker.pkg.dev/llm-wiki-cloud/cloud-run-images
+      QUERY_CONFIG_REVISION: query-dev-2026-08-21.1
+      QUERY_CONFIG_DIGEST: sha256:a35955fe4a451c740e6252cae8087f114fbac6b4162245d3de7818c1ad37a5c6
+    steps:
+      - name: Checkout exact candidate
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || inputs.commit_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify exact candidate and canonical develop ancestry
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "candidate SHA must be a 40-character lowercase commit SHA"
+            exit 1
+          fi
+          if [[ ! "$DEV_RUN_ID" =~ ^[1-9][0-9]*$ ]]; then
+            echo "DEV run ID must be a positive integer"
+            exit 1
+          fi
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          DEVELOP_SHA=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/develop" --jq .object.sha)
+          COMPARE_STATUS=$(gh api "repos/${GITHUB_REPOSITORY}/compare/${CANDIDATE_SHA}...${DEVELOP_SHA}" --jq .status)
+          if [[ "$COMPARE_STATUS" != ahead && "$COMPARE_STATUS" != identical ]]; then
+            echo "candidate SHA is not on canonical develop"
+            exit 1
+          fi
+
+      - name: Download exact DEV receipt
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          RUN_JSON="$RUNNER_TEMP/bff-dev-run.json"
+          ARTIFACT_DIR="$RUNNER_TEMP/bff-image-digest"
+          mkdir -p "$ARTIFACT_DIR"
+          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${DEV_RUN_ID}" > "$RUN_JSON"
+          gh run download "$DEV_RUN_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            --name "bff-image-digest-$CANDIDATE_SHA" \
+            --dir "$ARTIFACT_DIR"
+          DIGEST_FILE="$ARTIFACT_DIR/bff-image-digest-$CANDIDATE_SHA.txt"
+          if [[ ! -f "$DIGEST_FILE" ]] || [[ $(find "$ARTIFACT_DIR" -type f | wc -l) -ne 1 ]]; then
+            echo "exact DEV receipt contents are missing or unexpected"
+            exit 1
+          fi
+          printf 'RUN_JSON=%s\nDIGEST_FILE=%s\n' "$RUN_JSON" "$DIGEST_FILE" >> "$GITHUB_ENV"
+
+      - name: Validate exact DEV provenance receipt
+        run: |
+          set -euo pipefail
+          python3 scripts/validate_bff_promotion_contract.py validate-dev-receipt \
+            --receipt "$DIGEST_FILE" \
+            --run-json "$RUN_JSON" \
+            --expected-sha "$CANDIDATE_SHA" \
+            --expected-run-id "$DEV_RUN_ID" \
+            --expected-branch develop \
+            --expected-event workflow_dispatch \
+            --component lwc-bff \
+            --ar-repo "$AR_REPO" \
+            --query-config-revision "$QUERY_CONFIG_REVISION" \
+            --query-config-digest "$QUERY_CONFIG_DIGEST" \
+            --output "$RUNNER_TEMP/bff-production-promotion-ready.json"
+
+      - name: Validate canonical rollback traffic fixtures
+        run: |
+          set -euo pipefail
+          python3 scripts/validate_bff_promotion_contract.py validate-traffic \
+            --traffic-file scripts/fixtures/bff-service-before.json \
+            --traffic-path status.traffic \
+            --recognized-revision llm-wiki-bff-00001-old
+          python3 scripts/validate_bff_promotion_contract.py validate-traffic \
+            --traffic-file scripts/fixtures/bff-traffic-explicit.json \
+            --traffic-path traffic \
+            --recognized-revision llm-wiki-bff-00001-old
+
+      - name: Upload normalized readiness receipt
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: bff-production-promotion-ready-${{ env.CANDIDATE_SHA }}
+          path: ${{ runner.temp }}/bff-production-promotion-ready.json
+          if-no-files-found: error
+          retention-days: 90

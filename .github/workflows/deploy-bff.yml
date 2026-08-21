@@ -623,7 +623,12 @@ jobs:
           fi
           DIGEST_FILE="bff-image-digest-$COMMIT_SHA.txt"
           {
+            printf 'receipt_schema_version=1\n'
+            printf 'component=lwc-bff\n'
+            printf 'source_sha=%s\n' "$COMMIT_SHA"
+            printf 'dev_run_id=%s\n' "$GITHUB_RUN_ID"
             printf 'image_digest=%s\n' "$DIGEST"
+            printf 'image_reference=%s\n' "${{ env.AR_REPO }}/llm-wiki-bff@$DIGEST"
             printf 'query_config_revision=%s\n' "$READBACK_REVISION"
             printf 'query_config_digest=%s\n' "$READBACK_DIGEST"
           } > "$DIGEST_FILE"

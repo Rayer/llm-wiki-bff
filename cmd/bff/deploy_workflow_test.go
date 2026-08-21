@@ -1,9 +1,7 @@
 package main
 
 import (
-	"encoding/json"
 	"os"
-	"os/exec"
 	"strings"
 	"testing"
 
@@ -219,10 +217,9 @@ func TestReleaseBFFWorkflowPollsExactCreatedRevisionAndRollsBackReadbackFailure(
 	for _, required := range []string{
 		`FROZEN_READY_REVISION=$(jq -er '.ready_revision | select(type == "string" and length > 0)' "$ROLLBACK_CONTRACT")`,
 		"validate_frozen_rollback_traffic()",
-		"exactly one canonical rollback target",
-		"revision_name == $ready_revision",
-		"percent == 100",
-		"tag",
+		"scripts/validate_bff_promotion_contract.py validate-traffic",
+		"--traffic-path status.traffic",
+		"--recognized-revision \"$FROZEN_READY_REVISION\"",
 		"if: ${{ always() && steps.deploy.outputs.deploy_started == 'true' && (steps.deploy.outcome == 'failure' || steps.query_config_readback.outcome == 'failure') }}",
 		"SERVICE_JSON=$(gcloud run services describe",
 		"validate_effective_traffic()",
@@ -230,7 +227,6 @@ func TestReleaseBFFWorkflowPollsExactCreatedRevisionAndRollsBackReadbackFailure(
 		"provider traffic readback is unavailable, unsupported, or ambiguous",
 		"gcloud run services update-traffic",
 		`--to-revisions "${FROZEN_READY_REVISION}=100"`,
-		"latestRevision",
 		"RESTORED_EFFECTIVE_REVISION",
 		"RESTORED_EFFECTIVE_PERCENT",
 		"exit 1",
@@ -240,8 +236,8 @@ func TestReleaseBFFWorkflowPollsExactCreatedRevisionAndRollsBackReadbackFailure(
 			t.Errorf("rollback step missing exact post-failure contract %q", required)
 		}
 	}
-	if !strings.Contains(rollbackBlock, "keys | sort") || !strings.Contains(rollbackBlock, "latestRevision") {
-		t.Fatal("rollback readback must reject unknown provider traffic fields and mutable latest metadata")
+	if strings.Contains(rollbackBlock, "keys | sort") {
+		t.Fatal("rollback traffic semantics must not be duplicated in shell jq")
 	}
 	if strings.Contains(rollbackBlock, "ROLLBACK_TRAFFIC_JSON=$(jq -cer '.traffic'") || strings.Contains(rollbackBlock, "--to-latest") {
 		t.Fatal("release rollback must use the frozen ready revision with explicit effective traffic")
@@ -289,24 +285,17 @@ func TestReleaseBFFPreMutationTrafficGuard(t *testing.T) {
 		t.Fatal("pre-mutation validation block is missing")
 	}
 	preflight := workflow[start : start+end]
-	filter := `
-      .status.latestCreatedRevisionName == $ready_revision
-      and .status.latestReadyRevisionName == $ready_revision
-      and (.status.traffic | type == "array" and length == 1)
-      and (.status.traffic[0] | type == "object")
-      and ((.status.traffic[0] | keys | sort) == ["latestRevision", "percent", "revisionName"] or
-           (.status.traffic[0] | keys | sort) == ["percent", "revisionName"])
-      and .status.traffic[0].revisionName == $ready_revision
-      and .status.traffic[0].percent == 100
-      and ((.status.traffic[0] | has("latestRevision") | not) or
-           (.status.traffic[0].latestRevision | type == "boolean" and . == true))
-      and (.status.traffic[0].tag? == null)
-    `
-	if !strings.Contains(preflight, `(.status.traffic[0] | has("latestRevision") | not) or`) {
-		t.Fatal("pre-mutation live traffic must require absent or boolean-true latestRevision")
+	for _, want := range []string{
+		"scripts/validate_bff_promotion_contract.py validate-traffic",
+		"--traffic-path status.traffic",
+		"--recognized-revision \"$FROZEN_READY_REVISION\"",
+	} {
+		if !strings.Contains(preflight, want) {
+			t.Fatalf("pre-mutation validation must use shared traffic contract %q", want)
+		}
 	}
-	if strings.Contains(preflight, `((.status.traffic[0].latestRevision? // false) == false)`) {
-		t.Fatal("pre-mutation live traffic must not require latestRevision false")
+	if strings.Contains(preflight, "gcloud run services update-traffic") || strings.Contains(preflight, "gcloud run deploy") {
+		t.Fatal("pre-mutation validation must not mutate provider state")
 	}
 
 	rollback := workflow[strings.Index(workflow, "      - name: Restore frozen production traffic after query-config readback failure"):]
@@ -315,84 +304,13 @@ func TestReleaseBFFPreMutationTrafficGuard(t *testing.T) {
 			t.Fatalf("post-failure validator %q must remain present", validator)
 		}
 	}
-	if !strings.Contains(rollback, `((.status.traffic[0].latestRevision? // false) == false)`) {
-		t.Fatal("post-failure validation must continue requiring explicit effective traffic")
+	for _, want := range []string{
+		"scripts/validate_bff_promotion_contract.py validate-traffic",
+		"--traffic-path status.traffic",
+		"--recognized-revision \"$FROZEN_READY_REVISION\"",
+	} {
+		if !strings.Contains(rollback, want) {
+			t.Fatalf("post-failure validation must use shared traffic contract %q", want)
+		}
 	}
-	if !strings.Contains(rollback, `(.status.traffic[0] | keys | sort) == ["percent", "revisionName"]`) {
-		t.Fatal("post-failure validation must retain explicit old-route keys")
-	}
-
-	base := map[string]any{"status": map[string]any{
-		"latestCreatedRevisionName": "rev-1", "latestReadyRevisionName": "rev-1",
-		"traffic": []any{map[string]any{"revisionName": "rev-1", "percent": 100}},
-	}}
-	cases := []struct {
-		name   string
-		mutate func(map[string]any)
-		want   bool
-	}{
-		{"absent", func(map[string]any) {}, true},
-		{"true", func(m map[string]any) {
-			m["status"].(map[string]any)["traffic"].([]any)[0].(map[string]any)["latestRevision"] = true
-		}, true},
-		{"null", func(m map[string]any) {
-			m["status"].(map[string]any)["traffic"].([]any)[0].(map[string]any)["latestRevision"] = nil
-		}, false},
-		{"false", func(m map[string]any) {
-			m["status"].(map[string]any)["traffic"].([]any)[0].(map[string]any)["latestRevision"] = false
-		}, false},
-		{"string", func(m map[string]any) {
-			m["status"].(map[string]any)["traffic"].([]any)[0].(map[string]any)["latestRevision"] = "true"
-		}, false},
-		{"number", func(m map[string]any) {
-			m["status"].(map[string]any)["traffic"].([]any)[0].(map[string]any)["latestRevision"] = 1
-		}, false},
-		{"object", func(m map[string]any) {
-			x := m["status"].(map[string]any)["traffic"].([]any)[0].(map[string]any)
-			x["latestRevision"] = map[string]any{}
-		}, false},
-		{"array", func(m map[string]any) {
-			m["status"].(map[string]any)["traffic"].([]any)[0].(map[string]any)["latestRevision"] = []any{}
-		}, false},
-		{"missing revisionName", func(m map[string]any) {
-			delete(m["status"].(map[string]any)["traffic"].([]any)[0].(map[string]any), "revisionName")
-		}, false},
-		{"unknown key", func(m map[string]any) {
-			m["status"].(map[string]any)["traffic"].([]any)[0].(map[string]any)["extra"] = true
-		}, false},
-		{"tag", func(m map[string]any) {
-			m["status"].(map[string]any)["traffic"].([]any)[0].(map[string]any)["tag"] = "stable"
-		}, false},
-		{"split traffic", func(m map[string]any) {
-			m["status"].(map[string]any)["traffic"] = []any{m["status"].(map[string]any)["traffic"].([]any)[0], map[string]any{"revisionName": "rev-2", "percent": 0}}
-		}, false},
-		{"wrong revision", func(m map[string]any) {
-			m["status"].(map[string]any)["traffic"].([]any)[0].(map[string]any)["revisionName"] = "rev-2"
-		}, false},
-		{"wrong percent", func(m map[string]any) {
-			m["status"].(map[string]any)["traffic"].([]any)[0].(map[string]any)["percent"] = 99
-		}, false},
-		{"latestCreated mismatch", func(m map[string]any) { m["status"].(map[string]any)["latestCreatedRevisionName"] = "rev-2" }, false},
-		{"latestReady mismatch", func(m map[string]any) { m["status"].(map[string]any)["latestReadyRevisionName"] = "rev-2" }, false},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			value := jsonClone(base)
-			tc.mutate(value)
-			encoded, _ := json.Marshal(value)
-			cmd := exec.Command("jq", "-e", "--arg", "ready_revision", "rev-1", filter)
-			cmd.Stdin = strings.NewReader(string(encoded))
-			err := cmd.Run()
-			if (err == nil) != tc.want {
-				t.Fatalf("jq result error=%v, want pass=%v", err, tc.want)
-			}
-		})
-	}
-}
-
-func jsonClone(value map[string]any) map[string]any {
-	encoded, _ := json.Marshal(value)
-	var clone map[string]any
-	_ = json.Unmarshal(encoded, &clone)
-	return clone
 }
