@@ -18,9 +18,10 @@ import (
 )
 
 const (
-	SchemaVersionMin = 1
-	SchemaVersionMax = 1
-	SchemaVersion    = 1
+	SchemaVersionMin           = 1
+	SchemaVersionMax           = 1
+	SchemaVersion              = 1
+	QueryServiceImplementation = "query-retrieval-pipeline-v2"
 
 	QueryExpanderImplementation     = "parallel-minimal-structured-plan-v1"
 	CandidateMatcherImplementation  = "lexical-evidence-v1"
@@ -36,12 +37,13 @@ const (
 var safeID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 
 type Config struct {
-	SchemaVersion   int              `json:"schema_version"`
-	ConfigRevision  string           `json:"config_revision"`
-	ConfigDigest    string           `json:"config_digest"`
-	Stages          Stages           `json:"stages"`
-	Profiles        []Profile        `json:"profiles"`
-	ProjectBindings []ProjectBinding `json:"project_bindings"`
+	SchemaVersion              int              `json:"schema_version"`
+	ConfigRevision             string           `json:"config_revision"`
+	ConfigDigest               string           `json:"config_digest"`
+	QueryServiceImplementation string           `json:"query_service_implementation"`
+	Stages                     Stages           `json:"stages"`
+	Profiles                   []Profile        `json:"profiles"`
+	ProjectBindings            []ProjectBinding `json:"project_bindings"`
 }
 
 // StageConfig is the public name used by callers that persist query stage
@@ -178,6 +180,9 @@ func normalizeWithoutDigest(input Config) (Config, error) {
 	}
 	if err := validateSafeID("config_revision", input.ConfigRevision); err != nil {
 		return Config{}, err
+	}
+	if input.QueryServiceImplementation != QueryServiceImplementation {
+		return Config{}, errors.New("unsupported query service implementation")
 	}
 	config := input
 	config.ConfigDigest = ""
@@ -331,12 +336,13 @@ func canonicalWithoutDigest(config Config) ([]byte, error) {
 	copy := config
 	copy.ConfigDigest = ""
 	return json.Marshal(struct {
-		SchemaVersion   int              `json:"schema_version"`
-		ConfigRevision  string           `json:"config_revision"`
-		Stages          Stages           `json:"stages"`
-		Profiles        []Profile        `json:"profiles"`
-		ProjectBindings []ProjectBinding `json:"project_bindings"`
-	}{copy.SchemaVersion, copy.ConfigRevision, copy.Stages, copy.Profiles, copy.ProjectBindings})
+		SchemaVersion              int              `json:"schema_version"`
+		ConfigRevision             string           `json:"config_revision"`
+		QueryServiceImplementation string           `json:"query_service_implementation"`
+		Stages                     Stages           `json:"stages"`
+		Profiles                   []Profile        `json:"profiles"`
+		ProjectBindings            []ProjectBinding `json:"project_bindings"`
+	}{copy.SchemaVersion, copy.ConfigRevision, copy.QueryServiceImplementation, copy.Stages, copy.Profiles, copy.ProjectBindings})
 }
 
 func strictObject(data []byte) (map[string]json.RawMessage, error) {
@@ -375,7 +381,7 @@ func strictObject(data []byte) (map[string]json.RawMessage, error) {
 }
 
 func decodeConfig(object map[string]json.RawMessage) (Config, error) {
-	if err := fields(object, map[string]bool{"schema_version": true, "config_revision": true, "config_digest": true, "stages": true, "profiles": true, "project_bindings": true}); err != nil {
+	if err := fields(object, map[string]bool{"schema_version": true, "config_revision": true, "config_digest": true, "query_service_implementation": true, "stages": true, "profiles": true, "project_bindings": true}); err != nil {
 		return Config{}, err
 	}
 	var result Config
@@ -387,6 +393,9 @@ func decodeConfig(object map[string]json.RawMessage) (Config, error) {
 		return Config{}, err
 	}
 	if result.ConfigDigest, err = stringField(object, "config_digest"); err != nil {
+		return Config{}, err
+	}
+	if result.QueryServiceImplementation, err = stringField(object, "query_service_implementation"); err != nil {
 		return Config{}, err
 	}
 	if result.Stages, err = decodeStages(object["stages"]); err != nil {

@@ -64,6 +64,9 @@ production-owned built-in prompt, `deepseek-v4-flash`, provider `deepseek`,
 reasoning `none`, and temperature `0`. The artifact is atomically written only
 after every run succeeds.
 
+Promotion records the production `query-retrieval-pipeline-v2` implementation
+identity separately from the operator config revision.
+
 The query-retrieval trace preserves the ordered `expansion`, `matching`, and
 `selection` stages. It may include plan criteria, lexical field/term evidence,
 eligibility reasons, selection reasons, exploration markers, and seed metadata,

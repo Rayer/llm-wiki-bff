@@ -43,7 +43,7 @@ func TestWriteStageConfigIsAtomicRegularJSONWithoutExperimentSecrets(t *testing.
 		t.Fatal("missing prompt")
 	}
 	config := queryconfig.Config{
-		SchemaVersion: 1, ConfigRevision: "rev",
+		SchemaVersion: 1, ConfigRevision: "rev", QueryServiceImplementation: queryconfig.QueryServiceImplementation,
 		Stages: queryconfig.Stages{
 			QueryExpander:     queryconfig.QueryExpanderStage{Implementation: queryconfig.QueryExpanderImplementation, Model: "deepseek-v4-flash", Reasoning: "none", DefaultProfileID: profile.ID, DefaultProfileDigest: profileDigest, DefaultPromptID: prompt.ID, DefaultPromptDigest: prompt.TemplateDigest, KeywordsPerAttempt: 24, Attempts: 3},
 			CandidateMatcher:  queryconfig.CandidateMatcherStage{Implementation: queryconfig.CandidateMatcherImplementation, EvidenceThreshold: 2, RareKeywordMaxDocumentFrequency: 1},

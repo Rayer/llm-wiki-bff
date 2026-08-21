@@ -12,6 +12,17 @@ import (
 	"github.com/rayer/llm-wiki-bff/internal/search"
 )
 
+type runtimeConfigIdentityContextKey struct{}
+
+func WithRuntimeConfigIdentity(ctx context.Context, identity RuntimeConfigIdentity) context.Context {
+	return context.WithValue(ctx, runtimeConfigIdentityContextKey{}, identity)
+}
+
+func RuntimeConfigIdentityFromContext(ctx context.Context) (RuntimeConfigIdentity, bool) {
+	identity, ok := ctx.Value(runtimeConfigIdentityContextKey{}).(RuntimeConfigIdentity)
+	return identity, ok
+}
+
 // ErrCacheNotConfigured reports that the query service has no concept cache.
 var ErrCacheNotConfigured = errors.New("concept cache is not configured")
 
@@ -24,14 +35,56 @@ type Request struct {
 // Result is the application result for one query. Its fields are domain
 // values; HTTP adapters are responsible for choosing a wire representation.
 type Result struct {
-	Query     string
-	Mode      string
-	Results   []search.Result
-	Expand    *llm.ExpandResult
-	AISynth   string
-	Citations []search.Citation
-	Status    string
-	Reason    string
+	Query                 string
+	Mode                  string
+	Results               []search.Result
+	Expand                *llm.ExpandResult
+	AISynth               string
+	Citations             []search.Citation
+	Status                string
+	Reason                string
+	RuntimeConfigIdentity *RuntimeConfigIdentity `json:"-"`
+}
+
+// RuntimeConfigIdentity is the privacy-safe identity of the sealed runtime
+// composition that produced a result. It intentionally contains no request,
+// corpus, tenant, credential, or prompt-body data.
+type RuntimeConfigIdentity struct {
+	SchemaVersion              int     `json:"schema_version"`
+	ConfigRevision             string  `json:"config_revision"`
+	ConfigDigest               string  `json:"config_digest"`
+	EffectiveConfigDigest      string  `json:"effective_config_digest"`
+	QueryServiceImplementation string  `json:"query_service_implementation"`
+	ProfileID                  string  `json:"profile_id"`
+	ProfileDigest              string  `json:"profile_digest"`
+	PromptID                   string  `json:"prompt_id"`
+	PromptDigest               string  `json:"prompt_digest"`
+	BindingSource              string  `json:"binding_source"`
+	ExactBinding               bool    `json:"exact_binding"`
+	GenerationID               string  `json:"generation_id"`
+	ConceptsDigest             string  `json:"concepts_digest"`
+	ExpansionImplementation    string  `json:"expansion_implementation"`
+	ExpansionModel             string  `json:"expansion_model"`
+	ExpansionReasoning         string  `json:"expansion_reasoning"`
+	ExpansionTemperature       float64 `json:"expansion_temperature"`
+	SynthesisImplementation    string  `json:"synthesis_implementation"`
+	SynthesisModel             string  `json:"synthesis_model"`
+	SynthesisReasoning         string  `json:"synthesis_reasoning"`
+	SynthesisTemperature       float64 `json:"synthesis_temperature"`
+	SelectionLimit             int     `json:"selection_limit"`
+	ExplorationSlots           int     `json:"exploration_slots"`
+	EvidenceThreshold          int     `json:"evidence_threshold"`
+	KeywordsPerAttempt         int     `json:"keywords_per_attempt"`
+	ExpansionAttempts          int     `json:"expansion_attempts"`
+	RareDocumentFrequency      int     `json:"rare_document_frequency"`
+}
+
+func CloneRuntimeConfigIdentity(identity *RuntimeConfigIdentity) *RuntimeConfigIdentity {
+	if identity == nil {
+		return nil
+	}
+	copy := *identity
+	return &copy
 }
 
 // Executor is the narrow seam used by transport adapters.

@@ -38,8 +38,9 @@ func validConfig(t *testing.T) queryconfig.Config {
 		t.Fatal("missing technical prompt")
 	}
 	return queryconfig.Config{
-		SchemaVersion:  1,
-		ConfigRevision: "operator-2026-08-20",
+		SchemaVersion:              1,
+		ConfigRevision:             "operator-2026-08-20",
+		QueryServiceImplementation: queryconfig.QueryServiceImplementation,
 		Stages: queryconfig.Stages{
 			QueryExpander: queryconfig.QueryExpanderStage{
 				Implementation:       queryconfig.QueryExpanderImplementation,
@@ -118,6 +119,8 @@ func TestStrictDecodeRejectsSchemaBoundariesUnknownFieldsAndTrailingJSON(t *test
 		{"nested unknown", strings.Replace(base, `"implementation":"parallel-minimal-structured-plan-v1"`, `"extra":true,"implementation":"parallel-minimal-structured-plan-v1"`, 1)},
 		{"trailing JSON", base + " {}"},
 		{"secret-like field", strings.Replace(base, `"config_revision"`, `"api_key":"secret","config_revision"`, 1)},
+		{"missing query service revision", strings.Replace(base, `"query_service_implementation":"`+queryconfig.QueryServiceImplementation+`",`, "", 1)},
+		{"unknown query service revision", strings.Replace(base, queryconfig.QueryServiceImplementation, "query-retrieval-pipeline-v1", 1)},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			if _, err := queryconfig.DecodeStrict([]byte(test.data)); err == nil {

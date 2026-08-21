@@ -76,8 +76,9 @@ func buildStageConfig(options experimentOptions, variant fixtureVariant, prepare
 		return queryconfig.Config{}, err
 	}
 	config := queryconfig.Config{
-		SchemaVersion:  queryconfig.SchemaVersion,
-		ConfigRevision: options.configRevision,
+		SchemaVersion:              queryconfig.SchemaVersion,
+		ConfigRevision:             options.configRevision,
+		QueryServiceImplementation: queryconfig.QueryServiceImplementation,
 		Stages: queryconfig.Stages{
 			QueryExpander: queryconfig.QueryExpanderStage{
 				Implementation: queryconfig.QueryExpanderImplementation, Model: "deepseek-v4-flash", Reasoning: "none", Temperature: 0,

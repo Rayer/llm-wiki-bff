@@ -231,6 +231,25 @@ func (c *Client) ViewToken() string {
 	return c.view.token
 }
 
+// QueryGenerationIdentity returns identity from the immutable view captured by
+// Pin. It intentionally does not read the manifest or concepts object.
+func (c *Client) QueryGenerationIdentity(context.Context) (store.QueryGenerationIdentity, error) {
+	if c == nil || c.view == nil || c.view.manifest == nil {
+		return store.QueryGenerationIdentity{}, store.ErrQueryGenerationUnpinned
+	}
+	if c.projectID == "" {
+		return store.QueryGenerationIdentity{}, store.ErrQueryGenerationIdentityUnavailable
+	}
+	file, ok := c.view.manifest.File(conceptsCachePath)
+	if !ok || len(file.SHA256) != 64 {
+		return store.QueryGenerationIdentity{}, store.ErrQueryGenerationIdentityUnavailable
+	}
+	if _, err := hex.DecodeString(file.SHA256); err != nil {
+		return store.QueryGenerationIdentity{}, store.ErrQueryGenerationIdentityUnavailable
+	}
+	return store.QueryGenerationIdentity{ProjectID: c.projectID, GenerationID: c.view.manifest.GenerationID, ConceptsDigest: "sha256:" + strings.ToLower(file.SHA256)}, nil
+}
+
 // PinCurrentGeneration reads and validates the current manifest once, then
 // returns a client whose generation-owned reads use that immutable view.
 func (c *Client) PinCurrentGeneration(ctx context.Context) (*Client, GenerationSnapshot, error) {

@@ -71,30 +71,52 @@ type ProductionExecutor struct {
 	queryRetrievalPipeline *QueryRetrievalPipeline
 	legacy                 query.Executor
 	synthesizer            *query.Service
+	identity               query.RuntimeConfigIdentity
 }
 
 func NewProductionExecutor(conceptCache *cache.Cache, provider ChatProvider, legacy query.Executor, synthesizer *query.Service, options Options) (query.Executor, error) {
+	return NewProductionExecutorWithQueryServiceConfig(conceptCache, provider, legacy, synthesizer, DefaultRetrievalProfile(), StructuredPlanPromptID, options, query.RuntimeConfigIdentity{})
+}
+
+// NewProductionExecutorWithQueryServiceConfig is the production runtime
+// constructor for a sealed profile/prompt/options composition. Retrieval is
+// always built through NewQueryRetrievalService, the shared composition point.
+func NewProductionExecutorWithQueryServiceConfig(conceptCache *cache.Cache, provider ChatProvider, legacy query.Executor, synthesizer *query.Service, profile RetrievalProfile, promptID string, options Options, identity query.RuntimeConfigIdentity) (query.Executor, error) {
 	if legacy == nil {
 		return nil, errors.New("legacy query executor is nil")
 	}
 	queryRetrievalPipeline, err := NewQueryRetrievalService(QueryRetrievalServiceConfig{
-		Cache: conceptCache, ChatProvider: provider, Options: options, RetrievalProfile: DefaultRetrievalProfile(),
-		PromptID: StructuredPlanPromptID, AllowDeterministicFallback: true,
+		Cache: conceptCache, ChatProvider: provider, Options: options, RetrievalProfile: profile,
+		PromptID: promptID, AllowDeterministicFallback: true,
 	})
 	if err != nil {
 		return nil, err
 	}
-	return &ProductionExecutor{queryRetrievalPipeline: queryRetrievalPipeline, legacy: legacy, synthesizer: synthesizer}, nil
+	if identity.ProfileID != "" && (identity.ProfileID != queryRetrievalPipeline.profile.ID || identity.ProfileDigest != queryRetrievalPipeline.profileDigest || identity.PromptID != queryRetrievalPipeline.prompt.ID || identity.PromptDigest != queryRetrievalPipeline.prompt.TemplateDigest) {
+		return nil, errors.New("runtime query service identity mismatch")
+	}
+	return &ProductionExecutor{queryRetrievalPipeline: queryRetrievalPipeline, legacy: legacy, synthesizer: synthesizer, identity: identity}, nil
 }
 
 func (e *ProductionExecutor) Execute(ctx context.Context, reader cache.Reader, request query.Request) (query.Result, error) {
 	receiptCtx, receipt := query.WithReceipt(ctx)
 	defer query.FinishReceipt(receipt)
+	identity := e.identity
+	if contextual, ok := query.RuntimeConfigIdentityFromContext(ctx); ok {
+		identity = contextual
+	}
+	if identity.ProfileID != "" {
+		receipt.SetRuntimeConfigIdentity(identity)
+	}
 	result, err := e.queryRetrievalPipeline.Execute(receiptCtx, reader, request)
 	if err != nil {
 		var expansionErr *ExpansionError
 		if errors.As(err, &expansionErr) && ctx.Err() == nil {
-			return e.legacy.Execute(receiptCtx, reader, request)
+			result, err = e.legacy.Execute(receiptCtx, reader, request)
+			if err == nil && identity.ProfileID != "" {
+				result.RuntimeConfigIdentity = query.CloneRuntimeConfigIdentity(&identity)
+			}
+			return result, err
 		}
 		return query.Result{}, err
 	}
@@ -104,6 +126,9 @@ func (e *ProductionExecutor) Execute(ctx context.Context, reader cache.Reader, r
 		if err != nil {
 			return query.Result{}, err
 		}
+	}
+	if identity.ProfileID != "" {
+		result.RuntimeConfigIdentity = query.CloneRuntimeConfigIdentity(&identity)
 	}
 	return result, nil
 }
