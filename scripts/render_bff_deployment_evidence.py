@@ -220,6 +220,10 @@ EXPECTED_VALUES = {
     "DEV_JWT": "false",
     "QUERY_STAGE_CONFIG_PATH": "/app/configs/query/dev/query-dev-2026-08-21.2.json",
 }
+PRIOR_STAGE_CONFIG_PATHS = {
+    "/app/configs/query/dev/query-dev-2026-08-21.1.json",
+    "/app/configs/query/dev/query-dev-2026-08-21.2.json",
+}
 EXPECTED_SECRETS = {
     "JWT_SECRET": {"secret": "jwt-secret-prod", "version": "latest"},
     "DEEPSEEK_API_KEY": {"secret": "deepseek-apikey", "version": "latest"},
@@ -227,7 +231,9 @@ EXPECTED_SECRETS = {
 LEGACY_PRESERVED_NAMES = {"USER_ID", "PROJECT_ID"}
 
 
-def normalized_env(env, legacy_preserved=None, require_stage_config_path=False):
+def normalized_env(env, legacy_preserved=None, require_stage_config_path=False, allowed_stage_config_paths=None):
+    if allowed_stage_config_paths is None:
+        allowed_stage_config_paths = {EXPECTED_VALUES["QUERY_STAGE_CONFIG_PATH"]}
     values = {}
     secrets = {}
     legacy = {}
@@ -238,7 +244,7 @@ def normalized_env(env, legacy_preserved=None, require_stage_config_path=False):
         if name in values or name in secrets or name in legacy:
             reject("duplicate environment entry", "config_mismatch")
         if name in EXPECTED_VALUES:
-            if set(entry) != {"name", "value"} or not isinstance(entry["value"], str) or entry["value"] != EXPECTED_VALUES[name]:
+            if set(entry) != {"name", "value"} or not isinstance(entry["value"], str) or (name == "QUERY_STAGE_CONFIG_PATH" and entry["value"] not in allowed_stage_config_paths) or (name != "QUERY_STAGE_CONFIG_PATH" and entry["value"] != EXPECTED_VALUES[name]):
                 reject("environment value does not match production contract", "config_mismatch")
             values[name] = entry["value"]
         elif name in EXPECTED_SECRETS:
@@ -295,7 +301,7 @@ def normalized_revision_config(revision, service_annotations, legacy_preserved=N
     metadata = revision.get("metadata") if isinstance(revision, dict) else None
     expected_name = metadata.get("name") if isinstance(metadata, dict) else None
     parts = revision_parts(revision, expected_name, expected_image)
-    env = normalized_env(parts["container"]["env"], legacy_preserved, require_stage_config_path=expected_image is not None)
+    env = normalized_env(parts["container"]["env"], legacy_preserved, require_stage_config_path=expected_image is not None, allowed_stage_config_paths=None if expected_image is not None else PRIOR_STAGE_CONFIG_PATHS)
     return {**env, "network": network_config(service_annotations, parts["metadata_annotations"]), "runtime_service_account": parts["service_account"]}
 
 
@@ -314,7 +320,7 @@ def validate_saved_config(config):
             reject("rollback secret reference shape is invalid", "rollback_unavailable")
         reconstructed.append({"name": ref["name"], "valueFrom": {"secretKeyRef": {"name": ref["secret"], "key": ref["version"]}}})
     reconstructed.extend(legacy)
-    normalized = normalized_env(reconstructed, legacy)
+    normalized = normalized_env(reconstructed, legacy, allowed_stage_config_paths=PRIOR_STAGE_CONFIG_PATHS)
     if config.get("network") != {"network": "default", "subnet": "default", "vpc_egress": "private-ranges-only", "ingress": "all"} or config.get("runtime_service_account") != RUNTIME_SERVICE_ACCOUNT:
         reject("rollback network or identity config is invalid", "rollback_unavailable")
     return {**normalized, "network": config["network"], "runtime_service_account": config["runtime_service_account"]}
