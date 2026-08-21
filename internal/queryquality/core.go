@@ -1119,7 +1119,8 @@ func (s *QueryRetrievalPipeline) ExecuteWithTrace(ctx context.Context, reader ca
 	if err := s.validate(); err != nil {
 		return query.Result{}, nil, err
 	}
-	trace := &Trace{Variant: "query-retrieval-v1", ProfileID: s.profile.ID, ProfileDigest: s.profileDigest, PromptID: s.prompt.ID, PromptDigest: s.prompt.TemplateDigest, SelectionLimit: s.options.SelectionLimit, ExplorationSlots: s.options.ExplorationSlots, ExpansionAttempts: s.options.ExpansionAttempts, KeywordsPerAttempt: s.options.KeywordsPerAttempt, RareKeywordMaxDocumentFrequency: s.options.RareDocumentFrequency, EvidenceThreshold: resolvedEvidenceThreshold(s.options), Expansion: ExpansionTrace{RequestedAttempts: s.options.ExpansionAttempts, KeywordsPerAttempt: s.options.KeywordsPerAttempt, RareKeywordMaxDocumentFrequency: s.options.RareDocumentFrequency, EvidenceThreshold: resolvedEvidenceThreshold(s.options), KeywordConsensusMinimum: MinimumKeywordConsensusSupport}}
+	policy := matchingPolicyForOptions(s.options)
+	trace := &Trace{Variant: "query-retrieval-v1", ProfileID: s.profile.ID, ProfileDigest: s.profileDigest, PromptID: s.prompt.ID, PromptDigest: s.prompt.TemplateDigest, SelectionLimit: s.options.SelectionLimit, ExplorationSlots: s.options.ExplorationSlots, ExpansionAttempts: s.options.ExpansionAttempts, KeywordsPerAttempt: s.options.KeywordsPerAttempt, RareKeywordMaxDocumentFrequency: s.options.RareDocumentFrequency, EvidenceThreshold: policy.EvidenceThreshold, MatchingPolicy: policy, Expansion: ExpansionTrace{RequestedAttempts: s.options.ExpansionAttempts, KeywordsPerAttempt: s.options.KeywordsPerAttempt, RareKeywordMaxDocumentFrequency: s.options.RareDocumentFrequency, EvidenceThreshold: policy.EvidenceThreshold, KeywordConsensusMinimum: MinimumKeywordConsensusSupport}}
 	result, err := s.execute(ctx, reader, request, trace)
 	return result, trace, err
 }
@@ -1227,13 +1228,7 @@ func (s *QueryRetrievalPipeline) execute(ctx context.Context, reader cache.Reade
 		matchReq.RareKeywordMaxDocumentFrequency = DefaultRareDocumentFrequency
 	}
 	if trace != nil {
-		trace.MatchingPolicy = MatchingPolicy{
-			EvidenceThreshold:               resolvedEvidenceThreshold(s.options),
-			RareKeywordMaxDocumentFrequency: matchReq.RareKeywordMaxDocumentFrequency,
-			FallbackQualificationAllowed:    matchReq.FallbackQualificationAllowed,
-			SemanticRequiredFailClosed:      semanticRequiredFailClosed,
-			SemanticExcludedFailClosed:      semanticExcludedFailClosed,
-		}
+		trace.MatchingPolicy = matchingPolicyForOptions(s.options)
 	}
 	eligible, err := s.candidateMatcher.Match(matchCtx, matchReq)
 	if err != nil {
@@ -1323,21 +1318,22 @@ func expandFromPlan(plan QueryPlan) *llm.ExpandResult {
 }
 
 type Trace struct {
-	Variant                         string         `json:"variant"`
-	ProfileID                       string         `json:"profile_id"`
-	ProfileDigest                   string         `json:"profile_digest"`
-	PromptID                        string         `json:"prompt_id"`
-	PromptDigest                    string         `json:"prompt_digest"`
-	Seed                            int64          `json:"seed"`
-	SelectionLimit                  int            `json:"selection_limit"`
-	ExplorationSlots                int            `json:"exploration_slots"`
-	ExpansionAttempts               int            `json:"expansion_attempts"`
-	KeywordsPerAttempt              int            `json:"keywords_per_attempt"`
-	RareKeywordMaxDocumentFrequency int            `json:"rare_keyword_max_document_frequency"`
-	EvidenceThreshold               int            `json:"evidence_threshold"`
-	MatchingPolicy                  MatchingPolicy `json:"matching_policy"`
-	Expansion                       ExpansionTrace `json:"expansion"`
-	Stages                          []StageTrace   `json:"stages"`
+	Variant                         string `json:"variant"`
+	ProfileID                       string `json:"profile_id"`
+	ProfileDigest                   string `json:"profile_digest"`
+	PromptID                        string `json:"prompt_id"`
+	PromptDigest                    string `json:"prompt_digest"`
+	Seed                            int64  `json:"seed"`
+	SelectionLimit                  int    `json:"selection_limit"`
+	ExplorationSlots                int    `json:"exploration_slots"`
+	ExpansionAttempts               int    `json:"expansion_attempts"`
+	KeywordsPerAttempt              int    `json:"keywords_per_attempt"`
+	RareKeywordMaxDocumentFrequency int    `json:"rare_keyword_max_document_frequency"`
+	// Deprecated: use MatchingPolicy.EvidenceThreshold.
+	EvidenceThreshold int            `json:"evidence_threshold"`
+	MatchingPolicy    MatchingPolicy `json:"matching_policy"`
+	Expansion         ExpansionTrace `json:"expansion"`
+	Stages            []StageTrace   `json:"stages"`
 }
 
 type MatchingPolicy struct {
@@ -1366,6 +1362,16 @@ func resolvedEvidenceThreshold(options Options) int {
 		return options.EvidenceThreshold
 	}
 	return DefaultEvidenceThreshold
+}
+
+func matchingPolicyForOptions(options Options) MatchingPolicy {
+	return MatchingPolicy{
+		EvidenceThreshold:               resolvedEvidenceThreshold(options),
+		RareKeywordMaxDocumentFrequency: options.RareDocumentFrequency,
+		FallbackQualificationAllowed:    !options.EvidenceThresholdSet,
+		SemanticRequiredFailClosed:      semanticRequiredFailClosed,
+		SemanticExcludedFailClosed:      semanticExcludedFailClosed,
+	}
 }
 
 type StageTrace struct {

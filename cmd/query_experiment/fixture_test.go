@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/rayer/llm-wiki-bff/internal/cache"
+	"github.com/rayer/llm-wiki-bff/internal/llm"
 	"github.com/rayer/llm-wiki-bff/internal/query"
 	"github.com/rayer/llm-wiki-bff/internal/queryquality"
 	"github.com/rayer/llm-wiki-bff/internal/search"
@@ -62,26 +63,6 @@ func TestFixtureProfileCatalogRejectsChangedImmutableDefault(t *testing.T) {
 	writeTestFile(t, path, `{"profiles":[{"id":"platform-owned-lifestyle-v1","required_when_explicit":["changed"],"preferred_by_default":[],"goals_to_expand":[]}]}`)
 	if _, err := readProfileFixture(path); err == nil {
 		t.Fatal("accepted changed immutable default profile")
-	}
-}
-
-func TestFixtureRunnerDelegatesStageExecutionToProductionService(t *testing.T) {
-	data, err := os.ReadFile("fixture_runner.go")
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, forbidden := range []string{
-		"ExpandWithTrace(",
-		".Match(",
-		".Select(",
-		"ResultStatus(",
-		"NewParallelQueryExpander(",
-		"NewLexicalMatcher(",
-		"NewResultSelector(",
-	} {
-		if strings.Contains(string(data), forbidden) {
-			t.Fatalf("fixture runner directly invokes production stage %q", forbidden)
-		}
 	}
 }
 
@@ -358,15 +339,31 @@ func writeProductionPromptFixture(t *testing.T, dir, id string) string {
 }
 
 type tracedFixtureService struct {
-	calls  int
-	trace  queryquality.Trace
-	result query.Result
+	calls   int
+	config  queryquality.QueryRetrievalServiceConfig
+	request query.Request
+	trace   queryquality.Trace
+	result  query.Result
 }
 
-func (s *tracedFixtureService) ExecuteWithTrace(context.Context, cache.Reader, query.Request) (query.Result, *queryquality.Trace, error) {
+func (s *tracedFixtureService) ExecuteWithTrace(_ context.Context, _ cache.Reader, request query.Request) (query.Result, *queryquality.Trace, error) {
 	s.calls++
+	s.request = request
 	trace := s.trace
 	return s.result, &trace, nil
+}
+
+type capturingFixtureService struct {
+	delegate fixtureQueryService
+	trace    *queryquality.Trace
+	result   query.Result
+}
+
+func (s *capturingFixtureService) ExecuteWithTrace(ctx context.Context, reader cache.Reader, request query.Request) (query.Result, *queryquality.Trace, error) {
+	result, trace, err := s.delegate.ExecuteWithTrace(ctx, reader, request)
+	s.result = result
+	s.trace = trace
+	return result, trace, err
 }
 
 func TestFixtureRunnerUsesOneInjectedTracedServiceResult(t *testing.T) {
@@ -375,22 +372,47 @@ func TestFixtureRunnerUsesOneInjectedTracedServiceResult(t *testing.T) {
 	profilePath := writeFixture(t, dir, "profiles.json", `{"profiles":[{"id":"profile","required_when_explicit":[],"preferred_by_default":["topic"],"goals_to_expand":[]}]}`)
 	promptPath := writeProductionPromptFixture(t, dir, queryquality.StructuredPlanPromptID)
 	var output strings.Builder
-	plan := queryquality.QueryPlan{RawQuery: "coffee", Preferred: []queryquality.Criterion{{Kind: "topic", Value: "coffee", Terms: []string{"coffee"}, Proof: "lexical"}}}
-	candidate := queryquality.CandidateEvidence{Slug: "from-service", Title: "From service", Eligible: true, Qualified: true}
+	canonicalThreshold := 7
+	secret := "secret"
+	baseURL := "http://127.0.0.1:1"
+	plan := queryquality.QueryPlan{RawQuery: "coffee", Preferred: []queryquality.Criterion{{Kind: "topic", Value: secret, Terms: []string{baseURL}, Proof: "lexical"}}}
+	candidate := queryquality.CandidateEvidence{Slug: "from-service", Title: "From service", Eligible: true, Qualified: true, EvidenceThreshold: canonicalThreshold}
 	decision := queryquality.SelectedCandidate{Slug: candidate.Slug, Title: candidate.Title, Selected: true, Reason: "service decision"}
 	trace := queryquality.Trace{
 		ProfileID: "profile", PromptID: queryquality.StructuredPlanPromptID, Seed: 11,
-		SelectionLimit: 1, MatchingPolicy: queryquality.MatchingPolicy{EvidenceThreshold: 2, RareKeywordMaxDocumentFrequency: 1, SemanticRequiredFailClosed: true, SemanticExcludedFailClosed: true},
-		Expansion: queryquality.ExpansionTrace{KeywordsPerAttempt: 24},
-		Stages:    []queryquality.StageTrace{{Name: "expansion", Outcome: "success", Plan: &plan}, {Name: "matching", Outcome: "success", Candidates: []queryquality.CandidateEvidence{candidate}}, {Name: "selection", Outcome: "success", Decisions: []queryquality.SelectedCandidate{decision}}},
+		SelectionLimit: 1, ExplorationSlots: 0, EvidenceThreshold: 3,
+		MatchingPolicy: queryquality.MatchingPolicy{EvidenceThreshold: canonicalThreshold, RareKeywordMaxDocumentFrequency: 1, SemanticRequiredFailClosed: true, SemanticExcludedFailClosed: true},
+		Expansion:      queryquality.ExpansionTrace{KeywordsPerAttempt: 24, EvidenceThreshold: 3},
+		Stages: []queryquality.StageTrace{
+			{Name: "expansion", Outcome: "success", Plan: &plan, EvidenceThreshold: 3},
+			{Name: "matching", Outcome: "success", Candidates: []queryquality.CandidateEvidence{candidate}, EvidenceThreshold: 3},
+			{Name: "selection", Outcome: "success", Decisions: []queryquality.SelectedCandidate{decision}, EvidenceThreshold: 3},
+		},
 	}
-	service := &tracedFixtureService{trace: trace, result: query.Result{Query: "coffee", Mode: "wiki", Results: []search.Result{{Slug: candidate.Slug, Title: candidate.Title, Type: "concept"}}, Status: "ok", Reason: "qualified_evidence"}}
-	err := runFixtureExperiment(context.Background(), experimentOptions{modelFixturePath: modelPath, profileFixturePath: profilePath, promptFixturePath: promptPath, artifactsDir: filepath.Join(dir, "artifacts"), selectionLimit: 1, explorationSlots: 0, explorationSlotsSet: true, expansionAttempts: 1, runs: 1, service: serviceQueryRetrieval}, preparedSnapshot{label: "snapshot", digest: strings.Repeat("a", 64), cache: cache.New(), suggestedData: []byte("{}")}, []caseInput{{ID: "case", Query: "coffee", Mode: "wiki"}}, dependencies{now: time.Now, stdout: &output, newFixtureQueryService: func(queryquality.QueryRetrievalServiceConfig) (fixtureQueryService, error) { return service, nil }})
+	service := &tracedFixtureService{trace: trace, result: query.Result{Query: "coffee", Mode: "wiki", Expand: &llm.ExpandResult{Keywords: []string{secret, baseURL}}, Results: []search.Result{{Slug: candidate.Slug, Title: candidate.Title, Type: "concept"}}, Status: "ok", Reason: "qualified_evidence"}}
+	originalTrace := service.trace
+	originalResult := service.result
+	var gotConfig queryquality.QueryRetrievalServiceConfig
+	prepared := preparedSnapshot{label: "snapshot", digest: strings.Repeat("a", 64), cache: cache.New(), suggestedData: []byte("{}")}
+	err := runFixtureExperiment(context.Background(), experimentOptions{modelFixturePath: modelPath, profileFixturePath: profilePath, promptFixturePath: promptPath, artifactsDir: filepath.Join(dir, "artifacts"), summaryPath: filepath.Join(dir, "summary.json"), selectionLimit: 1, explorationSlots: 0, explorationSlotsSet: true, evidenceThreshold: canonicalThreshold, evidenceThresholdSet: true, expansionAttempts: 1, runs: 1, service: serviceQueryRetrieval}, prepared, []caseInput{{ID: "case", Query: "coffee", Mode: "wiki"}}, dependencies{now: time.Now, stdout: &output, newFixtureQueryService: func(config queryquality.QueryRetrievalServiceConfig) (fixtureQueryService, error) {
+		gotConfig = config
+		service.config = config
+		return service, nil
+	}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if service.calls != 1 {
 		t.Fatalf("service calls=%d, want exactly one", service.calls)
+	}
+	if gotConfig.Options.SelectionLimit != 1 || gotConfig.Options.ExplorationSlots != 0 || gotConfig.Options.EvidenceThreshold != canonicalThreshold || !gotConfig.Options.EvidenceThresholdSet || gotConfig.Options.ExpansionAttempts != 1 {
+		t.Fatalf("production config=%+v", gotConfig.Options)
+	}
+	if service.request != (query.Request{Query: "coffee", Mode: "wiki"}) {
+		t.Fatalf("request=%+v", service.request)
+	}
+	if !reflect.DeepEqual(service.trace, originalTrace) || !reflect.DeepEqual(service.result, originalResult) {
+		t.Fatal("fixture persistence mutated injected service state")
 	}
 	var record resultRecord
 	if err := json.Unmarshal([]byte(strings.TrimSpace(output.String())), &record); err != nil {
@@ -399,6 +421,263 @@ func TestFixtureRunnerUsesOneInjectedTracedServiceResult(t *testing.T) {
 	if record.Status != "ok" || record.Reason != "qualified_evidence" || len(record.Results) != 1 || record.Results[0].Slug != candidate.Slug {
 		t.Fatalf("record=%#v", record)
 	}
+	if record.EvidenceThreshold != canonicalThreshold || record.QueryRetrievalTrace == nil || record.QueryRetrievalTrace.MatchingPolicy.EvidenceThreshold != canonicalThreshold {
+		t.Fatalf("result policy=%+v evidence=%d", record.QueryRetrievalTrace, record.EvidenceThreshold)
+	}
+	if record.QueryRetrievalTrace.EvidenceThreshold != canonicalThreshold || record.QueryRetrievalTrace.Expansion.EvidenceThreshold != canonicalThreshold {
+		t.Fatalf("result duplicate policy fields=%+v", record.QueryRetrievalTrace)
+	}
+	for _, stage := range record.QueryRetrievalTrace.Stages {
+		if stage.EvidenceThreshold != canonicalThreshold {
+			t.Fatalf("stage policy=%+v", stage)
+		}
+		for _, candidate := range stage.Candidates {
+			if candidate.EvidenceThreshold != canonicalThreshold {
+				t.Fatalf("candidate policy=%+v", candidate)
+			}
+		}
+	}
+	variantDir := filepath.Join(dir, "artifacts", record.VariantID, "case", "run-1")
+	readJSON := func(name string, value any) {
+		t.Helper()
+		data, err := os.ReadFile(filepath.Join(variantDir, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal(data, value); err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(data), secret) || strings.Contains(string(data), baseURL) {
+			t.Fatalf("%s leaked sensitive value: %s", name, data)
+		}
+	}
+	var matching fixtureMatchingInput
+	readJSON("matching.input.json", &matching)
+	if matching.EvidenceThreshold != canonicalThreshold || matching.Parameters.EvidenceThreshold != canonicalThreshold {
+		t.Fatalf("matching policy=%+v", matching)
+	}
+	var selectionIn fixtureSelectionInput
+	readJSON("selection.input.json", &selectionIn)
+	if selectionIn.EvidenceThreshold != canonicalThreshold {
+		t.Fatalf("selection input=%+v", selectionIn)
+	}
+	var selectionOut fixtureSelectionOutput
+	readJSON("selection.output.json", &selectionOut)
+	if selectionOut.EvidenceThreshold != canonicalThreshold {
+		t.Fatalf("selection output=%+v", selectionOut)
+	}
+	var final fixtureFinalReceipt
+	readJSON("final.json", &final)
+	var finalObject map[string]any
+	readJSON("final.json", &finalObject)
+	if finalObject["evidence_threshold"] != float64(canonicalThreshold) {
+		t.Fatalf("final evidence threshold=%v", finalObject["evidence_threshold"])
+	}
+	var summary map[string]any
+	summaryData, err := os.ReadFile(filepath.Join(dir, "summary.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(summaryData), secret) || strings.Contains(string(summaryData), baseURL) {
+		t.Fatalf("summary leaked sensitive value: %s", summaryData)
+	}
+	if err := json.Unmarshal(summaryData, &summary); err != nil {
+		t.Fatal(err)
+	}
+	if summary["evidence_threshold"] != float64(canonicalThreshold) {
+		t.Fatalf("summary=%v", summary)
+	}
+}
+
+func TestFixturePersistenceDeepScrubsProviderEchoWithoutMutatingTrace(t *testing.T) {
+	secret := "fixture-secret"
+	var baseURL string
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		plan := map[string]any{
+			"raw_query":               secret + " " + baseURL,
+			"required":                []any{},
+			"excluded":                []any{},
+			"preferred":               []any{map[string]any{"kind": "topic", "value": secret, "terms": []string{baseURL}, "proof": "lexical"}},
+			"goals":                   []any{},
+			"supporting_dimensions":   []any{},
+			"acceptable_alternatives": []any{},
+			"ambiguity":               []any{},
+			"fallback":                false,
+		}
+		content, _ := json.Marshal(plan)
+		response, _ := json.Marshal(map[string]any{"choices": []any{map[string]any{"message": map[string]string{"content": string(content)}}}, "usage": fixtureUsage{PromptTokens: 2, CompletionTokens: 3, TotalTokens: 5}})
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write(response)
+	}))
+	defer server.Close()
+	baseURL = server.URL
+
+	dir := t.TempDir()
+	root := filepath.Join(dir, "snapshot")
+	writeTestFile(t, filepath.Join(root, "cache", "concepts.jsonl"), `{"slug":"candidate","title":"fixture-secret","body":""}`+"\n")
+	writeTestFile(t, filepath.Join(root, "cache", "suggested_queries.json"), `{"version":2,"queries":[],"candidates":[],"updated_at":"2026-08-20T00:00:00Z"}`)
+	modelPath := writeFixture(t, dir, "models.json", `{"models":[{"id":"m","provider":"fake","base_url":"`+baseURL+`","model":"selected","api_key":"`+secret+`"}]}`)
+	profilePath := writeFixture(t, dir, "profiles.json", `{"profiles":[{"id":"profile","required_when_explicit":[],"preferred_by_default":["topic"],"goals_to_expand":[]}]}`)
+	promptPath := writeProductionPromptFixture(t, dir, queryquality.StructuredPlanPromptID)
+	casesPath := writeFixture(t, dir, "cases.jsonl", `{"id":"case","query":"`+secret+` `+baseURL+`","mode":"wiki"}`+"\n")
+	outputPath := filepath.Join(dir, "results.jsonl")
+	summaryPath := filepath.Join(dir, "summary.json")
+	var captured *capturingFixtureService
+	err := runExperiment(context.Background(), experimentOptions{
+		snapshotPath: root, casesPath: casesPath, runs: 1, outputPath: outputPath, service: serviceQueryRetrieval,
+		selectionLimit: 1, explorationSlots: 0, explorationSlotsSet: true, expansionAttempts: 1,
+		modelFixturePath: modelPath, profileFixturePath: profilePath, promptFixturePath: promptPath,
+		artifactsDir: filepath.Join(dir, "artifacts"), summaryPath: summaryPath,
+	}, dependencies{now: time.Now, newFixtureQueryService: func(config queryquality.QueryRetrievalServiceConfig) (fixtureQueryService, error) {
+		service, err := queryquality.NewQueryRetrievalService(config)
+		if err != nil {
+			return nil, err
+		}
+		captured = &capturingFixtureService{delegate: service}
+		return captured, nil
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if captured == nil || captured.trace == nil || !strings.Contains(mustMarshalJSON(t, captured.trace), secret) || !strings.Contains(mustMarshalJSON(t, captured.trace), baseURL) {
+		t.Fatal("provider echo did not remain in the in-memory trace")
+	}
+	if !strings.Contains(mustMarshalJSON(t, captured.result), secret) || !strings.Contains(mustMarshalJSON(t, captured.result), baseURL) {
+		t.Fatal("provider echo did not remain in the in-memory result")
+	}
+	paths := []string{outputPath, summaryPath}
+	err = filepath.WalkDir(filepath.Join(dir, "artifacts"), func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if !entry.IsDir() {
+			paths = append(paths, path)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range paths {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(data), secret) || strings.Contains(string(data), baseURL) {
+			t.Fatalf("%s leaked provider values: %s", path, data)
+		}
+	}
+}
+
+func TestFixtureProviderFailuresPersistScrubbedTruthfulAttempts(t *testing.T) {
+	secret := "fixture-secret"
+	tests := []struct {
+		name          string
+		status        int
+		body          string
+		usagePresent  bool
+		wantRaw       bool
+		transportFail bool
+	}{
+		{name: "http", status: http.StatusBadGateway, body: `{"error":"` + secret + ` at BASE" ,"usage":{"prompt_tokens":4,"completion_tokens":1,"total_tokens":5}}`, usagePresent: true, wantRaw: true},
+		{name: "decode", status: http.StatusOK, body: `not-json ` + secret + ` BASE`, wantRaw: true},
+		{name: "transport", transportFail: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var server *httptest.Server
+			baseURL := "http://127.0.0.1:1"
+			if test.transportFail {
+				server = httptest.NewServer(nil)
+				baseURL = server.URL
+				server.Close()
+			} else {
+				server = httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+					writer.WriteHeader(test.status)
+					_, _ = writer.Write([]byte(strings.ReplaceAll(test.body, "BASE", baseURL)))
+				}))
+				defer server.Close()
+				baseURL = server.URL
+			}
+			dir := t.TempDir()
+			root := filepath.Join(dir, "snapshot")
+			writeTestFile(t, filepath.Join(root, "cache", "concepts.jsonl"), `{"slug":"unrelated","title":"Unrelated","body":""}`+"\n")
+			writeTestFile(t, filepath.Join(root, "cache", "suggested_queries.json"), `{"version":2,"queries":[],"candidates":[],"updated_at":"2026-08-20T00:00:00Z"}`)
+			modelPath := writeFixture(t, dir, "models.json", `{"models":[{"id":"m","provider":"fake","base_url":"`+baseURL+`","model":"selected","api_key":"`+secret+`"}]}`)
+			profilePath := writeFixture(t, dir, "profiles.json", `{"profiles":[{"id":"profile","required_when_explicit":[],"preferred_by_default":["topic"],"goals_to_expand":[]}]}`)
+			promptPath := writeProductionPromptFixture(t, dir, queryquality.StructuredPlanPromptID)
+			casesPath := writeFixture(t, dir, "cases.jsonl", `{"id":"case","query":"coffee","mode":"wiki"}`+"\n")
+			outputPath := filepath.Join(dir, "results.jsonl")
+			artifactsPath := filepath.Join(dir, "artifacts")
+			err := runExperiment(context.Background(), experimentOptions{
+				snapshotPath: root, casesPath: casesPath, runs: 1, outputPath: outputPath, service: serviceQueryRetrieval,
+				selectionLimit: 1, explorationSlots: 0, explorationSlotsSet: true, expansionAttempts: 3,
+				modelFixturePath: modelPath, profileFixturePath: profilePath, promptFixturePath: promptPath,
+				artifactsDir: artifactsPath,
+			}, dependencies{now: time.Now})
+			if err != nil {
+				t.Fatal(err)
+			}
+			data, err := os.ReadFile(outputPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var record resultRecord
+			if err := json.Unmarshal(data, &record); err != nil {
+				t.Fatal(err)
+			}
+			variantDir := filepath.Join(artifactsPath, record.VariantID, "case", "run-1")
+			expansionData, err := os.ReadFile(filepath.Join(variantDir, "expansion.output.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var expansion fixtureExpansionOutput
+			if err := json.Unmarshal(expansionData, &expansion); err != nil {
+				t.Fatal(err)
+			}
+			if len(expansion.Attempts) != 3 || expansion.ProviderFailedAttempts != 3 {
+				t.Fatalf("expansion=%+v", expansion)
+			}
+			for index, attempt := range expansion.Attempts {
+				if attempt.AttemptIndex != index+1 || attempt.Outcome != "provider_failed" || attempt.UsagePresent != test.usagePresent || (attempt.RawResponse != "") != test.wantRaw || attempt.Error == "" {
+					t.Fatalf("attempt=%+v", attempt)
+				}
+			}
+			finalData, err := os.ReadFile(filepath.Join(variantDir, "final.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var final fixtureFinalReceipt
+			if err := json.Unmarshal(finalData, &final); err != nil || final.Status == "" || final.Reason == "" {
+				t.Fatalf("final=%s err=%v", finalData, err)
+			}
+			paths := []string{outputPath, filepath.Join(variantDir, "expansion.output.json"), filepath.Join(variantDir, "final.json")}
+			_ = filepath.WalkDir(artifactsPath, func(path string, entry os.DirEntry, walkErr error) error {
+				if walkErr == nil && !entry.IsDir() {
+					paths = append(paths, path)
+				}
+				return walkErr
+			})
+			for _, path := range paths {
+				fileData, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if strings.Contains(string(fileData), secret) || strings.Contains(string(fileData), baseURL) {
+					t.Fatalf("%s leaked failure details: %s", path, fileData)
+				}
+			}
+		})
+	}
+}
+
+func mustMarshalJSON(t *testing.T, value any) string {
+	t.Helper()
+	data, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(data)
 }
 
 func TestFixtureModelCallSendsSelectedEndpointModelAndKeyOnlyOnHTTP(t *testing.T) {

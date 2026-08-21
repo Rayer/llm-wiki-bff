@@ -10,7 +10,6 @@ import (
 	"math"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -29,9 +28,6 @@ const artifactDigestTokenLength = 32
 const maxPortablePathSegmentBytes = 200
 const maxPOSIXPathSegmentBytes = 255
 const fixtureVariantIDPrefix = "v-"
-
-var sensitiveFixtureJSONValue = regexp.MustCompile(`(?i)("(?:api_key|authorization|access_token|token)"\s*:\s*)"[^"]*"`)
-var bearerCredential = regexp.MustCompile(`(?i)\bBearer\s+[^\s,;]+`)
 
 func (options experimentOptions) fixtureFlagsSet() bool {
 	return options.modelFixturePath != "" || options.models != "" || options.profileFixturePath != "" || options.profiles != "" || options.promptFixturePath != "" || options.prompts != "" || options.artifactsDir != "" || options.summaryPath != "" || options.stageConfigOutput != ""
@@ -253,6 +249,7 @@ type fixtureAttempt struct {
 	LatencyMS            int64
 	Usage                fixtureUsage
 	EvidenceThreshold    int
+	fixtureModel         modelFixtureEntry
 }
 
 func runFixtureExperiment(ctx context.Context, options experimentOptions, prepared preparedSnapshot, cases []caseInput, deps dependencies) error {
@@ -516,7 +513,16 @@ func runFixtureAttempt(ctx context.Context, options experimentOptions, retrieval
 	_ = now()
 	_ = now()
 	runCompletedAt := now()
+	if trace == nil {
+		return fixtureAttempt{}, errors.New("query-retrieval trace is missing")
+	}
+	trace, err = cloneTraceForFixture(trace)
+	if err != nil {
+		return fixtureAttempt{}, err
+	}
 	trace.Variant = variant.VariantID
+	canonicalizeFixtureTracePolicy(trace)
+	meta.EvidenceThreshold = trace.MatchingPolicy.EvidenceThreshold
 	expansionStage, err := fixtureTraceStage(trace, "expansion")
 	if err != nil {
 		return fixtureAttempt{}, err
@@ -560,7 +566,7 @@ func runFixtureAttempt(ctx context.Context, options experimentOptions, retrieval
 	if err := write("matching.output.json", fixtureMatchingOutput{CandidateIdentities: identities, Candidates: matchingStage.Candidates}); err != nil {
 		return fixtureAttempt{}, err
 	}
-	selectionInput := fixtureSelectionInput{Candidates: matchingStage.Candidates, Limit: trace.SelectionLimit, ExplorationSlots: trace.ExplorationSlots, EvidenceThreshold: trace.EvidenceThreshold, EffectiveSeed: trace.Seed}
+	selectionInput := fixtureSelectionInput{Candidates: matchingStage.Candidates, Limit: trace.SelectionLimit, ExplorationSlots: trace.ExplorationSlots, EvidenceThreshold: trace.MatchingPolicy.EvidenceThreshold, EffectiveSeed: trace.Seed}
 	if err := write("selection.input.json", selectionInput); err != nil {
 		return fixtureAttempt{}, err
 	}
@@ -571,7 +577,7 @@ func runFixtureAttempt(ctx context.Context, options experimentOptions, retrieval
 		resultIdentities = append(resultIdentities, identity)
 		finalOrder = append(finalOrder, identity.Slug)
 	}
-	if err := write("selection.output.json", fixtureSelectionOutput{Decisions: selectionStage.Decisions, FinalOrder: finalOrder, EvidenceThreshold: trace.EvidenceThreshold}); err != nil {
+	if err := write("selection.output.json", fixtureSelectionOutput{Decisions: selectionStage.Decisions, FinalOrder: finalOrder, EvidenceThreshold: trace.MatchingPolicy.EvidenceThreshold}); err != nil {
 		return fixtureAttempt{}, err
 	}
 	outcome := "success"
@@ -585,8 +591,9 @@ func runFixtureAttempt(ctx context.Context, options experimentOptions, retrieval
 	record := makeResultRecordWithTrace(input, runIndex, prepared, result, nil, expansionStage.ElapsedMS+matchingStage.ElapsedMS+selectionStage.ElapsedMS, metadata, trace)
 	record.QueryReceivedAt, record.RunCompletedAt, record.DurationMS = queryReceivedAtStr, runCompletedAtStr, durationMS
 	record.VariantID, record.ProfileID, record.ProfileDigest, record.PromptID, record.Provider, record.Model = variant.VariantID, profile.ID, profileDigest, variant.Prompt.ID, variant.Model.Provider, variant.Model.Model
+	record.fixtureAPIKey, record.fixtureBaseURL = variant.Model.APIKey, variant.Model.BaseURL
 	selectionDigest := digestJSON(selectionInput)
-	return fixtureAttempt{Record: record, Case: input, Candidates: matchingStage.Candidates, Decisions: selectionStage.Decisions, EffectiveSeed: trace.Seed, SelectionInputDigest: selectionDigest, Fallback: plan.Fallback, LatencyMS: expansionStage.ElapsedMS, Usage: expansionUsage, EvidenceThreshold: trace.EvidenceThreshold}, nil
+	return fixtureAttempt{Record: record, Case: input, Candidates: matchingStage.Candidates, Decisions: selectionStage.Decisions, EffectiveSeed: trace.Seed, SelectionInputDigest: selectionDigest, Fallback: plan.Fallback, LatencyMS: expansionStage.ElapsedMS, Usage: expansionUsage, EvidenceThreshold: trace.MatchingPolicy.EvidenceThreshold, fixtureModel: variant.Model}, nil
 }
 
 func fixtureTraceStage(trace *queryRetrievalTrace, name string) (stageTrace, error) {
@@ -599,6 +606,30 @@ func fixtureTraceStage(trace *queryRetrievalTrace, name string) (stageTrace, err
 		}
 	}
 	return stageTrace{}, fmt.Errorf("query-retrieval trace stage %q is missing", name)
+}
+
+func cloneTraceForFixture(trace *queryRetrievalTrace) (*queryRetrievalTrace, error) {
+	data, err := json.Marshal(trace)
+	if err != nil {
+		return nil, err
+	}
+	var clone queryRetrievalTrace
+	if err := json.Unmarshal(data, &clone); err != nil {
+		return nil, err
+	}
+	return &clone, nil
+}
+
+func canonicalizeFixtureTracePolicy(trace *queryRetrievalTrace) {
+	threshold := trace.MatchingPolicy.EvidenceThreshold
+	trace.EvidenceThreshold = threshold
+	trace.Expansion.EvidenceThreshold = threshold
+	for stageIndex := range trace.Stages {
+		trace.Stages[stageIndex].EvidenceThreshold = threshold
+		for candidateIndex := range trace.Stages[stageIndex].Candidates {
+			trace.Stages[stageIndex].Candidates[candidateIndex].EvidenceThreshold = threshold
+		}
+	}
 }
 
 func addFixtureUsage(total, next fixtureUsage) fixtureUsage {
@@ -625,17 +656,21 @@ func writeFixtureReceipt(path string, meta fixtureReceiptMeta, payload any, secr
 	if err := json.Unmarshal(data, &object); err != nil {
 		return err
 	}
-	metaData, _ := json.Marshal(meta)
-	var metaObject map[string]any
-	_ = json.Unmarshal(metaData, &metaObject)
-	for key, value := range metaObject {
-		object[key] = value
-	}
-	data, err = json.Marshal(object)
+	metaData, err := json.Marshal(meta)
 	if err != nil {
 		return err
 	}
-	data = []byte(scrubFixtureEvidence(string(data), modelFixtureEntry{APIKey: secret, BaseURL: baseURL}))
+	var metaObject map[string]any
+	if err := json.Unmarshal(metaData, &metaObject); err != nil {
+		return err
+	}
+	for key, value := range metaObject {
+		object[key] = value
+	}
+	data, err = marshalSanitizedFixtureJSON(object, modelFixtureEntry{APIKey: secret, BaseURL: baseURL})
+	if err != nil {
+		return err
+	}
 	data = append(data, '\n')
 	return os.WriteFile(filepath.Clean(path), data, 0o644)
 }
@@ -643,10 +678,40 @@ func writeFixtureReceipt(path string, meta fixtureReceiptMeta, payload any, secr
 func scrubFixtureEvidence(value string, model modelFixtureEntry) string {
 	value = scrubSecret(value, model.APIKey)
 	if model.BaseURL != "" {
-		value = strings.ReplaceAll(value, model.BaseURL, "[redacted-base-url]")
+		value = strings.ReplaceAll(value, model.BaseURL, "[redacted]")
 	}
-	value = sensitiveFixtureJSONValue.ReplaceAllString(value, `$1"[redacted]"`)
-	return bearerCredential.ReplaceAllString(value, "Bearer [redacted]")
+	return value
+}
+
+func marshalSanitizedFixtureJSON(value any, model modelFixtureEntry) ([]byte, error) {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return nil, err
+	}
+	var tree any
+	decoder := json.NewDecoder(strings.NewReader(string(data)))
+	decoder.UseNumber()
+	if err := decoder.Decode(&tree); err != nil {
+		return nil, err
+	}
+	tree = scrubFixtureJSONValue(tree, model)
+	return json.Marshal(tree)
+}
+
+func scrubFixtureJSONValue(value any, model modelFixtureEntry) any {
+	switch current := value.(type) {
+	case map[string]any:
+		for key, nested := range current {
+			current[key] = scrubFixtureJSONValue(nested, model)
+		}
+	case []any:
+		for index, nested := range current {
+			current[index] = scrubFixtureJSONValue(nested, model)
+		}
+	case string:
+		return scrubFixtureEvidence(current, model)
+	}
+	return value
 }
 
 func scrubSecret(value, secret string) string {
@@ -808,6 +873,12 @@ func writeFixtureSummary(path string, attempts []fixtureAttempt) error {
 	data, err := json.MarshalIndent(document, "", "  ")
 	if err != nil {
 		return err
+	}
+	for _, attempt := range attempts {
+		data, err = marshalSanitizedFixtureJSON(json.RawMessage(data), attempt.fixtureModel)
+		if err != nil {
+			return err
+		}
 	}
 	data = append(data, '\n')
 	return os.WriteFile(filepath.Clean(path), data, 0o644)

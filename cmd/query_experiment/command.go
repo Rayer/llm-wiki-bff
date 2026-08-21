@@ -147,6 +147,8 @@ type resultRecord struct {
 	ConfigDigest           string               `json:"config_digest,omitempty"`
 	EvidenceThreshold      int                  `json:"evidence_threshold,omitempty"`
 	QueryRetrievalTrace    *queryRetrievalTrace `json:"three_host_trace,omitempty"`
+	fixtureAPIKey          string
+	fixtureBaseURL         string
 }
 
 type recordSink interface {
@@ -162,7 +164,7 @@ type writerSink struct {
 }
 
 func (s *writerSink) WriteRecord(record resultRecord) error {
-	data, err := json.Marshal(record)
+	data, err := marshalSanitizedFixtureJSON(record, modelFixtureEntry{APIKey: record.fixtureAPIKey, BaseURL: record.fixtureBaseURL})
 	if err != nil {
 		return err
 	}
@@ -664,7 +666,7 @@ func makeResultRecordWithTrace(input caseInput, runIndex int, snapshot preparedS
 		QueryRetrievalTrace:    trace,
 	}
 	if trace != nil {
-		record.EvidenceThreshold = trace.EvidenceThreshold
+		record.EvidenceThreshold = trace.MatchingPolicy.EvidenceThreshold
 	}
 	if executeErr != nil {
 		record.ErrorStage = "execute"
