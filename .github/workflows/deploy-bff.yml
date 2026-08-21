@@ -2,7 +2,7 @@ name: Deploy BFF to Cloud Run (dev)
 
 on:
   push:
-    branches: [develop]
+    branches: [main]
   workflow_dispatch:
     inputs:
       commit_sha:
@@ -729,7 +729,7 @@ jobs:
 
   production-promotion-ready:
     name: production-promotion-ready
-    if: github.event_name == 'push' && github.ref == 'refs/heads/develop' && needs.test-and-deploy.result == 'success'
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/develop' && needs.test-and-deploy.result == 'success'
     needs: test-and-deploy
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -825,7 +825,7 @@ jobs:
 
   main-fast-forward-eligible:
     name: main-fast-forward-eligible
-    if: github.event_name == 'push' && github.ref == 'refs/heads/develop' && needs.production-promotion-ready.result == 'success'
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/develop' && needs.production-promotion-ready.result == 'success'
     needs: production-promotion-ready
     runs-on: ubuntu-latest
     permissions:
