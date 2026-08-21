@@ -12,6 +12,17 @@ import (
 	"github.com/rayer/llm-wiki-bff/internal/search"
 )
 
+type runtimeConfigIdentityContextKey struct{}
+
+func WithRuntimeConfigIdentity(ctx context.Context, identity RuntimeConfigIdentity) context.Context {
+	return context.WithValue(ctx, runtimeConfigIdentityContextKey{}, identity)
+}
+
+func RuntimeConfigIdentityFromContext(ctx context.Context) (RuntimeConfigIdentity, bool) {
+	identity, ok := ctx.Value(runtimeConfigIdentityContextKey{}).(RuntimeConfigIdentity)
+	return identity, ok
+}
+
 // ErrCacheNotConfigured reports that the query service has no concept cache.
 var ErrCacheNotConfigured = errors.New("concept cache is not configured")
 
@@ -24,19 +35,106 @@ type Request struct {
 // Result is the application result for one query. Its fields are domain
 // values; HTTP adapters are responsible for choosing a wire representation.
 type Result struct {
-	Query     string
-	Mode      string
-	Results   []search.Result
-	Expand    *llm.ExpandResult
-	AISynth   string
-	Citations []search.Citation
-	Status    string
-	Reason    string
+	Query                 string
+	Mode                  string
+	Results               []search.Result
+	Expand                *llm.ExpandResult
+	AISynth               string
+	Citations             []search.Citation
+	Status                string
+	Reason                string
+	RuntimeConfigIdentity *RuntimeConfigIdentity `json:"-"`
+}
+
+// RuntimeConfigIdentity is the privacy-safe identity of the sealed runtime
+// composition that produced a result. It intentionally contains no request,
+// corpus, tenant, credential, or prompt-body data.
+type RuntimeConfigIdentity struct {
+	SchemaVersion              int     `json:"schema_version"`
+	ConfigRevision             string  `json:"config_revision"`
+	ConfigDigest               string  `json:"config_digest"`
+	EffectiveConfigDigest      string  `json:"effective_config_digest"`
+	QueryServiceImplementation string  `json:"query_service_implementation"`
+	ProfileID                  string  `json:"profile_id"`
+	ProfileDigest              string  `json:"profile_digest"`
+	PromptID                   string  `json:"prompt_id"`
+	PromptDigest               string  `json:"prompt_digest"`
+	BindingSource              string  `json:"binding_source"`
+	ExactBinding               bool    `json:"exact_binding"`
+	GenerationID               string  `json:"generation_id"`
+	ConceptsDigest             string  `json:"concepts_digest"`
+	ExpansionProvider          string  `json:"expansion_provider"`
+	ExpansionImplementation    string  `json:"expansion_implementation"`
+	ExpansionModel             string  `json:"expansion_model"`
+	ExpansionReasoning         string  `json:"expansion_reasoning"`
+	ExpansionTemperature       float64 `json:"expansion_temperature"`
+	SynthesisImplementation    string  `json:"synthesis_implementation"`
+	SynthesisModel             string  `json:"synthesis_model"`
+	SynthesisReasoning         string  `json:"synthesis_reasoning"`
+	SynthesisTemperature       float64 `json:"synthesis_temperature"`
+	SelectionLimit             int     `json:"selection_limit"`
+	ExplorationSlots           int     `json:"exploration_slots"`
+	EvidenceThreshold          int     `json:"evidence_threshold"`
+	KeywordsPerAttempt         int     `json:"keywords_per_attempt"`
+	ExpansionAttempts          int     `json:"expansion_attempts"`
+	RareDocumentFrequency      int     `json:"rare_document_frequency"`
+	SynthesisProvider          string  `json:"synthesis_provider"`
+}
+
+// RuntimeConfigReadback is the sanitized global identity of a sealed runtime.
+// It deliberately has no project, generation, corpus, request, or prompt-body fields.
+type RuntimeConfigReadback struct {
+	SchemaVersion                   int                 `json:"schema_version"`
+	ConfigRevision                  string              `json:"config_revision"`
+	ConfigDigest                    string              `json:"config_digest"`
+	QueryServiceImplementation      string              `json:"query_service_implementation"`
+	DefaultProfileID                string              `json:"default_profile_id"`
+	DefaultProfileDigest            string              `json:"default_profile_digest"`
+	DefaultPromptID                 string              `json:"default_prompt_id"`
+	DefaultPromptDigest             string              `json:"default_prompt_digest"`
+	ExpansionProvider               string              `json:"expansion_provider"`
+	ExpansionModel                  string              `json:"expansion_model"`
+	ExpansionReasoning              string              `json:"expansion_reasoning"`
+	ExpansionTemperature            float64             `json:"expansion_temperature"`
+	SynthesisProvider               string              `json:"synthesis_provider"`
+	SynthesisModel                  string              `json:"synthesis_model"`
+	SynthesisReasoning              string              `json:"synthesis_reasoning"`
+	SynthesisTemperature            float64             `json:"synthesis_temperature"`
+	Options                         RuntimeQueryOptions `json:"options"`
+	BindingCount                    int                 `json:"binding_count"`
+	DistinctServiceCompositionCount int                 `json:"distinct_service_composition_count"`
+}
+
+type RuntimeQueryOptions struct {
+	SelectionLimit        int `json:"selection_limit"`
+	ExplorationSlots      int `json:"exploration_slots"`
+	EvidenceThreshold     int `json:"evidence_threshold"`
+	KeywordsPerAttempt    int `json:"keywords_per_attempt"`
+	ExpansionAttempts     int `json:"expansion_attempts"`
+	RareDocumentFrequency int `json:"rare_document_frequency"`
+}
+
+// RuntimeReadbackProvider is implemented only by the configured immutable runtime.
+type RuntimeReadbackProvider interface {
+	Readback() RuntimeConfigReadback
+}
+
+func CloneRuntimeConfigIdentity(identity *RuntimeConfigIdentity) *RuntimeConfigIdentity {
+	if identity == nil {
+		return nil
+	}
+	copy := *identity
+	return &copy
 }
 
 // Executor is the narrow seam used by transport adapters.
 type Executor interface {
 	Execute(context.Context, cache.Reader, Request) (Result, error)
+}
+
+type Synthesizer interface {
+	SynthesizeWithError(context.Context, cache.Reader, Request, Result) (Result, error)
+	ModelIdentity() (llm.ModelIdentity, bool)
 }
 
 // Service runs query expansion, cache search, and optional citation synthesis.
@@ -49,6 +147,13 @@ type Service struct {
 // NewService creates a query application service.
 func NewService(conceptCache *cache.Cache, expander *llm.QueryExpander, llmClient *llm.Client) *Service {
 	return &Service{cache: conceptCache, expander: expander, llm: llmClient}
+}
+
+func (s *Service) ModelIdentity() (llm.ModelIdentity, bool) {
+	if s == nil || s.llm == nil {
+		return llm.ModelIdentity{}, false
+	}
+	return s.llm.ModelIdentity()
 }
 
 // Execute runs the production query pipeline.

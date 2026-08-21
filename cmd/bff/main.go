@@ -32,7 +32,9 @@ import (
 	"github.com/rayer/llm-wiki-bff/internal/middleware"
 	"github.com/rayer/llm-wiki-bff/internal/observability"
 	"github.com/rayer/llm-wiki-bff/internal/query"
+	"github.com/rayer/llm-wiki-bff/internal/queryconfig"
 	"github.com/rayer/llm-wiki-bff/internal/queryquality"
+	"github.com/rayer/llm-wiki-bff/internal/queryruntime"
 	"github.com/rayer/llm-wiki-bff/internal/search"
 	store "github.com/rayer/llm-wiki-bff/internal/storage"
 	"github.com/rayer/llm-wiki-bff/internal/syssettings"
@@ -71,6 +73,15 @@ func main() {
 	cfg, err := config.Load(".")
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
+	}
+	var stageConfig *queryconfig.Config
+	if cfg.QueryStageConfigPath != "" {
+		loaded, err := queryconfig.LoadFile(cfg.QueryStageConfigPath)
+		if err != nil {
+			log.Fatalf("Failed to load query stage config: %v", err)
+		}
+		stageConfig = &loaded
+		log.Printf("Query stage config: schema=%d revision=%s digest=%s", loaded.SchemaVersion, loaded.ConfigRevision, loaded.ConfigDigest)
 	}
 
 	localDataDir := strings.TrimSpace(*localFlag)
@@ -117,10 +128,12 @@ func main() {
 	conceptCache := conceptcache.New()
 	log.Printf("Concept cache: not yet rebuilt — call /api/v1/pipeline/rebuild-index")
 
-	productionExecutor, err := newProductionQueryExecutor(cfg, conceptCache)
+	productionExecutor, err := newProductionQueryExecutorWithStageConfig(cfg, conceptCache, stageConfig)
 	if err != nil {
 		log.Fatalf("Failed to create production query executor: %v", err)
 	}
+	build := buildinfo.Current()
+	log.Printf("Build identity: commit=%s service=%s revision=%s", build.Commit, build.Service, build.Revision)
 
 	// OpenTelemetry metrics (graceful fallback)
 	provider, err := observability.InitMetrics(context.Background(), observabilityServiceName(os.Getenv("K_SERVICE")), observability.GetProjectID())
@@ -165,6 +178,47 @@ func main() {
 }
 
 func newProductionQueryExecutor(cfg config.Config, conceptCache *conceptcache.Cache) (query.Executor, error) {
+	var stageConfig *queryconfig.Config
+	if cfg.QueryStageConfigPath != "" {
+		loaded, err := queryconfig.LoadFile(cfg.QueryStageConfigPath)
+		if err != nil {
+			return nil, err
+		}
+		stageConfig = &loaded
+	}
+	return newProductionQueryExecutorWithStageConfig(cfg, conceptCache, stageConfig)
+}
+
+func newProductionQueryExecutorWithStageConfig(cfg config.Config, conceptCache *conceptcache.Cache, stageConfig *queryconfig.Config) (query.Executor, error) {
+	if cfg.QueryStageConfigPath != "" && stageConfig == nil {
+		return nil, errors.New("query stage config was not loaded")
+	}
+	if stageConfig != nil {
+		sealed := *stageConfig
+		expansionTemperature := sealed.Stages.QueryExpander.Temperature
+		expansionClient := llm.NewClientWithOptions(cfg.DeepSeekAPIKey, llm.ClientOptions{
+			Model: sealed.Stages.QueryExpander.Model, Temperature: &expansionTemperature,
+			Reasoning: llm.Reasoning(sealed.Stages.QueryExpander.Reasoning),
+		})
+		if expansionClient == nil {
+			return nil, errors.New("invalid sealed query expansion client configuration")
+		}
+		synthesisTemperature := sealed.Stages.AnswerSynthesizer.Temperature
+		synthesisClient := llm.NewClientWithOptions(cfg.DeepSeekAPIKey, llm.ClientOptions{
+			Model: sealed.Stages.AnswerSynthesizer.Model, Temperature: &synthesisTemperature,
+			Reasoning: llm.Reasoning(sealed.Stages.AnswerSynthesizer.Reasoning),
+		})
+		if synthesisClient == nil {
+			return nil, errors.New("invalid sealed query synthesis client configuration")
+		}
+		synthesisService := query.NewService(conceptCache, nil, synthesisClient)
+		runtime, err := queryruntime.NewExecutor(sealed, conceptCache, expansionClient, nil, synthesisService)
+		if err != nil {
+			return nil, err
+		}
+		return runtime, nil
+	}
+
 	selectionLimit := cfg.QuerySelectionLimit
 	if selectionLimit == 0 {
 		selectionLimit = config.DefaultQuerySelectionLimit
@@ -249,6 +303,7 @@ func newProductionRouter(
 	}))
 
 	registerPublicRoutes(r, settingsStore, cfg.AuthServiceURL)
+	r.GET("/api/v1/query/config", hV1.QueryConfig)
 
 	// Temporary Stage A compatibility lane for the frontend Auth cutover.
 	authRoutes := r.Group("/api/v1/auth")

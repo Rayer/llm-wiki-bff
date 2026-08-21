@@ -3,8 +3,56 @@ package handler
 import (
 	"github.com/rayer/llm-wiki-bff/internal/gcs"
 	"github.com/rayer/llm-wiki-bff/internal/llm"
+	"github.com/rayer/llm-wiki-bff/internal/query"
 	"github.com/rayer/llm-wiki-bff/internal/search"
 )
+
+type QueryConfigResponse struct {
+	QueryConfig PublicQueryConfig    `json:"query_config"`
+	Build       QueryConfigBuildInfo `json:"build"`
+}
+
+// PublicQueryConfig is the unauthenticated, privacy-safe query runtime DTO.
+// Internal diagnostic readback fields must be copied here explicitly.
+type PublicQueryConfig struct {
+	SchemaVersion              int                       `json:"schema_version"`
+	ConfigRevision             string                    `json:"config_revision"`
+	ConfigDigest               string                    `json:"config_digest"`
+	QueryServiceImplementation string                    `json:"query_service_implementation"`
+	DefaultProfileID           string                    `json:"default_profile_id"`
+	DefaultProfileDigest       string                    `json:"default_profile_digest"`
+	DefaultPromptID            string                    `json:"default_prompt_id"`
+	DefaultPromptDigest        string                    `json:"default_prompt_digest"`
+	ExpansionProvider          string                    `json:"expansion_provider"`
+	ExpansionModel             string                    `json:"expansion_model"`
+	ExpansionReasoning         string                    `json:"expansion_reasoning"`
+	ExpansionTemperature       float64                   `json:"expansion_temperature"`
+	SynthesisProvider          string                    `json:"synthesis_provider"`
+	SynthesisModel             string                    `json:"synthesis_model"`
+	SynthesisReasoning         string                    `json:"synthesis_reasoning"`
+	SynthesisTemperature       float64                   `json:"synthesis_temperature"`
+	Options                    query.RuntimeQueryOptions `json:"options"`
+}
+
+func PublicQueryConfigFromReadback(readback query.RuntimeConfigReadback) PublicQueryConfig {
+	return PublicQueryConfig{
+		SchemaVersion: readback.SchemaVersion, ConfigRevision: readback.ConfigRevision, ConfigDigest: readback.ConfigDigest,
+		QueryServiceImplementation: readback.QueryServiceImplementation,
+		DefaultProfileID:           readback.DefaultProfileID, DefaultProfileDigest: readback.DefaultProfileDigest,
+		DefaultPromptID: readback.DefaultPromptID, DefaultPromptDigest: readback.DefaultPromptDigest,
+		ExpansionProvider: readback.ExpansionProvider, ExpansionModel: readback.ExpansionModel,
+		ExpansionReasoning: readback.ExpansionReasoning, ExpansionTemperature: readback.ExpansionTemperature,
+		SynthesisProvider: readback.SynthesisProvider, SynthesisModel: readback.SynthesisModel,
+		SynthesisReasoning: readback.SynthesisReasoning, SynthesisTemperature: readback.SynthesisTemperature,
+		Options: readback.Options,
+	}
+}
+
+type QueryConfigBuildInfo struct {
+	Commit   string `json:"commit"`
+	Service  string `json:"service"`
+	Revision string `json:"revision"`
+}
 
 // ErrorResponse is returned on errors.
 type ErrorResponse struct {

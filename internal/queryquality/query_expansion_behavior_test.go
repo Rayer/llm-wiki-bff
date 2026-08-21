@@ -129,7 +129,7 @@ func TestParallelExpansionCancellationCancelsEveryAttempt(t *testing.T) {
 	}
 }
 
-func TestParallelExpansionReturnsOnCancellationBeforeNonCompliantWorkerReleases(t *testing.T) {
+func TestParallelExpansionWaitsForNonCompliantWorkerBeforeReturningCancellation(t *testing.T) {
 	provider := newNonCompliantExpander(3)
 	expander, err := queryquality.NewParallelQueryExpander(provider, nil, queryquality.Options{ExpansionAttempts: 3, KeywordsPerAttempt: 24})
 	if err != nil {
@@ -148,18 +148,57 @@ func TestParallelExpansionReturnsOnCancellationBeforeNonCompliantWorkerReleases(
 	}
 	cancel()
 	select {
-	case err := <-done:
-		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("error = %v, want context.Canceled", err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("canceled expansion did not return before release")
+	case <-done:
+		t.Fatal("canceled expansion returned before non-compliant workers finished")
+	case <-time.After(20 * time.Millisecond):
 	}
 	provider.release()
 	select {
 	case <-provider.allDone:
 	case <-time.After(time.Second):
 		t.Fatal("non-compliant expansion workers did not finish after release")
+	}
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("canceled expansion did not return after workers finished")
+	}
+}
+
+func TestParallelExpansionJoinsStartedAttemptsBeforeReturningCancellation(t *testing.T) {
+	provider := newNonCompliantExpander(2)
+	expander, err := queryquality.NewParallelQueryExpander(provider, nil, queryquality.Options{ExpansionAttempts: 2, KeywordsPerAttempt: 24})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := expander.Expand(ctx, queryquality.ExpansionRequest{Query: "coffee"})
+		done <- err
+	}()
+	select {
+	case <-provider.allStarted:
+	case <-time.After(time.Second):
+		t.Fatal("attempts did not start")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		t.Fatalf("returned before started attempts exited: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	provider.release()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("canceled expansion did not join attempts")
 	}
 }
 

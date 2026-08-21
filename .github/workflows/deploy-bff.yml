@@ -15,6 +15,9 @@ env:
   SERVICE_NAME: llm-wiki-bff-dev
   REGION: asia-east1
   AR_REPO: asia-east1-docker.pkg.dev/llm-wiki-cloud/cloud-run-images
+  QUERY_STAGE_CONFIG_PATH: /app/configs/query/dev/query-dev-2026-08-21.1.json
+  QUERY_STAGE_CONFIG_REVISION: query-dev-2026-08-21.1
+  QUERY_STAGE_CONFIG_DIGEST: sha256:a35955fe4a451c740e6252cae8087f114fbac6b4162245d3de7818c1ad37a5c6
 
 concurrency:
   group: deploy-bff-dev
@@ -92,6 +95,15 @@ jobs:
 
       - name: Run Go vet
         run: go vet ./...
+
+      - name: Verify immutable DEV query stage artifact
+        run: |
+          set -euo pipefail
+          ARTIFACT_PATH="${QUERY_STAGE_CONFIG_PATH#/app/}"
+          go run ./cmd/query_config_check \
+            --path "$ARTIFACT_PATH" \
+            --revision "$QUERY_STAGE_CONFIG_REVISION" \
+            --digest "$QUERY_STAGE_CONFIG_DIGEST"
 
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v3
@@ -173,16 +185,6 @@ jobs:
         env:
           BUCKET: llm-wiki-data-dev
           FIRESTORE_DATABASE_ID: llm-wiki-cloud-dev
-          QUERY_EXPANSION_MODEL: deepseek-v4-flash
-          QUERY_EXPANSION_REASONING: none
-          ANSWER_SYNTHESIS_MODEL: deepseek-v4-pro
-          ANSWER_SYNTHESIS_REASONING: none
-          QUERY_SELECTION_LIMIT: 10
-          QUERY_SELECTION_EXPLORATION_SLOTS: 1
-          QUERY_SELECTION_EVIDENCE_THRESHOLD: 2
-          QUERY_EXPANSION_KEYWORDS_PER_ATTEMPT: 24
-          QUERY_EXPANSION_ATTEMPTS: 3
-          QUERY_MATCHING_RARE_KEYWORD_MAX_DOCUMENT_FREQUENCY: 1
           PIPELINE_JOB_NAME: olw-pipeline-dev
           RUNTIME_SERVICE_ACCOUNT: lwc-bff-dev@llm-wiki-cloud.iam.gserviceaccount.com
           JWT_SECRET_NAME: jwt-secret-dev
@@ -415,7 +417,8 @@ jobs:
             --vpc-egress private-ranges-only \
             --max-instances 1 \
             --update-secrets "JWT_SECRET=${{ env.JWT_SECRET_NAME }}:latest,DEEPSEEK_API_KEY=deepseek-apikey:latest" \
-            --update-env-vars "^@^GCP_PROJECT=${{ env.PROJECT_ID }}@BUCKET=${{ env.BUCKET }}@FIRESTORE_DATABASE_ID=${{ env.FIRESTORE_DATABASE_ID }}@PIPELINE_JOB_URL=https://run.googleapis.com/v2/projects/${{ env.PROJECT_ID }}/locations/${{ env.REGION }}/jobs/${{ env.PIPELINE_JOB_NAME }}:run@ALLOWED_ORIGINS=${{ env.ALLOWED_ORIGINS }}@AUTH_SERVICE_URL=https://auth.dev.rayer.idv.tw@QUERY_EXPANSION_MODEL=${{ env.QUERY_EXPANSION_MODEL }}@QUERY_EXPANSION_REASONING=${{ env.QUERY_EXPANSION_REASONING }}@ANSWER_SYNTHESIS_MODEL=${{ env.ANSWER_SYNTHESIS_MODEL }}@ANSWER_SYNTHESIS_REASONING=${{ env.ANSWER_SYNTHESIS_REASONING }}@QUERY_SELECTION_LIMIT=${{ env.QUERY_SELECTION_LIMIT }}@QUERY_SELECTION_EXPLORATION_SLOTS=${{ env.QUERY_SELECTION_EXPLORATION_SLOTS }}@QUERY_SELECTION_EVIDENCE_THRESHOLD=${{ env.QUERY_SELECTION_EVIDENCE_THRESHOLD }}@QUERY_EXPANSION_KEYWORDS_PER_ATTEMPT=${{ env.QUERY_EXPANSION_KEYWORDS_PER_ATTEMPT }}@QUERY_EXPANSION_ATTEMPTS=${{ env.QUERY_EXPANSION_ATTEMPTS }}@QUERY_MATCHING_RARE_KEYWORD_MAX_DOCUMENT_FREQUENCY=${{ env.QUERY_MATCHING_RARE_KEYWORD_MAX_DOCUMENT_FREQUENCY }}@DEV_JWT=false" \
+            --remove-env-vars "QUERY_EXPANSION_MODEL,QUERY_EXPANSION_REASONING,ANSWER_SYNTHESIS_MODEL,ANSWER_SYNTHESIS_REASONING,QUERY_SELECTION_LIMIT,QUERY_SELECTION_EXPLORATION_SLOTS,QUERY_SELECTION_EVIDENCE_THRESHOLD,QUERY_EXPANSION_KEYWORDS_PER_ATTEMPT,QUERY_EXPANSION_ATTEMPTS,QUERY_MATCHING_RARE_KEYWORD_MAX_DOCUMENT_FREQUENCY" \
+            --update-env-vars "^@^GCP_PROJECT=${{ env.PROJECT_ID }}@BUCKET=${{ env.BUCKET }}@FIRESTORE_DATABASE_ID=${{ env.FIRESTORE_DATABASE_ID }}@PIPELINE_JOB_URL=https://run.googleapis.com/v2/projects/${{ env.PROJECT_ID }}/locations/${{ env.REGION }}/jobs/${{ env.PIPELINE_JOB_NAME }}:run@ALLOWED_ORIGINS=${{ env.ALLOWED_ORIGINS }}@AUTH_SERVICE_URL=https://auth.dev.rayer.idv.tw@QUERY_STAGE_CONFIG_PATH=${{ env.QUERY_STAGE_CONFIG_PATH }}@DEV_JWT=false" \
             --quiet
 
           CREATED_REVISION=""
@@ -506,10 +509,101 @@ jobs:
           echo "immutable_image=$IMMUTABLE_IMAGE" >> "$GITHUB_OUTPUT"
           echo "✅ Deployed ${{ env.SERVICE_NAME }} ($GIT_SHA) to $CREATED_REVISION"
 
+      - name: Verify deployed query config readback
+        id: query_config_readback
+        env:
+          EXPECTED_COMMIT: ${{ steps.identity.outputs.git_sha }}
+          EXPECTED_REVISION: ${{ steps.build.outputs.new_revision }}
+        run: |
+          set -euo pipefail
+          SERVICE_URL=$(gcloud run services describe "${{ env.SERVICE_NAME }}" \
+            --region "${{ env.REGION }}" \
+            --project "${{ env.PROJECT_ID }}" \
+            --format='value(status.url)' \
+            --quiet)
+          if [[ ! "$SERVICE_URL" =~ ^https://llm-wiki-bff-dev-[a-z0-9-]+\.a\.run\.app$ ]]; then
+            echo "Cloud Run returned an invalid public service URL or host; refusing to verify readback."
+            exit 1
+          fi
+          BODY_FILE=$(mktemp)
+          HEADER_FILE=$(mktemp)
+          trap 'rm -f "$BODY_FILE" "$HEADER_FILE"' EXIT
+          HTTP_STATUS=""
+          READBACK_VALID=0
+          READBACK_DEADLINE=$((SECONDS + 300))
+          while (( SECONDS < READBACK_DEADLINE )); do
+            : > "$BODY_FILE"
+            : > "$HEADER_FILE"
+            HTTP_STATUS=$(curl --silent --show-error --proto '=https' \
+              --connect-timeout 5 --max-time 10 \
+              --dump-header "$HEADER_FILE" --output "$BODY_FILE" \
+              --write-out '%{http_code}' \
+              "$SERVICE_URL/api/v1/query/config" || true)
+            if [[ "$HTTP_STATUS" == "200" ]] \
+              && grep -Eiq '^cache-control:[[:space:]]*no-store([[:space:]]*;.*)?[[:space:]]*$' "$HEADER_FILE" \
+              && jq -e --arg revision "$QUERY_STAGE_CONFIG_REVISION" \
+                --arg digest "$QUERY_STAGE_CONFIG_DIGEST" \
+                --arg commit "$EXPECTED_COMMIT" \
+                --arg cloud_revision "$EXPECTED_REVISION" \
+                --arg service "${{ env.SERVICE_NAME }}" '
+                  ((. | keys | sort) == ["build", "query_config"])
+                  and ((.build | keys | sort) == ["commit", "revision", "service"])
+                  and ((.query_config | keys | sort) == ["config_digest", "config_revision", "default_profile_digest", "default_profile_id", "default_prompt_digest", "default_prompt_id", "expansion_model", "expansion_provider", "expansion_reasoning", "expansion_temperature", "options", "query_service_implementation", "schema_version", "synthesis_model", "synthesis_provider", "synthesis_reasoning", "synthesis_temperature"])
+                  and ((.query_config.options | keys | sort) == ["evidence_threshold", "expansion_attempts", "exploration_slots", "keywords_per_attempt", "rare_document_frequency", "selection_limit"])
+                  and .query_config.schema_version == 2
+                  and .query_config.config_revision == $revision
+                  and .query_config.config_digest == $digest
+                  and .query_config.query_service_implementation == "query-retrieval-pipeline-v2"
+                  and .query_config.expansion_provider == "deepseek"
+                  and .query_config.expansion_model == "deepseek-v4-flash"
+                  and .query_config.expansion_reasoning == "none"
+                  and .query_config.expansion_temperature == 0
+                  and .query_config.synthesis_provider == "deepseek"
+                  and .query_config.synthesis_model == "deepseek-v4-pro"
+                  and .query_config.synthesis_reasoning == "none"
+                  and .query_config.synthesis_temperature == 0
+                  and .query_config.options.selection_limit == 10
+                  and .query_config.options.exploration_slots == 1
+                  and .query_config.options.evidence_threshold == 2
+                  and .query_config.options.keywords_per_attempt == 24
+                  and .query_config.options.expansion_attempts == 3
+                  and .query_config.options.rare_document_frequency == 1
+                  and .build.commit == $commit
+                  and .build.revision == $cloud_revision
+                  and .build.service == $service
+                ' "$BODY_FILE" \
+              && ! grep -Eiq 'project_id|generation_id|concepts_digest|binding_count|distinct_service_composition_count|system_template|user_template|api[_-]?key|credential' "$BODY_FILE"; then
+              READBACK_VALID=1
+              break
+            fi
+            sleep 10
+          done
+          if [[ "$HTTP_STATUS" != "200" || "$READBACK_VALID" != "1" ]]; then
+            echo "public query config readback identity/schema is invalid or did not return HTTP 200 (last status: ${HTTP_STATUS:-empty})"
+            exit 1
+          fi
+          if ! grep -Eiq '^cache-control:[[:space:]]*no-store([[:space:]]*;.*)?[[:space:]]*$' "$HEADER_FILE"; then
+            echo "public query config readback did not return Cache-Control: no-store"
+            exit 1
+          fi
+          if ! jq -e --arg revision "$QUERY_STAGE_CONFIG_REVISION" --arg digest "$QUERY_STAGE_CONFIG_DIGEST" \
+            '.query_config.config_revision == $revision and .query_config.config_digest == $digest' "$BODY_FILE" >/dev/null; then
+            echo "public query config readback did not match the immutable artifact"
+            exit 1
+          fi
+          if grep -Eiq 'project_id|generation_id|concepts_digest|binding_count|distinct_service_composition_count|system_template|user_template|api[_-]?key|credential' "$BODY_FILE"; then
+            echo "public query config readback contained private fields"
+            exit 1
+          fi
+          jq -er '.query_config.config_revision' "$BODY_FILE" | { read value; echo "config_revision=$value" >> "$GITHUB_OUTPUT"; }
+          jq -er '.query_config.config_digest' "$BODY_FILE" | { read value; echo "config_digest=$value" >> "$GITHUB_OUTPUT"; }
+
       - name: Persist build image digest
         id: image_digest
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
+          READBACK_REVISION: ${{ steps.query_config_readback.outputs.config_revision }}
+          READBACK_DIGEST: ${{ steps.query_config_readback.outputs.config_digest }}
         run: |
           set -euo pipefail
           COMMIT_SHA="${{ steps.identity.outputs.git_sha }}"
@@ -521,11 +615,21 @@ jobs:
             echo "Cloud Build image digest is missing or invalid"
             exit 1
           fi
+          if [[ "$READBACK_REVISION" != "$QUERY_STAGE_CONFIG_REVISION" || "$READBACK_DIGEST" != "$QUERY_STAGE_CONFIG_DIGEST" ]]; then
+            echo "deployed query config readback identity is not the expected immutable artifact"
+            exit 1
+          fi
           DIGEST_FILE="bff-image-digest-$COMMIT_SHA.txt"
-          printf '%s\n' "$DIGEST" > "$DIGEST_FILE"
+          {
+            printf 'image_digest=%s\n' "$DIGEST"
+            printf 'query_config_revision=%s\n' "$READBACK_REVISION"
+            printf 'query_config_digest=%s\n' "$READBACK_DIGEST"
+          } > "$DIGEST_FILE"
           echo "commit_sha=$COMMIT_SHA" >> "$GITHUB_OUTPUT"
           echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
           echo "digest_file=$DIGEST_FILE" >> "$GITHUB_OUTPUT"
+          echo "query_config_revision=$READBACK_REVISION" >> "$GITHUB_OUTPUT"
+          echo "query_config_digest=$READBACK_DIGEST" >> "$GITHUB_OUTPUT"
           echo "Persisted Cloud Build image digest $DIGEST"
 
       - name: Upload image digest artifact
@@ -553,7 +657,7 @@ jobs:
             --format="value(status.url)"
 
       - name: Restore BFF traffic on post-cutover failure
-        if: ${{ always() && failure() && steps.build.outputs.traffic_mutated == 'true' }}
+        if: ${{ always() && (failure() || cancelled()) && steps.build.outputs.traffic_mutated == 'true' }}
         run: |
           set -euo pipefail
           PREVIOUS_REVISION="${{ steps.build.outputs.previous_revision }}"

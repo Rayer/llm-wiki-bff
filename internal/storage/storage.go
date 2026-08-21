@@ -12,6 +12,22 @@ var ErrGenerationManaged = errors.New("generated output is managed by the pipeli
 var ErrGenerationStateUnavailable = errors.New("generation state unavailable")
 var ErrDeclaredObjectUnavailable = errors.New("declared generation object unavailable")
 var ErrLeaseCleanup = errors.New("lease cleanup failed")
+var ErrQueryGenerationUnpinned = errors.New("query generation is not pinned")
+var ErrQueryGenerationIdentityUnavailable = errors.New("query generation identity unavailable")
+
+// QueryGenerationIdentity is the privacy-safe identity of a pinned concept
+// corpus. An empty ConceptsDigest is reserved for explicit local legacy mode.
+type QueryGenerationIdentity struct {
+	ProjectID      string
+	GenerationID   string
+	ConceptsDigest string
+}
+
+// QueryGenerationIdentityProvider exposes the identity of an already pinned
+// storage view without permitting a fresh manifest or object read.
+type QueryGenerationIdentityProvider interface {
+	QueryGenerationIdentity(context.Context) (QueryGenerationIdentity, error)
+}
 
 // RetryGenerationCleanup performs bounded, exact-generation cleanup with a
 // fresh background timeout for every attempt. Cleanup must remain possible

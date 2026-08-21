@@ -16,8 +16,6 @@ const (
 	serviceQueryRetrievalLegacy = "three-host"
 	defaultLimit                = queryquality.DefaultSelectionLimit
 	maxSelectionLimit           = 1000
-	semanticRequiredFailClosed  = true
-	semanticExcludedFailClosed  = true
 )
 
 type queryRetrievalOptions struct {

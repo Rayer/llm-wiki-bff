@@ -25,7 +25,9 @@ import (
 	"github.com/rayer/llm-wiki-bff/internal/localfs"
 	"github.com/rayer/llm-wiki-bff/internal/middleware"
 	"github.com/rayer/llm-wiki-bff/internal/query"
+	"github.com/rayer/llm-wiki-bff/internal/queryconfig"
 	"github.com/rayer/llm-wiki-bff/internal/queryquality"
+	"github.com/rayer/llm-wiki-bff/internal/queryruntime"
 	"github.com/rayer/llm-wiki-bff/internal/syssettings"
 	"gopkg.in/yaml.v3"
 )
@@ -37,6 +39,46 @@ func TestDefaultProductionQueryCompositionUsesProductionExecutor(t *testing.T) {
 	}
 	if _, ok := executor.(*queryquality.ProductionExecutor); !ok {
 		t.Fatalf("production executor = %T, want queryquality.ProductionExecutor", executor)
+	}
+}
+
+func TestConfiguredProductionQueryCompositionLoadsImmutableRuntime(t *testing.T) {
+	executor, err := newProductionQueryExecutor(config.Config{
+		QueryStageConfigPath: "../../configs/query/dev/query-dev-2026-08-21.1.json",
+		DeepSeekAPIKey:       "test-key",
+	}, conceptcache.New())
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime, ok := executor.(*queryruntime.Executor)
+	if !ok {
+		t.Fatalf("configured executor=%T, want *queryruntime.Executor", executor)
+	}
+	readback := runtime.Readback()
+	if readback.SchemaVersion != 2 || readback.ConfigRevision != "query-dev-2026-08-21.1" || readback.ConfigDigest != "sha256:a35955fe4a451c740e6252cae8087f114fbac6b4162245d3de7818c1ad37a5c6" || readback.DefaultProfileID != "platform-owned-lifestyle-v1" || readback.DefaultPromptID != "minimal-v1" || readback.ExpansionModel != "deepseek-v4-flash" || readback.SynthesisModel != "deepseek-v4-pro" || readback.Options.SelectionLimit != 10 || readback.BindingCount != 1 || readback.DistinctServiceCompositionCount != 2 {
+		t.Fatalf("readback=%+v", readback)
+	}
+}
+
+func TestInjectedStageConfigDoesNotReadArtifactAgain(t *testing.T) {
+	source := "../../configs/query/dev/query-dev-2026-08-21.1.json"
+	data, err := os.ReadFile(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := t.TempDir() + "/query-stage.json"
+	if err := os.WriteFile(path, data, 0o444); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := queryconfig.LoadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := newProductionQueryExecutorWithStageConfig(config.Config{QueryStageConfigPath: path, DeepSeekAPIKey: "test-key"}, conceptcache.New(), &loaded); err != nil {
+		t.Fatalf("injected stage config was read again: %v", err)
 	}
 }
 

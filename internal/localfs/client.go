@@ -264,6 +264,15 @@ func (c *Client) Pin(context.Context) (store.Store, error) { return c, nil }
 
 func (c *Client) ViewToken() string { return "legacy" }
 
+// QueryGenerationIdentity makes local development's legacy behavior explicit;
+// it does not scan the filesystem or inspect generated artifacts.
+func (c *Client) QueryGenerationIdentity(context.Context) (store.QueryGenerationIdentity, error) {
+	if c == nil || c.projectID == "" {
+		return store.QueryGenerationIdentity{}, store.ErrQueryGenerationIdentityUnavailable
+	}
+	return store.QueryGenerationIdentity{ProjectID: c.projectID, GenerationID: "legacy"}, nil
+}
+
 func (c *Client) Prefix() string {
 	return store.ProjectPrefix(c.userID, c.projectID)
 }

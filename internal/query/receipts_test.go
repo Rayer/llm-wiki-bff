@@ -109,3 +109,20 @@ func TestReceiptDigestsSurfaceFormsWithoutPersistingThem(t *testing.T) {
 		t.Fatalf("surface form was not sanitized: %s", encoded)
 	}
 }
+
+func TestReceiptStoresDefensiveRuntimeConfigIdentity(t *testing.T) {
+	_, recorder := WithReceipt(context.Background())
+	identity := RuntimeConfigIdentity{SchemaVersion: 2, ConfigRevision: "rev", ConfigDigest: "sha256:config", EffectiveConfigDigest: "sha256:effective", QueryServiceImplementation: "query-retrieval-pipeline-v2", ProfileID: "profile", ProfileDigest: "sha256:profile", PromptID: "prompt", PromptDigest: "sha256:prompt", BindingSource: "legacy_compatibility", GenerationID: "legacy", ConceptsDigest: "", ExpansionProvider: "deepseek", SynthesisProvider: "deepseek"}
+	recorder.SetRuntimeConfigIdentity(identity)
+	identity.ProfileID = "mutated"
+	got := recorder.Receipt()
+	if got.RuntimeConfigIdentity == nil || got.RuntimeConfigIdentity.ProfileID != "profile" {
+		t.Fatalf("identity=%+v", got.RuntimeConfigIdentity)
+	}
+	data, _ := json.Marshal(got)
+	for _, forbidden := range []string{"raw-query", "prompt-body", "corpus-body", "project-id", "user-id", "/private/path"} {
+		if strings.Contains(string(data), forbidden) {
+			t.Fatalf("receipt leaked %q: %s", forbidden, data)
+		}
+	}
+}

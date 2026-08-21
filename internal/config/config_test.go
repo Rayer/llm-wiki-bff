@@ -1,12 +1,38 @@
 package config
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 )
+
+func TestLoadStageConfigPathTracksAuthorityAndRejectsMixedLegacyFactors(t *testing.T) {
+	t.Setenv("QUERY_STAGE_CONFIG_PATH", "/app/configs/query/dev/query-dev-2026-08-21.1.json")
+	for _, name := range []string{
+		"QUERY_EXPANSION_MODEL", "QUERY_EXPANSION_REASONING", "ANSWER_SYNTHESIS_MODEL", "ANSWER_SYNTHESIS_REASONING",
+		"QUERY_SELECTION_LIMIT", "QUERY_SELECTION_EXPLORATION_SLOTS", "QUERY_SELECTION_EVIDENCE_THRESHOLD",
+		"QUERY_EXPANSION_KEYWORDS_PER_ATTEMPT", "QUERY_EXPANSION_ATTEMPTS", "QUERY_MATCHING_RARE_KEYWORD_MAX_DOCUMENT_FREQUENCY",
+	} {
+		t.Setenv(name, "")
+	}
+	cfg, err := Load(writeConfig(t, "dev_jwt = true\n"))
+	if err != nil {
+		t.Fatalf("defaults unexpectedly became explicit: %v", err)
+	}
+	if cfg.QueryStageConfigPath == "" {
+		t.Fatal("stage config path was not loaded")
+	}
+	t.Setenv("QUERY_SELECTION_LIMIT", "9")
+	if _, err := Load(writeConfig(t, "dev_jwt = true\n")); !errors.Is(err, ErrMixedQueryConfigAuthority) {
+		t.Fatalf("mixed authority error=%v, want %v", err, ErrMixedQueryConfigAuthority)
+	}
+	if _, err := Load(writeConfig(t, "dev_jwt = true\nquery_selection_limit = 9\n")); !errors.Is(err, ErrMixedQueryConfigAuthority) {
+		t.Fatalf("TOML mixed authority error=%v, want %v", err, ErrMixedQueryConfigAuthority)
+	}
+}
 
 func TestLoadDefaultsQueryExpansionModel(t *testing.T) {
 	t.Setenv("QUERY_EXPANSION_MODEL", "")

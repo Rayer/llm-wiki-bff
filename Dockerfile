@@ -34,6 +34,7 @@ LABEL org.opencontainers.image.version=${APP_VERSION} \
       io.llm-wiki.image.tag=${GIT_SHA}
 
 COPY --from=build /bff /bff
+COPY --chmod=0444 --from=build /src/configs/query /app/configs/query
 
 EXPOSE 8080
 ENTRYPOINT ["/bff"]

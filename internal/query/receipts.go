@@ -37,6 +37,9 @@ type Receipt struct {
 	ExpansionAttemptOutcomes        []ExpansionAttemptReceipt `json:"expansion_attempt_outcomes,omitempty"`
 	RetrievalProfileID              string                    `json:"retrieval_profile_id,omitempty"`
 	RetrievalProfileDigest          string                    `json:"retrieval_profile_digest,omitempty"`
+	PromptID                        string                    `json:"prompt_id,omitempty"`
+	PromptDigest                    string                    `json:"prompt_digest,omitempty"`
+	RuntimeConfigIdentity           *RuntimeConfigIdentity    `json:"runtime_config_identity,omitempty"`
 	runStartedMono                  time.Time
 }
 
@@ -72,6 +75,19 @@ func (r *ReceiptRecorder) SetRetrievalProfile(id, digest string) {
 	defer r.mu.Unlock()
 	r.receipt.RetrievalProfileID = id
 	r.receipt.RetrievalProfileDigest = digest
+}
+
+func (r *ReceiptRecorder) SetPromptIdentity(id, digest string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.receipt.PromptID = id
+	r.receipt.PromptDigest = digest
+}
+
+func (r *ReceiptRecorder) SetRuntimeConfigIdentity(identity RuntimeConfigIdentity) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.receipt.RuntimeConfigIdentity = CloneRuntimeConfigIdentity(&identity)
 }
 
 func (r *ReceiptRecorder) SetExpansionConfig(attempts, successful, providerFailed, keywordsPerAttempt, evidenceThreshold, rareDocumentFrequency, keywordConsensusMinimum int, support []KeywordSupportReceipt) {
@@ -257,5 +273,6 @@ func (r *ReceiptRecorder) Receipt() Receipt {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	sort.SliceStable(r.receipt.HostCalls, func(i, j int) bool { return r.receipt.HostCalls[i].Sequence < r.receipt.HostCalls[j].Sequence })
+	r.receipt.RuntimeConfigIdentity = CloneRuntimeConfigIdentity(r.receipt.RuntimeConfigIdentity)
 	return r.receipt
 }

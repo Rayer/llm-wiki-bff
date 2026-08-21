@@ -243,6 +243,19 @@ type ChatProvider interface {
 	Chat(context.Context, string, string) (string, error)
 }
 
+type expansionAttemptContextKey struct{}
+
+// WithExpansionAttempt carries the stable parallel attempt identity to a chat transport.
+func WithExpansionAttempt(ctx context.Context, attempt int) context.Context {
+	return context.WithValue(ctx, expansionAttemptContextKey{}, attempt)
+}
+
+// ExpansionAttemptFromContext returns the stable parallel attempt identity, when present.
+func ExpansionAttemptFromContext(ctx context.Context) (int, bool) {
+	attempt, ok := ctx.Value(expansionAttemptContextKey{}).(int)
+	return attempt, ok
+}
+
 type ExpansionInfo struct {
 	Source                 string
 	FallbackReason         string
@@ -267,6 +280,7 @@ type StructuredPlanExpander struct {
 	provider   ChatProvider
 	fallback   QueryExpander
 	decodePlan func(string, string) (QueryPlan, error)
+	prompt     PromptIdentity
 }
 
 type ExpansionError struct {
@@ -284,11 +298,29 @@ func (e *ExpansionError) Error() string {
 func (e *ExpansionError) Unwrap() error { return e.Err }
 
 func NewStructuredPlanExpander(provider ChatProvider, fallback QueryExpander) QueryExpander {
-	return StructuredPlanExpander{provider: provider, fallback: fallback, decodePlan: DecodePlan}
+	prompt, _ := LookupPrompt(StructuredPlanPromptID)
+	return StructuredPlanExpander{provider: provider, fallback: fallback, decodePlan: DecodePlan, prompt: prompt}
 }
 
 func NewMinimalStructuredPlanExpander(provider ChatProvider, fallback QueryExpander) QueryExpander {
-	return StructuredPlanExpander{provider: provider, fallback: fallback, decodePlan: DecodeMinimalV1Plan}
+	prompt, _ := LookupPrompt(StructuredPlanPromptID)
+	return StructuredPlanExpander{provider: provider, fallback: fallback, decodePlan: DecodeMinimalV1Plan, prompt: prompt}
+}
+
+func NewStructuredPlanExpanderWithPrompt(provider ChatProvider, fallback QueryExpander, promptID string) (QueryExpander, error) {
+	prompt, ok := LookupPrompt(promptID)
+	if !ok {
+		return nil, fmt.Errorf("unsupported prompt id %q", promptID)
+	}
+	return StructuredPlanExpander{provider: provider, fallback: fallback, decodePlan: DecodePlan, prompt: prompt}, nil
+}
+
+func NewMinimalStructuredPlanExpanderWithPrompt(provider ChatProvider, fallback QueryExpander, promptID string) (QueryExpander, error) {
+	prompt, ok := LookupPrompt(promptID)
+	if !ok {
+		return nil, fmt.Errorf("unsupported prompt id %q", promptID)
+	}
+	return StructuredPlanExpander{provider: provider, fallback: fallback, decodePlan: DecodeMinimalV1Plan, prompt: prompt}, nil
 }
 
 func (e StructuredPlanExpander) Expand(ctx context.Context, request ExpansionRequest) (QueryPlan, error) {
@@ -312,7 +344,15 @@ func (e StructuredPlanExpander) ExpandWithTrace(ctx context.Context, request Exp
 		if limit == 0 {
 			limit = DefaultKeywordsPerAttempt
 		}
-		response, err := e.provider.Chat(ctx, structuredPlanSystemPrompt, structuredPlanUserPromptWithLimit(request.Query, request.CriterionPolicy, limit))
+		prompt := e.prompt
+		if prompt.ID == "" {
+			prompt, _ = LookupPrompt(StructuredPlanPromptID)
+		}
+		rendered, err := RenderPrompt(prompt.ID, request.Query, request.CriterionPolicy, limit)
+		if err != nil {
+			return QueryPlan{}, ExpansionInfo{}, err
+		}
+		response, err := e.provider.Chat(WithExpansionAttempt(ctx, request.Attempt), rendered.System, rendered.User)
 		if err == nil {
 			if plan, decodeErr := decodePlan(response, request.Query); decodeErr == nil {
 				plan, normalizeErr := NormalizeQueryPlan(plan, limit)
@@ -442,7 +482,15 @@ func NewParallelQueryExpander(expander QueryExpander, fallback QueryExpander, op
 }
 
 func NewParallelMinimalStructuredPlanExpander(provider ChatProvider, fallback QueryExpander, options Options) (QueryExpander, error) {
-	structured := StructuredPlanExpander{provider: provider, decodePlan: DecodeMinimalV1Plan}
+	structured := NewMinimalStructuredPlanExpander(provider, nil)
+	return NewParallelQueryExpander(structured, fallback, options)
+}
+
+func NewParallelMinimalStructuredPlanExpanderWithPrompt(provider ChatProvider, fallback QueryExpander, options Options, promptID string) (QueryExpander, error) {
+	structured, err := NewMinimalStructuredPlanExpanderWithPrompt(provider, nil, promptID)
+	if err != nil {
+		return nil, err
+	}
 	return NewParallelQueryExpander(structured, fallback, options)
 }
 
@@ -476,12 +524,8 @@ func (e parallelQueryExpander) ExpandWithTrace(ctx context.Context, request Expa
 		}(index)
 	}
 	for completed := 0; completed < e.options.ExpansionAttempts; completed++ {
-		select {
-		case outcome := <-outcomes:
-			results[outcome.index] = outcome.value
-		case <-ctx.Done():
-			return QueryPlan{}, ExpansionInfo{}, ctx.Err()
-		}
+		outcome := <-outcomes
+		results[outcome.index] = outcome.value
 	}
 	if err := ctx.Err(); err != nil {
 		return QueryPlan{}, ExpansionInfo{}, err
@@ -696,22 +740,13 @@ func uniqueStrings(values []string) []string {
 	return result
 }
 
-const (
-	StructuredPlanPromptID     = "minimal-v1"
-	structuredPlanSystemPrompt = `You produce a retrieval plan for a frozen Lifestyle concept corpus. Return exactly one JSON object and no markdown. The object fields and exact types are: raw_query string; required array of Criterion; excluded array of Criterion; preferred array of Criterion; goals array of Criterion; supporting_dimensions array of Criterion; acceptable_alternatives array of Criterion; ambiguity array of strings; fallback boolean. Every Criterion is exactly {kind:string,value:string,terms:array of strings,proof:"lexical" or "semantic"}. Every lexical Criterion needs at least one discovery term. Never output a string where an array or object is required. Be conservative: only explicit user constraints may be required or excluded; absent never means excluded. In this minimal variant, supporting_dimensions and acceptable_alternatives must be empty arrays and fallback must be false.`
-	structuredPlanUserTemplate = "Raw query: {{raw_query}}\nCriterion policy: {{criterion_policy}}\nInterpret the query into required, excluded, preferred and goals. Preserve the raw query exactly in raw_query. Return the single JSON object only."
-)
-
 func structuredPlanUserPrompt(raw string, policy CriterionPolicy) string {
 	return structuredPlanUserPromptWithLimit(raw, policy, DefaultKeywordsPerAttempt)
 }
 
 func structuredPlanUserPromptWithLimit(raw string, policy CriterionPolicy, keywordsPerAttempt int) string {
-	rawJSON, _ := json.Marshal(raw)
-	policyJSON, _ := json.Marshal(policy)
-	result := strings.ReplaceAll(structuredPlanUserTemplate, "{{raw_query}}", string(rawJSON))
-	result = strings.ReplaceAll(result, "{{criterion_policy}}", string(policyJSON))
-	return result + fmt.Sprintf("\nMaximum normalized positive discovery keywords for this attempt: %d.", keywordsPerAttempt)
+	rendered, _ := RenderPrompt(StructuredPlanPromptID, raw, policy, keywordsPerAttempt)
+	return rendered.User
 }
 
 func ValidateQueryPlan(plan QueryPlan) error {
@@ -1026,6 +1061,7 @@ type QueryRetrievalPipeline struct {
 	allowDeterministicFallback bool
 	profile                    RetrievalProfile
 	profileDigest              string
+	prompt                     PromptIdentity
 }
 
 func NewQueryRetrievalPipeline(queryExpander QueryExpander, candidateMatcher CandidateMatcher, resultSelector ResultSelector, seedFor func(string) int64) *QueryRetrievalPipeline {
@@ -1034,6 +1070,21 @@ func NewQueryRetrievalPipeline(queryExpander QueryExpander, candidateMatcher Can
 }
 
 func NewQueryRetrievalPipelineWithProfile(queryExpander QueryExpander, candidateMatcher CandidateMatcher, resultSelector ResultSelector, seedFor func(string) int64, profile RetrievalProfile) (*QueryRetrievalPipeline, error) {
+	return newQueryRetrievalPipelineWithCache(cache.New(), queryExpander, candidateMatcher, resultSelector, seedFor, DefaultOptions(), profile)
+}
+
+func newQueryRetrievalPipelineWithCache(conceptCache *cache.Cache, queryExpander QueryExpander, candidateMatcher CandidateMatcher, resultSelector ResultSelector, seedFor func(string) int64, options Options, profile RetrievalProfile) (*QueryRetrievalPipeline, error) {
+	normalizedOptions, err := NormalizeOptions(options)
+	if err != nil {
+		return nil, err
+	}
+	return newQueryRetrievalPipelineWithNormalizedOptions(conceptCache, queryExpander, candidateMatcher, resultSelector, seedFor, normalizedOptions, profile)
+}
+
+func newQueryRetrievalPipelineWithNormalizedOptions(conceptCache *cache.Cache, queryExpander QueryExpander, candidateMatcher CandidateMatcher, resultSelector ResultSelector, seedFor func(string) int64, options Options, profile RetrievalProfile) (*QueryRetrievalPipeline, error) {
+	if conceptCache == nil {
+		return nil, errors.New("query-retrieval cache is nil")
+	}
 	validatedProfile, err := profile.ValidatedCopy()
 	if err != nil {
 		return nil, err
@@ -1045,7 +1096,8 @@ func NewQueryRetrievalPipelineWithProfile(queryExpander QueryExpander, candidate
 	if err != nil {
 		return nil, err
 	}
-	return &QueryRetrievalPipeline{cache: cache.New(), queryExpander: queryExpander, candidateMatcher: candidateMatcher, resultSelector: resultSelector, seedFor: seedFor, options: DefaultOptions(), profile: validatedProfile, profileDigest: profileDigest}, nil
+	prompt, _ := LookupPrompt(StructuredPlanPromptID)
+	return &QueryRetrievalPipeline{cache: conceptCache, queryExpander: queryExpander, candidateMatcher: candidateMatcher, resultSelector: resultSelector, seedFor: seedFor, options: options, profile: validatedProfile, profileDigest: profileDigest, prompt: prompt}, nil
 }
 
 func NewQueryRetrievalPipelineWithOptions(queryExpander QueryExpander, candidateMatcher CandidateMatcher, resultSelector ResultSelector, seedFor func(string) int64, options Options) *QueryRetrievalPipeline {
@@ -1054,43 +1106,14 @@ func NewQueryRetrievalPipelineWithOptions(queryExpander QueryExpander, candidate
 }
 
 func NewQueryRetrievalPipelineWithOptionsAndProfile(queryExpander QueryExpander, candidateMatcher CandidateMatcher, resultSelector ResultSelector, seedFor func(string) int64, options Options, profile RetrievalProfile) (*QueryRetrievalPipeline, error) {
-	validatedProfile, err := profile.ValidatedCopy()
-	if err != nil {
-		return nil, err
-	}
-	if seedFor == nil {
-		seedFor = ReproducibleSeed
-	}
-	profileDigest, err := validatedProfile.Digest()
-	if err != nil {
-		return nil, err
-	}
-	return &QueryRetrievalPipeline{cache: cache.New(), queryExpander: queryExpander, candidateMatcher: candidateMatcher, resultSelector: resultSelector, seedFor: seedFor, options: options, profile: validatedProfile, profileDigest: profileDigest}, nil
+	return newQueryRetrievalPipelineWithCache(cache.New(), queryExpander, candidateMatcher, resultSelector, seedFor, options, profile)
 }
 
 func NewExperimentExecutor(conceptCache *cache.Cache, provider ChatProvider, options Options) (query.Executor, error) {
-	if conceptCache == nil {
-		return nil, errors.New("query-retrieval cache is nil")
-	}
-	options, err := NormalizeOptions(options)
-	if err != nil {
-		return nil, err
-	}
-	seedFor := options.SeedFor
-	if seedFor == nil {
-		seedFor = ReproducibleSeed
-	}
-	expander, err := NewParallelMinimalStructuredPlanExpander(provider, NewDeterministicExpander(), options)
-	if err != nil {
-		return nil, err
-	}
-	service, err := NewQueryRetrievalPipelineWithOptionsAndProfile(expander, NewLexicalMatcher(nil), NewResultSelector(), seedFor, options, DefaultRetrievalProfile())
-	if err != nil {
-		return nil, err
-	}
-	service.cache = conceptCache
-	service.allowDeterministicFallback = true
-	return service, nil
+	return NewQueryRetrievalService(QueryRetrievalServiceConfig{
+		Cache: conceptCache, ChatProvider: provider, Options: options, RetrievalProfile: DefaultRetrievalProfile(),
+		PromptID: StructuredPlanPromptID, AllowDeterministicFallback: true,
+	})
 }
 
 func (s *QueryRetrievalPipeline) Execute(ctx context.Context, reader cache.Reader, request query.Request) (query.Result, error) {
@@ -1104,7 +1127,8 @@ func (s *QueryRetrievalPipeline) ExecuteWithTrace(ctx context.Context, reader ca
 	if err := s.validate(); err != nil {
 		return query.Result{}, nil, err
 	}
-	trace := &Trace{Variant: "query-retrieval-v1", EvidenceThreshold: resolvedEvidenceThreshold(s.options), Expansion: ExpansionTrace{RequestedAttempts: s.options.ExpansionAttempts, KeywordsPerAttempt: s.options.KeywordsPerAttempt, RareKeywordMaxDocumentFrequency: s.options.RareDocumentFrequency, KeywordConsensusMinimum: MinimumKeywordConsensusSupport}}
+	policy := matchingPolicyForOptions(s.options)
+	trace := &Trace{Variant: "query-retrieval-v1", ProfileID: s.profile.ID, ProfileDigest: s.profileDigest, PromptID: s.prompt.ID, PromptDigest: s.prompt.TemplateDigest, SelectionLimit: s.options.SelectionLimit, ExplorationSlots: s.options.ExplorationSlots, ExpansionAttempts: s.options.ExpansionAttempts, KeywordsPerAttempt: s.options.KeywordsPerAttempt, RareKeywordMaxDocumentFrequency: s.options.RareDocumentFrequency, EvidenceThreshold: policy.EvidenceThreshold, MatchingPolicy: policy, Expansion: expansionTraceForPolicy(ExpansionTrace{RequestedAttempts: s.options.ExpansionAttempts, KeywordsPerAttempt: s.options.KeywordsPerAttempt, KeywordConsensusMinimum: MinimumKeywordConsensusSupport}, policy)}
 	result, err := s.execute(ctx, reader, request, trace)
 	return result, trace, err
 }
@@ -1119,6 +1143,7 @@ func (s *QueryRetrievalPipeline) validate() error {
 func (s *QueryRetrievalPipeline) execute(ctx context.Context, reader cache.Reader, request query.Request, trace *Trace) (query.Result, error) {
 	if recorder := query.ReceiptRecorderFromContext(ctx); recorder != nil {
 		recorder.SetRetrievalProfile(s.profile.ID, s.profileDigest)
+		recorder.SetPromptIdentity(s.prompt.ID, s.prompt.TemplateDigest)
 		recorder.SetRetrievalConfig(s.options.SelectionLimit, s.options.ExplorationSlots, resolvedEvidenceThreshold(s.options))
 		recorder.SetExpansionConfig(s.options.ExpansionAttempts, 0, 0, s.options.KeywordsPerAttempt, resolvedEvidenceThreshold(s.options), s.options.RareDocumentFrequency, MinimumKeywordConsensusSupport, nil)
 	}
@@ -1183,7 +1208,7 @@ func (s *QueryRetrievalPipeline) execute(ctx context.Context, reader cache.Reade
 		recorder.SetFallbackExpansionCount(info.FallbackCount)
 	}
 	if trace != nil {
-		trace.Expansion = ExpansionTrace{RequestedAttempts: info.RequestedAttempts, SuccessfulAttempts: info.SuccessfulAttempts, ProviderFailedAttempts: info.ProviderFailedAttempts, FallbackCount: info.FallbackCount, KeywordsPerAttempt: info.KeywordsPerAttempt, RareKeywordMaxDocumentFrequency: s.options.RareDocumentFrequency, EvidenceThreshold: resolvedEvidenceThreshold(s.options), KeywordConsensusMinimum: MinimumKeywordConsensusSupport, KeywordSupport: append([]KeywordSupport(nil), plan.KeywordSupport...)}
+		trace.Expansion = expansionTraceForPolicy(ExpansionTrace{RequestedAttempts: info.RequestedAttempts, SuccessfulAttempts: info.SuccessfulAttempts, ProviderFailedAttempts: info.ProviderFailedAttempts, FallbackCount: info.FallbackCount, KeywordsPerAttempt: info.KeywordsPerAttempt, KeywordConsensusMinimum: MinimumKeywordConsensusSupport, KeywordSupport: append([]KeywordSupport(nil), plan.KeywordSupport...), AttemptOutcomes: append([]ExpansionAttemptInfo(nil), info.AttemptOutcomes...)}, matchingPolicyForOptions(s.options))
 	}
 	appendTraceStage(trace, StageTrace{
 		Name: "expansion", Outcome: PlanOutcome(plan), Source: info.Source, FallbackReason: info.FallbackReason,
@@ -1206,7 +1231,11 @@ func (s *QueryRetrievalPipeline) execute(ctx context.Context, reader cache.Reade
 	if recorder := query.ReceiptRecorderFromContext(ctx); recorder != nil {
 		matchCtx = recorder.StartStage(ctx, "candidate_matching", "", "", "")
 	}
-	matchReq := MatchRequest{Plan: plan, CorpusEntries: entries, EvidenceThreshold: s.options.EvidenceThreshold, EvidenceThresholdSet: s.options.EvidenceThresholdSet, RareKeywordMaxDocumentFrequency: s.options.RareDocumentFrequency, FallbackQualificationAllowed: !s.options.EvidenceThresholdSet}
+	policy := matchingPolicyForOptions(s.options)
+	matchReq := MatchRequest{Plan: plan, CorpusEntries: entries, EvidenceThreshold: policy.EvidenceThreshold, EvidenceThresholdSet: true, RareKeywordMaxDocumentFrequency: policy.RareKeywordMaxDocumentFrequency, FallbackQualificationAllowed: policy.FallbackQualificationAllowed}
+	if trace != nil {
+		trace.MatchingPolicy = policy
+	}
 	eligible, err := s.candidateMatcher.Match(matchCtx, matchReq)
 	if err != nil {
 		query.FinishStage(matchCtx, "failure")
@@ -1259,8 +1288,10 @@ func providerIdentity(expander QueryExpander) (string, string, string) {
 		return providerIdentity(parallel.expander)
 	}
 	if structured, ok := expander.(StructuredPlanExpander); ok {
-		if client, ok := structured.provider.(*llm.Client); ok {
-			return "deepseek", client.Model(), string(client.Reasoning())
+		if identityProvider, ok := structured.provider.(llm.ModelIdentityProvider); ok {
+			if identity, available := identityProvider.ModelIdentity(); available {
+				return identity.Provider, identity.Model, identity.Reasoning
+			}
 		}
 	}
 	return "", "", ""
@@ -1295,23 +1326,46 @@ func expandFromPlan(plan QueryPlan) *llm.ExpandResult {
 }
 
 type Trace struct {
-	Variant           string         `json:"variant"`
-	Seed              int64          `json:"seed"`
-	EvidenceThreshold int            `json:"evidence_threshold"`
+	Variant                         string `json:"variant"`
+	ProfileID                       string `json:"profile_id"`
+	ProfileDigest                   string `json:"profile_digest"`
+	PromptID                        string `json:"prompt_id"`
+	PromptDigest                    string `json:"prompt_digest"`
+	Seed                            int64  `json:"seed"`
+	SelectionLimit                  int    `json:"selection_limit"`
+	ExplorationSlots                int    `json:"exploration_slots"`
+	ExpansionAttempts               int    `json:"expansion_attempts"`
+	KeywordsPerAttempt              int    `json:"keywords_per_attempt"`
+	RareKeywordMaxDocumentFrequency int    `json:"-"`
+	// Deprecated: use MatchingPolicy.EvidenceThreshold.
+	EvidenceThreshold int            `json:"-"`
+	MatchingPolicy    MatchingPolicy `json:"matching_policy"`
 	Expansion         ExpansionTrace `json:"expansion"`
 	Stages            []StageTrace   `json:"stages"`
 }
 
+type MatchingPolicy struct {
+	EvidenceThreshold               int  `json:"evidence_threshold"`
+	RareKeywordMaxDocumentFrequency int  `json:"rare_keyword_max_document_frequency"`
+	FallbackQualificationAllowed    bool `json:"fallback_qualification_allowed"`
+	SemanticRequiredFailClosed      bool `json:"semantic_required_fail_closed"`
+	SemanticExcludedFailClosed      bool `json:"semantic_excluded_fail_closed"`
+}
+
 type ExpansionTrace struct {
-	RequestedAttempts               int              `json:"requested_attempts"`
-	SuccessfulAttempts              int              `json:"successful_attempts"`
-	ProviderFailedAttempts          int              `json:"provider_failed_attempts"`
-	FallbackCount                   int              `json:"fallback_count"`
-	KeywordsPerAttempt              int              `json:"keywords_per_attempt"`
-	RareKeywordMaxDocumentFrequency int              `json:"rare_keyword_max_document_frequency"`
-	EvidenceThreshold               int              `json:"evidence_threshold"`
-	KeywordConsensusMinimum         int              `json:"keyword_consensus_minimum"`
-	KeywordSupport                  []KeywordSupport `json:"keyword_support,omitempty"`
+	RequestedAttempts               int                    `json:"requested_attempts"`
+	SuccessfulAttempts              int                    `json:"successful_attempts"`
+	ProviderFailedAttempts          int                    `json:"provider_failed_attempts"`
+	FallbackCount                   int                    `json:"fallback_count"`
+	KeywordsPerAttempt              int                    `json:"keywords_per_attempt"`
+	RareKeywordMaxDocumentFrequency int                    `json:"rare_keyword_max_document_frequency"`
+	EvidenceThreshold               int                    `json:"evidence_threshold"`
+	FallbackQualificationAllowed    bool                   `json:"fallback_qualification_allowed"`
+	SemanticRequiredFailClosed      bool                   `json:"semantic_required_fail_closed"`
+	SemanticExcludedFailClosed      bool                   `json:"semantic_excluded_fail_closed"`
+	KeywordConsensusMinimum         int                    `json:"keyword_consensus_minimum"`
+	KeywordSupport                  []KeywordSupport       `json:"keyword_support,omitempty"`
+	AttemptOutcomes                 []ExpansionAttemptInfo `json:"attempt_outcomes,omitempty"`
 }
 
 func resolvedEvidenceThreshold(options Options) int {
@@ -1319,6 +1373,25 @@ func resolvedEvidenceThreshold(options Options) int {
 		return options.EvidenceThreshold
 	}
 	return DefaultEvidenceThreshold
+}
+
+func matchingPolicyForOptions(options Options) MatchingPolicy {
+	return MatchingPolicy{
+		EvidenceThreshold:               resolvedEvidenceThreshold(options),
+		RareKeywordMaxDocumentFrequency: options.RareDocumentFrequency,
+		FallbackQualificationAllowed:    !options.EvidenceThresholdSet,
+		SemanticRequiredFailClosed:      semanticRequiredFailClosed,
+		SemanticExcludedFailClosed:      semanticExcludedFailClosed,
+	}
+}
+
+func expansionTraceForPolicy(trace ExpansionTrace, policy MatchingPolicy) ExpansionTrace {
+	trace.EvidenceThreshold = policy.EvidenceThreshold
+	trace.RareKeywordMaxDocumentFrequency = policy.RareKeywordMaxDocumentFrequency
+	trace.FallbackQualificationAllowed = policy.FallbackQualificationAllowed
+	trace.SemanticRequiredFailClosed = policy.SemanticRequiredFailClosed
+	trace.SemanticExcludedFailClosed = policy.SemanticExcludedFailClosed
+	return trace
 }
 
 type StageTrace struct {

@@ -20,6 +20,7 @@ import (
 	"cloud.google.com/go/storage"
 	"github.com/gin-gonic/gin"
 	"github.com/rayer/llm-wiki-bff/internal/auth"
+	"github.com/rayer/llm-wiki-bff/internal/buildinfo"
 	"github.com/rayer/llm-wiki-bff/internal/config"
 	"github.com/rayer/llm-wiki-bff/internal/gcs"
 	"github.com/rayer/llm-wiki-bff/internal/handler"
@@ -463,7 +464,31 @@ func (h *Handler) Query(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "generated data unavailable"})
 		return
 	}
+	if identity := result.RuntimeConfigIdentity; identity != nil {
+		setQueryIdentityHeaders(c, identity)
+	}
 	c.JSON(http.StatusOK, mapQueryResult(result))
+}
+
+// QueryConfig exposes only the immutable configured runtime identity. It is
+// public so deploy verification can use it without a user token.
+func (h *Handler) QueryConfig(c *gin.Context) {
+	provider, ok := h.queryExecutor.(query.RuntimeReadbackProvider)
+	if !ok {
+		c.JSON(http.StatusServiceUnavailable, handler.ErrorResponse{Error: "query runtime config is unavailable"})
+		return
+	}
+	readback := provider.Readback()
+	if readback.SchemaVersion == 0 {
+		c.JSON(http.StatusServiceUnavailable, handler.ErrorResponse{Error: "query runtime config is unavailable"})
+		return
+	}
+	build := buildinfo.Current()
+	c.Header("Cache-Control", "no-store")
+	c.JSON(http.StatusOK, handler.QueryConfigResponse{
+		QueryConfig: handler.PublicQueryConfigFromReadback(readback),
+		Build:       handler.QueryConfigBuildInfo{Commit: build.Commit, Service: build.Service, Revision: build.Revision},
+	})
 }
 
 // ListSources handles GET /api/v1/sources using the request's GCS scope.

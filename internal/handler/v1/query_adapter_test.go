@@ -53,6 +53,86 @@ func TestV1QueryDelegatesTrimmedDefaultRequestAndScopedReader(t *testing.T) {
 	}
 }
 
+func TestV1QuerySetsOnlyAllowlistedRuntimeIdentityHeaders(t *testing.T) {
+	identity := query.RuntimeConfigIdentity{
+		ConfigRevision: "rev", ConfigDigest: "sha256:config", EffectiveConfigDigest: "sha256:effective",
+		QueryServiceImplementation: "query-retrieval-pipeline-v2", ProfileID: "profile", ProfileDigest: "sha256:profile",
+		PromptID: "prompt", PromptDigest: "sha256:prompt", BindingSource: "corpus_derived_approximation", ExactBinding: true,
+		GenerationID: "generation", ConceptsDigest: "sha256:concepts",
+	}
+	h := New(newQueryAdapterRoot(t), nil, search.NewIndex(), cache.New(), nil, nil)
+	h.queryExecutor = &recordingQueryExecutor{result: query.Result{Query: "coffee", Mode: "wiki", RuntimeConfigIdentity: &identity}}
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/api/v1/query", strings.NewReader(`{"q":"coffee"}`))
+	c.Set("userID", "user")
+	c.Set("projectID", "project")
+	h.Query(c)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	for key, want := range map[string]string{
+		"X-Query-Config-Revision": "rev", "X-Query-Config-Digest": "sha256:config", "X-Query-Effective-Config-Digest": "sha256:effective",
+		"X-Query-Service-Implementation": "query-retrieval-pipeline-v2", "X-Query-Profile-ID": "profile", "X-Query-Profile-Digest": "sha256:profile",
+		"X-Query-Prompt-ID": "prompt", "X-Query-Prompt-Digest": "sha256:prompt", "X-Query-Binding-Source": "corpus_derived_approximation",
+		"X-Query-Binding-Exact": "true", "X-Query-Generation-ID": "generation", "X-Query-Concepts-Digest": "sha256:concepts",
+	} {
+		if got := recorder.Header().Get(key); got != want {
+			t.Fatalf("header %s=%q, want %q", key, got, want)
+		}
+	}
+}
+
+type readbackExecutor struct {
+	query.Executor
+	readback query.RuntimeConfigReadback
+}
+
+func (e readbackExecutor) Readback() query.RuntimeConfigReadback { return e.readback }
+
+func TestQueryConfigReadbackIsPublicAndLegacyIsUnavailable(t *testing.T) {
+	readback := query.RuntimeConfigReadback{SchemaVersion: 2, ConfigRevision: "rev", ConfigDigest: "sha256:config", DefaultProfileID: "profile", DefaultPromptID: "prompt", BindingCount: 1, DistinctServiceCompositionCount: 1}
+	h := New(nil, nil, nil, nil, nil, nil)
+	h.queryExecutor = readbackExecutor{readback: readback}
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/api/v1/query/config", nil)
+	h.QueryConfig(c)
+	if recorder.Code != http.StatusOK || recorder.Header().Get("Cache-Control") != "no-store" || !strings.Contains(recorder.Body.String(), `"config_revision":"rev"`) {
+		t.Fatalf("readback status/body=%d/%s", recorder.Code, recorder.Body.String())
+	}
+	var response map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	forbidden := map[string]bool{"project_id": true, "generation_id": true, "concepts_digest": true, "binding_count": true, "distinct_service_composition_count": true, "path": true, "system_template": true, "user_template": true, "api_key": true, "credential": true}
+	var visit func(any)
+	visit = func(value any) {
+		switch value := value.(type) {
+		case map[string]any:
+			for key, child := range value {
+				if forbidden[key] {
+					t.Fatalf("public query config contains forbidden key %q", key)
+				}
+				visit(child)
+			}
+		case []any:
+			for _, child := range value {
+				visit(child)
+			}
+		}
+	}
+	visit(response)
+	h.queryExecutor = query.NewService(nil, nil, nil)
+	recorder = httptest.NewRecorder()
+	c, _ = gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/api/v1/query/config", nil)
+	h.QueryConfig(c)
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("legacy readback status=%d, want 503", recorder.Code)
+	}
+}
+
 func TestV1QueryMapsSentinelAndGenericErrors(t *testing.T) {
 	for _, test := range []struct {
 		name string
