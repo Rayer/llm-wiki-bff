@@ -32,6 +32,13 @@ func (m *countingMatcher) Match(_ context.Context, request queryquality.MatchReq
 	return queryquality.EligibilityResult{Candidates: []queryquality.CandidateEvidence{{Slug: "deploy", Title: "Deploy", Eligible: true, Qualified: true, Score: 1}}}, nil
 }
 
+type policyMatcher struct{ request queryquality.MatchRequest }
+
+func (m *policyMatcher) Match(_ context.Context, request queryquality.MatchRequest) (queryquality.EligibilityResult, error) {
+	m.request = request
+	return queryquality.EligibilityResult{Candidates: []queryquality.CandidateEvidence{{Slug: "deploy", Title: "Deploy", Eligible: true, Qualified: true, Score: 1}}}, nil
+}
+
 type countingSelector struct{ calls int }
 
 func (s *countingSelector) Select(_ context.Context, input queryquality.SelectionInput) (queryquality.SelectionResult, error) {
@@ -102,6 +109,37 @@ func TestQueryRetrievalServiceCopiesConfigAndUsesLifestyleDefaults(t *testing.T)
 	defaultPrompt, _ := queryquality.LookupPrompt(queryquality.StructuredPlanPromptID)
 	if trace.PromptID != defaultPrompt.ID || trace.PromptDigest != defaultPrompt.TemplateDigest || trace.Seed != 7 || trace.ProfileID != queryquality.DefaultRetrievalProfile().ID {
 		t.Fatalf("default trace=%#v", trace)
+	}
+}
+
+func TestQueryRetrievalServiceNormalizesRareDocumentFrequencyOnce(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		want  int
+		input int
+	}{
+		{name: "default", want: queryquality.DefaultRareDocumentFrequency, input: 0},
+		{name: "explicit", want: 7, input: 7},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			provider := &countingProvider{}
+			matcher := &policyMatcher{}
+			options := queryquality.Options{SelectionLimit: 1, KeywordsPerAttempt: 12, ExpansionAttempts: 1, EvidenceThreshold: 2, EvidenceThresholdSet: true, RareDocumentFrequency: test.input}
+			service, err := queryquality.NewQueryRetrievalService(queryquality.QueryRetrievalServiceConfig{
+				Cache: cache.New(), ChatProvider: provider, Options: options, RetrievalProfile: queryquality.DefaultRetrievalProfile(),
+				PromptID: queryquality.StructuredPlanPromptID, AllowDeterministicFallback: true, CandidateMatcher: matcher, ResultSelector: &countingSelector{},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, trace, err := service.ExecuteWithTrace(context.Background(), &jsonlReader{data: []byte(`{"slug":"deploy","title":"Deploy","body":""}` + "\n")}, query.Request{Query: "deploy", Mode: "wiki"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if matcher.request.RareKeywordMaxDocumentFrequency != test.want || trace.MatchingPolicy.RareKeywordMaxDocumentFrequency != test.want {
+				t.Fatalf("request=%+v trace=%+v want rare document frequency %d", matcher.request, trace.MatchingPolicy, test.want)
+			}
+		})
 	}
 }
 

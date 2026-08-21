@@ -58,7 +58,7 @@ func NewQueryRetrievalService(config QueryRetrievalServiceConfig) (*QueryRetriev
 	if selector == nil {
 		selector = NewResultSelector()
 	}
-	pipeline, err := newQueryRetrievalPipelineWithCache(config.Cache, expander, matcher, selector, options.SeedFor, options, profile)
+	pipeline, err := newQueryRetrievalPipelineWithNormalizedOptions(config.Cache, expander, matcher, selector, options.SeedFor, options, profile)
 	if err != nil {
 		return nil, err
 	}

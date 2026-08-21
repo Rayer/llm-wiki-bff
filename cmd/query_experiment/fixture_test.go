@@ -380,9 +380,9 @@ func TestFixtureRunnerUsesOneInjectedTracedServiceResult(t *testing.T) {
 	decision := queryquality.SelectedCandidate{Slug: candidate.Slug, Title: candidate.Title, Selected: true, Reason: "service decision"}
 	trace := queryquality.Trace{
 		ProfileID: "profile", PromptID: queryquality.StructuredPlanPromptID, Seed: 11,
-		SelectionLimit: 1, ExplorationSlots: 0, EvidenceThreshold: 3,
+		SelectionLimit: 1, ExplorationSlots: 0, EvidenceThreshold: 3, RareKeywordMaxDocumentFrequency: 99,
 		MatchingPolicy: queryquality.MatchingPolicy{EvidenceThreshold: canonicalThreshold, RareKeywordMaxDocumentFrequency: 1, SemanticRequiredFailClosed: true, SemanticExcludedFailClosed: true},
-		Expansion:      queryquality.ExpansionTrace{KeywordsPerAttempt: 24, EvidenceThreshold: 3},
+		Expansion:      queryquality.ExpansionTrace{KeywordsPerAttempt: 24, EvidenceThreshold: 3, RareKeywordMaxDocumentFrequency: 88, FallbackQualificationAllowed: true, SemanticRequiredFailClosed: false, SemanticExcludedFailClosed: false},
 		Stages: []queryquality.StageTrace{
 			{Name: "expansion", Outcome: "success", Plan: &plan, EvidenceThreshold: 3},
 			{Name: "matching", Outcome: "success", Candidates: []queryquality.CandidateEvidence{candidate}, EvidenceThreshold: 3},
@@ -424,8 +424,8 @@ func TestFixtureRunnerUsesOneInjectedTracedServiceResult(t *testing.T) {
 	if record.EvidenceThreshold != canonicalThreshold || record.QueryRetrievalTrace == nil || record.QueryRetrievalTrace.MatchingPolicy.EvidenceThreshold != canonicalThreshold {
 		t.Fatalf("result policy=%+v evidence=%d", record.QueryRetrievalTrace, record.EvidenceThreshold)
 	}
-	if record.QueryRetrievalTrace.EvidenceThreshold != canonicalThreshold || record.QueryRetrievalTrace.Expansion.EvidenceThreshold != canonicalThreshold {
-		t.Fatalf("result duplicate policy fields=%+v", record.QueryRetrievalTrace)
+	if record.QueryRetrievalTrace.Expansion.EvidenceThreshold != canonicalThreshold || record.QueryRetrievalTrace.Expansion.RareKeywordMaxDocumentFrequency != 1 || record.QueryRetrievalTrace.Expansion.FallbackQualificationAllowed || !record.QueryRetrievalTrace.Expansion.SemanticRequiredFailClosed || !record.QueryRetrievalTrace.Expansion.SemanticExcludedFailClosed {
+		t.Fatalf("result expansion policy=%+v", record.QueryRetrievalTrace.Expansion)
 	}
 	for _, stage := range record.QueryRetrievalTrace.Stages {
 		if stage.EvidenceThreshold != canonicalThreshold {
@@ -453,8 +453,21 @@ func TestFixtureRunnerUsesOneInjectedTracedServiceResult(t *testing.T) {
 	}
 	var matching fixtureMatchingInput
 	readJSON("matching.input.json", &matching)
-	if matching.EvidenceThreshold != canonicalThreshold || matching.Parameters.EvidenceThreshold != canonicalThreshold {
+	if matching.Parameters.EvidenceThreshold != canonicalThreshold {
 		t.Fatalf("matching policy=%+v", matching)
+	}
+	matchingData, err := os.ReadFile(filepath.Join(variantDir, "matching.input.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var matchingObject map[string]json.RawMessage
+	if err := json.Unmarshal(matchingData, &matchingObject); err != nil {
+		t.Fatal(err)
+	}
+	for _, deprecated := range []string{"rare_keyword_max_document_frequency", "fallback_qualification_allowed"} {
+		if _, ok := matchingObject[deprecated]; ok {
+			t.Fatalf("matching.input retained deprecated top-level policy field %q", deprecated)
+		}
 	}
 	var selectionIn fixtureSelectionInput
 	readJSON("selection.input.json", &selectionIn)
@@ -578,9 +591,10 @@ func TestFixtureProviderFailuresPersistScrubbedTruthfulAttempts(t *testing.T) {
 		usagePresent  bool
 		wantRaw       bool
 		transportFail bool
+		escaped       bool
 	}{
-		{name: "http", status: http.StatusBadGateway, body: `{"error":"` + secret + ` at BASE" ,"usage":{"prompt_tokens":4,"completion_tokens":1,"total_tokens":5}}`, usagePresent: true, wantRaw: true},
-		{name: "decode", status: http.StatusOK, body: `not-json ` + secret + ` BASE`, wantRaw: true},
+		{name: "http", status: http.StatusBadGateway, body: `{"error":"` + secret + ` at BASE" ,"usage":{"prompt_tokens":4,"completion_tokens":1,"total_tokens":5}}`, usagePresent: true, wantRaw: true, escaped: true},
+		{name: "decode", status: http.StatusOK, body: `not-json ` + secret + ` BASE`, wantRaw: true, escaped: true},
 		{name: "transport", transportFail: true},
 	}
 	for _, test := range tests {
@@ -594,7 +608,12 @@ func TestFixtureProviderFailuresPersistScrubbedTruthfulAttempts(t *testing.T) {
 			} else {
 				server = httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
 					writer.WriteHeader(test.status)
-					_, _ = writer.Write([]byte(strings.ReplaceAll(test.body, "BASE", baseURL)))
+					body := strings.ReplaceAll(test.body, "BASE", baseURL)
+					if test.escaped {
+						body = strings.ReplaceAll(body, secret, `fixture-\u0073ecret`)
+						body = strings.ReplaceAll(body, baseURL, strings.ReplaceAll(baseURL, "/", `\/`))
+					}
+					_, _ = writer.Write([]byte(body))
 				}))
 				defer server.Close()
 				baseURL = server.URL
@@ -663,11 +682,59 @@ func TestFixtureProviderFailuresPersistScrubbedTruthfulAttempts(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				if strings.Contains(string(fileData), secret) || strings.Contains(string(fileData), baseURL) {
+				if strings.Contains(string(fileData), secret) || strings.Contains(string(fileData), baseURL) || strings.Contains(normalizeJSONEscapes(string(fileData)), secret) || strings.Contains(normalizeJSONEscapes(string(fileData)), baseURL) {
 					t.Fatalf("%s leaked failure details: %s", path, fileData)
 				}
 			}
 		})
+	}
+}
+
+func TestScrubFixtureEvidenceRedactsEscapedSecretsFailClosed(t *testing.T) {
+	secret := "sk-abc😀"
+	baseURL := "https://api.example.com/v1/chat/completions"
+	secretEscaped := `sk-\u0061bc\uD83D\uDE00`
+	baseURLEscaped := `https:\/\/api.example.com\/v1\/chat\/completions`
+	tests := []struct {
+		name      string
+		value     string
+		wantWhole bool
+	}{
+		{name: "plaintext", value: `{"error":"` + secret + `","url":"` + baseURL + `"}`},
+		{name: "unicode escaped", value: `{"error":"` + secretEscaped + `","url":"` + baseURLEscaped + `"}`},
+		{name: "mixed", value: `{"error":"sk-\u0061bc😀","url":"https://api.example.com\/v1/chat\/completions"}`},
+		{name: "nested JSON string", value: `{"error":"{\"cause\":\"` + secretEscaped + `\",\"url\":\"` + baseURLEscaped + `\"}"}`},
+		{name: "malformed outer JSON", value: `{"error":"` + secretEscaped, wantWhole: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := scrubFixtureEvidence(test.value, modelFixtureEntry{APIKey: secret, BaseURL: baseURL})
+			if strings.Contains(got, secret) || strings.Contains(got, baseURL) || strings.Contains(normalizeJSONEscapes(got), secret) || strings.Contains(normalizeJSONEscapes(got), baseURL) || strings.Contains(got, secretEscaped) || strings.Contains(got, baseURLEscaped) {
+				t.Fatalf("scrubbed evidence leaked secret: %q", got)
+			}
+			if test.wantWhole && got != "[redacted]" {
+				t.Fatalf("malformed evidence=%q, want whole-field redaction", got)
+			}
+			if !test.wantWhole {
+				var decoded any
+				if err := json.Unmarshal([]byte(got), &decoded); err != nil {
+					t.Fatalf("scrubbed evidence is not JSON: %v (%q)", err, got)
+				}
+			}
+		})
+	}
+}
+
+func TestScrubFixtureEvidencePreservesJSONNumbers(t *testing.T) {
+	got := scrubFixtureEvidence(`{"count":9007199254740993,"nested":"{\"ok\":true}"}`, modelFixtureEntry{APIKey: "secret"})
+	var decoded map[string]any
+	decoder := json.NewDecoder(strings.NewReader(got))
+	decoder.UseNumber()
+	if err := decoder.Decode(&decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded["count"] != json.Number("9007199254740993") {
+		t.Fatalf("decoded number=%v", decoded["count"])
 	}
 }
 
@@ -810,14 +877,14 @@ func TestFixtureRunWritesEightReceiptsAndSummaryWithoutKey(t *testing.T) {
 	if err := json.Unmarshal(matchingData, &matching); err != nil {
 		t.Fatal(err)
 	}
-	if got, want := matching.EvidenceThreshold, record.EvidenceThreshold; got != want {
-		t.Fatalf("matching.evidence_threshold=%d, want %d", got, want)
+	if got, want := matching.Parameters.EvidenceThreshold, record.EvidenceThreshold; got != want {
+		t.Fatalf("matching.parameters.evidence_threshold=%d, want %d", got, want)
 	}
-	if got, want := matching.RareKeywordMaxDocumentFrequency, request.RareKeywordMaxDocumentFrequency; got != want {
-		t.Fatalf("matching.rare_keyword_max_document_frequency=%d, want %d", got, want)
+	if got, want := matching.Parameters.RareKeywordMaxDocumentFrequency, request.RareKeywordMaxDocumentFrequency; got != want {
+		t.Fatalf("matching.parameters.rare_keyword_max_document_frequency=%d, want %d", got, want)
 	}
-	if matching.FallbackQualificationAllowed != false {
-		t.Fatalf("matching.fallback_qualification_allowed=%v, want false", matching.FallbackQualificationAllowed)
+	if matching.Parameters.FallbackQualificationAllowed != false {
+		t.Fatalf("matching.parameters.fallback_qualification_allowed=%v, want false", matching.Parameters.FallbackQualificationAllowed)
 	}
 	var summary map[string]any
 	data, err := os.ReadFile(summaryPath)

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -14,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf16"
 
 	"github.com/rayer/llm-wiki-bff/internal/buildinfo"
 	"github.com/rayer/llm-wiki-bff/internal/cache"
@@ -197,9 +199,9 @@ type fixtureMatchingInput struct {
 	SnapshotIdentity                string                      `json:"snapshot_identity"`
 	CorpusSHA256                    string                      `json:"corpus_sha256"`
 	Parameters                      queryquality.MatchingPolicy `json:"parameters"`
-	EvidenceThreshold               int                         `json:"evidence_threshold"`
-	RareKeywordMaxDocumentFrequency int                         `json:"rare_keyword_max_document_frequency"`
-	FallbackQualificationAllowed    bool                        `json:"fallback_qualification_allowed"`
+	EvidenceThreshold               int                         `json:"-"`
+	RareKeywordMaxDocumentFrequency int                         `json:"-"`
+	FallbackQualificationAllowed    bool                        `json:"-"`
 }
 
 type fixtureMatchingOutput struct {
@@ -621,13 +623,16 @@ func cloneTraceForFixture(trace *queryRetrievalTrace) (*queryRetrievalTrace, err
 }
 
 func canonicalizeFixtureTracePolicy(trace *queryRetrievalTrace) {
-	threshold := trace.MatchingPolicy.EvidenceThreshold
-	trace.EvidenceThreshold = threshold
-	trace.Expansion.EvidenceThreshold = threshold
+	policy := trace.MatchingPolicy
+	trace.Expansion.EvidenceThreshold = policy.EvidenceThreshold
+	trace.Expansion.RareKeywordMaxDocumentFrequency = policy.RareKeywordMaxDocumentFrequency
+	trace.Expansion.FallbackQualificationAllowed = policy.FallbackQualificationAllowed
+	trace.Expansion.SemanticRequiredFailClosed = policy.SemanticRequiredFailClosed
+	trace.Expansion.SemanticExcludedFailClosed = policy.SemanticExcludedFailClosed
 	for stageIndex := range trace.Stages {
-		trace.Stages[stageIndex].EvidenceThreshold = threshold
+		trace.Stages[stageIndex].EvidenceThreshold = policy.EvidenceThreshold
 		for candidateIndex := range trace.Stages[stageIndex].Candidates {
-			trace.Stages[stageIndex].Candidates[candidateIndex].EvidenceThreshold = threshold
+			trace.Stages[stageIndex].Candidates[candidateIndex].EvidenceThreshold = policy.EvidenceThreshold
 		}
 	}
 }
@@ -676,11 +681,118 @@ func writeFixtureReceipt(path string, meta fixtureReceiptMeta, payload any, secr
 }
 
 func scrubFixtureEvidence(value string, model modelFixtureEntry) string {
-	value = scrubSecret(value, model.APIKey)
+	if sanitized, ok := scrubFixtureJSONDocument(value, model); ok {
+		return sanitized
+	}
+	normalized := normalizeJSONEscapes(value)
+	if fixtureContainsSensitiveValue(normalized, model) {
+		return "[redacted]"
+	}
+	return scrubFixturePlaintext(value, model)
+}
+
+func scrubFixtureJSONDocument(value string, model modelFixtureEntry) (string, bool) {
+	decoder := json.NewDecoder(strings.NewReader(value))
+	decoder.UseNumber()
+	var tree any
+	if err := decoder.Decode(&tree); err != nil {
+		return "", false
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		return "", false
+	}
+	tree = scrubFixtureJSONValue(tree, model)
+	data, err := json.Marshal(tree)
+	if err != nil {
+		return "", false
+	}
+	return string(data), true
+}
+
+func fixtureContainsSensitiveValue(value string, model modelFixtureEntry) bool {
+	return (model.APIKey != "" && strings.Contains(value, model.APIKey)) || (model.BaseURL != "" && strings.Contains(value, model.BaseURL))
+}
+
+func scrubFixturePlaintext(value string, model modelFixtureEntry) string {
+	if model.APIKey != "" {
+		value = strings.ReplaceAll(value, model.APIKey, "[redacted]")
+	}
 	if model.BaseURL != "" {
 		value = strings.ReplaceAll(value, model.BaseURL, "[redacted]")
 	}
 	return value
+}
+
+func normalizeJSONEscapes(value string) string {
+	var normalized strings.Builder
+	normalized.Grow(len(value))
+	for index := 0; index < len(value); index++ {
+		if value[index] != '\\' || index+1 >= len(value) {
+			normalized.WriteByte(value[index])
+			continue
+		}
+		switch value[index+1] {
+		case '"', '\\', '/':
+			normalized.WriteByte(value[index+1])
+			index++
+		case 'b':
+			normalized.WriteByte('\b')
+			index++
+		case 'f':
+			normalized.WriteByte('\f')
+			index++
+		case 'n':
+			normalized.WriteByte('\n')
+			index++
+		case 'r':
+			normalized.WriteByte('\r')
+			index++
+		case 't':
+			normalized.WriteByte('\t')
+			index++
+		case 'u':
+			first, ok := decodeJSONUnicodeEscape(value[index+2:])
+			if !ok {
+				normalized.WriteByte(value[index])
+				continue
+			}
+			index += 5
+			if first >= 0xD800 && first <= 0xDBFF && index+2 < len(value) && value[index+1] == '\\' && value[index+2] == 'u' {
+				second, pairOK := decodeJSONUnicodeEscape(value[index+3:])
+				if pairOK && second >= 0xDC00 && second <= 0xDFFF {
+					normalized.WriteString(string(utf16.Decode([]uint16{first, second})))
+					index += 5
+					continue
+				}
+			}
+			normalized.WriteString(string(utf16.Decode([]uint16{first})))
+		default:
+			normalized.WriteByte(value[index])
+		}
+	}
+	return normalized.String()
+}
+
+func decodeJSONUnicodeEscape(value string) (uint16, bool) {
+	if len(value) < 4 {
+		return 0, false
+	}
+	var result uint16
+	for _, digit := range []byte(value[:4]) {
+		result <<= 4
+		switch {
+		case digit >= '0' && digit <= '9':
+			result |= uint16(digit - '0')
+		case digit >= 'a' && digit <= 'f':
+			result |= uint16(digit-'a') + 10
+		case digit >= 'A' && digit <= 'F':
+			result |= uint16(digit-'A') + 10
+		default:
+			return 0, false
+		}
+	}
+	return result, true
 }
 
 func marshalSanitizedFixtureJSON(value any, model modelFixtureEntry) ([]byte, error) {
@@ -701,9 +813,11 @@ func marshalSanitizedFixtureJSON(value any, model modelFixtureEntry) ([]byte, er
 func scrubFixtureJSONValue(value any, model modelFixtureEntry) any {
 	switch current := value.(type) {
 	case map[string]any:
+		result := make(map[string]any, len(current))
 		for key, nested := range current {
-			current[key] = scrubFixtureJSONValue(nested, model)
+			result[scrubFixturePlaintext(key, model)] = scrubFixtureJSONValue(nested, model)
 		}
+		return result
 	case []any:
 		for index, nested := range current {
 			current[index] = scrubFixtureJSONValue(nested, model)
@@ -715,10 +829,7 @@ func scrubFixtureJSONValue(value any, model modelFixtureEntry) any {
 }
 
 func scrubSecret(value, secret string) string {
-	if secret == "" {
-		return value
-	}
-	return strings.ReplaceAll(value, secret, "[redacted]")
+	return scrubFixturePlaintext(value, modelFixtureEntry{APIKey: secret})
 }
 
 func errorString(err error) string {

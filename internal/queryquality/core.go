@@ -1074,6 +1074,14 @@ func NewQueryRetrievalPipelineWithProfile(queryExpander QueryExpander, candidate
 }
 
 func newQueryRetrievalPipelineWithCache(conceptCache *cache.Cache, queryExpander QueryExpander, candidateMatcher CandidateMatcher, resultSelector ResultSelector, seedFor func(string) int64, options Options, profile RetrievalProfile) (*QueryRetrievalPipeline, error) {
+	normalizedOptions, err := NormalizeOptions(options)
+	if err != nil {
+		return nil, err
+	}
+	return newQueryRetrievalPipelineWithNormalizedOptions(conceptCache, queryExpander, candidateMatcher, resultSelector, seedFor, normalizedOptions, profile)
+}
+
+func newQueryRetrievalPipelineWithNormalizedOptions(conceptCache *cache.Cache, queryExpander QueryExpander, candidateMatcher CandidateMatcher, resultSelector ResultSelector, seedFor func(string) int64, options Options, profile RetrievalProfile) (*QueryRetrievalPipeline, error) {
 	if conceptCache == nil {
 		return nil, errors.New("query-retrieval cache is nil")
 	}
@@ -1120,7 +1128,7 @@ func (s *QueryRetrievalPipeline) ExecuteWithTrace(ctx context.Context, reader ca
 		return query.Result{}, nil, err
 	}
 	policy := matchingPolicyForOptions(s.options)
-	trace := &Trace{Variant: "query-retrieval-v1", ProfileID: s.profile.ID, ProfileDigest: s.profileDigest, PromptID: s.prompt.ID, PromptDigest: s.prompt.TemplateDigest, SelectionLimit: s.options.SelectionLimit, ExplorationSlots: s.options.ExplorationSlots, ExpansionAttempts: s.options.ExpansionAttempts, KeywordsPerAttempt: s.options.KeywordsPerAttempt, RareKeywordMaxDocumentFrequency: s.options.RareDocumentFrequency, EvidenceThreshold: policy.EvidenceThreshold, MatchingPolicy: policy, Expansion: ExpansionTrace{RequestedAttempts: s.options.ExpansionAttempts, KeywordsPerAttempt: s.options.KeywordsPerAttempt, RareKeywordMaxDocumentFrequency: s.options.RareDocumentFrequency, EvidenceThreshold: policy.EvidenceThreshold, KeywordConsensusMinimum: MinimumKeywordConsensusSupport}}
+	trace := &Trace{Variant: "query-retrieval-v1", ProfileID: s.profile.ID, ProfileDigest: s.profileDigest, PromptID: s.prompt.ID, PromptDigest: s.prompt.TemplateDigest, SelectionLimit: s.options.SelectionLimit, ExplorationSlots: s.options.ExplorationSlots, ExpansionAttempts: s.options.ExpansionAttempts, KeywordsPerAttempt: s.options.KeywordsPerAttempt, RareKeywordMaxDocumentFrequency: s.options.RareDocumentFrequency, EvidenceThreshold: policy.EvidenceThreshold, MatchingPolicy: policy, Expansion: expansionTraceForPolicy(ExpansionTrace{RequestedAttempts: s.options.ExpansionAttempts, KeywordsPerAttempt: s.options.KeywordsPerAttempt, KeywordConsensusMinimum: MinimumKeywordConsensusSupport}, policy)}
 	result, err := s.execute(ctx, reader, request, trace)
 	return result, trace, err
 }
@@ -1200,7 +1208,7 @@ func (s *QueryRetrievalPipeline) execute(ctx context.Context, reader cache.Reade
 		recorder.SetFallbackExpansionCount(info.FallbackCount)
 	}
 	if trace != nil {
-		trace.Expansion = ExpansionTrace{RequestedAttempts: info.RequestedAttempts, SuccessfulAttempts: info.SuccessfulAttempts, ProviderFailedAttempts: info.ProviderFailedAttempts, FallbackCount: info.FallbackCount, KeywordsPerAttempt: info.KeywordsPerAttempt, RareKeywordMaxDocumentFrequency: s.options.RareDocumentFrequency, EvidenceThreshold: resolvedEvidenceThreshold(s.options), KeywordConsensusMinimum: MinimumKeywordConsensusSupport, KeywordSupport: append([]KeywordSupport(nil), plan.KeywordSupport...), AttemptOutcomes: append([]ExpansionAttemptInfo(nil), info.AttemptOutcomes...)}
+		trace.Expansion = expansionTraceForPolicy(ExpansionTrace{RequestedAttempts: info.RequestedAttempts, SuccessfulAttempts: info.SuccessfulAttempts, ProviderFailedAttempts: info.ProviderFailedAttempts, FallbackCount: info.FallbackCount, KeywordsPerAttempt: info.KeywordsPerAttempt, KeywordConsensusMinimum: MinimumKeywordConsensusSupport, KeywordSupport: append([]KeywordSupport(nil), plan.KeywordSupport...), AttemptOutcomes: append([]ExpansionAttemptInfo(nil), info.AttemptOutcomes...)}, matchingPolicyForOptions(s.options))
 	}
 	appendTraceStage(trace, StageTrace{
 		Name: "expansion", Outcome: PlanOutcome(plan), Source: info.Source, FallbackReason: info.FallbackReason,
@@ -1223,12 +1231,10 @@ func (s *QueryRetrievalPipeline) execute(ctx context.Context, reader cache.Reade
 	if recorder := query.ReceiptRecorderFromContext(ctx); recorder != nil {
 		matchCtx = recorder.StartStage(ctx, "candidate_matching", "", "", "")
 	}
-	matchReq := MatchRequest{Plan: plan, CorpusEntries: entries, EvidenceThreshold: s.options.EvidenceThreshold, EvidenceThresholdSet: s.options.EvidenceThresholdSet, RareKeywordMaxDocumentFrequency: s.options.RareDocumentFrequency, FallbackQualificationAllowed: !s.options.EvidenceThresholdSet}
-	if matchReq.RareKeywordMaxDocumentFrequency == 0 {
-		matchReq.RareKeywordMaxDocumentFrequency = DefaultRareDocumentFrequency
-	}
+	policy := matchingPolicyForOptions(s.options)
+	matchReq := MatchRequest{Plan: plan, CorpusEntries: entries, EvidenceThreshold: policy.EvidenceThreshold, EvidenceThresholdSet: true, RareKeywordMaxDocumentFrequency: policy.RareKeywordMaxDocumentFrequency, FallbackQualificationAllowed: policy.FallbackQualificationAllowed}
 	if trace != nil {
-		trace.MatchingPolicy = matchingPolicyForOptions(s.options)
+		trace.MatchingPolicy = policy
 	}
 	eligible, err := s.candidateMatcher.Match(matchCtx, matchReq)
 	if err != nil {
@@ -1328,9 +1334,9 @@ type Trace struct {
 	ExplorationSlots                int    `json:"exploration_slots"`
 	ExpansionAttempts               int    `json:"expansion_attempts"`
 	KeywordsPerAttempt              int    `json:"keywords_per_attempt"`
-	RareKeywordMaxDocumentFrequency int    `json:"rare_keyword_max_document_frequency"`
+	RareKeywordMaxDocumentFrequency int    `json:"-"`
 	// Deprecated: use MatchingPolicy.EvidenceThreshold.
-	EvidenceThreshold int            `json:"evidence_threshold"`
+	EvidenceThreshold int            `json:"-"`
 	MatchingPolicy    MatchingPolicy `json:"matching_policy"`
 	Expansion         ExpansionTrace `json:"expansion"`
 	Stages            []StageTrace   `json:"stages"`
@@ -1352,6 +1358,9 @@ type ExpansionTrace struct {
 	KeywordsPerAttempt              int                    `json:"keywords_per_attempt"`
 	RareKeywordMaxDocumentFrequency int                    `json:"rare_keyword_max_document_frequency"`
 	EvidenceThreshold               int                    `json:"evidence_threshold"`
+	FallbackQualificationAllowed    bool                   `json:"fallback_qualification_allowed"`
+	SemanticRequiredFailClosed      bool                   `json:"semantic_required_fail_closed"`
+	SemanticExcludedFailClosed      bool                   `json:"semantic_excluded_fail_closed"`
 	KeywordConsensusMinimum         int                    `json:"keyword_consensus_minimum"`
 	KeywordSupport                  []KeywordSupport       `json:"keyword_support,omitempty"`
 	AttemptOutcomes                 []ExpansionAttemptInfo `json:"attempt_outcomes,omitempty"`
@@ -1372,6 +1381,15 @@ func matchingPolicyForOptions(options Options) MatchingPolicy {
 		SemanticRequiredFailClosed:      semanticRequiredFailClosed,
 		SemanticExcludedFailClosed:      semanticExcludedFailClosed,
 	}
+}
+
+func expansionTraceForPolicy(trace ExpansionTrace, policy MatchingPolicy) ExpansionTrace {
+	trace.EvidenceThreshold = policy.EvidenceThreshold
+	trace.RareKeywordMaxDocumentFrequency = policy.RareKeywordMaxDocumentFrequency
+	trace.FallbackQualificationAllowed = policy.FallbackQualificationAllowed
+	trace.SemanticRequiredFailClosed = policy.SemanticRequiredFailClosed
+	trace.SemanticExcludedFailClosed = policy.SemanticExcludedFailClosed
+	return trace
 }
 
 type StageTrace struct {
