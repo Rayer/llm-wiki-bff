@@ -11,7 +11,12 @@ RUN apk add --no-cache python3
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN go generate ./... && CGO_ENABLED=0 go build -ldflags="-s -w \
+RUN rm -rf /runtime-configs/query \
+  && mkdir -p /runtime-configs/query \
+  && cp -R configs/query/. /runtime-configs/query/ \
+  && find /runtime-configs/query -type d -exec chmod 0555 {} + \
+  && find /runtime-configs/query -type f -exec chmod 0444 {} +
+RUN CGO_ENABLED=0 go generate ./... && CGO_ENABLED=0 go build -ldflags="-s -w \
   -X github.com/rayer/llm-wiki-bff/internal/buildinfo.ProductVersion=${APP_VERSION} \
   -X github.com/rayer/llm-wiki-bff/internal/buildinfo.GitSHA=${GIT_SHA} \
   -X github.com/rayer/llm-wiki-bff/internal/buildinfo.GitBranch=${GIT_BRANCH} \
@@ -34,7 +39,7 @@ LABEL org.opencontainers.image.version=${APP_VERSION} \
       io.llm-wiki.image.tag=${GIT_SHA}
 
 COPY --from=build /bff /bff
-COPY --chmod=0444 --from=build /src/configs/query /app/configs/query
+COPY --from=build /runtime-configs/query /app/configs/query
 
 EXPOSE 8080
 ENTRYPOINT ["/bff"]

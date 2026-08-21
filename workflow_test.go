@@ -1075,8 +1075,8 @@ func TestDockerfileRestoresPreRemediationBuildSemantics(t *testing.T) {
 	if strings.Contains(contents, "ENV CGO_ENABLED=0") {
 		t.Fatal("Dockerfile must not add a global CGO_ENABLED environment setting")
 	}
-	if !strings.Contains(contents, "RUN go generate ./... && CGO_ENABLED=0 go build") {
-		t.Fatal("Dockerfile must keep CGO_ENABLED scoped to the build instruction")
+	if !strings.Contains(contents, "RUN CGO_ENABLED=0 go generate ./... && CGO_ENABLED=0 go build") {
+		t.Fatal("Dockerfile must disable CGO for both generation and build")
 	}
 }
 
@@ -1084,7 +1084,7 @@ func TestDockerfileProvidesPythonForBFFGeneration(t *testing.T) {
 	contents := readWorkflow(t, "Dockerfile")
 	buildStage := contents[:strings.Index(contents, "# Runtime")]
 	pythonInstall := strings.Index(buildStage, "apk add --no-cache python3")
-	generate := strings.Index(buildStage, "RUN go generate ./...")
+	generate := strings.Index(buildStage, "RUN CGO_ENABLED=0 go generate ./...")
 	if pythonInstall < 0 || generate < 0 || pythonInstall > generate {
 		t.Fatal("BFF build stage must provide python3 before go generate")
 	}
