@@ -91,6 +91,8 @@ jobs:
           cache: true
 
       - name: Run Go tests
+        env:
+          QUERY_STAGE_CONFIG_PATH: ""
         run: go test ./... -count=1
 
       - name: Run Go vet
