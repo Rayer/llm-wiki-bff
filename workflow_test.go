@@ -477,17 +477,32 @@ main-fast-forward-eligible:
       with:
         fetch-depth: 0
         persist-credentials: false
-    - name: Verify main fast-forward eligibility
+    - name: Publish pending main fast-forward eligibility status
+      if: success()
       env:
         CANDIDATE_SHA: ${{ needs.test-and-deploy.outputs.candidate_sha }}
+        GH_TOKEN: ${{ github.token }}
       run: |
         set -euo pipefail
-        [[ "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]]
-        git fetch --no-tags origin main develop
-	        test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
-	        test "$(git rev-parse origin/develop)" = "$CANDIDATE_SHA"
-	        git merge-base --is-ancestor origin/main "$CANDIDATE_SHA"
-    - name: Publish main fast-forward eligibility status
+          if [[ ! "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "candidate SHA must be a 40-character lowercase commit SHA"
+            exit 1
+          fi
+          if [[ "$(git rev-parse HEAD)" != "$CANDIDATE_SHA" ]]; then
+            echo "checked-out HEAD does not match candidate"
+            exit 1
+          fi
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/$CANDIDATE_SHA" \
+          -f state=pending \
+          -f context=main-fast-forward-eligible \
+          -f description="validating exact candidate for a main fast-forward" \
+          | jq -e --arg candidate "$CANDIDATE_SHA" '
+              type == "object" and
+              .state == "pending" and
+              .context == "main-fast-forward-eligible" and
+              .sha == $candidate
+            ' >/dev/null
+    - name: Revalidate and publish main fast-forward eligibility status
       if: success()
       env:
         CANDIDATE_SHA: ${{ needs.test-and-deploy.outputs.candidate_sha }}
@@ -511,7 +526,13 @@ main-fast-forward-eligible:
         gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/$CANDIDATE_SHA" \
           -f state=success \
           -f context=main-fast-forward-eligible \
-          -f description="exact candidate is eligible for a main fast-forward" >/dev/null
+          -f description="exact candidate is eligible for a main fast-forward" \
+          | jq -e --arg candidate "$CANDIDATE_SHA" '
+              type == "object" and
+              .state == "success" and
+              .context == "main-fast-forward-eligible" and
+              .sha == $candidate
+            ' >/dev/null
 `)
 	if got := normalizeWorkflowContract(job); got != want {
 		t.Errorf("main fast-forward gate contract changed\n got:\n%s\nwant:\n%s", got, want)
@@ -1877,6 +1898,7 @@ func TestMainFastForwardEligibilityPublishesExactCommitStatus(t *testing.T) {
 		"git merge-base --is-ancestor origin/main",
 		"gh api --method POST",
 		"statuses/$CANDIDATE_SHA",
+		"-f state=pending",
 		"-f state=success",
 		"-f context=main-fast-forward-eligible",
 	} {
@@ -1885,18 +1907,167 @@ func TestMainFastForwardEligibilityPublishesExactCommitStatus(t *testing.T) {
 		}
 	}
 
-	verify := strings.Index(job, "- name: Verify main fast-forward eligibility")
-	publish := strings.Index(job, "- name: Publish main fast-forward eligibility status")
-	post := strings.Index(job, "gh api --method POST")
-	if verify < 0 || publish < 0 || post < 0 || !(verify < publish && publish < post) {
-		t.Fatal("status publication must follow the existing eligibility gates")
+	pending := strings.Index(job, "- name: Publish pending main fast-forward eligibility status")
+	revalidate := strings.Index(job, "- name: Revalidate and publish main fast-forward eligibility status")
+	firstPost := strings.Index(job, "gh api --method POST")
+	lastPost := strings.LastIndex(job, "gh api --method POST")
+	if pending < 0 || revalidate < 0 || firstPost < 0 || lastPost < 0 || !(pending < firstPost && firstPost < revalidate && revalidate < lastPost) {
+		t.Fatal("pending status must precede fresh eligibility gates and final status publication")
 	}
-	if !strings.Contains(job[publish:], "if: success()") {
-		t.Fatal("status publication must be success-only")
+	if !strings.Contains(job[pending:], "if: success()") || !strings.Contains(job[revalidate:], "if: success()") {
+		t.Fatal("status publication steps must be success-only")
 	}
-	if strings.Contains(job[post+len("gh api --method POST"):], "run:") {
-		t.Fatal("status publication must be the final action in its step")
+	if !strings.Contains(job[pending:firstPost], "git rev-parse HEAD") {
+		t.Fatal("pending publication must bind the candidate to checked-out HEAD")
 	}
+	if !strings.Contains(job[pending:revalidate], ".state == \"pending\"") || !strings.Contains(job[pending:revalidate], ".sha == $candidate") {
+		t.Fatal("pending publication must validate the returned status identity")
+	}
+	final := job[revalidate:]
+	for _, want := range []string{
+		"git fetch --no-tags origin main develop",
+		"git rev-parse HEAD",
+		"git rev-parse origin/develop",
+		"git merge-base --is-ancestor origin/main",
+		".state == \"success\"",
+		".context == \"main-fast-forward-eligible\"",
+		".sha == $candidate",
+	} {
+		if !strings.Contains(final, want) {
+			t.Errorf("final status action is missing %q", want)
+		}
+	}
+	if strings.Contains(final[lastPost-revalidate+len("gh api --method POST"):], "-f state=pending") {
+		t.Fatal("final status publication must not publish pending")
+	}
+	if !strings.HasSuffix(strings.TrimSpace(final), ">/dev/null") {
+		t.Fatal("success publication and response validation must be the final action")
+	}
+	if strings.Count(contents, "statuses: write") != 1 || strings.Contains(contents[:strings.Index(contents, "  main-fast-forward-eligible:")], "statuses: write") {
+		t.Fatal("statuses: write must be limited to the main fast-forward job")
+	}
+}
+
+func TestMainFastForwardEligibilityNegativePathsDoNotPublishSuccess(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
+	pending := workflowRunBlock(contents, "Publish pending main fast-forward eligibility status")
+	final := workflowRunBlock(contents, "Revalidate and publish main fast-forward eligibility status")
+	if pending == "" || final == "" {
+		t.Fatal("could not extract main fast-forward status run blocks")
+	}
+
+	const candidate = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	const other = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	tests := []struct {
+		name       string
+		head       string
+		develop    string
+		ancestry   string
+		ghMode     string
+		wantStates string
+	}{
+		{name: "stale candidate", head: other, develop: candidate, wantStates: ""},
+		{name: "remote develop advanced", head: candidate, develop: other, wantStates: "pending"},
+		{name: "ancestry failure", head: candidate, develop: candidate, ancestry: "fail", wantStates: "pending"},
+		{name: "pending API failure", head: candidate, develop: candidate, ghMode: "fail_pending", wantStates: "pending"},
+		{name: "pending unexpected response", head: candidate, develop: candidate, ghMode: "wrong_pending", wantStates: "pending"},
+		{name: "success API failure", head: candidate, develop: candidate, ghMode: "fail_success", wantStates: "pending,success"},
+		{name: "success unexpected response", head: candidate, develop: candidate, ghMode: "wrong_success", wantStates: "pending,success"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			bin := t.TempDir()
+			writeExecutable(t, filepath.Join(bin, "git"), `#!/usr/bin/env bash
+set -euo pipefail
+case "$1 ${2:-}" in
+  fetch\ *) exit 0 ;;
+  rev-parse\ HEAD) printf '%s\n' "$FAKE_HEAD" ;;
+  rev-parse\ origin/develop) printf '%s\n' "$FAKE_DEVELOP" ;;
+  merge-base\ --is-ancestor) [[ "${FAKE_ANCESTRY:-}" != fail ]] ;;
+  *) echo "unexpected git invocation: $*" >&2; exit 2 ;;
+esac
+`)
+			writeExecutable(t, filepath.Join(bin, "gh"), `#!/usr/bin/env bash
+set -euo pipefail
+state=""
+for arg in "$@"; do
+  [[ "$arg" == state=* ]] && state="${arg#state=}"
+done
+printf '%s\n' "$state" >> "$GH_LOG"
+case "${GH_MODE:-}" in
+  fail_pending) [[ "$state" != pending ]] || exit 1 ;;
+  fail_success) [[ "$state" != success ]] || exit 1 ;;
+  wrong_pending) [[ "$state" != pending ]] || printf '%s\n' '{"state":"pending","context":"main-fast-forward-eligible","sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}' ;;
+  wrong_success) [[ "$state" != success ]] || printf '%s\n' '{"state":"failure","context":"main-fast-forward-eligible","sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}' ;;
+esac
+if [[ "$state" == pending && "${GH_MODE:-}" != wrong_pending ]] || [[ "$state" == success && "${GH_MODE:-}" != wrong_success ]]; then
+  printf '{"state":"%s","context":"main-fast-forward-eligible","sha":"%s"}\n' "$state" "$CANDIDATE_SHA"
+fi
+`)
+			log := filepath.Join(t.TempDir(), "status.log")
+			env := append(os.Environ(),
+				"PATH="+bin+":"+os.Getenv("PATH"),
+				"CANDIDATE_SHA="+candidate,
+				"FAKE_HEAD="+tc.head,
+				"FAKE_DEVELOP="+tc.develop,
+				"FAKE_ANCESTRY="+tc.ancestry,
+				"GH_MODE="+tc.ghMode,
+				"GH_LOG="+log,
+				"GITHUB_REPOSITORY=owner/repo",
+			)
+			pendingErr := runWorkflowBlock(t, pending, env)
+			if pendingErr == nil {
+				pendingErr = runWorkflowBlock(t, final, env)
+			}
+			if pendingErr == nil {
+				t.Fatal("negative scenario unexpectedly succeeded")
+			}
+			states, _ := os.ReadFile(log)
+			if got := strings.Trim(strings.ReplaceAll(string(states), "\n", ","), ",\n "); got != tc.wantStates {
+				t.Fatalf("status states = %q, want %q", got, tc.wantStates)
+			}
+			if strings.Contains(string(states), "success") && tc.wantStates == "" {
+				t.Fatal("failed candidate must not publish success")
+			}
+		})
+	}
+}
+
+func workflowRunBlock(contents, stepName string) string {
+	start := strings.Index(contents, "      - name: "+stepName)
+	if start < 0 {
+		return ""
+	}
+	section := contents[start:]
+	if next := strings.Index(section, "\n      - "); next >= 0 {
+		section = section[:next]
+	}
+	run := strings.Index(section, "        run: |\n")
+	if run < 0 {
+		return ""
+	}
+	body := section[run+len("        run: |\n"):]
+	lines := strings.Split(body, "\n")
+	for i, line := range lines {
+		if strings.HasPrefix(line, "          ") {
+			lines[i] = line[10:]
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+func writeExecutable(t *testing.T, path, contents string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(contents), 0o755); err != nil {
+		t.Fatalf("write fake executable %s: %v", path, err)
+	}
+}
+
+func runWorkflowBlock(t *testing.T, body string, env []string) error {
+	t.Helper()
+	cmd := exec.Command("bash", "-c", body)
+	cmd.Env = env
+	return cmd.Run()
 }
 
 func TestDevReceiptProducerIsVersionedAndSelfBound(t *testing.T) {

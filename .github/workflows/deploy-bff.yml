@@ -836,17 +836,32 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Verify main fast-forward eligibility
+      - name: Publish pending main fast-forward eligibility status
+        if: success()
         env:
           CANDIDATE_SHA: ${{ needs.test-and-deploy.outputs.candidate_sha }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          [[ "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]]
-          git fetch --no-tags origin main develop
-          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
-          test "$(git rev-parse origin/develop)" = "$CANDIDATE_SHA"
-          git merge-base --is-ancestor origin/main "$CANDIDATE_SHA"
-      - name: Publish main fast-forward eligibility status
+          if [[ ! "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "candidate SHA must be a 40-character lowercase commit SHA"
+            exit 1
+          fi
+          if [[ "$(git rev-parse HEAD)" != "$CANDIDATE_SHA" ]]; then
+            echo "checked-out HEAD does not match candidate"
+            exit 1
+          fi
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/$CANDIDATE_SHA" \
+            -f state=pending \
+            -f context=main-fast-forward-eligible \
+            -f description="validating exact candidate for a main fast-forward" \
+            | jq -e --arg candidate "$CANDIDATE_SHA" '
+                type == "object" and
+                .state == "pending" and
+                .context == "main-fast-forward-eligible" and
+                .sha == $candidate
+              ' >/dev/null
+      - name: Revalidate and publish main fast-forward eligibility status
         if: success()
         env:
           CANDIDATE_SHA: ${{ needs.test-and-deploy.outputs.candidate_sha }}
@@ -870,4 +885,10 @@ jobs:
           gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/$CANDIDATE_SHA" \
             -f state=success \
             -f context=main-fast-forward-eligible \
-            -f description="exact candidate is eligible for a main fast-forward" >/dev/null
+            -f description="exact candidate is eligible for a main fast-forward" \
+            | jq -e --arg candidate "$CANDIDATE_SHA" '
+                type == "object" and
+                .state == "success" and
+                .context == "main-fast-forward-eligible" and
+                .sha == $candidate
+              ' >/dev/null
