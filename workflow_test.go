@@ -1504,6 +1504,116 @@ func TestReleaseWorkflowDurablyUploadsRollbackBeforeMutation(t *testing.T) {
 	}
 }
 
+func TestReleaseWorkflowHasBoundedTimeoutBudget(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/release-bff.yml")
+	if !strings.Contains(contents, "    timeout-minutes: 40") {
+		t.Fatal("production release must reserve bounded time for deploy, convergence, HTTP readback, rollback, and evidence")
+	}
+	for _, forbidden := range []string{"    timeout-minutes: 20", "while true", "until true"} {
+		if strings.Contains(contents, forbidden) {
+			t.Fatalf("production release must not use the unbounded or undersized timeout contract %q", forbidden)
+		}
+	}
+	readback := workflowSection(t, contents, "      - name: Verify deployed query config readback", "      - name: Persist build image digest")
+	for _, want := range []string{"READBACK_REVISION_DEADLINE=$((SECONDS + 300))", "READBACK_DEADLINE=$((SECONDS + 300))"} {
+		if !strings.Contains(readback, want) {
+			t.Errorf("post-deploy readback is missing bounded loop %q", want)
+		}
+	}
+}
+
+func TestReleaseWorkflowValidatesAndPersistsFrozenLiveRevisionBeforeMutation(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/release-bff.yml")
+	validation := workflowSection(t, contents, "      - name: Validate frozen rollback traffic before mutation", "      - name: Deploy existing immutable image to Cloud Run")
+	for _, want := range []string{
+		`SERVICE_JSON=$(gcloud run services describe "$SERVICE_NAME"`,
+		`.status.latestCreatedRevisionName == $ready_revision`,
+		`.status.latestReadyRevisionName == $ready_revision`,
+		`.status.traffic | type == "array" and length == 1`,
+		`.status.traffic[0].revisionName == $ready_revision`,
+		`.status.traffic[0].percent == 100`,
+		`(.status.traffic[0].latestRevision? // false) == false`,
+		`echo "FROZEN_CREATED_REVISION=$FROZEN_CREATED_REVISION" >> "$GITHUB_ENV"`,
+	} {
+		if !strings.Contains(validation, want) {
+			t.Errorf("pre-mutation frozen live validation is missing %q", want)
+		}
+	}
+	if strings.Index(validation, "gcloud run services describe") > strings.Index(validation, "FROZEN_CREATED_REVISION=$(jq -er") {
+		t.Fatal("frozen created revision must be extracted from the live service read")
+	}
+	if strings.Contains(validation, "gcloud run services update-traffic") || strings.Contains(validation, "gcloud run deploy") {
+		t.Fatal("frozen live validation must not mutate before completing")
+	}
+}
+
+func TestReleaseWorkflowRequiresExactChangedCreatedRevision(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/release-bff.yml")
+	readback := workflowSection(t, contents, "      - name: Verify deployed query config readback", "      - name: Persist build image digest")
+	deploy := strings.Index(contents, "gcloud run deploy")
+	validation := strings.Index(contents, "      - name: Validate frozen rollback traffic before mutation")
+	readbackStart := strings.Index(contents, "      - name: Verify deployed query config readback")
+	if validation < 0 || deploy < 0 || readbackStart < 0 || !(validation < deploy && deploy < readbackStart) {
+		t.Fatal("release mutation and post-deploy validation anchors are missing or misordered")
+	}
+	for _, want := range []string{
+		`FROZEN_CREATED_REVISION="${FROZEN_CREATED_REVISION:?}"`,
+		`CANDIDATE_REVISION=$(jq -er '.status.latestCreatedRevisionName | select(type == "string" and length > 0)'`,
+		`[[ "$CANDIDATE_REVISION" != "$FROZEN_CREATED_REVISION" ]]`,
+		`.status.latestCreatedRevisionName == $revision and .status.latestReadyRevisionName == $revision`,
+	} {
+		if !strings.Contains(readback, want) {
+			t.Errorf("post-deploy exact changed-created contract is missing %q", want)
+		}
+	}
+	if strings.Contains(readback, "CANDIDATE_REVISION=$(jq -er '.status.latestCreatedRevisionName // empty'") {
+		t.Fatal("post-deploy candidate revision must reject empty latestCreatedRevisionName")
+	}
+	if strings.Contains(readback, "!= \"$FROZEN_READY_REVISION\"") {
+		t.Fatal("post-deploy convergence must compare against the exact frozen latest-created revision")
+	}
+}
+
+func TestReleaseWorkflowReconcilesFrozenRestoreRegardlessOfUpdateTrafficStatus(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/release-bff.yml")
+	restore := workflowSection(t, contents, "      - name: Restore frozen production traffic after query-config readback failure", "      - name: Render normalized deployment evidence after strict read-back")
+	mutation := strings.Index(restore, `gcloud run services update-traffic "$SERVICE_NAME"`)
+	if mutation < 0 {
+		t.Fatal("restore step is missing the traffic mutation")
+	}
+	command := restore[mutation:]
+	status := strings.Index(command, "ROLLBACK_EXIT=$?")
+	readback := strings.Index(command, "ROLLBACK_READBACK_DEADLINE=$((SECONDS + 240))")
+	if status < 0 || readback < 0 || status > readback {
+		t.Fatal("restore must capture update-traffic status before bounded readback")
+	}
+	if !strings.Contains(restore[:mutation], "set +e") || !strings.Contains(restore[mutation:], "set -e") {
+		t.Fatal("restore must disable errexit only around update-traffic and restore it before readback")
+	}
+	if strings.LastIndex(restore[:mutation], "set +e") < 0 || strings.Index(restore[mutation:], "set -e") < 0 {
+		t.Fatal("restore must bracket update-traffic with errexit handling")
+	}
+	for _, want := range []string{
+		"while (( SECONDS < ROLLBACK_READBACK_DEADLINE )); do",
+		"gcloud run services describe \"$SERVICE_NAME\"",
+		"validate_restored_effective_traffic \"$SERVICE_JSON\"",
+		".status.traffic | type == \"array\" and length == 1",
+		"(.status.traffic[0] | keys | sort) == [\"percent\", \"revisionName\"]",
+		".status.traffic[0].revisionName == $ready_revision",
+		".status.traffic[0].percent == 100",
+		"echo \"frozen production traffic was not authoritative within timeout (update exit $ROLLBACK_EXIT)\"",
+		"echo \"restored effective routing: ${RESTORED_EFFECTIVE_REVISION}=${RESTORED_EFFECTIVE_PERCENT} (update exit $ROLLBACK_EXIT); preserving workflow failure\"",
+		"exit 1",
+	} {
+		if !strings.Contains(restore, want) {
+			t.Errorf("restore reconciliation is missing %q", want)
+		}
+	}
+	if strings.Index(command, "ROLLBACK_EXIT=$?") > strings.Index(command, "while (( SECONDS < ROLLBACK_READBACK_DEADLINE )); do") {
+		t.Fatal("readback must follow update-traffic for both zero and nonzero command statuses")
+	}
+}
+
 func TestCIWorkflowValidatesProductVersion(t *testing.T) {
 	contents := readWorkflow(t, ".github/workflows/ci.yml")
 	for _, want := range []string{
