@@ -39,10 +39,14 @@ def reject(message):
     raise ContractError(message)
 
 
+def _reject_non_finite_constant(constant):
+    reject(f"invalid JSON constant: {constant}")
+
+
 def read_json(path):
     try:
         raw = sys.stdin.read() if path == "-" else Path(path).read_text(encoding="utf-8")
-        value = json.loads(raw, object_pairs_hook=_object_pairs)
+        value = json.loads(raw, object_pairs_hook=_object_pairs, parse_constant=_reject_non_finite_constant)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
         reject(f"JSON input is unreadable: {error.__class__.__name__}")
     return value

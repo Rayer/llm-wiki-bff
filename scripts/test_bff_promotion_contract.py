@@ -141,6 +141,13 @@ class BFFPromotionContractTest(unittest.TestCase):
                 self.assertNotEqual(self.invoke_receipt(github_output=output).returncode, 0)
                 self.assertFalse(output.exists())
 
+    def test_receipt_rejects_non_finite_json_constants(self):
+        original = self.run_path.read_text()
+        for constant in ("NaN", "Infinity", "-Infinity"):
+            with self.subTest(constant=constant):
+                self.run_path.write_text(original.replace('"id": 123', f'"id": {constant}', 1))
+                self.assertNotEqual(self.invoke_receipt().returncode, 0)
+
     def test_traffic_accepts_pre_mutation_explicit_and_resolved_latest_forms(self):
         explicit = self.invoke_traffic({"traffic": [{"revisionName": REVISION, "percent": 100}]}, mode="provider-pre-mutation")
         latest = self.invoke_traffic({"status": {"traffic": [{"latestRevision": True, "revisionName": REVISION, "percent": 100}]}}, path="status.traffic", mode="provider-pre-mutation")
@@ -203,6 +210,21 @@ class BFFPromotionContractTest(unittest.TestCase):
         trailing = self.root / "trailing.json"
         trailing.write_text('{"traffic":[]} {}')
         self.assertNotEqual(self.invoke_traffic_from_path(trailing, "provider-pre-mutation").returncode, 0)
+
+    def test_traffic_rejects_non_finite_json_constants(self):
+        baseline = json.dumps({"traffic": [{"revisionName": REVISION, "percent": 100}]})
+        for constant in ("NaN", "Infinity", "-Infinity"):
+            with self.subTest(constant=constant):
+                source = self.root / "non-finite-traffic.json"
+                source.write_text(baseline.replace('"percent": 100', f'"percent": {constant}', 1))
+                result = subprocess.run([
+                    "python3", str(SCRIPT), "validate-traffic",
+                    "--traffic-file", str(source),
+                    "--traffic-path", "traffic",
+                    "--traffic-mode", "provider-pre-mutation",
+                    "--recognized-revision", REVISION,
+                ], capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0, result.stderr)
 
     def invoke_traffic_from_path(self, source, mode):
         return subprocess.run([
