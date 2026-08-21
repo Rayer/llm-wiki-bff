@@ -35,6 +35,7 @@ func TestLoadStageConfigPathTracksAuthorityAndRejectsMixedLegacyFactors(t *testi
 }
 
 func TestLoadDefaultsQueryExpansionModel(t *testing.T) {
+	t.Setenv("QUERY_STAGE_CONFIG_PATH", "")
 	t.Setenv("QUERY_EXPANSION_MODEL", "")
 	cfg, err := Load(t.TempDir())
 	if err != nil {
@@ -49,6 +50,7 @@ func TestLoadDefaultsQueryExpansionModel(t *testing.T) {
 }
 
 func TestLoadDefaultsAndEnvForParallelQueryExpansion(t *testing.T) {
+	t.Setenv("QUERY_STAGE_CONFIG_PATH", "")
 	for _, name := range []string{
 		"QUERY_EXPANSION_KEYWORDS_PER_ATTEMPT",
 		"QUERY_EXPANSION_ATTEMPTS",
@@ -79,6 +81,7 @@ func TestLoadDefaultsAndEnvForParallelQueryExpansion(t *testing.T) {
 }
 
 func TestLoadRejectsUnsafeParallelQueryExpansionConfig(t *testing.T) {
+	t.Setenv("QUERY_STAGE_CONFIG_PATH", "")
 	for _, test := range []struct {
 		name string
 		env  map[string]string
@@ -105,12 +108,14 @@ func TestLoadRejectsUnsafeParallelQueryExpansionConfig(t *testing.T) {
 }
 
 func TestLoadRejectsUnknownQueryConfiguration(t *testing.T) {
+	t.Setenv("QUERY_STAGE_CONFIG_PATH", "")
 	if _, err := Load(writeConfig(t, "dev_jwt = true\nquery_expansion_attempts_typo = 3\n")); err == nil {
 		t.Fatal("Load() accepted unknown query configuration")
 	}
 }
 
 func TestLoadQuerySelectionDefaultsAndTypedEnv(t *testing.T) {
+	t.Setenv("QUERY_STAGE_CONFIG_PATH", "")
 	t.Setenv("QUERY_SELECTION_LIMIT", "")
 	t.Setenv("QUERY_SELECTION_EXPLORATION_SLOTS", "")
 	t.Setenv("QUERY_SELECTION_EVIDENCE_THRESHOLD", "")
@@ -134,6 +139,7 @@ func TestLoadQuerySelectionDefaultsAndTypedEnv(t *testing.T) {
 }
 
 func TestLoadRejectsMalformedOrUnsafeQuerySelectionConfig(t *testing.T) {
+	t.Setenv("QUERY_STAGE_CONFIG_PATH", "")
 	tests := []struct {
 		name string
 		env  string
@@ -162,6 +168,7 @@ func TestLoadRejectsMalformedOrUnsafeQuerySelectionConfig(t *testing.T) {
 }
 
 func TestLoadRejectsNonBaselineQueryExpansionModel(t *testing.T) {
+	t.Setenv("QUERY_STAGE_CONFIG_PATH", "")
 	t.Setenv("QUERY_EXPANSION_MODEL", "deepseek-chat")
 	if _, err := Load(t.TempDir()); err == nil {
 		t.Fatal("Load() error = nil, want fixed baseline rejection")
@@ -169,6 +176,7 @@ func TestLoadRejectsNonBaselineQueryExpansionModel(t *testing.T) {
 }
 
 func TestLoadRejectsEnabledExpansionAndInvalidSynthesisReasoning(t *testing.T) {
+	t.Setenv("QUERY_STAGE_CONFIG_PATH", "")
 	t.Setenv("QUERY_EXPANSION_REASONING", "low")
 	if _, err := Load(t.TempDir()); err == nil {
 		t.Fatal("Load() accepted enabled expansion reasoning")
