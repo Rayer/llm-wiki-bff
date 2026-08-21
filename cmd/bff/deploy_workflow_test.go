@@ -149,9 +149,8 @@ func TestReleaseBFFWorkflowPromotesImmutableStageConfig(t *testing.T) {
 
 	readback := strings.Index(workflow, "- name: Verify deployed query config readback")
 	evidence := strings.Index(workflow, "- name: Render normalized deployment evidence after strict read-back")
-	tag := strings.Index(workflow, "- name: Tag promoted production image")
-	if readback <= deploy || evidence <= readback || tag <= evidence {
-		t.Fatal("production query config readback/evidence/tag order is unsafe")
+	if readback <= deploy || evidence <= readback {
+		t.Fatal("production query config readback/evidence order is unsafe")
 	}
 	readbackBlock := workflow[readback:evidence]
 	for _, required := range []string{

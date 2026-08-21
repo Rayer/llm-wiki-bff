@@ -394,7 +394,7 @@ def prepare_rollback(args):
 
 
 def validate_metadata(metadata, args):
-    if set(metadata) != {"schema_version", "project", "component", "environment", "action", "rollback_artifact_name", "source", "dev_provenance", "image", "originating_workflow"}:
+    if set(metadata) != {"schema_version", "project", "component", "environment", "action", "rollback_artifact_name", "build_ref", "production_source_ref", "source", "dev_provenance", "image", "originating_workflow"}:
         reject("metadata contains unsupported fields")
     if metadata.get("schema_version") != EXPECTED_SCHEMA or metadata.get("project") != args.project or metadata.get("component") != "lwc-bff" or metadata.get("environment") != "production" or metadata.get("action") != "promote":
         reject("metadata identity is invalid")
@@ -404,9 +404,11 @@ def validate_metadata(metadata, args):
     source = metadata.get("source")
     if not isinstance(source, dict) or set(source) != {"commit_sha", "ref"} or not isinstance(source.get("commit_sha"), str) or not SHA_RE.fullmatch(source["commit_sha"]) or source["ref"] != "refs/heads/main":
         reject("source identity is invalid")
+    if metadata.get("build_ref") != "develop" or metadata.get("production_source_ref") != "main":
+        reject("build and production source refs are invalid")
     provenance = metadata.get("dev_provenance")
     required_provenance = {"workflow", "event", "head_branch", "head_sha", "conclusion", "run_id", "run_url"}
-    if not isinstance(provenance, dict) or set(provenance) != required_provenance or provenance.get("workflow") != "deploy-bff.yml" or provenance.get("event") != "push" or provenance.get("head_branch") != "main" or provenance.get("head_sha") != source["commit_sha"] or provenance.get("conclusion") != "success" or not isinstance(provenance.get("run_id"), int) or provenance["run_id"] <= 0 or not isinstance(provenance.get("run_url"), str) or not provenance["run_url"].startswith("https://"):
+    if not isinstance(provenance, dict) or set(provenance) != required_provenance or provenance.get("workflow") != "deploy-bff.yml" or provenance.get("event") != "workflow_dispatch" or provenance.get("head_branch") != "develop" or provenance.get("head_sha") != source["commit_sha"] or provenance.get("conclusion") != "success" or not isinstance(provenance.get("run_id"), int) or provenance["run_id"] <= 0 or not isinstance(provenance.get("run_url"), str) or not provenance["run_url"].startswith("https://"):
         reject("dev deployment provenance does not match source")
     image = metadata.get("image")
     if not isinstance(image, dict) or set(image) != {"digest", "reference"} or not isinstance(image.get("digest"), str) or not DIGEST_RE.fullmatch(image["digest"]) or image.get("reference") != AR_REPO + "/llm-wiki-bff@" + image["digest"]:
@@ -517,7 +519,7 @@ def render_strict(args):
         "component": metadata["component"],
         "environment": metadata["environment"],
         "action": metadata["action"],
-        "source": metadata["source"],
+        "build_ref": metadata["build_ref"], "production_source_ref": metadata["production_source_ref"], "source": metadata["source"],
         "dev_provenance": metadata["dev_provenance"],
         "image": metadata["image"],
         "provider": {"current_handle": handle(args), "rollback_handle": rollback["provider_handle"], "rollback_artifact_name": artifact},
@@ -562,7 +564,7 @@ def partial(args):
     reason = marker["reason_code"] if marker else "deployment_outcome_unknown"
     checked = marker["checked_at"] if marker else None
     return {
-        "schema_version": EXPECTED_SCHEMA, "project": metadata["project"], "component": metadata["component"], "environment": metadata["environment"], "action": metadata["action"], "source": metadata["source"], "dev_provenance": metadata["dev_provenance"], "image": metadata["image"], "provider": {"current_handle": handle(args), "rollback_handle": rollback["provider_handle"], "rollback_artifact_name": artifact}, "observed_service": None, "config": {"result": result, "fingerprint": None, "allowlisted": None}, "provider_verification": {"result": result, "reason_code": reason if marker else None, "checked_at": checked, "checks": []}, "originating_workflow": metadata["originating_workflow"], "rollback": rollback, "health": {"result": result, "checked_at": checked, "identity": None}, "status": status, "reason": reason, "next_action": "independent provider read-back required before retry or rollback; do not tag the image",
+        "schema_version": EXPECTED_SCHEMA, "project": metadata["project"], "component": metadata["component"], "environment": metadata["environment"], "action": metadata["action"], "build_ref": metadata["build_ref"], "production_source_ref": metadata["production_source_ref"], "source": metadata["source"], "dev_provenance": metadata["dev_provenance"], "image": metadata["image"], "provider": {"current_handle": handle(args), "rollback_handle": rollback["provider_handle"], "rollback_artifact_name": artifact}, "observed_service": None, "config": {"result": result, "fingerprint": None, "allowlisted": None}, "provider_verification": {"result": result, "reason_code": reason if marker else None, "checked_at": checked, "checks": []}, "originating_workflow": metadata["originating_workflow"], "rollback": rollback, "health": {"result": result, "checked_at": checked, "identity": None}, "status": status, "reason": reason, "next_action": "independent provider read-back required before retry or rollback; do not tag the image",
     }
 
 

@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       commit_sha:
-        description: Full lowercase commit SHA for an image already built by the main dev workflow
+        description: Full lowercase commit SHA for an image built by canonical develop
         required: true
         type: string
       dev_run_id:
@@ -69,6 +69,7 @@ jobs:
         id: commit
         env:
           COMMIT_SHA: ${{ inputs.commit_sha }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           if [[ ! "$COMMIT_SHA" =~ ^[0-9a-f]{40}$ ]]; then
@@ -79,13 +80,14 @@ jobs:
             echo "commit_sha does not identify a commit"
             exit 1
           fi
-          if ! git merge-base --is-ancestor "$COMMIT_SHA" HEAD; then
-            echo "commit_sha is not an ancestor of main"
+          MAIN_SHA=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq .object.sha)
+          if [[ "$MAIN_SHA" != "$COMMIT_SHA" ]]; then
+            echo "current main must exactly equal commit_sha"
             exit 1
           fi
           echo "commit_sha=$COMMIT_SHA" >> "$GITHUB_OUTPUT"
 
-      - name: Locate exact successful main dev deployment
+      - name: Locate exact successful canonical develop DEV deployment
         id: dev_run
         env:
           GH_TOKEN: ${{ github.token }}
@@ -100,7 +102,7 @@ jobs:
           gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${DEV_RUN_ID}" > "$DEV_RUN_JSON"
           echo "run_id=$DEV_RUN_ID" >> "$GITHUB_OUTPUT"
 
-      - name: Download exact dev image digest
+      - name: Download exact DEV receipt and readiness evidence
         id: image
         env:
           GH_TOKEN: ${{ github.token }}
@@ -115,9 +117,14 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --name "bff-image-digest-$COMMIT_SHA" \
             --dir "$ARTIFACT_DIR"
+          gh run download "$DEV_RUN_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            --name "bff-production-promotion-ready-$COMMIT_SHA" \
+            --dir "$ARTIFACT_DIR"
           DIGEST_FILE="$ARTIFACT_DIR/bff-image-digest-$COMMIT_SHA.txt"
-          if [[ ! -f "$DIGEST_FILE" ]] || [[ $(find "$ARTIFACT_DIR" -type f | wc -l) -ne 1 ]]; then
-            echo "digest artifact contents are missing or unexpected"
+          READINESS_FILE="$ARTIFACT_DIR/bff-production-promotion-ready.json"
+          if [[ ! -f "$DIGEST_FILE" || ! -f "$READINESS_FILE" ]] || [[ $(find "$ARTIFACT_DIR" -type f | wc -l) -ne 2 ]]; then
+            echo "DEV receipt or readiness artifact contents are missing or unexpected"
             exit 1
           fi
           python3 scripts/validate_bff_promotion_contract.py validate-dev-receipt \
@@ -125,16 +132,25 @@ jobs:
             --run-json "$DEV_RUN_JSON" \
             --expected-sha "$COMMIT_SHA" \
             --expected-run-id "$DEV_RUN_ID" \
-            --expected-branch main \
-            --expected-event push \
+            --expected-branch develop \
+            --expected-event workflow_dispatch \
             --lifecycle production \
             --component lwc-bff \
             --repository "$GITHUB_REPOSITORY" \
             --ar-repo "$AR_REPO" \
             --query-config-revision "$QUERY_STAGE_CONFIG_REVISION" \
             --query-config-digest "$QUERY_STAGE_CONFIG_DIGEST" \
-            --output "$RUNNER_TEMP/bff-production-readiness.json" \
+            --output "$RUNNER_TEMP/validated-bff-dev-receipt.json" \
             --github-output "$GITHUB_OUTPUT"
+          python3 scripts/validate_bff_promotion_contract.py validate-production-readiness \
+            --readiness "$READINESS_FILE" \
+            --expected-sha "$COMMIT_SHA" \
+            --expected-run-id "$DEV_RUN_ID" \
+            --expected-branch develop \
+            --component lwc-bff \
+            --repository "$GITHUB_REPOSITORY" \
+            --ar-repo "$AR_REPO" \
+            --receipt "$DIGEST_FILE"
 
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
@@ -201,6 +217,7 @@ jobs:
           DEV_RUN_HEAD_BRANCH: ${{ steps.image.outputs.dev_run_head_branch }}
           DEV_RUN_HEAD_SHA: ${{ steps.image.outputs.dev_run_head_sha }}
           DEV_RUN_CONCLUSION: ${{ steps.image.outputs.dev_run_conclusion }}
+          BUILD_REF: ${{ steps.image.outputs.build_ref }}
           ROLLBACK_ARTIFACT_NAME: ${{ steps.rollback.outputs.rollback_artifact_name }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           GITHUB_WORKFLOW: ${{ github.workflow }}
@@ -216,6 +233,8 @@ jobs:
             --argjson schema_version 1 \
             --arg commit_sha "$COMMIT_SHA" \
             --arg source_ref "refs/heads/main" \
+            --arg build_ref "$BUILD_REF" \
+            --arg production_source_ref "main" \
             --arg dev_workflow "deploy-bff.yml" \
             --arg dev_event "$DEV_RUN_EVENT" \
             --arg dev_head_branch "$DEV_RUN_HEAD_BRANCH" \
@@ -230,7 +249,7 @@ jobs:
             --arg workflow "$GITHUB_WORKFLOW" \
             --argjson workflow_run_id "$GITHUB_RUN_ID" \
             --argjson workflow_run_attempt "$GITHUB_RUN_ATTEMPT" \
-            '{schema_version: $schema_version, project: $project, component: $component, environment: $environment, action: $action, rollback_artifact_name: $rollback_artifact_name, source: {commit_sha: $commit_sha, ref: $source_ref}, dev_provenance: {workflow: $dev_workflow, event: $dev_event, head_branch: $dev_head_branch, head_sha: $dev_head_sha, conclusion: $dev_conclusion, run_id: $dev_run_id, run_url: $dev_run_url}, image: {digest: $digest, reference: $image}, originating_workflow: {repository: $repository, workflow: $workflow, run_id: $workflow_run_id, run_attempt: $workflow_run_attempt}}' \
+            '{schema_version: $schema_version, project: $project, component: $component, environment: $environment, action: $action, rollback_artifact_name: $rollback_artifact_name, build_ref: $build_ref, production_source_ref: $production_source_ref, source: {commit_sha: $commit_sha, ref: $source_ref}, dev_provenance: {workflow: $dev_workflow, event: $dev_event, head_branch: $dev_head_branch, head_sha: $dev_head_sha, conclusion: $dev_conclusion, run_id: $dev_run_id, run_url: $dev_run_url}, image: {digest: $digest, reference: $image}, originating_workflow: {repository: $repository, workflow: $workflow, run_id: $workflow_run_id, run_attempt: $workflow_run_attempt}}' \
             > "$METADATA"
           python3 scripts/render_bff_deployment_evidence.py validate-metadata \
             --project "$PROJECT_ID" --region "$REGION" --service-name "$SERVICE_NAME" \
@@ -537,19 +556,3 @@ jobs:
           path: ${{ env.EVIDENCE }}
           if-no-files-found: error
           retention-days: 90
-
-      - name: Tag promoted production image
-        if: success()
-        env:
-          IMMUTABLE_IMAGE: ${{ steps.image.outputs.image }}
-          COMMIT_SHA: ${{ steps.commit.outputs.commit_sha }}
-        run: |
-          set -euo pipefail
-          if [[ ! -f "$EVIDENCE" ]] || [[ "$(jq -r '.status // empty' "$EVIDENCE")" != "HEALTHY" ]]; then
-            echo "verified evidence is unavailable; refusing to tag the promoted image"
-            exit 1
-          fi
-          gcloud artifacts docker tags add \
-            "$IMMUTABLE_IMAGE" \
-            "${AR_REPO}/llm-wiki-bff:prod-${COMMIT_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
-            --quiet

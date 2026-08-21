@@ -10,13 +10,14 @@ import sys
 import tempfile
 
 
-RECEIPT_SCHEMA_VERSION = 1
+RECEIPT_SCHEMA_VERSION = 2
 PROMOTION_SCHEMA_VERSION = 1
 IMAGE_NAME = "llm-wiki-bff"
 WORKFLOW_PATH = ".github/workflows/deploy-bff.yml"
 RECEIPT_KEYS = (
     "receipt_schema_version",
     "component",
+    "build_ref",
     "source_sha",
     "dev_run_id",
     "image_digest",
@@ -97,6 +98,8 @@ def validate_dev_receipt(args):
         reject("receipt schema version is unsupported")
     if values["component"] != args.component:
         reject("receipt component does not match")
+    if values["build_ref"] != args.expected_branch:
+        reject("receipt build ref does not match")
     if not SHA_RE.fullmatch(values["source_sha"]) or values["source_sha"] != args.expected_sha:
         reject("receipt source SHA does not match")
     if not RUN_ID_RE.fullmatch(values["dev_run_id"]) or int(values["dev_run_id"]) != args.expected_run_id:
@@ -141,6 +144,7 @@ def validate_dev_receipt(args):
         "schema_version": PROMOTION_SCHEMA_VERSION,
         "receipt_schema_version": RECEIPT_SCHEMA_VERSION,
         "component": args.component,
+        "build_ref": values["build_ref"],
         "result": "ready",
         "source_sha": args.expected_sha,
         "dev_run_id": args.expected_run_id,
@@ -156,6 +160,7 @@ def validate_dev_receipt(args):
                 ("dev_run_id", str(args.expected_run_id)),
                 ("dev_run_url", run_url),
                 ("dev_run_event", args.expected_event),
+                ("build_ref", values["build_ref"]),
                 ("dev_run_head_branch", args.expected_branch),
                 ("dev_run_head_sha", args.expected_sha),
                 ("dev_run_conclusion", "success"),
@@ -165,6 +170,24 @@ def validate_dev_receipt(args):
                 ("query_config_digest", values["query_config_digest"]),
             ):
                 output.write(f"{key}={value}\n")
+
+
+def validate_production_readiness(args):
+    readiness = read_json(args.readiness)
+    expected = {
+        "schema_version": PROMOTION_SCHEMA_VERSION,
+        "receipt_schema_version": RECEIPT_SCHEMA_VERSION,
+        "component": args.component,
+        "result": "ready",
+        "build_ref": args.expected_branch,
+        "source_sha": args.expected_sha,
+        "dev_run_id": args.expected_run_id,
+        "dev_run_url": f"https://github.com/{args.repository}/actions/runs/{args.expected_run_id}",
+        "image_digest": read_receipt(args.receipt)["image_digest"],
+        "image_reference": f"{args.ar_repo}/{IMAGE_NAME}@{read_receipt(args.receipt)['image_digest']}",
+    }
+    if readiness != expected:
+        reject("normalized readiness receipt does not match the validated DEV receipt")
 
 
 def path_value(document, path):
@@ -285,6 +308,15 @@ def parser():
     receipt.add_argument("--query-config-digest", required=True)
     receipt.add_argument("--output", required=True)
     receipt.add_argument("--github-output")
+    readiness = subparsers.add_parser("validate-production-readiness")
+    readiness.add_argument("--readiness", required=True)
+    readiness.add_argument("--expected-sha", required=True)
+    readiness.add_argument("--expected-run-id", required=True, type=int)
+    readiness.add_argument("--expected-branch", required=True)
+    readiness.add_argument("--component", required=True)
+    readiness.add_argument("--repository", required=True)
+    readiness.add_argument("--ar-repo", required=True)
+    readiness.add_argument("--receipt", required=True)
     traffic = subparsers.add_parser("validate-traffic")
     traffic.add_argument("--traffic-file", required=True)
     traffic.add_argument("--traffic-path", required=True)
@@ -302,6 +334,10 @@ def main(argv=None):
             if args.expected_run_id <= 0:
                 reject("expected DEV run ID is invalid")
             validate_dev_receipt(args)
+        elif args.mode == "validate-production-readiness":
+            if args.expected_run_id <= 0 or not SHA_RE.fullmatch(args.expected_sha):
+                reject("expected readiness identity is invalid")
+            validate_production_readiness(args)
         else:
             if args.traffic_mode == "provider-dev-convergence" and not args.compare_path:
                 reject("DEV convergence validation requires a comparison path")

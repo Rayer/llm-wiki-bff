@@ -108,7 +108,7 @@ class BFFDeploymentEvidenceTest(unittest.TestCase):
         return subprocess.run(["python3", str(SCRIPT), mode, "--project", "llm-wiki-cloud", "--region", "asia-east1", "--service-name", SERVICE, "--pipeline-job-name", JOB, "--ar-repo", AR_REPO, *extra], env=self.env, capture_output=True, text=True)
 
     def metadata(self):
-        return {"schema_version": 1, "project": "llm-wiki-cloud", "component": "lwc-bff", "environment": "production", "action": "promote", "rollback_artifact_name": ARTIFACT, "source": {"commit_sha": "c" * 40, "ref": "refs/heads/main"}, "dev_provenance": {"workflow": "deploy-bff.yml", "event": "push", "head_branch": "main", "head_sha": "c" * 40, "conclusion": "success", "run_id": 123, "run_url": "https://github.com/Rayer/llm-wiki-bff/actions/runs/123"}, "image": {"digest": DIGEST, "reference": IMAGE}, "originating_workflow": {"repository": "Rayer/llm-wiki-bff", "workflow": "Promote BFF to Cloud Run (production)", "run_id": 456, "run_attempt": 2}}
+        return {"schema_version": 1, "project": "llm-wiki-cloud", "component": "lwc-bff", "environment": "production", "action": "promote", "rollback_artifact_name": ARTIFACT, "build_ref": "develop", "production_source_ref": "main", "source": {"commit_sha": "c" * 40, "ref": "refs/heads/main"}, "dev_provenance": {"workflow": "deploy-bff.yml", "event": "workflow_dispatch", "head_branch": "develop", "head_sha": "c" * 40, "conclusion": "success", "run_id": 123, "run_url": "https://github.com/Rayer/llm-wiki-bff/actions/runs/123"}, "image": {"digest": DIGEST, "reference": IMAGE}, "originating_workflow": {"repository": "Rayer/llm-wiki-bff", "workflow": "Promote BFF to Cloud Run (production)", "run_id": 456, "run_attempt": 2}}
 
     def prepare(self):
         output = self.root / "rollback.json"
@@ -154,6 +154,8 @@ class BFFDeploymentEvidenceTest(unittest.TestCase):
         self.assertEqual(document["provider"]["rollback_artifact_name"], ARTIFACT)
         self.assertNotEqual(document["provider"]["rollback_artifact_name"], EVIDENCE_ARTIFACT)
         self.assertEqual(document["source"]["commit_sha"], "c" * 40)
+        self.assertEqual(document["build_ref"], "develop")
+        self.assertEqual(document["production_source_ref"], "main")
         self.assertEqual(document["image"], {"digest": DIGEST, "reference": IMAGE})
         self.assertEqual(document["observed_service"]["ready_revision"], "llm-wiki-bff-00002-new")
         self.assertEqual(document["observed_service"]["image_reference"], IMAGE)
@@ -303,6 +305,8 @@ class BFFDeploymentEvidenceTest(unittest.TestCase):
         self.assertEqual(prepared.returncode, 0, prepared.stderr)
         cases = {
             "malformed SHA": lambda m: m["source"].update(commit_sha="bad"),
+            "build ref mismatch": lambda m: m.update(build_ref="main"),
+            "production source ref mismatch": lambda m: m.update(production_source_ref="develop"),
             "duplicate digest": lambda m: m["image"].update(digest="sha256:" + "a" * 64),
             "provenance mismatch": lambda m: m["dev_provenance"].update(head_sha="d" * 40),
             "origin repository mismatch": lambda m: m["originating_workflow"].update(repository="fork/llm-wiki-bff"),

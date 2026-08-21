@@ -17,8 +17,9 @@ REVISION = "llm-wiki-bff-00001-old"
 
 def receipt():
     return (
-        "receipt_schema_version=1\n"
+        "receipt_schema_version=2\n"
         "component=lwc-bff\n"
+        "build_ref=develop\n"
         f"source_sha={SHA}\n"
         f"dev_run_id={RUN_ID}\n"
         f"image_digest={DIGEST}\n"
@@ -93,8 +94,9 @@ class BFFPromotionContractTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(self.output.read_text()), {
             "schema_version": 1,
-            "receipt_schema_version": 1,
+            "receipt_schema_version": 2,
             "component": "lwc-bff",
+            "build_ref": "develop",
             "result": "ready",
             "source_sha": SHA,
             "dev_run_id": RUN_ID,
@@ -120,6 +122,21 @@ class BFFPromotionContractTest(unittest.TestCase):
         self.assertIn("dev_run_url=https://github.com/Rayer/llm-wiki-bff/actions/runs/123\n", github_output.read_text())
         self.assertEqual(self.output.read_text().count("\n"), 1)
 
+    def test_production_readiness_must_be_the_exact_normalized_develop_receipt(self):
+        self.assertEqual(self.invoke_receipt().returncode, 0)
+        command = [
+            "python3", str(SCRIPT), "validate-production-readiness",
+            "--readiness", str(self.output), "--expected-sha", SHA,
+            "--expected-run-id", str(RUN_ID), "--expected-branch", "develop",
+            "--component", "lwc-bff", "--repository", "Rayer/llm-wiki-bff",
+            "--ar-repo", AR_REPO, "--receipt", str(self.receipt_path),
+        ]
+        self.assertEqual(subprocess.run(command, capture_output=True, text=True).returncode, 0)
+        readiness = json.loads(self.output.read_text())
+        readiness["build_ref"] = "main"
+        self.output.write_text(json.dumps(readiness))
+        self.assertNotEqual(subprocess.run(command, capture_output=True, text=True).returncode, 0)
+
     def test_receipt_rejects_unknown_missing_trailing_duplicate_ambiguous_and_identity_fields(self):
         cases = {
             "unknown": receipt().replace("component=lwc-bff\n", "unknown=value\n"),
@@ -134,7 +151,7 @@ class BFFPromotionContractTest(unittest.TestCase):
             "wrong component": receipt().replace("component=lwc-bff", "component=worker"),
             "tag image": receipt().replace(f"image_reference={AR_REPO}/llm-wiki-bff@{DIGEST}", "repo/lwc-bff:latest"),
             "invalid digest": receipt().replace(DIGEST, "sha256:bad"),
-            "schema": receipt().replace("receipt_schema_version=1", "receipt_schema_version=2"),
+            "schema": receipt().replace("receipt_schema_version=2", "receipt_schema_version=1"),
         }
         for name, value in cases.items():
             with self.subTest(name=name):
