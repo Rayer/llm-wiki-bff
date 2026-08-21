@@ -466,11 +466,12 @@ func TestMainFastForwardEligibilityFollowsReadiness(t *testing.T) {
 	want := normalizeWorkflowContract(`
 main-fast-forward-eligible:
   name: main-fast-forward-eligible
-  if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/develop' && needs.production-promotion-ready.result == 'success'
+  if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/develop' && needs.test-and-deploy.result == 'success' && needs.production-promotion-ready.result == 'success'
   needs: [test-and-deploy, production-promotion-ready]
   runs-on: ubuntu-latest
   permissions:
     contents: read
+    statuses: write
   steps:
     - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       with:
@@ -486,6 +487,31 @@ main-fast-forward-eligible:
 	        test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
 	        test "$(git rev-parse origin/develop)" = "$CANDIDATE_SHA"
 	        git merge-base --is-ancestor origin/main "$CANDIDATE_SHA"
+    - name: Publish main fast-forward eligibility status
+      if: success()
+      env:
+        CANDIDATE_SHA: ${{ needs.test-and-deploy.outputs.candidate_sha }}
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        if [[ ! "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+          echo "candidate SHA must be a 40-character lowercase commit SHA"
+          exit 1
+        fi
+        git fetch --no-tags origin main develop
+        if [[ "$(git rev-parse HEAD)" != "$CANDIDATE_SHA" ]]; then
+          echo "checked-out HEAD changed before status publication"
+          exit 1
+        fi
+        if [[ "$(git rev-parse origin/develop)" != "$CANDIDATE_SHA" ]]; then
+          echo "develop advanced before status publication"
+          exit 1
+        fi
+        git merge-base --is-ancestor origin/main "$CANDIDATE_SHA"
+        gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/$CANDIDATE_SHA" \
+          -f state=success \
+          -f context=main-fast-forward-eligible \
+          -f description="exact candidate is eligible for a main fast-forward" >/dev/null
 `)
 	if got := normalizeWorkflowContract(job); got != want {
 		t.Errorf("main fast-forward gate contract changed\n got:\n%s\nwant:\n%s", got, want)
@@ -1832,6 +1858,44 @@ func TestPromotionReadyUsesWorkflowQueryConfigAuthority(t *testing.T) {
 		if strings.Contains(job, forbidden) {
 			t.Fatalf("readiness must not use undefined query config alias %s", forbidden)
 		}
+	}
+}
+
+func TestMainFastForwardEligibilityPublishesExactCommitStatus(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
+	job := workflowSection(t, contents, "  main-fast-forward-eligible:", "\n\n")
+
+	for _, want := range []string{
+		"needs: [test-and-deploy, production-promotion-ready]",
+		"needs.test-and-deploy.result == 'success'",
+		"needs.production-promotion-ready.result == 'success'",
+		"statuses: write",
+		"GH_TOKEN: ${{ github.token }}",
+		"CANDIDATE_SHA: ${{ needs.test-and-deploy.outputs.candidate_sha }}",
+		"git rev-parse HEAD",
+		"git rev-parse origin/develop",
+		"git merge-base --is-ancestor origin/main",
+		"gh api --method POST",
+		"statuses/$CANDIDATE_SHA",
+		"-f state=success",
+		"-f context=main-fast-forward-eligible",
+	} {
+		if !strings.Contains(job, want) {
+			t.Errorf("main eligibility job is missing exact status contract %q", want)
+		}
+	}
+
+	verify := strings.Index(job, "- name: Verify main fast-forward eligibility")
+	publish := strings.Index(job, "- name: Publish main fast-forward eligibility status")
+	post := strings.Index(job, "gh api --method POST")
+	if verify < 0 || publish < 0 || post < 0 || !(verify < publish && publish < post) {
+		t.Fatal("status publication must follow the existing eligibility gates")
+	}
+	if !strings.Contains(job[publish:], "if: success()") {
+		t.Fatal("status publication must be success-only")
+	}
+	if strings.Contains(job[post+len("gh api --method POST"):], "run:") {
+		t.Fatal("status publication must be the final action in its step")
 	}
 }
 
