@@ -646,7 +646,7 @@ jobs:
           IMMUTABLE_IMAGE: ${{ env.AR_REPO }}/llm-wiki-bff@${{ steps.image_digest.outputs.digest }}
         run: |
           set -euo pipefail
-          DEV_IMAGE_TAG="${{ env.AR_REPO }}/llm-wiki-bff:dev-${{ steps.identity.outputs.git_sha }}"
+          DEV_IMAGE_TAG="${{ env.AR_REPO }}/llm-wiki-bff:dev-${{ steps.identity.outputs.git_sha }}-${{ github.run_id }}-${{ github.run_attempt }}"
           gcloud artifacts docker tags add \
             "$IMMUTABLE_IMAGE" \
             "$DEV_IMAGE_TAG" \
