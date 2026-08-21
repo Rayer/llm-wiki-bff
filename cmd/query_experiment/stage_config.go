@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -106,11 +105,10 @@ func writeStageConfig(path string, config queryconfig.Config) error {
 	if err := queryconfig.ValidateSealed(config); err != nil {
 		return err
 	}
-	data, err := json.Marshal(config)
+	data, err := queryconfig.CanonicalJSON(config)
 	if err != nil {
 		return err
 	}
-	data = append(data, '\n')
 	clean := filepath.Clean(path)
 	temp, err := os.CreateTemp(filepath.Dir(clean), "."+filepath.Base(clean)+".tmp-")
 	if err != nil {

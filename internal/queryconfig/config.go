@@ -16,6 +16,7 @@ import (
 	"strings"
 
 	"github.com/rayer/llm-wiki-bff/internal/queryquality"
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -159,15 +160,16 @@ func LoadFile(path string) (Config, error) {
 	if strings.TrimSpace(path) == "" {
 		return Config{}, errors.New("query config file path is empty")
 	}
-	info, err := os.Lstat(path)
+	// O_NONBLOCK keeps special files such as FIFOs from blocking before fstat.
+	// O_NOFOLLOW closes the pathname symlink race; all subsequent checks and reads
+	// use this same descriptor.
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
 	if err != nil {
 		return Config{}, errors.New("query config file is unavailable")
 	}
-	if !info.Mode().IsRegular() {
-		return Config{}, errors.New("query config file must be a regular file")
-	}
-	file, err := os.Open(path)
-	if err != nil {
+	file := os.NewFile(uintptr(fd), "")
+	if file == nil {
+		_ = unix.Close(fd)
 		return Config{}, errors.New("query config file is unavailable")
 	}
 	defer file.Close()
@@ -175,12 +177,24 @@ func LoadFile(path string) (Config, error) {
 	if err != nil || !openedInfo.Mode().IsRegular() {
 		return Config{}, errors.New("query config file must be a regular file")
 	}
+	if openedInfo.Mode().Perm()&0o022 != 0 {
+		return Config{}, errors.New("query config file must not be group or other writable")
+	}
+	if openedInfo.Size() <= 0 {
+		return Config{}, errors.New("query config file must not be empty")
+	}
+	if openedInfo.Size() > MaxFileBytes {
+		return Config{}, errors.New("query config file is too large")
+	}
 	data, err := io.ReadAll(io.LimitReader(file, MaxFileBytes+1))
 	if err != nil {
 		return Config{}, errors.New("query config file cannot be read")
 	}
 	if int64(len(data)) > MaxFileBytes {
 		return Config{}, errors.New("query config file is too large")
+	}
+	if len(data) == 0 {
+		return Config{}, errors.New("query config file must not be empty")
 	}
 	config, err := DecodeStrict(data)
 	if err != nil {

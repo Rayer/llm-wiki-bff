@@ -98,9 +98,31 @@ func TestQueryConfigReadbackIsPublicAndLegacyIsUnavailable(t *testing.T) {
 	c, _ := gin.CreateTestContext(recorder)
 	c.Request = httptest.NewRequest(http.MethodGet, "/api/v1/query/config", nil)
 	h.QueryConfig(c)
-	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `"config_revision":"rev"`) || strings.Contains(recorder.Body.String(), "project") || strings.Contains(recorder.Body.String(), "generation") {
+	if recorder.Code != http.StatusOK || recorder.Header().Get("Cache-Control") != "no-store" || !strings.Contains(recorder.Body.String(), `"config_revision":"rev"`) {
 		t.Fatalf("readback status/body=%d/%s", recorder.Code, recorder.Body.String())
 	}
+	var response map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	forbidden := map[string]bool{"project_id": true, "generation_id": true, "concepts_digest": true, "binding_count": true, "distinct_service_composition_count": true, "path": true, "system_template": true, "user_template": true, "api_key": true, "credential": true}
+	var visit func(any)
+	visit = func(value any) {
+		switch value := value.(type) {
+		case map[string]any:
+			for key, child := range value {
+				if forbidden[key] {
+					t.Fatalf("public query config contains forbidden key %q", key)
+				}
+				visit(child)
+			}
+		case []any:
+			for _, child := range value {
+				visit(child)
+			}
+		}
+	}
+	visit(response)
 	h.queryExecutor = query.NewService(nil, nil, nil)
 	recorder = httptest.NewRecorder()
 	c, _ = gin.CreateTestContext(recorder)

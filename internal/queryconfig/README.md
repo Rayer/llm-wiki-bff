@@ -19,3 +19,10 @@ order is preserved because profile digests are order-sensitive.
 `DecodeStrict` rejects unknown fields, duplicate fields, trailing JSON, and
 unsupported identities before validation. `Seal` returns the normalized sealed
 copy; `ValidateSealed` verifies its stored digest and all referenced built-ins.
+
+`LoadFile` opens without following the final path symlink, validates metadata,
+and reads through that same descriptor. It accepts owner-writable artifacts
+because startup is load-once and the sealed digest is validated, while
+rejecting group- or other-writable, non-regular, empty, and oversized files.
+The runtime image copies reviewed query artifacts with mode `0444`; local
+repository artifacts may remain owner-owned `0644`.

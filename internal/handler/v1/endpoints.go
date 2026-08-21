@@ -486,7 +486,7 @@ func (h *Handler) QueryConfig(c *gin.Context) {
 	build := buildinfo.Current()
 	c.Header("Cache-Control", "no-store")
 	c.JSON(http.StatusOK, handler.QueryConfigResponse{
-		QueryConfig: readback,
+		QueryConfig: handler.PublicQueryConfigFromReadback(readback),
 		Build:       handler.QueryConfigBuildInfo{Commit: build.Commit, Service: build.Service, Revision: build.Revision},
 	})
 }

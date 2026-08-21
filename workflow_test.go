@@ -700,18 +700,23 @@ func TestBFFDevWorkflowAllowsBothMigrationOrigins(t *testing.T) {
 	}
 }
 
-func TestBFFDevWorkflowSetsExpansionModelWithoutChangingSecretBinding(t *testing.T) {
+func TestBFFDevWorkflowUsesImmutableQueryConfigWithoutChangingSecretBinding(t *testing.T) {
 	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
-	if !strings.Contains(contents, "QUERY_EXPANSION_MODEL: deepseek-v4-flash") {
-		t.Fatal("BFF DEV workflow must set the platform-owned expansion model")
-	}
-	for _, want := range []string{"QUERY_EXPANSION_REASONING: none", "ANSWER_SYNTHESIS_MODEL: deepseek-v4-pro", "ANSWER_SYNTHESIS_REASONING: none", "@QUERY_EXPANSION_REASONING=${{ env.QUERY_EXPANSION_REASONING }}", "@ANSWER_SYNTHESIS_MODEL=${{ env.ANSWER_SYNTHESIS_MODEL }}", "@ANSWER_SYNTHESIS_REASONING=${{ env.ANSWER_SYNTHESIS_REASONING }}"} {
+	for _, want := range []string{
+		"QUERY_STAGE_CONFIG_PATH: /app/configs/query/dev/query-dev-2026-08-21.1.json",
+		"QUERY_STAGE_CONFIG_REVISION: query-dev-2026-08-21.1",
+		"QUERY_STAGE_CONFIG_DIGEST: sha256:a35955fe4a451c740e6252cae8087f114fbac6b4162245d3de7818c1ad37a5c6",
+		"QUERY_STAGE_CONFIG_PATH=${{ env.QUERY_STAGE_CONFIG_PATH }}",
+		"--remove-env-vars \"QUERY_EXPANSION_MODEL,QUERY_EXPANSION_REASONING,ANSWER_SYNTHESIS_MODEL,ANSWER_SYNTHESIS_REASONING,QUERY_SELECTION_LIMIT,QUERY_SELECTION_EXPLORATION_SLOTS,QUERY_SELECTION_EVIDENCE_THRESHOLD,QUERY_EXPANSION_KEYWORDS_PER_ATTEMPT,QUERY_EXPANSION_ATTEMPTS,QUERY_MATCHING_RARE_KEYWORD_MAX_DOCUMENT_FREQUENCY\"",
+	} {
 		if !strings.Contains(contents, want) {
 			t.Fatalf("BFF DEV workflow missing %q", want)
 		}
 	}
-	if !strings.Contains(contents, "@QUERY_EXPANSION_MODEL=${{ env.QUERY_EXPANSION_MODEL }}") {
-		t.Fatal("BFF DEV deploy must pass the non-secret expansion model config")
+	for _, legacy := range []string{"QUERY_EXPANSION_MODEL", "QUERY_EXPANSION_REASONING", "ANSWER_SYNTHESIS_MODEL", "ANSWER_SYNTHESIS_REASONING", "QUERY_SELECTION_LIMIT", "QUERY_SELECTION_EXPLORATION_SLOTS", "QUERY_SELECTION_EVIDENCE_THRESHOLD", "QUERY_EXPANSION_KEYWORDS_PER_ATTEMPT", "QUERY_EXPANSION_ATTEMPTS", "QUERY_MATCHING_RARE_KEYWORD_MAX_DOCUMENT_FREQUENCY"} {
+		if strings.Count(contents, legacy) != 1 {
+			t.Fatalf("BFF DEV workflow must remove legacy query env %q exactly once", legacy)
+		}
 	}
 	if !strings.Contains(contents, "DEEPSEEK_API_KEY=deepseek-apikey:latest") {
 		t.Fatal("BFF DEV deploy must preserve the existing DeepSeek secret reference")
@@ -1195,18 +1200,9 @@ func TestBFFDevWorkflowUsesCanonicalRevisionTransaction(t *testing.T) {
 		`REMOTE_SHA=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${GITHUB_REF_NAME}" --jq .object.sha)`,
 		`[[ ! "$REMOTE_SHA" =~ ^[0-9a-f]{40}$ ]]`,
 		"Cloud Run traffic changed before cutover; refusing to mutate traffic.",
-		"QUERY_SELECTION_LIMIT: 10",
-		"QUERY_SELECTION_EXPLORATION_SLOTS: 1",
-		"QUERY_SELECTION_EVIDENCE_THRESHOLD: 2",
-		"QUERY_EXPANSION_KEYWORDS_PER_ATTEMPT: 24",
-		"QUERY_EXPANSION_ATTEMPTS: 3",
-		"QUERY_MATCHING_RARE_KEYWORD_MAX_DOCUMENT_FREQUENCY: 1",
-		"QUERY_SELECTION_LIMIT=${{ env.QUERY_SELECTION_LIMIT }}",
-		"QUERY_SELECTION_EXPLORATION_SLOTS=${{ env.QUERY_SELECTION_EXPLORATION_SLOTS }}",
-		"QUERY_SELECTION_EVIDENCE_THRESHOLD=${{ env.QUERY_SELECTION_EVIDENCE_THRESHOLD }}",
-		"QUERY_EXPANSION_KEYWORDS_PER_ATTEMPT=${{ env.QUERY_EXPANSION_KEYWORDS_PER_ATTEMPT }}",
-		"QUERY_EXPANSION_ATTEMPTS=${{ env.QUERY_EXPANSION_ATTEMPTS }}",
-		"QUERY_MATCHING_RARE_KEYWORD_MAX_DOCUMENT_FREQUENCY=${{ env.QUERY_MATCHING_RARE_KEYWORD_MAX_DOCUMENT_FREQUENCY }}",
+		"--remove-env-vars",
+		"--update-env-vars",
+		"QUERY_STAGE_CONFIG_PATH=${{ env.QUERY_STAGE_CONFIG_PATH }}",
 	} {
 		if !strings.Contains(contents, want) {
 			t.Errorf("BFF workflow missing contract %q", want)

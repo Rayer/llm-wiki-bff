@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/rayer/llm-wiki-bff/internal/queryconfig"
 	"github.com/rayer/llm-wiki-bff/internal/queryquality"
+	"golang.org/x/sys/unix"
 )
 
 func validConfig(t *testing.T) queryconfig.Config {
@@ -156,6 +158,104 @@ func TestLoadFileRejectsUnsafeFilesAndBadDocuments(t *testing.T) {
 	}
 	if _, err := queryconfig.LoadFile(symlink); err == nil {
 		t.Fatal("accepted symlink")
+	}
+}
+
+func TestLoadFileModeBoundaryAndSpecialFileRejection(t *testing.T) {
+	dir := t.TempDir()
+	data := mustJSON(mustSeal(t))
+	path := filepath.Join(dir, "config.json")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, mode := range []os.FileMode{0o644, 0o600, 0o400} {
+		t.Run(fmt.Sprintf("mode-%04o", mode), func(t *testing.T) {
+			if err := os.Chmod(path, mode); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := queryconfig.LoadFile(path); err != nil {
+				t.Fatalf("LoadFile(%04o) error = %v", mode, err)
+			}
+		})
+	}
+	for _, mode := range []os.FileMode{0o666, 0o602} {
+		t.Run(fmt.Sprintf("writable-%04o", mode), func(t *testing.T) {
+			if err := os.Chmod(path, mode); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := queryconfig.LoadFile(path); err == nil {
+				t.Fatalf("LoadFile(%04o) accepted writable file", mode)
+			}
+		})
+	}
+
+	empty := filepath.Join(dir, "empty.json")
+	if err := os.WriteFile(empty, nil, 0o444); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := queryconfig.LoadFile(empty); err == nil {
+		t.Fatal("LoadFile accepted empty file")
+	}
+
+	fifo := filepath.Join(dir, "config.fifo")
+	if err := unix.Mkfifo(fifo, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := queryconfig.LoadFile(fifo); err == nil {
+		t.Fatal("LoadFile accepted FIFO")
+	}
+}
+
+func TestLoadFileSymlinkSwapNeverLoadsSymlinkTarget(t *testing.T) {
+	dir := t.TempDir()
+	safe, err := json.Marshal(mustSeal(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	attackerConfig := validConfig(t)
+	attackerConfig.ConfigRevision = "attacker-revision"
+	attacker, err := queryconfig.Seal(attackerConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attackerData, err := json.Marshal(attacker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	safePath := filepath.Join(dir, "safe.json")
+	attackerPath := filepath.Join(dir, "attacker.json")
+	candidatePath := filepath.Join(dir, "candidate.json")
+	tempPath := filepath.Join(dir, "swap.tmp")
+	for path, data := range map[string][]byte{safePath: safe, attackerPath: attackerData, candidatePath: safe} {
+		if err := os.WriteFile(path, data, 0o444); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			_ = os.Link(safePath, tempPath)
+			_ = os.Rename(tempPath, candidatePath)
+			_ = os.Symlink(attackerPath, tempPath)
+			_ = os.Rename(tempPath, candidatePath)
+		}
+	}()
+	defer func() {
+		close(stop)
+		<-done
+	}()
+	for i := 0; i < 1000; i++ {
+		loaded, err := queryconfig.LoadFile(candidatePath)
+		if err == nil && loaded.ConfigRevision == "attacker-revision" {
+			t.Fatal("LoadFile followed a symlink during pathname swap")
+		}
 	}
 }
 
