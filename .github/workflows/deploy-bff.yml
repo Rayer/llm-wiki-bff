@@ -825,70 +825,87 @@ jobs:
 
   main-fast-forward-eligible:
     name: main-fast-forward-eligible
-    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/develop' && needs.test-and-deploy.result == 'success' && needs.production-promotion-ready.result == 'success'
+    if: ${{ always() && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/develop' }}
     needs: [test-and-deploy, production-promotion-ready]
     runs-on: ubuntu-latest
     permissions:
       contents: read
       statuses: write
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          fetch-depth: 0
-          persist-credentials: false
       - name: Publish pending main fast-forward eligibility status
-        if: success()
         env:
-          CANDIDATE_SHA: ${{ needs.test-and-deploy.outputs.candidate_sha }}
+          EVENT_SHA: ${{ github.sha }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          if [[ ! "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "candidate SHA must be a 40-character lowercase commit SHA"
+          if [[ ! "$EVENT_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "event SHA must be a 40-character lowercase commit SHA"
             exit 1
           fi
-          if [[ "$(git rev-parse HEAD)" != "$CANDIDATE_SHA" ]]; then
-            echo "checked-out HEAD does not match candidate"
-            exit 1
-          fi
-          gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/$CANDIDATE_SHA" \
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/$EVENT_SHA" \
             -f state=pending \
             -f context=main-fast-forward-eligible \
-            -f description="validating exact candidate for a main fast-forward" \
-            | jq -e --arg candidate "$CANDIDATE_SHA" '
-                type == "object" and
-                .state == "pending" and
-                .context == "main-fast-forward-eligible" and
-                .sha == $candidate
-              ' >/dev/null
-      - name: Revalidate and publish main fast-forward eligibility status
-        if: success()
+            -f description="validating exact candidate for a main fast-forward"
+
+      - name: Checkout exact event SHA
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify exact candidate and main fast-forward eligibility
+        if: ${{ needs.test-and-deploy.result == 'success' && needs.production-promotion-ready.result == 'success' }}
         env:
+          EVENT_SHA: ${{ github.sha }}
           CANDIDATE_SHA: ${{ needs.test-and-deploy.outputs.candidate_sha }}
-          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          if [[ ! "$EVENT_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "event SHA must be a 40-character lowercase commit SHA"
+            exit 1
+          fi
           if [[ ! "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
             echo "candidate SHA must be a 40-character lowercase commit SHA"
+            exit 1
+          fi
+          if [[ "$CANDIDATE_SHA" != "$EVENT_SHA" ]]; then
+            echo "candidate SHA does not match the event SHA"
+            exit 1
+          fi
+          if [[ "$(git rev-parse HEAD)" != "$EVENT_SHA" ]]; then
+            echo "checked-out HEAD does not match the event SHA"
             exit 1
           fi
           git fetch --no-tags origin main develop
-          if [[ "$(git rev-parse HEAD)" != "$CANDIDATE_SHA" ]]; then
-            echo "checked-out HEAD changed before status publication"
+          if [[ "$(git rev-parse origin/develop)" != "$EVENT_SHA" ]]; then
+            echo "develop advanced before fresh eligibility verification"
             exit 1
           fi
-          if [[ "$(git rev-parse origin/develop)" != "$CANDIDATE_SHA" ]]; then
-            echo "develop advanced before status publication"
+          git merge-base --is-ancestor origin/main "$EVENT_SHA"
+
+      - name: Publish successful main fast-forward eligibility status
+        if: ${{ success() && needs.test-and-deploy.result == 'success' && needs.production-promotion-ready.result == 'success' }}
+        env:
+          EVENT_SHA: ${{ github.sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$EVENT_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "event SHA must be a 40-character lowercase commit SHA"
             exit 1
           fi
-          git merge-base --is-ancestor origin/main "$CANDIDATE_SHA"
-          gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/$CANDIDATE_SHA" \
+          git fetch --no-tags origin main develop
+          if [[ "$(git rev-parse HEAD)" != "$EVENT_SHA" ]]; then
+            echo "checked-out HEAD changed before success publication"
+            exit 1
+          fi
+          if [[ "$(git rev-parse origin/develop)" != "$EVENT_SHA" ]]; then
+            echo "develop advanced before success publication"
+            exit 1
+          fi
+          git merge-base --is-ancestor origin/main "$EVENT_SHA"
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/$EVENT_SHA" \
             -f state=success \
             -f context=main-fast-forward-eligible \
-            -f description="exact candidate is eligible for a main fast-forward" \
-            | jq -e --arg candidate "$CANDIDATE_SHA" '
-                type == "object" and
-                .state == "success" and
-                .context == "main-fast-forward-eligible" and
-                .sha == $candidate
-              ' >/dev/null
+            -f description="exact candidate is eligible for a main fast-forward"
