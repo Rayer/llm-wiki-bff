@@ -1167,6 +1167,21 @@ func TestDeployWorkflowUsesImmutableCloudBuildResultDigest(t *testing.T) {
 	}
 }
 
+func TestBFFDevImageTagIsRunScopedAndImmutable(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
+	tagStep := workflowSection(t, contents, "      - name: Tag deployed dev image (fail-closed)", "      - name: Show deployment info")
+	want := `DEV_IMAGE_TAG="${{ env.AR_REPO }}/llm-wiki-bff:dev-${{ steps.identity.outputs.git_sha }}-${{ github.run_id }}-${{ github.run_attempt }}"`
+	if !strings.Contains(tagStep, want) {
+		t.Fatalf("BFF DEV tag must include commit SHA, run ID, and run attempt: missing %q", want)
+	}
+	if strings.Contains(tagStep, `:dev-${{ steps.identity.outputs.git_sha }}"`) {
+		t.Fatal("BFF DEV tag must not be commit-only scoped")
+	}
+	if !strings.Contains(tagStep, "gcloud artifacts docker tags add") {
+		t.Fatal("BFF DEV tag step must add the immutable image tag")
+	}
+}
+
 func TestBFFDevWorkflowUsesCanonicalRevisionTransaction(t *testing.T) {
 	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
 	build := workflowSection(t, contents, "      - name: Build and deploy to Cloud Run", "      - name: Persist build image digest")
