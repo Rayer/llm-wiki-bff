@@ -297,7 +297,8 @@ jobs:
                  (.status.traffic[0] | keys | sort) == ["percent", "revisionName"])
             and .status.traffic[0].revisionName == $ready_revision
             and .status.traffic[0].percent == 100
-            and ((.status.traffic[0].latestRevision? // false) == false)
+            and ((.status.traffic[0] | has("latestRevision") | not) or
+                 (.status.traffic[0].latestRevision | type == "boolean" and . == true))
             and (.status.traffic[0].tag? == null)
           ' <<<"$SERVICE_JSON" >/dev/null; then
             echo "live rollback state no longer matches the frozen ready revision or authoritative traffic"
