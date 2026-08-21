@@ -1489,6 +1489,23 @@ func TestReleaseWorkflowRequiresMainBuildProvenance(t *testing.T) {
 	}
 }
 
+func TestReleaseWorkflowCreatesEvidenceDirectoryBeforeDevRunReceiptWrite(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/release-bff.yml")
+	initialize := workflowSection(t, contents, "      - name: Initialize deployment evidence paths", "      - name: Validate promotion commit")
+	mkdirAt := strings.Index(initialize, `mkdir -p "$EVIDENCE_DIR"`)
+	redirectAt := strings.Index(contents, `> "$DEV_RUN_JSON"`)
+	if mkdirAt < 0 {
+		t.Fatal("release workflow must create the evidence directory during path initialization")
+	}
+	if redirectAt < 0 {
+		t.Fatal("release workflow must write the exact dev run receipt")
+	}
+	initializeAt := strings.Index(contents, initialize)
+	if initializeAt < 0 || initializeAt+mkdirAt > redirectAt {
+		t.Fatal("release workflow must create the evidence directory before the first DEV_RUN_JSON redirect")
+	}
+}
+
 func TestReleaseWorkflowAuthenticatesOnlyAfterReadOnlyGatesAndHasOneProviderMutation(t *testing.T) {
 	contents := readWorkflow(t, ".github/workflows/release-bff.yml")
 	auth := strings.Index(contents, "- name: Authenticate to Google Cloud")

@@ -56,6 +56,7 @@ jobs:
         run: |
           set -euo pipefail
           EVIDENCE_DIR="$RUNNER_TEMP/bff-deployment-evidence"
+          mkdir -p "$EVIDENCE_DIR"
           ROLLBACK_CONTRACT="$EVIDENCE_DIR/rollback-contract.json"
           METADATA="$EVIDENCE_DIR/metadata.json"
           EVIDENCE="$EVIDENCE_DIR/deployment-evidence.json"
