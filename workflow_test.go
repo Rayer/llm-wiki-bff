@@ -1775,6 +1775,7 @@ func TestPromotionReadyJobIsSameRunExactAndReadOnly(t *testing.T) {
 		"gh api \"repos/${GITHUB_REPOSITORY}/actions/runs/${DEV_RUN_ID}\" > \"$RUNNER_TEMP/bff-dev-run.json\"",
 		"bff-image-digest-$CANDIDATE_SHA",
 		"scripts/validate_bff_promotion_contract.py validate-dev-receipt",
+		"--expected-event workflow_dispatch",
 		"--lifecycle readiness",
 		"--producer-result \"${{ needs.test-and-deploy.result }}\"",
 		"--repository \"$GITHUB_REPOSITORY\"",

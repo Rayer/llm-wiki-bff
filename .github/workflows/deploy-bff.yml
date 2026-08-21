@@ -796,7 +796,7 @@ jobs:
             --expected-sha "$CANDIDATE_SHA" \
             --expected-run-id "$DEV_RUN_ID" \
             --expected-branch develop \
-            --expected-event push \
+            --expected-event workflow_dispatch \
             --lifecycle readiness \
             --producer-result "${{ needs.test-and-deploy.result }}" \
             --component lwc-bff \
