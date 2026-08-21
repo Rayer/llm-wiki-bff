@@ -81,6 +81,100 @@ func TestParallelExpansionAggregationIsStableAcrossCompletionOrder(t *testing.T)
 	}
 }
 
+func TestParallelRequiredRoleConsensusExactReproduction(t *testing.T) {
+	criteria := []queryquality.Criterion{
+		{Kind: "entity", Value: "software factory", Terms: []string{"software factory"}, Proof: "lexical"},
+		{Kind: "entity", Value: "researcher agent", Terms: []string{"researcher agent"}, Proof: "lexical"},
+		{Kind: "constraint", Value: "read-only permission", Terms: []string{"read-only permission"}, Proof: "lexical"},
+	}
+	plans := []queryquality.QueryPlan{
+		{Preferred: criteria},
+		{Required: []queryquality.Criterion{
+			{Kind: "entity", Value: "software factory", Terms: []string{"factory"}, Proof: "lexical"},
+			{Kind: "entity", Value: "researcher agent", Terms: []string{"researcher"}, Proof: "lexical"},
+			{Kind: "constraint", Value: "read-only permission", Terms: []string{"permission"}, Proof: "lexical"},
+		}},
+		{Preferred: criteria},
+	}
+	got := expandPlans(t, plans)
+	wantPreferred := []queryquality.Criterion{
+		{Kind: "entity", Value: "software factory", Terms: []string{"software factory", "factory"}, Proof: "lexical"},
+		{Kind: "entity", Value: "researcher agent", Terms: []string{"researcher agent", "researcher"}, Proof: "lexical"},
+		{Kind: "constraint", Value: "read-only permission", Terms: []string{"read only permission", "permission"}, Proof: "lexical"},
+	}
+	assertRoles(t, got, nil, wantPreferred)
+}
+
+func TestParallelRequiredRoleConsensusOneOfThreeBecomesPreferred(t *testing.T) {
+	criterion := testRoleCriterion("topic", "software factory", "factory")
+	got := expandPlans(t, []queryquality.QueryPlan{
+		{Required: []queryquality.Criterion{criterion}},
+		{},
+		{},
+	})
+	assertRoles(t, got, nil, []queryquality.Criterion{criterion})
+}
+
+func TestParallelRequiredRoleConsensusTwoOfThreeBecomesPreferred(t *testing.T) {
+	criterion := testRoleCriterion("topic", "software factory", "factory")
+	got := expandPlans(t, []queryquality.QueryPlan{
+		{Required: []queryquality.Criterion{criterion}},
+		{Required: []queryquality.Criterion{criterion}},
+		{},
+	})
+	assertRoles(t, got, nil, []queryquality.Criterion{criterion})
+}
+
+func TestParallelRequiredRoleConsensusThreeOfThreeRemainsRequiredOnly(t *testing.T) {
+	criterion := testRoleCriterion("topic", "software factory", "factory")
+	plans := []queryquality.QueryPlan{
+		{Required: []queryquality.Criterion{criterion}},
+		{Required: []queryquality.Criterion{criterion}},
+		{Required: []queryquality.Criterion{criterion}},
+	}
+	got := expandPlans(t, plans)
+	assertRoles(t, got, []queryquality.Criterion{criterion}, nil)
+}
+
+func TestParallelRequiredRoleConsensusOneAttemptRemainsRequired(t *testing.T) {
+	criterion := testRoleCriterion("topic", "software factory", "factory")
+	got := expandPlans(t, []queryquality.QueryPlan{{Required: []queryquality.Criterion{criterion}}})
+	assertRoles(t, got, []queryquality.Criterion{criterion}, nil)
+}
+
+func TestParallelRequiredRoleConsensusNeverKeepsCriterionInBothRoles(t *testing.T) {
+	criterion := testRoleCriterion("topic", "software factory", "factory")
+	got := expandPlans(t, []queryquality.QueryPlan{
+		{Preferred: []queryquality.Criterion{criterion}},
+		{Required: []queryquality.Criterion{criterion}},
+		{Preferred: []queryquality.Criterion{criterion}},
+	})
+	assertRoles(t, got, nil, []queryquality.Criterion{criterion})
+}
+
+func TestParallelRequiredRoleConsensusPreservesTermsFromBothRoles(t *testing.T) {
+	got := expandPlans(t, []queryquality.QueryPlan{
+		{Preferred: []queryquality.Criterion{{Kind: "topic", Value: "software factory", Terms: []string{"factory"}, Proof: "lexical"}}},
+		{Required: []queryquality.Criterion{{Kind: "topic", Value: "software factory", Terms: []string{"software factory", "factory"}, Proof: "lexical"}}},
+		{Preferred: []queryquality.Criterion{{Kind: "topic", Value: "software factory", Terms: []string{"software factory"}, Proof: "lexical"}}},
+	})
+	assertRoles(t, got, nil, []queryquality.Criterion{{Kind: "topic", Value: "software factory", Terms: []string{"factory", "software factory"}, Proof: "lexical"}})
+}
+
+func TestParallelRequiredRoleConsensusIsStableAcrossCompletionOrder(t *testing.T) {
+	plans := []queryquality.QueryPlan{
+		{Preferred: []queryquality.Criterion{{Kind: "topic", Value: "software factory", Terms: []string{"first"}, Proof: "lexical"}}},
+		{Required: []queryquality.Criterion{{Kind: "topic", Value: "software factory", Terms: []string{"second"}, Proof: "lexical"}}},
+		{Preferred: []queryquality.Criterion{{Kind: "topic", Value: "software factory", Terms: []string{"third"}, Proof: "lexical"}}},
+	}
+	left := expandRoleOrderedPlans(t, newRoleOrderedExpander(false, plans))
+	right := expandRoleOrderedPlans(t, newRoleOrderedExpander(true, plans))
+	if !reflect.DeepEqual(left, right) {
+		t.Fatalf("completion order changed aggregate: left=%#v right=%#v", left, right)
+	}
+	assertRoles(t, left, nil, []queryquality.Criterion{{Kind: "topic", Value: "software factory", Terms: []string{"first", "second", "third"}, Proof: "lexical"}})
+}
+
 func TestParallelExpansionRepeatedAliasesWithinAttemptCountOnce(t *testing.T) {
 	provider := &aliasExpander{}
 	parallel, err := queryquality.NewParallelQueryExpander(provider, nil, queryquality.Options{ExpansionAttempts: 2, KeywordsPerAttempt: 24})
@@ -365,9 +459,95 @@ func TestConflictingHardConstraintsUseTypedFallbackOnce(t *testing.T) {
 	}
 }
 
+func testRoleCriterion(kind, value, term string) queryquality.Criterion {
+	return queryquality.Criterion{Kind: kind, Value: value, Terms: []string{term}, Proof: "lexical"}
+}
+
+func assertRoles(t *testing.T, got queryquality.QueryPlan, wantRequired, wantPreferred []queryquality.Criterion) {
+	t.Helper()
+	if len(got.Required) != len(wantRequired) || len(got.Preferred) != len(wantPreferred) || (len(wantRequired) > 0 && !reflect.DeepEqual(got.Required, wantRequired)) || (len(wantPreferred) > 0 && !reflect.DeepEqual(got.Preferred, wantPreferred)) {
+		t.Fatalf("roles = required=%#v preferred=%#v, want required=%#v preferred=%#v", got.Required, got.Preferred, wantRequired, wantPreferred)
+	}
+}
+
+func expandPlans(t *testing.T, plans []queryquality.QueryPlan) queryquality.QueryPlan {
+	t.Helper()
+	parallel, err := queryquality.NewParallelQueryExpander(&singlePlanExpander{plans: plans}, nil, queryquality.Options{ExpansionAttempts: len(plans), KeywordsPerAttempt: 24})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := parallel.Expand(context.Background(), queryquality.ExpansionRequest{Query: "software factory"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return got
+}
+
+func expandRoleOrderedPlans(t *testing.T, expander queryquality.QueryExpander) queryquality.QueryPlan {
+	t.Helper()
+	parallel, err := queryquality.NewParallelQueryExpander(expander, nil, queryquality.Options{ExpansionAttempts: 3, KeywordsPerAttempt: 24})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := parallel.Expand(context.Background(), queryquality.ExpansionRequest{Query: "software factory"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return got
+}
+
 type singlePlanExpander struct {
 	mu    sync.Mutex
 	plans []queryquality.QueryPlan
+}
+
+type roleOrderedExpander struct {
+	reverse    bool
+	plans      []queryquality.QueryPlan
+	started    chan struct{}
+	allStarted chan struct{}
+	startOnce  sync.Once
+	firstDone  chan struct{}
+	secondDone chan struct{}
+	thirdDone  chan struct{}
+}
+
+func newRoleOrderedExpander(reverse bool, plans []queryquality.QueryPlan) *roleOrderedExpander {
+	return &roleOrderedExpander{reverse: reverse, plans: plans, started: make(chan struct{}, 3), allStarted: make(chan struct{}), firstDone: make(chan struct{}), secondDone: make(chan struct{}), thirdDone: make(chan struct{})}
+}
+
+func (e *roleOrderedExpander) Expand(ctx context.Context, request queryquality.ExpansionRequest) (queryquality.QueryPlan, error) {
+	e.started <- struct{}{}
+	if len(e.started) == 3 {
+		e.startOnce.Do(func() { close(e.allStarted) })
+	}
+	select {
+	case <-ctx.Done():
+		return queryquality.QueryPlan{}, ctx.Err()
+	case <-e.allStarted:
+	}
+	if e.reverse {
+		switch request.Attempt {
+		case 3:
+			close(e.secondDone)
+		case 2:
+			<-e.secondDone
+			close(e.firstDone)
+		case 1:
+			<-e.firstDone
+		}
+	} else {
+		switch request.Attempt {
+		case 1:
+			close(e.secondDone)
+		case 2:
+			<-e.secondDone
+			close(e.thirdDone)
+		case 3:
+			<-e.thirdDone
+		}
+	}
+	return e.plans[request.Attempt-1], nil
 }
 
 func (e *singlePlanExpander) Expand(_ context.Context, request queryquality.ExpansionRequest) (queryquality.QueryPlan, error) {

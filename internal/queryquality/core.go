@@ -612,10 +612,9 @@ func aggregatePlans(rawQuery string, attempts []indexedPlan) QueryPlan {
 	plan.RawQuery = rawQuery
 	plan.Fallback = false
 	plan.KeywordSupport = nil
+	plan.Required, plan.Preferred = aggregateRequiredPreferred(attempts)
 	for _, attempt := range attempts[1:] {
-		plan.Required = mergeCriteria(plan.Required, attempt.plan.Required)
 		plan.Excluded = mergeCriteria(plan.Excluded, attempt.plan.Excluded)
-		plan.Preferred = mergeCriteria(plan.Preferred, attempt.plan.Preferred)
 		plan.Goals = mergeCriteria(plan.Goals, attempt.plan.Goals)
 		plan.SupportingDimensions = mergeCriteria(plan.SupportingDimensions, attempt.plan.SupportingDimensions)
 		plan.AcceptableAlternatives = mergeCriteria(plan.AcceptableAlternatives, attempt.plan.AcceptableAlternatives)
@@ -623,6 +622,51 @@ func aggregatePlans(rawQuery string, attempts []indexedPlan) QueryPlan {
 	}
 	plan.KeywordSupport = keywordSupport(attempts)
 	return plan
+}
+
+func aggregateRequiredPreferred(attempts []indexedPlan) ([]Criterion, []Criterion) {
+	type criterionIdentity struct {
+		key   string
+		proof string
+	}
+	type aggregate struct {
+		criterion       Criterion
+		requiredAttempt map[int]struct{}
+	}
+	aggregates := make([]aggregate, 0)
+	indexes := make(map[criterionIdentity]int)
+	for _, attempt := range attempts {
+		for _, role := range []struct {
+			criteria []Criterion
+			required bool
+		}{{attempt.plan.Required, true}, {attempt.plan.Preferred, false}} {
+			for _, criterion := range role.criteria {
+				identity := criterionIdentity{key: criterionKey(criterion), proof: criterion.Proof}
+				index, exists := indexes[identity]
+				if !exists {
+					criterion.Terms = uniqueTerms(criterion.Terms)
+					aggregates = append(aggregates, aggregate{criterion: criterion, requiredAttempt: make(map[int]struct{})})
+					index = len(aggregates) - 1
+					indexes[identity] = index
+				}
+				item := &aggregates[index]
+				item.criterion.Terms = uniqueTerms(append(item.criterion.Terms, criterion.Terms...))
+				if role.required {
+					item.requiredAttempt[attempt.index] = struct{}{}
+				}
+			}
+		}
+	}
+	required := make([]Criterion, 0)
+	preferred := make([]Criterion, 0)
+	for _, item := range aggregates {
+		if len(item.requiredAttempt) == len(attempts) {
+			required = append(required, item.criterion)
+			continue
+		}
+		preferred = append(preferred, item.criterion)
+	}
+	return required, preferred
 }
 
 func mergeCriteria(existing, additions []Criterion) []Criterion {
