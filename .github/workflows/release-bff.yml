@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       commit_sha:
-        description: Full lowercase commit SHA for an image already built by the main dev workflow
+        description: Full lowercase commit SHA for an image already built by the develop dev workflow
         required: true
         type: string
       dev_run_id:
@@ -85,7 +85,7 @@ jobs:
           fi
           echo "commit_sha=$COMMIT_SHA" >> "$GITHUB_OUTPUT"
 
-      - name: Locate exact successful main dev deployment
+      - name: Locate exact successful develop dev deployment
         id: dev_run
         env:
           GH_TOKEN: ${{ github.token }}
@@ -125,8 +125,9 @@ jobs:
             --run-json "$DEV_RUN_JSON" \
             --expected-sha "$COMMIT_SHA" \
             --expected-run-id "$DEV_RUN_ID" \
-            --expected-branch main \
+            --expected-branch develop \
             --expected-event push \
+            --lifecycle production \
             --component lwc-bff \
             --repository "$GITHUB_REPOSITORY" \
             --ar-repo "$AR_REPO" \

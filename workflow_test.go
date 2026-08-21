@@ -30,7 +30,7 @@ func TestDevWorkflowManualDispatchRequiresCanonicalDevelopSHA(t *testing.T) {
 	if err := yaml.Unmarshal([]byte(contents), &workflow); err != nil {
 		t.Fatalf("deploy workflow is not valid YAML: %v", err)
 	}
-	if got, want := strings.Join(workflow.On.Push.Branches, ","), "main"; got != want {
+	if got, want := strings.Join(workflow.On.Push.Branches, ","), "develop"; got != want {
 		t.Fatalf("automatic push branches = %q, want %q", got, want)
 	}
 	commitInput, ok := workflow.On.WorkflowDispatch.Inputs["commit_sha"]
@@ -456,25 +456,36 @@ func TestCIWorkflowPushesAndPRsMainAndDevelop(t *testing.T) {
 	}
 }
 
-func TestCIMainFastForwardEligibilityGate(t *testing.T) {
-	contents := readWorkflow(t, ".github/workflows/ci.yml")
+func TestMainFastForwardEligibilityFollowsReadiness(t *testing.T) {
+	ci := readWorkflow(t, ".github/workflows/ci.yml")
+	if strings.Contains(ci, "main-fast-forward-eligible:") {
+		t.Fatal("CI must not publish the protected main gate")
+	}
+	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
 	job := workflowSection(t, contents, "  main-fast-forward-eligible:", "\n\n")
 	want := normalizeWorkflowContract(`
 main-fast-forward-eligible:
-  if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
-  needs: test
+  name: main-fast-forward-eligible
+  if: github.event_name == 'push' && github.ref == 'refs/heads/develop' && needs.production-promotion-ready.result == 'success'
+  needs: production-promotion-ready
   runs-on: ubuntu-latest
+  permissions:
+    contents: read
   steps:
     - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       with:
         fetch-depth: 0
         persist-credentials: false
     - name: Verify main fast-forward eligibility
+      env:
+        CANDIDATE_SHA: ${{ needs.test-and-deploy.outputs.candidate_sha }}
       run: |
         set -euo pipefail
+        [[ "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]]
         git fetch --no-tags origin main develop
-        test "$(git rev-parse origin/develop)" = "$GITHUB_SHA"
-        git merge-base --is-ancestor origin/main "$GITHUB_SHA"
+	        test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+	        test "$(git rev-parse origin/develop)" = "$CANDIDATE_SHA"
+	        git merge-base --is-ancestor origin/main "$CANDIDATE_SHA"
 `)
 	if got := normalizeWorkflowContract(job); got != want {
 		t.Errorf("main fast-forward gate contract changed\n got:\n%s\nwant:\n%s", got, want)
@@ -493,10 +504,10 @@ func normalizeWorkflowContract(contents string) string {
 	return strings.Join(normalized, "\n")
 }
 
-func TestBFFDevWorkflowPushesMainOnlyAndSupportsManualDispatch(t *testing.T) {
+func TestBFFDevWorkflowPushesDevelopAndSupportsManualDispatch(t *testing.T) {
 	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
 	for _, want := range []string{
-		"  push:\n    branches: [main]",
+		"  push:\n    branches: [develop]",
 		"  workflow_dispatch:",
 	} {
 		if !strings.Contains(contents, want) {
@@ -1401,7 +1412,7 @@ func TestReleaseWorkflowRequiresMainBuildProvenance(t *testing.T) {
 		"dev_run_id",
 		`gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${DEV_RUN_ID}"`,
 		"scripts/validate_bff_promotion_contract.py validate-dev-receipt",
-		"--expected-branch main",
+		"--expected-branch develop",
 		"--expected-event push",
 		"roles/run.jobsExecutorWithOverrides",
 		"get-iam-policy",
@@ -1415,7 +1426,7 @@ func TestReleaseWorkflowRequiresMainBuildProvenance(t *testing.T) {
 			t.Errorf("release workflow is missing main provenance contract %q", want)
 		}
 	}
-	for _, forbidden := range []string{"ref: develop", `origin/develop`, `.head_branch == "develop"`} {
+	for _, forbidden := range []string{"ref: develop", `origin/develop`} {
 		if strings.Contains(contents, forbidden) {
 			t.Fatalf("release workflow must not accept develop provenance %q", forbidden)
 		}
@@ -1439,7 +1450,7 @@ func TestReleaseWorkflowRequiresMainBuildProvenance(t *testing.T) {
 func TestReleaseWorkflowAuthenticatesOnlyAfterReadOnlyGatesAndHasOneProviderMutation(t *testing.T) {
 	contents := readWorkflow(t, ".github/workflows/release-bff.yml")
 	auth := strings.Index(contents, "- name: Authenticate to Google Cloud")
-	provenance := strings.Index(contents, "- name: Locate exact successful main dev deployment")
+	provenance := strings.Index(contents, "- name: Locate exact successful develop dev deployment")
 	image := strings.Index(contents, "- name: Download exact dev image digest")
 	preflight := strings.Index(contents, "- name: Verify production IAM preflight")
 	deploy := strings.Index(contents, "gcloud run deploy")
@@ -1485,8 +1496,9 @@ func TestReleaseWorkflowStrictlyParsesQueryConfigReceipt(t *testing.T) {
 			"--run-json \"$DEV_RUN_JSON\"",
 			"--expected-sha \"$COMMIT_SHA\"",
 			"--expected-run-id \"$DEV_RUN_ID\"",
-			"--expected-branch main",
+			"--expected-branch develop",
 			"--expected-event push",
+			"--lifecycle production",
 			"--component lwc-bff",
 			"--repository \"$GITHUB_REPOSITORY\"",
 			"--ar-repo \"$AR_REPO\"",
@@ -1754,14 +1766,17 @@ func TestPromotionReadyJobIsSameRunExactAndReadOnly(t *testing.T) {
 	for _, want := range []string{
 		"name: production-promotion-ready",
 		"needs: test-and-deploy",
-		"github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/develop'",
+		"github.event_name == 'push' && github.ref == 'refs/heads/develop'",
 		"needs.test-and-deploy.result == 'success'",
 		"[[ \"$GITHUB_REF\" != \"refs/heads/develop\" ]]",
 		"DEVELOP_SHA=$(gh api \"repos/${GITHUB_REPOSITORY}/git/ref/heads/develop\" --jq .object.sha)",
 		"if [[ \"$DEVELOP_SHA\" != \"$CANDIDATE_SHA\" ]]",
 		"gh run download \"$DEV_RUN_ID\"",
+		"gh api \"repos/${GITHUB_REPOSITORY}/actions/runs/${DEV_RUN_ID}\" > \"$RUNNER_TEMP/bff-dev-run.json\"",
 		"bff-image-digest-$CANDIDATE_SHA",
 		"scripts/validate_bff_promotion_contract.py validate-dev-receipt",
+		"--lifecycle readiness",
+		"--producer-result \"${{ needs.test-and-deploy.result }}\"",
 		"--repository \"$GITHUB_REPOSITORY\"",
 		"--traffic-mode artifact",
 		"bff-production-promotion-ready-",
@@ -1784,6 +1799,12 @@ func TestPromotionReadyJobIsSameRunExactAndReadOnly(t *testing.T) {
 		if strings.Contains(job, forbidden) {
 			t.Errorf("readiness job must remain read-only and same-run: found %q", forbidden)
 		}
+	}
+	if strings.Contains(job, "conclusion: \"success\"") {
+		t.Fatal("readiness must use actual in-progress run metadata, not synthesize success")
+	}
+	if strings.Count(contents, "QUERY_STAGE_CONFIG_REVISION:") != 1 || strings.Count(contents, "QUERY_STAGE_CONFIG_DIGEST:") != 1 {
+		t.Fatal("query config identity must have one workflow-level authority")
 	}
 }
 

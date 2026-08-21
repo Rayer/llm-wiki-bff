@@ -42,14 +42,15 @@ class BFFPromotionContractTest(unittest.TestCase):
             "event": "workflow_dispatch",
             "head_branch": "develop",
             "head_sha": SHA,
-            "conclusion": "success",
+            "status": "in_progress",
+            "conclusion": None,
             "html_url": "https://github.com/Rayer/llm-wiki-bff/actions/runs/123",
         }))
 
     def tearDown(self):
         self.tempdir.cleanup()
 
-    def invoke_receipt(self, receipt_path=None, **extra):
+    def invoke_receipt(self, receipt_path=None, lifecycle="readiness", **extra):
         command = [
             "python3", str(SCRIPT), "validate-dev-receipt",
             "--receipt", str(receipt_path or self.receipt_path),
@@ -58,6 +59,8 @@ class BFFPromotionContractTest(unittest.TestCase):
             "--expected-run-id", str(RUN_ID),
             "--expected-branch", "develop",
             "--expected-event", "workflow_dispatch",
+            "--lifecycle", lifecycle,
+            "--producer-result", "success",
             "--component", "lwc-bff",
             "--repository", "Rayer/llm-wiki-bff",
             "--ar-repo", AR_REPO,
@@ -99,6 +102,16 @@ class BFFPromotionContractTest(unittest.TestCase):
             "image_digest": DIGEST,
             "image_reference": f"{AR_REPO}/llm-wiki-bff@{DIGEST}",
         })
+
+    def test_receipt_lifecycle_is_explicit_and_fail_closed(self):
+        self.assertEqual(self.invoke_receipt().returncode, 0)
+        run = json.loads(self.run_path.read_text())
+        for field, value in (("status", "completed"), ("conclusion", "success")):
+            with self.subTest(field=field):
+                self.run_path.write_text(json.dumps({**run, field: value}))
+                self.assertNotEqual(self.invoke_receipt().returncode, 0)
+        self.run_path.write_text(json.dumps({**run, "status": "completed", "conclusion": "success"}))
+        self.assertEqual(self.invoke_receipt(lifecycle="production").returncode, 0)
 
     def test_output_integrity_and_atomic_readiness_receipt(self):
         github_output = self.root / "github-output"
@@ -150,8 +163,10 @@ class BFFPromotionContractTest(unittest.TestCase):
 
     def test_traffic_accepts_pre_mutation_explicit_and_resolved_latest_forms(self):
         explicit = self.invoke_traffic({"traffic": [{"revisionName": REVISION, "percent": 100}]}, mode="provider-pre-mutation")
+        explicit_false = self.invoke_traffic({"traffic": [{"latestRevision": False, "revisionName": REVISION, "percent": 100}]}, mode="provider-pre-mutation")
         latest = self.invoke_traffic({"status": {"traffic": [{"latestRevision": True, "revisionName": REVISION, "percent": 100}]}}, path="status.traffic", mode="provider-pre-mutation")
         self.assertEqual(explicit.returncode, 0, explicit.stderr)
+        self.assertEqual(explicit_false.returncode, 0, explicit_false.stderr)
         self.assertEqual(latest.returncode, 0, latest.stderr)
 
     def test_post_rollback_requires_explicit_frozen_revision(self):

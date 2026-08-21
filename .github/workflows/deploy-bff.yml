@@ -2,7 +2,7 @@ name: Deploy BFF to Cloud Run (dev)
 
 on:
   push:
-    branches: [main]
+    branches: [develop]
   workflow_dispatch:
     inputs:
       commit_sha:
@@ -729,7 +729,7 @@ jobs:
 
   production-promotion-ready:
     name: production-promotion-ready
-    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/develop' && needs.test-and-deploy.result == 'success'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/develop' && needs.test-and-deploy.result == 'success'
     needs: test-and-deploy
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -740,8 +740,6 @@ jobs:
       CANDIDATE_SHA: ${{ needs.test-and-deploy.outputs.candidate_sha }}
       DEV_RUN_ID: ${{ github.run_id }}
       AR_REPO: asia-east1-docker.pkg.dev/llm-wiki-cloud/cloud-run-images
-      QUERY_CONFIG_REVISION: query-dev-2026-08-21.1
-      QUERY_CONFIG_DIGEST: sha256:a35955fe4a451c740e6252cae8087f114fbac6b4162245d3de7818c1ad37a5c6
     steps:
       - name: Checkout exact candidate
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -786,15 +784,7 @@ jobs:
             echo "same-run DEV receipt contents are missing or unexpected"
             exit 1
           fi
-          jq -n \
-            --argjson id "$DEV_RUN_ID" \
-            --arg path ".github/workflows/deploy-bff.yml" \
-            --arg event "$GITHUB_EVENT_NAME" \
-            --arg branch "$GITHUB_REF_NAME" \
-            --arg sha "$CANDIDATE_SHA" \
-            --arg url "https://github.com/$GITHUB_REPOSITORY/actions/runs/$DEV_RUN_ID" \
-            '{id: $id, path: $path, event: $event, head_branch: $branch, head_sha: $sha, conclusion: "success", html_url: $url}' \
-            > "$RUNNER_TEMP/bff-dev-run.json"
+          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${DEV_RUN_ID}" > "$RUNNER_TEMP/bff-dev-run.json"
           printf 'RUN_JSON=%s\nDIGEST_FILE=%s\n' "$RUNNER_TEMP/bff-dev-run.json" "$DIGEST_FILE" >> "$GITHUB_ENV"
 
       - name: Validate exact same-run DEV provenance receipt
@@ -806,7 +796,9 @@ jobs:
             --expected-sha "$CANDIDATE_SHA" \
             --expected-run-id "$DEV_RUN_ID" \
             --expected-branch develop \
-            --expected-event workflow_dispatch \
+            --expected-event push \
+            --lifecycle readiness \
+            --producer-result "${{ needs.test-and-deploy.result }}" \
             --component lwc-bff \
             --repository "$GITHUB_REPOSITORY" \
             --ar-repo "$AR_REPO" \
@@ -830,3 +822,26 @@ jobs:
           path: ${{ runner.temp }}/bff-production-promotion-ready.json
           if-no-files-found: error
           retention-days: 90
+
+  main-fast-forward-eligible:
+    name: main-fast-forward-eligible
+    if: github.event_name == 'push' && github.ref == 'refs/heads/develop' && needs.production-promotion-ready.result == 'success'
+    needs: production-promotion-ready
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify main fast-forward eligibility
+        env:
+          CANDIDATE_SHA: ${{ needs.test-and-deploy.outputs.candidate_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          git fetch --no-tags origin main develop
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          test "$(git rev-parse origin/develop)" = "$CANDIDATE_SHA"
+          git merge-base --is-ancestor origin/main "$CANDIDATE_SHA"

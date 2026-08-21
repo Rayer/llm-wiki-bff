@@ -121,11 +121,17 @@ def validate_dev_receipt(args):
         "event": args.expected_event,
         "head_branch": args.expected_branch,
         "head_sha": args.expected_sha,
-        "conclusion": "success",
     }
     for key, value in expected.items():
         if run.get(key) != value:
             reject(f"DEV run provenance {key} is invalid")
+    if args.lifecycle == "readiness":
+        if run.get("status") != "in_progress" or run.get("conclusion") is not None:
+            reject("readiness requires the same DEV run to be in progress without a conclusion")
+        if args.producer_result != "success":
+            reject("readiness requires a successful DEV producer dependency")
+    elif run.get("status") != "completed" or run.get("conclusion") != "success":
+        reject("production requires a completed successful DEV run")
     run_url = run.get("html_url")
     expected_run_url = f"https://github.com/{args.repository}/actions/runs/{args.expected_run_id}"
     if not isinstance(run_url, str) or not RUN_URL_RE.fullmatch(run_url) or run_url != expected_run_url:
@@ -270,6 +276,8 @@ def parser():
     receipt.add_argument("--expected-run-id", required=True, type=int)
     receipt.add_argument("--expected-branch", required=True)
     receipt.add_argument("--expected-event", required=True)
+    receipt.add_argument("--lifecycle", choices=("readiness", "production"), required=True)
+    receipt.add_argument("--producer-result")
     receipt.add_argument("--component", required=True)
     receipt.add_argument("--repository", required=True)
     receipt.add_argument("--ar-repo", required=True)
