@@ -13,6 +13,9 @@ env:
   SERVICE_NAME: llm-wiki-bff
   REGION: asia-east1
   AR_REPO: asia-east1-docker.pkg.dev/llm-wiki-cloud/cloud-run-images
+  QUERY_STAGE_CONFIG_PATH: /app/configs/query/dev/query-dev-2026-08-21.1.json
+  QUERY_STAGE_CONFIG_REVISION: query-dev-2026-08-21.1
+  QUERY_STAGE_CONFIG_DIGEST: sha256:a35955fe4a451c740e6252cae8087f114fbac6b4162245d3de7818c1ad37a5c6
   PIPELINE_JOB_NAME: olw-pipeline
   RUNTIME_SERVICE_ACCOUNT: lwc-bff-prod@llm-wiki-cloud.iam.gserviceaccount.com
   BUCKET: llm-wiki-data
@@ -30,7 +33,7 @@ jobs:
     name: Promote immutable BFF image
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 40
     environment: production
     permissions:
       contents: read
@@ -236,11 +239,53 @@ jobs:
           if-no-files-found: error
           retention-days: 90
 
+      - name: Validate frozen rollback traffic before mutation
+        run: |
+          set -euo pipefail
+          FROZEN_READY_REVISION=$(jq -er '.ready_revision | select(type == "string" and length > 0)' "$ROLLBACK_CONTRACT")
+          if ! jq -e --arg ready_revision "$FROZEN_READY_REVISION" '
+            (.traffic | type == "array" and length == 1)
+            and (.traffic[0] | type == "object")
+            and ((.traffic[0] | keys | sort) == ["latest_revision", "percent", "revision_name"] or
+                 (.traffic[0] | keys | sort) == ["percent", "revision_name"])
+            and .traffic[0].revision_name == $ready_revision
+            and .traffic[0].percent == 100
+            and (.traffic[0].tag? == null)
+          ' "$ROLLBACK_CONTRACT" >/dev/null; then
+            echo "exactly one canonical rollback target is required: revision_name=$FROZEN_READY_REVISION, percent=100, no tag"
+            exit 1
+          fi
+          SERVICE_JSON=$(gcloud run services describe "$SERVICE_NAME" \
+            --region "$REGION" \
+            --project "$PROJECT_ID" \
+            --format=json \
+            --quiet)
+          if ! jq -e --arg ready_revision "$FROZEN_READY_REVISION" '
+            .status.latestCreatedRevisionName == $ready_revision
+            and .status.latestReadyRevisionName == $ready_revision
+            and (.status.traffic | type == "array" and length == 1)
+            and (.status.traffic[0] | type == "object")
+            and ((.status.traffic[0] | keys | sort) == ["latestRevision", "percent", "revisionName"] or
+                 (.status.traffic[0] | keys | sort) == ["percent", "revisionName"])
+            and .status.traffic[0].revisionName == $ready_revision
+            and .status.traffic[0].percent == 100
+            and ((.status.traffic[0].latestRevision? // false) == false)
+            and (.status.traffic[0].tag? == null)
+          ' <<<"$SERVICE_JSON" >/dev/null; then
+            echo "live rollback state no longer matches the frozen ready revision or authoritative traffic"
+            exit 1
+          fi
+          FROZEN_CREATED_REVISION=$(jq -er '.status.latestCreatedRevisionName | select(type == "string" and length > 0)' <<<"$SERVICE_JSON")
+          echo "FROZEN_CREATED_REVISION=$FROZEN_CREATED_REVISION" >> "$GITHUB_ENV"
+          echo "frozen rollback traffic is supported"
+
       - name: Deploy existing immutable image to Cloud Run
+        id: deploy
         env:
           IMMUTABLE_IMAGE: ${{ steps.image.outputs.image }}
         run: |
           set -euo pipefail
+          echo "deploy_started=true" >> "$GITHUB_OUTPUT"
           gcloud run deploy "$SERVICE_NAME" \
             --project "$PROJECT_ID" \
             --image "$IMMUTABLE_IMAGE" \
@@ -250,8 +295,216 @@ jobs:
             --vpc-egress private-ranges-only \
             --ingress all \
             --update-secrets "JWT_SECRET=${JWT_SECRET_NAME}:latest,DEEPSEEK_API_KEY=${DEEPSEEK_SECRET_NAME}:latest" \
-            --update-env-vars "^@^GCP_PROJECT=${PROJECT_ID}@BUCKET=${BUCKET}@FIRESTORE_DATABASE_ID=${FIRESTORE_DATABASE_ID}@PIPELINE_JOB_URL=https://run.googleapis.com/v2/projects/${PROJECT_ID}/locations/${REGION}/jobs/${PIPELINE_JOB_NAME}:run@ALLOWED_ORIGINS=${ALLOWED_ORIGINS}@DEV_JWT=false" \
+            --remove-env-vars "QUERY_EXPANSION_MODEL,QUERY_EXPANSION_REASONING,ANSWER_SYNTHESIS_MODEL,ANSWER_SYNTHESIS_REASONING,QUERY_SELECTION_LIMIT,QUERY_SELECTION_EXPLORATION_SLOTS,QUERY_SELECTION_EVIDENCE_THRESHOLD,QUERY_EXPANSION_KEYWORDS_PER_ATTEMPT,QUERY_EXPANSION_ATTEMPTS,QUERY_MATCHING_RARE_KEYWORD_MAX_DOCUMENT_FREQUENCY" \
+            --update-env-vars "^@^GCP_PROJECT=${PROJECT_ID}@BUCKET=${BUCKET}@FIRESTORE_DATABASE_ID=${FIRESTORE_DATABASE_ID}@PIPELINE_JOB_URL=https://run.googleapis.com/v2/projects/${PROJECT_ID}/locations/${REGION}/jobs/${PIPELINE_JOB_NAME}:run@ALLOWED_ORIGINS=${ALLOWED_ORIGINS}@QUERY_STAGE_CONFIG_PATH=${QUERY_STAGE_CONFIG_PATH}@DEV_JWT=false" \
             --quiet
+
+      - name: Verify deployed query config readback
+        id: query_config_readback
+        env:
+          EXPECTED_COMMIT: ${{ steps.commit.outputs.commit_sha }}
+        run: |
+          set -euo pipefail
+          SERVICE_URL=$(gcloud run services describe "$SERVICE_NAME" \
+            --region "$REGION" \
+            --project "$PROJECT_ID" \
+            --format='value(status.url)' \
+            --quiet)
+          if [[ ! "$SERVICE_URL" =~ ^https://llm-wiki-bff-[a-z0-9-]+\.a\.run\.app$ ]]; then
+            echo "Cloud Run returned an invalid public service URL or host; refusing to verify readback."
+            exit 1
+          fi
+          FROZEN_READY_REVISION=$(jq -er '.ready_revision | select(type == "string" and length > 0)' "$ROLLBACK_CONTRACT")
+          FROZEN_CREATED_REVISION="${FROZEN_CREATED_REVISION:?}"
+          CREATED_REVISION=""
+          READBACK_REVISION_DEADLINE=$((SECONDS + 300))
+          while (( SECONDS < READBACK_REVISION_DEADLINE )); do
+            SERVICE_JSON=$(gcloud run services describe "$SERVICE_NAME" \
+              --region "$REGION" \
+              --project "$PROJECT_ID" \
+              --format=json \
+              --quiet) || true
+            CANDIDATE_REVISION=$(jq -er '.status.latestCreatedRevisionName | select(type == "string" and length > 0)' <<<"$SERVICE_JSON" 2>/dev/null || true)
+            if [[ -z "$CREATED_REVISION" && -n "$CANDIDATE_REVISION" ]]; then
+              if [[ "$CANDIDATE_REVISION" != "$FROZEN_CREATED_REVISION" ]]; then
+                CREATED_REVISION="$CANDIDATE_REVISION"
+              fi
+            fi
+            if [[ -n "$CREATED_REVISION" ]] \
+              && [[ "$CANDIDATE_REVISION" == "$CREATED_REVISION" ]] \
+              && jq -e --arg revision "$CREATED_REVISION" \
+                '.status.latestCreatedRevisionName == $revision and .status.latestReadyRevisionName == $revision' <<<"$SERVICE_JSON" >/dev/null; then
+              EXPECTED_REVISION="$CREATED_REVISION"
+              break
+            fi
+            sleep 5
+          done
+          if [[ -z "${EXPECTED_REVISION:-}" ]]; then
+            echo "the exact created production revision did not become authoritative within timeout"
+            exit 1
+          fi
+          BODY_FILE=$(mktemp)
+          HEADER_FILE=$(mktemp)
+          trap 'rm -f "$BODY_FILE" "$HEADER_FILE"' EXIT
+          HTTP_STATUS=""
+          READBACK_VALID=0
+          READBACK_DEADLINE=$((SECONDS + 300))
+          while (( SECONDS < READBACK_DEADLINE )); do
+            : > "$BODY_FILE"
+            : > "$HEADER_FILE"
+            HTTP_STATUS=$(curl --silent --show-error --proto '=https' \
+              --connect-timeout 5 --max-time 10 \
+              --dump-header "$HEADER_FILE" --output "$BODY_FILE" \
+              --write-out '%{http_code}' \
+              "$SERVICE_URL/api/v1/query/config" || true)
+            if [[ "$HTTP_STATUS" == "200" ]] \
+              && grep -Eiq '^cache-control:[[:space:]]*no-store([[:space:]]*;.*)?[[:space:]]*$' "$HEADER_FILE" \
+              && jq -e --arg revision "$QUERY_STAGE_CONFIG_REVISION" \
+                --arg digest "$QUERY_STAGE_CONFIG_DIGEST" \
+                --arg commit "$EXPECTED_COMMIT" \
+                --arg cloud_revision "$EXPECTED_REVISION" \
+                --arg service "$SERVICE_NAME" '
+                  ((. | keys | sort) == ["build", "query_config"])
+                  and ((.build | keys | sort) == ["commit", "revision", "service"])
+                  and ((.query_config | keys | sort) == ["config_digest", "config_revision", "default_profile_digest", "default_profile_id", "default_prompt_digest", "default_prompt_id", "expansion_model", "expansion_provider", "expansion_reasoning", "expansion_temperature", "options", "query_service_implementation", "schema_version", "synthesis_model", "synthesis_provider", "synthesis_reasoning", "synthesis_temperature"])
+                  and ((.query_config.options | keys | sort) == ["evidence_threshold", "expansion_attempts", "exploration_slots", "keywords_per_attempt", "rare_document_frequency", "selection_limit"])
+                  and .query_config.schema_version == 2
+                  and .query_config.config_revision == $revision
+                  and .query_config.config_digest == $digest
+                  and .query_config.query_service_implementation == "query-retrieval-pipeline-v2"
+                  and .query_config.expansion_provider == "deepseek"
+                  and .query_config.expansion_model == "deepseek-v4-flash"
+                  and .query_config.expansion_reasoning == "none"
+                  and .query_config.expansion_temperature == 0
+                  and .query_config.synthesis_provider == "deepseek"
+                  and .query_config.synthesis_model == "deepseek-v4-pro"
+                  and .query_config.synthesis_reasoning == "none"
+                  and .query_config.synthesis_temperature == 0
+                  and .query_config.options.selection_limit == 10
+                  and .query_config.options.exploration_slots == 1
+                  and .query_config.options.evidence_threshold == 2
+                  and .query_config.options.keywords_per_attempt == 24
+                  and .query_config.options.expansion_attempts == 3
+                  and .query_config.options.rare_document_frequency == 1
+                  and .build.commit == $commit
+                  and .build.revision == $cloud_revision
+                  and .build.service == $service
+                ' "$BODY_FILE" \
+              && ! grep -Eiq 'project_id|generation_id|concepts_digest|binding_count|distinct_service_composition_count|system_template|user_template|api[_-]?key|credential' "$BODY_FILE"; then
+              READBACK_VALID=1
+              break
+            fi
+            sleep 10
+          done
+          if [[ "$HTTP_STATUS" != "200" || "$READBACK_VALID" != "1" ]]; then
+            echo "public query config readback identity/schema is invalid or did not return HTTP 200 (last status: ${HTTP_STATUS:-empty})"
+            exit 1
+          fi
+          if ! grep -Eiq '^cache-control:[[:space:]]*no-store([[:space:]]*;.*)?[[:space:]]*$' "$HEADER_FILE"; then
+            echo "public query config readback did not return Cache-Control: no-store"
+            exit 1
+          fi
+          jq -er '.query_config.config_revision' "$BODY_FILE" | { read value; echo "config_revision=$value" >> "$GITHUB_OUTPUT"; }
+          jq -er '.query_config.config_digest' "$BODY_FILE" | { read value; echo "config_digest=$value" >> "$GITHUB_OUTPUT"; }
+
+      - name: Restore frozen production traffic after query-config readback failure
+        if: ${{ always() && steps.deploy.outputs.deploy_started == 'true' && (steps.deploy.outcome == 'failure' || steps.query_config_readback.outcome == 'failure') }}
+        run: |
+          set -euo pipefail
+          FROZEN_READY_REVISION=$(jq -er '.ready_revision | select(type == "string" and length > 0)' "$ROLLBACK_CONTRACT")
+          validate_frozen_rollback_traffic() {
+            jq -e --arg ready_revision "$FROZEN_READY_REVISION" '
+              (.traffic | type == "array" and length == 1)
+              and (.traffic[0] | type == "object")
+              and ((.traffic[0] | keys | sort) == ["latest_revision", "percent", "revision_name"] or
+                   (.traffic[0] | keys | sort) == ["percent", "revision_name"])
+              and .traffic[0].revision_name == $ready_revision
+              and .traffic[0].percent == 100
+              and (.traffic[0].tag? == null)
+            ' "$ROLLBACK_CONTRACT" >/dev/null
+          }
+          validate_restored_effective_traffic() {
+            jq -e --arg ready_revision "$FROZEN_READY_REVISION" '
+              (.status.traffic | type == "array" and length == 1)
+              and (.status.traffic[0] | type == "object")
+              and ((.status.traffic[0] | keys | sort) == ["percent", "revisionName"] or
+                   (.status.traffic[0] | keys | sort) == ["latestRevision", "percent", "revisionName"])
+              and .status.traffic[0].revisionName == $ready_revision
+              and .status.traffic[0].percent == 100
+              and ((.status.traffic[0].latestRevision? // false) == false)
+            ' <<<"$1" >/dev/null
+          }
+          validate_effective_traffic() {
+            jq -e '
+              (.status.traffic | type == "array" and length == 1)
+              and (.status.traffic[0] | type == "object")
+              and ((.status.traffic[0] | keys | sort) == ["percent", "revisionName"] or
+                   (.status.traffic[0] | keys | sort) == ["latestRevision", "percent", "revisionName"])
+              and (.status.traffic[0].revisionName | type == "string" and length > 0)
+              and (.status.traffic[0].percent | type == "number" and . == 100)
+              and ((.status.traffic[0].latestRevision? // false) == false)
+            ' <<<"$1" >/dev/null
+          }
+          validate_frozen_effective_traffic() {
+            jq -e --arg ready_revision "$FROZEN_READY_REVISION" '
+              (.status.traffic | type == "array" and length == 1)
+              and (.status.traffic[0] | type == "object")
+              and ((.status.traffic[0] | keys | sort) == ["percent", "revisionName"] or
+                   (.status.traffic[0] | keys | sort) == ["latestRevision", "percent", "revisionName"])
+              and .status.traffic[0].revisionName == $ready_revision
+              and .status.traffic[0].percent == 100
+              and ((.status.traffic[0].latestRevision? // false) == false)
+            ' <<<"$1" >/dev/null
+          }
+          validate_frozen_rollback_traffic
+          if ! SERVICE_JSON=$(gcloud run services describe "$SERVICE_NAME" \
+            --region "$REGION" \
+            --project "$PROJECT_ID" \
+            --format=json \
+            --quiet); then
+            echo "provider traffic readback is unavailable, unsupported, or ambiguous; refusing to guess or write"
+            exit 1
+          fi
+          if ! validate_effective_traffic "$SERVICE_JSON"; then
+            echo "provider traffic readback is unavailable, unsupported, or ambiguous; refusing to guess or write"
+            exit 1
+          fi
+          if validate_frozen_effective_traffic "$SERVICE_JSON"; then
+            echo "live production traffic is already the frozen revision; no restore needed; preserving workflow failure"
+            exit 1
+          fi
+          echo "live production traffic differs from the frozen revision; restoring explicit frozen production traffic"
+          set +e
+          gcloud run services update-traffic "$SERVICE_NAME" \
+            --project "$PROJECT_ID" \
+            --region "$REGION" \
+            --to-revisions "${FROZEN_READY_REVISION}=100" \
+            --quiet
+          ROLLBACK_EXIT=$?
+          set -e
+          ROLLBACK_READBACK_DEADLINE=$((SECONDS + 240))
+          RESTORED=0
+          while (( SECONDS < ROLLBACK_READBACK_DEADLINE )); do
+            if SERVICE_JSON=$(gcloud run services describe "$SERVICE_NAME" \
+              --region "$REGION" \
+              --project "$PROJECT_ID" \
+              --format=json \
+              --quiet); then
+              RESTORED_EFFECTIVE_REVISION=$(jq -er '.status.traffic[0].revisionName' <<<"$SERVICE_JSON")
+              RESTORED_EFFECTIVE_PERCENT=$(jq -er '.status.traffic[0].percent' <<<"$SERVICE_JSON")
+              if validate_restored_effective_traffic "$SERVICE_JSON"; then
+                RESTORED=1
+                break
+              fi
+            fi
+            sleep 5
+          done
+          if [[ "$RESTORED" != "1" ]]; then
+            echo "frozen production traffic was not authoritative within timeout (update exit $ROLLBACK_EXIT)"
+            exit 1
+          fi
+          echo "restored effective routing: ${RESTORED_EFFECTIVE_REVISION}=${RESTORED_EFFECTIVE_PERCENT} (update exit $ROLLBACK_EXIT); preserving workflow failure"
+          exit 1
 
       - name: Render normalized deployment evidence after strict read-back
         env:

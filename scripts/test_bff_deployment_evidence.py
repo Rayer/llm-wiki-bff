@@ -21,6 +21,13 @@ JOB = "olw-pipeline"
 SERVICE = "llm-wiki-bff"
 ARTIFACT = "bff-rollback-contract-" + "c" * 40
 EVIDENCE_ARTIFACT = "bff-deployment-evidence-" + "c" * 40
+QUERY_STAGE_CONFIG_PATH = "/app/configs/query/dev/query-dev-2026-08-21.1.json"
+LEGACY_QUERY_ENV_NAMES = [
+    "QUERY_EXPANSION_MODEL", "QUERY_EXPANSION_REASONING", "ANSWER_SYNTHESIS_MODEL",
+    "ANSWER_SYNTHESIS_REASONING", "QUERY_SELECTION_LIMIT", "QUERY_SELECTION_EXPLORATION_SLOTS",
+    "QUERY_SELECTION_EVIDENCE_THRESHOLD", "QUERY_EXPANSION_KEYWORDS_PER_ATTEMPT",
+    "QUERY_EXPANSION_ATTEMPTS", "QUERY_MATCHING_RARE_KEYWORD_MAX_DOCUMENT_FREQUENCY",
+]
 
 
 FIXTURES = ROOT / "scripts" / "fixtures"
@@ -151,6 +158,7 @@ class BFFDeploymentEvidenceTest(unittest.TestCase):
         self.assertEqual(document["observed_service"]["image_reference"], IMAGE)
         self.assertEqual(document["observed_service"]["image_digest"], DIGEST)
         self.assertEqual(document["observed_service"]["traffic"], [{"revision_name": "llm-wiki-bff-00002-new", "percent": 100, "latest_revision": True}])
+        self.assertEqual(document["config"]["allowlisted"]["env"][-1], {"name": "QUERY_STAGE_CONFIG_PATH", "value": QUERY_STAGE_CONFIG_PATH})
         self.assertEqual(document["config"]["allowlisted"]["legacy_preserved"], [{"name": "PROJECT_ID", "value": "demo"}, {"name": "USER_ID", "value": "test-user"}])
         self.assertEqual(document["health"]["identity"]["commit"], "c" * 40)
         self.assertNotIn("secret-value", output.read_text())
@@ -207,6 +215,39 @@ class BFFDeploymentEvidenceTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(json.loads(failure.read_text())["reason_code"], "config_mismatch")
         self.assertFalse(output.exists())
+
+    def test_promoted_service_and_revision_require_exact_query_stage_path(self):
+        prepared, _ = self.prepare()
+        self.assertEqual(prepared.returncode, 0, prepared.stderr)
+        for location in ("service", "revision"):
+            for value in (None, "/app/configs/query/dev/wrong.json", "duplicate"):
+                with self.subTest(location=location, value=value):
+                    observed_service = fixture("bff-service-after.json")
+                    observed_revision = fixture("bff-revision-after.json")
+                    target = observed_service["spec"]["template"]["spec"]["containers"][0] if location == "service" else observed_revision["spec"]["containers"][0]
+                    path_entry = next(entry for entry in target["env"] if entry["name"] == "QUERY_STAGE_CONFIG_PATH")
+                    if value is None:
+                        target["env"].remove(path_entry)
+                    elif value == "duplicate":
+                        target["env"].append(dict(path_entry))
+                    else:
+                        path_entry["value"] = value
+                    result, output, failure = self.render_documents(observed_service, observed_revision)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(json.loads(failure.read_text())["reason_code"], "config_mismatch")
+                    self.assertFalse(output.exists())
+
+    def test_all_legacy_query_envs_are_rejected_from_promoted_evidence(self):
+        prepared, _ = self.prepare()
+        self.assertEqual(prepared.returncode, 0, prepared.stderr)
+        for name in LEGACY_QUERY_ENV_NAMES:
+            with self.subTest(name=name):
+                observed_service = fixture("bff-service-after.json")
+                observed_service["spec"]["template"]["spec"]["containers"][0]["env"].append({"name": name, "value": "legacy"})
+                result, output, failure = self.render_documents(observed_service, fixture("bff-revision-after.json"))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(json.loads(failure.read_text())["reason_code"], "config_mismatch")
+                self.assertFalse(output.exists())
 
     def test_invalid_metadata_and_provider_contracts_fail_closed(self):
         prepared, _ = self.prepare()

@@ -25,6 +25,7 @@
               {"name": "PIPELINE_JOB_URL", "value": "https://run.googleapis.com/v2/projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline:run"},
               {"name": "ALLOWED_ORIGINS", "value": "https://wiki.rayer.idv.tw,https://llm-wiki-frontend.vercel.app"},
               {"name": "DEV_JWT", "value": "false"},
+              {"name": "QUERY_STAGE_CONFIG_PATH", "value": "/app/configs/query/dev/query-dev-2026-08-21.1.json"},
               {"name": "JWT_SECRET", "valueFrom": {"secretKeyRef": {"name": "jwt-secret-prod", "key": "latest"}}},
               {"name": "DEEPSEEK_API_KEY", "valueFrom": {"secretKeyRef": {"name": "deepseek-apikey", "key": "latest"}}},
               {"name": "USER_ID", "value": "test-user"},

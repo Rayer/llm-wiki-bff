@@ -92,3 +92,185 @@ func TestDeployBFFWorkflowUsesOnlyImmutableStageConfig(t *testing.T) {
 		}
 	}
 }
+
+func TestReleaseBFFWorkflowPromotesImmutableStageConfig(t *testing.T) {
+	data, err := os.ReadFile("../../.github/workflows/release-bff.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	workflow := string(data)
+	var document map[string]any
+	if err := yaml.Unmarshal(data, &document); err != nil {
+		t.Fatalf("workflow YAML: %v", err)
+	}
+	if len(document) == 0 {
+		t.Fatal("workflow YAML is empty")
+	}
+
+	for _, declaration := range []string{
+		"QUERY_STAGE_CONFIG_PATH: /app/configs/query/dev/query-dev-2026-08-21.1.json",
+		"QUERY_STAGE_CONFIG_REVISION: query-dev-2026-08-21.1",
+		"QUERY_STAGE_CONFIG_DIGEST: sha256:a35955fe4a451c740e6252cae8087f114fbac6b4162245d3de7818c1ad37a5c6",
+	} {
+		if strings.Count(workflow, declaration) != 1 {
+			t.Fatalf("production workflow declaration %q count = %d", declaration, strings.Count(workflow, declaration))
+		}
+	}
+
+	deploy := strings.Index(workflow, "gcloud run deploy")
+	quiet := strings.Index(workflow[deploy:], "--quiet")
+	if deploy < 0 || quiet < 0 {
+		t.Fatal("production deploy command is missing")
+	}
+	deployCommand := workflow[deploy : deploy+quiet]
+	remove := strings.Index(deployCommand, "--remove-env-vars")
+	update := strings.Index(deployCommand, "--update-env-vars")
+	if remove < 0 || update < 0 || remove >= update {
+		t.Fatal("production deploy must remove stale vars before updating env vars")
+	}
+	removeBlock := deployCommand[remove:update]
+	updateBlock := deployCommand[update:]
+	legacy := []string{
+		"QUERY_EXPANSION_MODEL", "QUERY_EXPANSION_REASONING", "ANSWER_SYNTHESIS_MODEL", "ANSWER_SYNTHESIS_REASONING",
+		"QUERY_SELECTION_LIMIT", "QUERY_SELECTION_EXPLORATION_SLOTS", "QUERY_SELECTION_EVIDENCE_THRESHOLD",
+		"QUERY_EXPANSION_KEYWORDS_PER_ATTEMPT", "QUERY_EXPANSION_ATTEMPTS", "QUERY_MATCHING_RARE_KEYWORD_MAX_DOCUMENT_FREQUENCY",
+	}
+	for _, name := range legacy {
+		if !strings.Contains(removeBlock, name) || strings.Contains(updateBlock, name) || strings.Count(workflow, name) != 1 {
+			t.Fatalf("production legacy env %q is not removed-only", name)
+		}
+	}
+	if !strings.Contains(updateBlock, "QUERY_STAGE_CONFIG_PATH=${QUERY_STAGE_CONFIG_PATH}") {
+		t.Fatal("production deploy does not set the immutable stage config path")
+	}
+	if strings.Contains(workflow[deploy:], "set-iam-policy") {
+		t.Fatal("production query config wiring must not mutate IAM")
+	}
+
+	readback := strings.Index(workflow, "- name: Verify deployed query config readback")
+	evidence := strings.Index(workflow, "- name: Render normalized deployment evidence after strict read-back")
+	tag := strings.Index(workflow, "- name: Tag promoted production image")
+	if readback <= deploy || evidence <= readback || tag <= evidence {
+		t.Fatal("production query config readback/evidence/tag order is unsafe")
+	}
+	readbackBlock := workflow[readback:evidence]
+	for _, required := range []string{
+		"/api/v1/query/config", "Cache-Control", "no-store", "QUERY_STAGE_CONFIG_REVISION", "QUERY_STAGE_CONFIG_DIGEST",
+		"query-retrieval-pipeline-v2", "deepseek-v4-flash", "deepseek-v4-pro", "project_id|generation_id",
+		"EXPECTED_COMMIT", "latestReadyRevisionName", "build.commit", "build.revision", "build.service",
+	} {
+		if !strings.Contains(readbackBlock, required) {
+			t.Fatalf("production query config readback missing %q", required)
+		}
+	}
+}
+
+func TestReleaseBFFWorkflowPollsExactCreatedRevisionAndRollsBackReadbackFailure(t *testing.T) {
+	data, err := os.ReadFile("../../.github/workflows/release-bff.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	workflow := string(data)
+
+	deploy := strings.Index(workflow, "      - name: Deploy existing immutable image to Cloud Run")
+	readback := strings.Index(workflow, "      - name: Verify deployed query config readback")
+	rollback := strings.Index(workflow, "      - name: Restore frozen production traffic after query-config readback failure")
+	if deploy < 0 || readback <= deploy || rollback <= readback {
+		t.Fatal("release deploy, readback, and rollback steps are missing or out of order")
+	}
+	deployBlock := workflow[deploy:readback]
+	readbackBlock := workflow[readback:rollback]
+	rollbackBlock := workflow[rollback:]
+
+	for _, required := range []string{
+		"id: deploy",
+		"gcloud run deploy",
+		"deploy_started=true",
+	} {
+		if !strings.Contains(deployBlock, required) {
+			t.Errorf("deploy step missing mutation-state contract %q", required)
+		}
+	}
+	for _, required := range []string{
+		`FROZEN_READY_REVISION=$(jq -er '.ready_revision | select(type == "string" and length > 0)' "$ROLLBACK_CONTRACT")`,
+		"latestCreatedRevisionName",
+		"latestReadyRevisionName",
+		"READBACK_REVISION_DEADLINE",
+		`FROZEN_CREATED_REVISION="${FROZEN_CREATED_REVISION:?}"`,
+		`"$CANDIDATE_REVISION" != "$FROZEN_CREATED_REVISION"`,
+		".status.latestCreatedRevisionName == $revision",
+		".status.latestReadyRevisionName == $revision",
+		"EXPECTED_REVISION=\"$CREATED_REVISION\"",
+	} {
+		if !strings.Contains(readbackBlock, required) {
+			t.Errorf("readback step missing exact convergence contract %q", required)
+		}
+	}
+	if strings.Contains(readbackBlock, "EXPECTED_REVISION=$(jq -er '.status.latestReadyRevisionName") {
+		t.Fatal("readback must not select the ready revision before exact created-revision convergence")
+	}
+	validation := strings.Index(workflow, "      - name: Validate frozen rollback traffic before mutation")
+	upload := strings.Index(workflow, "      - name: Upload immutable rollback contract")
+	if validation < 0 || upload < 0 || validation <= upload || validation >= deploy {
+		t.Fatal("frozen rollback traffic validation must follow durable upload and precede deploy")
+	}
+	for _, required := range []string{
+		`FROZEN_READY_REVISION=$(jq -er '.ready_revision | select(type == "string" and length > 0)' "$ROLLBACK_CONTRACT")`,
+		"validate_frozen_rollback_traffic()",
+		"exactly one canonical rollback target",
+		"revision_name == $ready_revision",
+		"percent == 100",
+		"tag",
+		"if: ${{ always() && steps.deploy.outputs.deploy_started == 'true' && (steps.deploy.outcome == 'failure' || steps.query_config_readback.outcome == 'failure') }}",
+		"SERVICE_JSON=$(gcloud run services describe",
+		"validate_effective_traffic()",
+		"live production traffic is already the frozen revision",
+		"provider traffic readback is unavailable, unsupported, or ambiguous",
+		"gcloud run services update-traffic",
+		`--to-revisions "${FROZEN_READY_REVISION}=100"`,
+		"latestRevision",
+		"RESTORED_EFFECTIVE_REVISION",
+		"RESTORED_EFFECTIVE_PERCENT",
+		"exit 1",
+		"ROLLBACK_READBACK_DEADLINE",
+	} {
+		if !strings.Contains(rollbackBlock, required) && !strings.Contains(workflow[validation:deploy], required) {
+			t.Errorf("rollback step missing exact post-failure contract %q", required)
+		}
+	}
+	if !strings.Contains(rollbackBlock, "keys | sort") || !strings.Contains(rollbackBlock, "latestRevision") {
+		t.Fatal("rollback readback must reject unknown provider traffic fields and mutable latest metadata")
+	}
+	if strings.Contains(rollbackBlock, "ROLLBACK_TRAFFIC_JSON=$(jq -cer '.traffic'") || strings.Contains(rollbackBlock, "--to-latest") {
+		t.Fatal("release rollback must use the frozen ready revision with explicit effective traffic")
+	}
+
+	marker := strings.Index(deployBlock, `echo "deploy_started=true" >> "$GITHUB_OUTPUT"`)
+	command := strings.Index(deployBlock, "gcloud run deploy")
+	if marker < 0 || command < 0 || marker > command {
+		t.Fatal("deploy_started must be emitted immediately before the deploy command")
+	}
+	if strings.Contains(workflow, "deploy_attempted") {
+		t.Fatal("obsolete deploy_attempted ledger must not remain")
+	}
+
+	readLive := strings.Index(rollbackBlock, `SERVICE_JSON=$(gcloud run services describe`)
+	validateLive := strings.Index(rollbackBlock, `validate_effective_traffic "$SERVICE_JSON"`)
+	mutate := strings.Index(rollbackBlock, "gcloud run services update-traffic")
+	if readLive < 0 || validateLive < 0 || mutate < 0 || !(readLive < validateLive && validateLive < mutate) {
+		t.Fatal("rollback must strictly read and validate live traffic before any write")
+	}
+	alreadyFrozen := strings.Index(rollbackBlock, "live production traffic is already the frozen revision")
+	alreadyFrozenExit := strings.Index(rollbackBlock[alreadyFrozen:], "exit 1")
+	if alreadyFrozen < 0 || alreadyFrozenExit < 0 || strings.Contains(rollbackBlock[alreadyFrozen:alreadyFrozen+alreadyFrozenExit], "update-traffic") {
+		t.Fatal("already-frozen traffic path must perform zero writes and preserve failure")
+	}
+	unknown := strings.Index(rollbackBlock, "provider traffic readback is unavailable, unsupported, or ambiguous")
+	unknownExit := strings.Index(rollbackBlock[unknown:], "exit 1")
+	if unknown < 0 || unknownExit < 0 || strings.Contains(rollbackBlock[unknown:unknown+unknownExit], "update-traffic") {
+		t.Fatal("unknown traffic readback must fail partial/unknown without guessing or writing")
+	}
+	if !strings.Contains(rollbackBlock, "live production traffic differs from the frozen revision; restoring") || !strings.Contains(rollbackBlock, "validate_restored_effective_traffic") {
+		t.Fatal("changed traffic path must restore and verify exact frozen effective routing")
+	}
+}

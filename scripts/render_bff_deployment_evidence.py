@@ -218,6 +218,7 @@ EXPECTED_VALUES = {
     "PIPELINE_JOB_URL": "https://run.googleapis.com/v2/projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline:run",
     "ALLOWED_ORIGINS": "https://wiki.rayer.idv.tw,https://llm-wiki-frontend.vercel.app",
     "DEV_JWT": "false",
+    "QUERY_STAGE_CONFIG_PATH": "/app/configs/query/dev/query-dev-2026-08-21.1.json",
 }
 EXPECTED_SECRETS = {
     "JWT_SECRET": {"secret": "jwt-secret-prod", "version": "latest"},
@@ -226,7 +227,7 @@ EXPECTED_SECRETS = {
 LEGACY_PRESERVED_NAMES = {"USER_ID", "PROJECT_ID"}
 
 
-def normalized_env(env, legacy_preserved=None):
+def normalized_env(env, legacy_preserved=None, require_stage_config_path=False):
     values = {}
     secrets = {}
     legacy = {}
@@ -253,7 +254,8 @@ def normalized_env(env, legacy_preserved=None):
             legacy[name] = entry["value"]
         else:
             reject("environment is not allowlisted", "config_mismatch")
-    if set(values) != set(EXPECTED_VALUES) or set(secrets) != set(EXPECTED_SECRETS) or set(legacy) != LEGACY_PRESERVED_NAMES:
+    required_values = set(EXPECTED_VALUES) if require_stage_config_path else set(EXPECTED_VALUES) - {"QUERY_STAGE_CONFIG_PATH"}
+    if not required_values <= set(values) or set(values) - set(EXPECTED_VALUES) or set(secrets) != set(EXPECTED_SECRETS) or set(legacy) != LEGACY_PRESERVED_NAMES:
         reject("production environment is incomplete", "config_mismatch")
     normalized_legacy = [{"name": key, "value": legacy[key]} for key in sorted(legacy)]
     if legacy_preserved is not None:
@@ -284,7 +286,7 @@ def normalized_config(parts, legacy_preserved):
     _, service_annotations, template_annotations, spec, container, service_account, _ = parts
     if service_account != RUNTIME_SERVICE_ACCOUNT:
         reject("runtime service account does not match production", "runtime_service_account_mismatch")
-    env = normalized_env(container["env"], legacy_preserved)
+    env = normalized_env(container["env"], legacy_preserved, require_stage_config_path=True)
     config = {**env, "network": network_config(service_annotations, template_annotations), "runtime_service_account": service_account}
     return config
 
@@ -293,7 +295,7 @@ def normalized_revision_config(revision, service_annotations, legacy_preserved=N
     metadata = revision.get("metadata") if isinstance(revision, dict) else None
     expected_name = metadata.get("name") if isinstance(metadata, dict) else None
     parts = revision_parts(revision, expected_name, expected_image)
-    env = normalized_env(parts["container"]["env"], legacy_preserved)
+    env = normalized_env(parts["container"]["env"], legacy_preserved, require_stage_config_path=expected_image is not None)
     return {**env, "network": network_config(service_annotations, parts["metadata_annotations"]), "runtime_service_account": parts["service_account"]}
 
 
