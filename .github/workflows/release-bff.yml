@@ -61,9 +61,10 @@ jobs:
           EVIDENCE="$EVIDENCE_DIR/deployment-evidence.json"
           EVIDENCE_FAILURE="$EVIDENCE_DIR/deployment-evidence-failure.json"
           DEV_RUN_JSON="$EVIDENCE_DIR/dev-run.json"
+          DEV_JOBS_JSON="$EVIDENCE_DIR/dev-jobs.json"
           printf 'EVIDENCE_DIR=%s\nROLLBACK_CONTRACT=%s\nMETADATA=%s\nEVIDENCE=%s\nEVIDENCE_FAILURE=%s\n' \
             "$EVIDENCE_DIR" "$ROLLBACK_CONTRACT" "$METADATA" "$EVIDENCE" "$EVIDENCE_FAILURE" >> "$GITHUB_ENV"
-          printf 'DEV_RUN_JSON=%s\n' "$DEV_RUN_JSON" >> "$GITHUB_ENV"
+          printf 'DEV_RUN_JSON=%s\nDEV_JOBS_JSON=%s\n' "$DEV_RUN_JSON" "$DEV_JOBS_JSON" >> "$GITHUB_ENV"
 
       - name: Validate promotion commit
         id: commit
@@ -101,6 +102,45 @@ jobs:
           fi
           gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${DEV_RUN_ID}" > "$DEV_RUN_JSON"
           echo "run_id=$DEV_RUN_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Validate exact successful DEV promotion jobs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEV_RUN_ID: ${{ steps.dev_run.outputs.run_id }}
+        run: |
+          set -euo pipefail
+          PAGES_FILE="$DEV_JOBS_JSON.pages"
+          rm -f "$PAGES_FILE"
+          TOTAL=""
+          COLLECTED=0
+          PAGE=1
+          while :; do
+            RESPONSE=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${DEV_RUN_ID}/jobs?per_page=100&page=${PAGE}")
+            PAGE_TOTAL=$(jq -er '.total_count | select(type == "number" and . >= 0 and floor == .)' <<<"$RESPONSE")
+            PAGE_JOBS=$(jq -cer '.jobs | select(type == "array")' <<<"$RESPONSE")
+            PAGE_COUNT=$(jq -er 'length' <<<"$PAGE_JOBS")
+            if [[ -z "$TOTAL" ]]; then
+              TOTAL="$PAGE_TOTAL"
+            elif [[ "$TOTAL" != "$PAGE_TOTAL" ]]; then
+              echo "DEV run job count changed while fetching evidence"
+              exit 1
+            fi
+            printf '%s\n' "$PAGE_JOBS" >> "$PAGES_FILE"
+            COLLECTED=$((COLLECTED + PAGE_COUNT))
+            if (( COLLECTED == TOTAL )); then
+              jq -s 'add' "$PAGES_FILE" > "$DEV_JOBS_JSON"
+              rm -f "$PAGES_FILE"
+              break
+            fi
+            if (( COLLECTED > TOTAL || PAGE_COUNT == 0 )); then
+              echo "DEV run jobs listing was incomplete or malformed"
+              exit 1
+            fi
+            PAGE=$((PAGE + 1))
+          done
+          python3 scripts/validate_bff_promotion_contract.py validate-run-jobs \
+            --jobs-json "$DEV_JOBS_JSON" \
+            --expected-run-id "$DEV_RUN_ID"
 
       - name: Download exact DEV receipt and readiness evidence
         id: image
@@ -303,9 +343,16 @@ jobs:
         id: deploy
         env:
           IMMUTABLE_IMAGE: ${{ steps.image.outputs.image }}
+          COMMIT_SHA: ${{ steps.commit.outputs.commit_sha }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           echo "deploy_started=true" >> "$GITHUB_OUTPUT"
+          MAIN_SHA=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq .object.sha)
+          if [[ "$MAIN_SHA" != "$COMMIT_SHA" ]]; then
+            echo "current main changed before deploy; refusing to mutate production"
+            exit 1
+          fi
           gcloud run deploy "$SERVICE_NAME" \
             --project "$PROJECT_ID" \
             --image "$IMMUTABLE_IMAGE" \

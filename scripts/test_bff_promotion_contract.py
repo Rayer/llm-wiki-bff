@@ -89,6 +89,14 @@ class BFFPromotionContractTest(unittest.TestCase):
             command.extend(["--compare-path", compare_path])
         return subprocess.run(command, capture_output=True, text=True)
 
+    def invoke_run_jobs(self, jobs):
+        path = self.root / "jobs.json"
+        path.write_text(json.dumps(jobs))
+        return subprocess.run([
+            "python3", str(SCRIPT), "validate-run-jobs",
+            "--jobs-json", str(path), "--expected-run-id", str(RUN_ID),
+        ], capture_output=True, text=True)
+
     def test_real_receipt_shape_normalizes_exact_identity(self):
         result = self.invoke_receipt()
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -158,6 +166,30 @@ class BFFPromotionContractTest(unittest.TestCase):
                 path = self.root / f"{name}.txt"
                 path.write_bytes(value.encode())
                 self.assertNotEqual(self.invoke_receipt(path).returncode, 0)
+
+    def test_receipt_line_count_diagnostic_names_nine_lines(self):
+        path = self.root / "unterminated-receipt.txt"
+        path.write_bytes(receipt().rstrip("\n").encode())
+        result = self.invoke_receipt(path)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stderr, "promotion contract rejected: receipt must use exactly nine LF-terminated lines\n")
+
+    def test_run_jobs_require_unique_successful_same_run_promotion_evidence(self):
+        jobs = [
+            {"name": "production-promotion-ready", "run_id": RUN_ID, "status": "completed", "conclusion": "success"},
+            {"name": "main-fast-forward-eligible", "run_id": RUN_ID, "status": "completed", "conclusion": "success"},
+        ]
+        self.assertEqual(self.invoke_run_jobs(jobs).returncode, 0)
+        cases = {
+            "missing": jobs[:1],
+            "skipped": [{**jobs[1], "conclusion": "skipped"}, jobs[0]],
+            "failed": [{**jobs[0], "conclusion": "failure"}, jobs[1]],
+            "duplicate": jobs + [jobs[0]],
+            "wrong run": [{**jobs[0], "run_id": RUN_ID + 1}, jobs[1]],
+        }
+        for name, value in cases.items():
+            with self.subTest(name=name):
+                self.assertNotEqual(self.invoke_run_jobs(value).returncode, 0)
 
     def test_receipt_rejects_noncanonical_run_url_without_writing_output(self):
         original = json.loads(self.run_path.read_text())

@@ -1469,13 +1469,14 @@ func TestReleaseWorkflowAuthenticatesOnlyAfterReadOnlyGatesAndHasOneProviderMuta
 	contents := readWorkflow(t, ".github/workflows/release-bff.yml")
 	auth := strings.Index(contents, "- name: Authenticate to Google Cloud")
 	provenance := strings.Index(contents, "- name: Locate exact successful canonical develop DEV deployment")
+	jobs := strings.Index(contents, "- name: Validate exact successful DEV promotion jobs")
 	image := strings.Index(contents, "- name: Download exact DEV receipt and readiness evidence")
 	preflight := strings.Index(contents, "- name: Verify production IAM preflight")
 	deploy := strings.Index(contents, "gcloud run deploy")
-	if auth < 0 || provenance < 0 || image < 0 || preflight < 0 || deploy < 0 {
+	if auth < 0 || provenance < 0 || jobs < 0 || image < 0 || preflight < 0 || deploy < 0 {
 		t.Fatal("release workflow is missing the source, provenance, IAM, or deploy gates")
 	}
-	if auth < provenance || auth < image || auth > preflight || preflight > deploy {
+	if auth < provenance || auth < jobs || auth < image || auth > preflight || preflight > deploy {
 		t.Fatal("release authentication/deploy order is not fail-closed")
 	}
 	serviceIAM := strings.Index(contents, "gcloud run services get-iam-policy")
@@ -1497,6 +1498,45 @@ func TestReleaseWorkflowAuthenticatesOnlyAfterReadOnlyGatesAndHasOneProviderMuta
 	}
 	if strings.Contains(contents, "gcloud artifacts docker tags add") || strings.Contains(contents, ":prod-${COMMIT_SHA}") {
 		t.Fatal("production workflow must not mutate or consume removed observability tags")
+	}
+}
+
+func TestReleaseWorkflowRequiresCompleteSameRunJobEvidenceBeforeAuth(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/release-bff.yml")
+	start := strings.Index(contents, "- name: Validate exact successful DEV promotion jobs")
+	auth := strings.Index(contents, "- name: Authenticate to Google Cloud")
+	if start < 0 || auth < 0 || start >= auth {
+		t.Fatal("release workflow must validate DEV job evidence before cloud authentication")
+	}
+	section := contents[start:auth]
+	for _, want := range []string{
+		`gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${DEV_RUN_ID}/jobs?per_page=100&page=${PAGE}"`,
+		`PAGE_TOTAL=$(jq -er '.total_count`,
+		`if (( COLLECTED == TOTAL )); then`,
+		`if (( COLLECTED > TOTAL || PAGE_COUNT == 0 )); then`,
+		`jq -s 'add' "$PAGES_FILE" > "$DEV_JOBS_JSON"`,
+		"validate-run-jobs",
+		`--jobs-json "$DEV_JOBS_JSON"`,
+		`--expected-run-id "$DEV_RUN_ID"`,
+	} {
+		if !strings.Contains(section, want) {
+			t.Errorf("release workflow is missing complete same-run jobs contract %q", want)
+		}
+	}
+}
+
+func TestReleaseWorkflowRereadsMainImmediatelyBeforeDeploy(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/release-bff.yml")
+	start := strings.Index(contents, "- name: Deploy existing immutable image to Cloud Run")
+	if start < 0 {
+		t.Fatal("release workflow is missing deploy step")
+	}
+	section := contents[start:]
+	read := strings.Index(section, `MAIN_SHA=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq .object.sha)`)
+	check := strings.Index(section, `if [[ "$MAIN_SHA" != "$COMMIT_SHA" ]]; then`)
+	deploy := strings.Index(section, `gcloud run deploy "$SERVICE_NAME"`)
+	if read < 0 || check < 0 || deploy < 0 || !(read < check && check < deploy) {
+		t.Fatal("deploy step must reread and verify main immediately before its Cloud Run mutation")
 	}
 }
 
