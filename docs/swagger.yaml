@@ -710,19 +710,13 @@ paths:
     post:
       consumes:
       - application/json
-      description: Invokes the Cloud Run worker job for the specified project. Optional
-        body {"clean_rebuild":true} cold-starts Synto from raw without prior wiki/state.
+      description: Invokes the Cloud Run worker job for the specified project, then rebuilds the search index.
       parameters:
       - description: Project doc ID ({userID}_{projectID})
         in: path
         name: id
         required: true
         type: string
-      - description: Optional flags
-        in: body
-        name: body
-        schema:
-          type: object
       produces:
       - application/json
       responses:
@@ -757,7 +751,7 @@ paths:
             $ref: '#/definitions/handler.ErrorResponse'
       security:
       - BearerAuth: []
-      summary: Trigger pipeline for a project (admin)
+      summary: Trigger pipeline + rebuild for a project (admin)
       tags:
       - admin
   /api/v1/admin/projects/{id}/rebuild-index:

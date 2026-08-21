@@ -221,7 +221,7 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "description": "Invokes the Cloud Run worker job for the specified project. Optional body {\"clean_rebuild\":true} cold-starts Synto from raw without prior wiki/state.",
+                "description": "Invokes the Cloud Run worker job for the specified project, then rebuilds the search index.",
                 "consumes": [
                     "application/json"
                 ],
@@ -231,7 +231,7 @@ const docTemplate = `{
                 "tags": [
                     "admin"
                 ],
-                "summary": "Trigger pipeline for a project (admin)",
+                "summary": "Trigger pipeline + rebuild for a project (admin)",
                 "parameters": [
                     {
                         "type": "string",
@@ -239,14 +239,6 @@ const docTemplate = `{
                         "name": "id",
                         "in": "path",
                         "required": true
-                    },
-                    {
-                        "description": "Optional flags",
-                        "name": "body",
-                        "in": "body",
-                        "schema": {
-                            "type": "object"
-                        }
                     }
                 ],
                 "responses": {
