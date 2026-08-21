@@ -107,7 +107,7 @@ class LocalDevMakefileTests(unittest.TestCase):
             self.assertIn(name, remove_block)
             self.assertNotIn(name, update_block)
         self.assertIn(
-            'QUERY_STAGE_CONFIG_PATH=/app/configs/query/dev/query-dev-2026-08-21.1.json',
+            'QUERY_STAGE_CONFIG_PATH=/app/configs/query/dev/query-dev-2026-08-21.2.json',
             update_block,
         )
         self.assertEqual(update_block.count("QUERY_STAGE_CONFIG_PATH="), 1)

@@ -218,7 +218,7 @@ EXPECTED_VALUES = {
     "PIPELINE_JOB_URL": "https://run.googleapis.com/v2/projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline:run",
     "ALLOWED_ORIGINS": "https://wiki.rayer.idv.tw,https://llm-wiki-frontend.vercel.app",
     "DEV_JWT": "false",
-    "QUERY_STAGE_CONFIG_PATH": "/app/configs/query/dev/query-dev-2026-08-21.1.json",
+    "QUERY_STAGE_CONFIG_PATH": "/app/configs/query/dev/query-dev-2026-08-21.2.json",
 }
 EXPECTED_SECRETS = {
     "JWT_SECRET": {"secret": "jwt-secret-prod", "version": "latest"},

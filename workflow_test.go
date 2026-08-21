@@ -703,9 +703,9 @@ func TestBFFDevWorkflowAllowsBothMigrationOrigins(t *testing.T) {
 func TestBFFDevWorkflowUsesImmutableQueryConfigWithoutChangingSecretBinding(t *testing.T) {
 	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
 	for _, want := range []string{
-		"QUERY_STAGE_CONFIG_PATH: /app/configs/query/dev/query-dev-2026-08-21.1.json",
-		"QUERY_STAGE_CONFIG_REVISION: query-dev-2026-08-21.1",
-		"QUERY_STAGE_CONFIG_DIGEST: sha256:a35955fe4a451c740e6252cae8087f114fbac6b4162245d3de7818c1ad37a5c6",
+		"QUERY_STAGE_CONFIG_PATH: /app/configs/query/dev/query-dev-2026-08-21.2.json",
+		"QUERY_STAGE_CONFIG_REVISION: query-dev-2026-08-21.2",
+		"QUERY_STAGE_CONFIG_DIGEST: sha256:75e4f76de991b496c503b42fd893d34408ddae726fe99003365a5c89b8e46642",
 		"QUERY_STAGE_CONFIG_PATH=${{ env.QUERY_STAGE_CONFIG_PATH }}",
 		"--remove-env-vars \"QUERY_EXPANSION_MODEL,QUERY_EXPANSION_REASONING,ANSWER_SYNTHESIS_MODEL,ANSWER_SYNTHESIS_REASONING,QUERY_SELECTION_LIMIT,QUERY_SELECTION_EXPLORATION_SLOTS,QUERY_SELECTION_EVIDENCE_THRESHOLD,QUERY_EXPANSION_KEYWORDS_PER_ATTEMPT,QUERY_EXPANSION_ATTEMPTS,QUERY_MATCHING_RARE_KEYWORD_MAX_DOCUMENT_FREQUENCY\"",
 	} {
@@ -1494,8 +1494,8 @@ func TestReleaseWorkflowStrictlyParsesQueryConfigReceipt(t *testing.T) {
 	parser = strings.Join(parserLines, "\n")
 
 	imageDigest := "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-	revision := "query-dev-2026-08-21.1"
-	configDigest := "sha256:a35955fe4a451c740e6252cae8087f114fbac6b4162245d3de7818c1ad37a5c6"
+	revision := "query-dev-2026-08-21.2"
+	configDigest := "sha256:75e4f76de991b496c503b42fd893d34408ddae726fe99003365a5c89b8e46642"
 	receipt := "image_digest=" + imageDigest + "\nquery_config_revision=" + revision + "\nquery_config_digest=" + configDigest + "\n"
 	run := func(t *testing.T, input string) ([]byte, string, error) {
 		t.Helper()
