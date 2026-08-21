@@ -29,11 +29,11 @@ its `BUCKET` value, and that both `volumes` and `volumeMounts` are empty.
 - `Promote BFF to Cloud Run (production)` is manually dispatched from protected `main` with a full commit SHA and its exact successful canonical-`develop` DEV run ID. Before any production authentication or mutation, it requires live `main` to equal that SHA, then validates the same-run versioned digest receipt and `bff-production-promotion-ready-<SHA>` normalized readiness artifact before deploying that digest without rebuilding or resolving an environment tag. Production evidence separately records `production_source_ref=main`; public build identity remains `develop`. This removes the main BFF DEV rebuild from the critical path (about 9m19 observed), not Main CI or Worker work.
 - The successful canonical `develop` DEV deployment feeds the read-only downstream job named exactly `production-promotion-ready`; it uses actual in-progress workflow metadata and fails closed unless the candidate remains the exact current `develop` head. Before an ordinary non-force `develop` to `main` fast-forward, the required `main-fast-forward-eligible` check runs only after readiness and rechecks exact head and ancestry. No branch protection is mutated by this change.
 
-The commit-SHA image tag identifies the immutable dev build, and the validated `repository@sha256:...` digest identifies the immutable image promoted to production. No run-scoped DEV or production observability tags are used; the digest, Cloud Run revision, GitHub run, rollback contract, and deployment evidence remain authoritative.
+A commit-SHA image tag is a convenient build identifier, but remains mutable and non-authoritative. Only the validated `repository@sha256:...` digest plus the Cloud Run revision, GitHub run, and deployment evidence form immutable authority for the image promoted to production. No run-scoped DEV or production observability tags are used; the rollback contract remains authoritative.
 
 No credential values belong in workflow files, Makefiles, documentation, or command output. Workload Identity secrets remain GitHub environment secrets.
 
-For a local/manual development deploy, use the Makefile with its immutable commit tag and development-only defaults:
+For a local/manual development deploy, use the Makefile with its mutable, non-authoritative commit tag and development-only defaults:
 
 ```sh
 make docker-build docker-push deploy-dev
