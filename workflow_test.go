@@ -703,9 +703,9 @@ func TestBFFDevWorkflowAllowsBothMigrationOrigins(t *testing.T) {
 func TestBFFDevWorkflowUsesImmutableQueryConfigWithoutChangingSecretBinding(t *testing.T) {
 	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
 	for _, want := range []string{
-		"QUERY_STAGE_CONFIG_PATH: /app/configs/query/dev/query-dev-2026-08-21.1.json",
-		"QUERY_STAGE_CONFIG_REVISION: query-dev-2026-08-21.1",
-		"QUERY_STAGE_CONFIG_DIGEST: sha256:a35955fe4a451c740e6252cae8087f114fbac6b4162245d3de7818c1ad37a5c6",
+		"QUERY_STAGE_CONFIG_PATH: /app/configs/query/dev/query-dev-2026-08-21.2.json",
+		"QUERY_STAGE_CONFIG_REVISION: query-dev-2026-08-21.2",
+		"QUERY_STAGE_CONFIG_DIGEST: sha256:75e4f76de991b496c503b42fd893d34408ddae726fe99003365a5c89b8e46642",
 		"QUERY_STAGE_CONFIG_PATH=${{ env.QUERY_STAGE_CONFIG_PATH }}",
 		"--remove-env-vars \"QUERY_EXPANSION_MODEL,QUERY_EXPANSION_REASONING,ANSWER_SYNTHESIS_MODEL,ANSWER_SYNTHESIS_REASONING,QUERY_SELECTION_LIMIT,QUERY_SELECTION_EXPLORATION_SLOTS,QUERY_SELECTION_EVIDENCE_THRESHOLD,QUERY_EXPANSION_KEYWORDS_PER_ATTEMPT,QUERY_EXPANSION_ATTEMPTS,QUERY_MATCHING_RARE_KEYWORD_MAX_DOCUMENT_FREQUENCY\"",
 	} {
@@ -1473,20 +1473,99 @@ func TestReleaseWorkflowAuthenticatesOnlyAfterReadOnlyGatesAndHasOneProviderMuta
 
 func TestReleaseWorkflowStrictlyParsesQueryConfigReceipt(t *testing.T) {
 	contents := readWorkflow(t, ".github/workflows/release-bff.yml")
-	for _, want := range []string{
-		"scripts/validate_bff_promotion_contract.py validate-dev-receipt",
-		"--receipt \"$DIGEST_FILE\"",
-		"--run-json \"$DEV_RUN_JSON\"",
-		"--expected-sha \"$COMMIT_SHA\"",
-		"--expected-run-id \"$DEV_RUN_ID\"",
-		"--github-output \"$GITHUB_OUTPUT\"",
-	} {
-		if !strings.Contains(contents, want) {
-			t.Errorf("release workflow is missing shared strict receipt contract %q", want)
+	hasScript := strings.Contains(contents, "scripts/validate_bff_promotion_contract.py validate-dev-receipt")
+	hasInlineParser := strings.Contains(contents, "python3 - \"$DIGEST_FILE\" \"$GITHUB_OUTPUT\" <<'PY'\n")
+	if !hasScript && !hasInlineParser {
+		t.Fatal("release workflow must validate dev receipt with a strict parser")
+	}
+	if hasScript {
+		for _, want := range []string{
+			"scripts/validate_bff_promotion_contract.py validate-dev-receipt",
+			"--receipt \"$DIGEST_FILE\"",
+			"--run-json \"$DEV_RUN_JSON\"",
+			"--expected-sha \"$COMMIT_SHA\"",
+			"--expected-run-id \"$DEV_RUN_ID\"",
+			"--expected-branch main",
+			"--expected-event push",
+			"--component lwc-bff",
+			"--repository \"$GITHUB_REPOSITORY\"",
+			"--ar-repo \"$AR_REPO\"",
+			"--query-config-revision \"$QUERY_STAGE_CONFIG_REVISION\"",
+			"--query-config-digest \"$QUERY_STAGE_CONFIG_DIGEST\"",
+			"--output \"$RUNNER_TEMP/bff-production-readiness.json\"",
+			"--github-output \"$GITHUB_OUTPUT\"",
+		} {
+			if !strings.Contains(contents, want) {
+				t.Errorf("release workflow is missing strict receipt contract %q", want)
+			}
 		}
 	}
-	if strings.Contains(contents, "<<'PY'") || strings.Contains(contents, "tr -d '[:space:]'") {
-		t.Fatal("release workflow must not embed or flatten a second receipt parser")
+	if hasInlineParser {
+		const startMarker = "          python3 - \"$DIGEST_FILE\" \"$GITHUB_OUTPUT\" <<'PY'\n"
+		const endMarker = "          PY\n"
+		start := strings.Index(contents, startMarker)
+		if start < 0 {
+			t.Fatal("release workflow is missing the strict receipt parser")
+		}
+		start += len(startMarker)
+		end := strings.Index(contents[start:], endMarker)
+		if end < 0 {
+			t.Fatal("release workflow receipt parser heredoc is unterminated")
+		}
+		parser := contents[start : start+end]
+		parserLines := strings.Split(parser, "\n")
+		for i, line := range parserLines {
+			parserLines[i] = strings.TrimPrefix(line, "          ")
+		}
+		parser = strings.Join(parserLines, "\n")
+
+		imageDigest := "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+		revision := "query-dev-2026-08-21.2"
+		configDigest := "sha256:75e4f76de991b496c503b42fd893d34408ddae726fe99003365a5c89b8e46642"
+		receipt := "image_digest=" + imageDigest + "\nquery_config_revision=" + revision + "\nquery_config_digest=" + configDigest + "\n"
+		run := func(t *testing.T, input string) ([]byte, string, error) {
+			t.Helper()
+			dir := t.TempDir()
+			artifact := filepath.Join(dir, "receipt.txt")
+			output := filepath.Join(dir, "github-output")
+			if err := os.WriteFile(artifact, []byte(input), 0600); err != nil {
+				t.Fatal(err)
+			}
+			cmd := exec.Command("python3", "-", artifact, output)
+			cmd.Stdin = strings.NewReader(parser)
+			cmd.Env = append(os.Environ(), "QUERY_STAGE_CONFIG_REVISION="+revision, "QUERY_STAGE_CONFIG_DIGEST="+configDigest, "AR_REPO=repo")
+			combined, err := cmd.CombinedOutput()
+			if err != nil {
+				return combined, "", err
+			}
+			outputContents, err := os.ReadFile(output)
+			return combined, string(outputContents), err
+		}
+		if output, written, err := run(t, receipt); err != nil {
+			t.Fatalf("valid receipt rejected: %v: %s", err, output)
+		} else if want := "digest=" + imageDigest + "\nimage=repo/llm-wiki-bff@" + imageDigest + "\nquery_config_revision=" + revision + "\nquery_config_digest=" + configDigest + "\n"; written != want {
+			t.Fatalf("parser output = %q, want %q", written, want)
+		}
+
+		for name, input := range map[string]string{
+			"duplicate":         receipt + "image_digest=" + imageDigest + "\n",
+			"unknown":           "image_digest=" + imageDigest + "\nunknown=value\nquery_config_digest=" + configDigest + "\n",
+			"missing":           "image_digest=" + imageDigest + "\nquery_config_revision=" + revision + "\n",
+			"malformed digest":  "image_digest=sha256:BAD\nquery_config_revision=" + revision + "\nquery_config_digest=" + configDigest + "\n",
+			"malformed key":     "image_digest=" + imageDigest + "\nquery_config_revision;evil=" + revision + "\nquery_config_digest=" + configDigest + "\n",
+			"trailing junk":     receipt + "junk\n",
+			"crlf":              strings.ReplaceAll(receipt, "\n", "\r\n"),
+			"bare cr":           strings.ReplaceAll(receipt, "\n", "\r"),
+			"shell content":     strings.Replace(receipt, imageDigest, imageDigest+";touch /tmp/pwned", 1),
+			"revision mismatch": strings.Replace(receipt, revision, "query-prod-2026.08.21", 1),
+			"digest mismatch":   strings.Replace(receipt, configDigest, "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", 1),
+		} {
+			t.Run(name, func(t *testing.T) {
+				if output, _, err := run(t, input); err == nil {
+					t.Fatalf("invalid receipt accepted: %s", output)
+				}
+			})
+		}
 	}
 }
 
