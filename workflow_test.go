@@ -1473,6 +1473,75 @@ func TestReleaseWorkflowAuthenticatesOnlyAfterReadOnlyGatesAndHasOneProviderMuta
 	}
 }
 
+func TestReleaseWorkflowStrictlyParsesQueryConfigReceipt(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/release-bff.yml")
+	const startMarker = "          python3 - \"$DIGEST_FILE\" \"$GITHUB_OUTPUT\" <<'PY'\n"
+	const endMarker = "          PY\n"
+	start := strings.Index(contents, startMarker)
+	if start < 0 {
+		t.Fatal("release workflow is missing the strict receipt parser")
+	}
+	start += len(startMarker)
+	end := strings.Index(contents[start:], endMarker)
+	if end < 0 {
+		t.Fatal("release workflow receipt parser heredoc is unterminated")
+	}
+	parser := contents[start : start+end]
+	parserLines := strings.Split(parser, "\n")
+	for i, line := range parserLines {
+		parserLines[i] = strings.TrimPrefix(line, "          ")
+	}
+	parser = strings.Join(parserLines, "\n")
+
+	imageDigest := "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	revision := "query-dev-2026-08-21.1"
+	configDigest := "sha256:a35955fe4a451c740e6252cae8087f114fbac6b4162245d3de7818c1ad37a5c6"
+	receipt := "image_digest=" + imageDigest + "\nquery_config_revision=" + revision + "\nquery_config_digest=" + configDigest + "\n"
+	run := func(t *testing.T, input string) ([]byte, string, error) {
+		t.Helper()
+		dir := t.TempDir()
+		artifact := filepath.Join(dir, "receipt.txt")
+		output := filepath.Join(dir, "github-output")
+		if err := os.WriteFile(artifact, []byte(input), 0600); err != nil {
+			t.Fatal(err)
+		}
+		cmd := exec.Command("python3", "-", artifact, output)
+		cmd.Stdin = strings.NewReader(parser)
+		cmd.Env = append(os.Environ(), "QUERY_STAGE_CONFIG_REVISION="+revision, "QUERY_STAGE_CONFIG_DIGEST="+configDigest, "AR_REPO=repo")
+		combined, err := cmd.CombinedOutput()
+		if err != nil {
+			return combined, "", err
+		}
+		contents, err := os.ReadFile(output)
+		return combined, string(contents), err
+	}
+	if output, written, err := run(t, receipt); err != nil {
+		t.Fatalf("valid receipt rejected: %v: %s", err, output)
+	} else if want := "digest=" + imageDigest + "\nimage=repo/llm-wiki-bff@" + imageDigest + "\nquery_config_revision=" + revision + "\nquery_config_digest=" + configDigest + "\n"; written != want {
+		t.Fatalf("parser output = %q, want %q", written, want)
+	}
+
+	for name, input := range map[string]string{
+		"duplicate":         receipt + "image_digest=" + imageDigest + "\n",
+		"unknown":           "image_digest=" + imageDigest + "\nunknown=value\nquery_config_digest=" + configDigest + "\n",
+		"missing":           "image_digest=" + imageDigest + "\nquery_config_revision=" + revision + "\n",
+		"malformed digest":  "image_digest=sha256:BAD\nquery_config_revision=" + revision + "\nquery_config_digest=" + configDigest + "\n",
+		"malformed key":     "image_digest=" + imageDigest + "\nquery_config_revision;evil=" + revision + "\nquery_config_digest=" + configDigest + "\n",
+		"trailing junk":     receipt + "junk\n",
+		"crlf":              strings.ReplaceAll(receipt, "\n", "\r\n"),
+		"bare cr":           strings.ReplaceAll(receipt, "\n", "\r"),
+		"shell content":     strings.Replace(receipt, imageDigest, imageDigest+";touch /tmp/pwned", 1),
+		"revision mismatch": strings.Replace(receipt, revision, "query-prod-2026.08.21", 1),
+		"digest mismatch":   strings.Replace(receipt, configDigest, "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if output, _, err := run(t, input); err == nil {
+				t.Fatalf("invalid receipt accepted: %s", output)
+			}
+		})
+	}
+}
+
 func TestReleaseWorkflowDurablyUploadsRollbackBeforeMutation(t *testing.T) {
 	contents := readWorkflow(t, ".github/workflows/release-bff.yml")
 	freeze := strings.Index(contents, "- name: Freeze production rollback contract")

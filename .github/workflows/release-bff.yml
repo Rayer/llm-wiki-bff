@@ -122,13 +122,41 @@ jobs:
             echo "digest artifact contents are missing or unexpected"
             exit 1
           fi
-          DIGEST=$(tr -d '[:space:]' < "$DIGEST_FILE")
-          if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-            echo "digest artifact is missing or invalid"
-            exit 1
-          fi
-          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
-          echo "image=${AR_REPO}/llm-wiki-bff@${DIGEST}" >> "$GITHUB_OUTPUT"
+          python3 - "$DIGEST_FILE" "$GITHUB_OUTPUT" <<'PY'
+          import os
+          import re
+          import sys
+          from pathlib import Path
+
+          artifact_path, output_path = sys.argv[1:]
+          raw = Path(artifact_path).read_bytes()
+          if not raw.endswith(b"\n") or raw.endswith(b"\n\n") or b"\r" in raw:
+              raise SystemExit("digest artifact must use exactly three LF-terminated lines")
+          lines = raw[:-1].split(b"\n")
+          keys = (b"image_digest", b"query_config_revision", b"query_config_digest")
+          values = {}
+          for expected_key, line in zip(keys, lines):
+              if line.count(b"=") != 1:
+                  raise SystemExit("digest artifact contains a malformed line")
+              key, value = line.split(b"=", 1)
+              if key != expected_key or key in values or not value:
+                  raise SystemExit("digest artifact keys or line order are invalid")
+              values[key] = value
+          if len(lines) != len(keys) or set(values) != set(keys):
+              raise SystemExit("digest artifact must contain exactly the required keys")
+          digest_pattern = re.compile(rb"sha256:[0-9a-f]{64}\Z")
+          if not digest_pattern.fullmatch(values[b"image_digest"]):
+              raise SystemExit("image digest is missing or invalid")
+          if values[b"query_config_revision"] != os.environ["QUERY_STAGE_CONFIG_REVISION"].encode():
+              raise SystemExit("query config revision does not match the workflow artifact")
+          config_digest = values[b"query_config_digest"]
+          if not digest_pattern.fullmatch(config_digest) or config_digest != os.environ["QUERY_STAGE_CONFIG_DIGEST"].encode():
+              raise SystemExit("query config digest does not match the workflow artifact")
+          digest = values[b"image_digest"].decode("ascii")
+          image = f"{os.environ['AR_REPO']}/llm-wiki-bff@{digest}"
+          with Path(output_path).open("a", encoding="utf-8") as output:
+              output.write(f"digest={digest}\nimage={image}\nquery_config_revision={values[b'query_config_revision'].decode('ascii')}\nquery_config_digest={config_digest.decode('ascii')}\n")
+          PY
 
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
