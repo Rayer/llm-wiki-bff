@@ -7,6 +7,10 @@ on:
         description: Full lowercase commit SHA for an image already built by the main dev workflow
         required: true
         type: string
+      dev_run_id:
+        description: Exact successful DEV deployment run ID for this commit SHA
+        required: true
+        type: string
 
 env:
   PROJECT_ID: llm-wiki-cloud
@@ -56,8 +60,10 @@ jobs:
           METADATA="$EVIDENCE_DIR/metadata.json"
           EVIDENCE="$EVIDENCE_DIR/deployment-evidence.json"
           EVIDENCE_FAILURE="$EVIDENCE_DIR/deployment-evidence-failure.json"
+          DEV_RUN_JSON="$EVIDENCE_DIR/dev-run.json"
           printf 'EVIDENCE_DIR=%s\nROLLBACK_CONTRACT=%s\nMETADATA=%s\nEVIDENCE=%s\nEVIDENCE_FAILURE=%s\n' \
             "$EVIDENCE_DIR" "$ROLLBACK_CONTRACT" "$METADATA" "$EVIDENCE" "$EVIDENCE_FAILURE" >> "$GITHUB_ENV"
+          printf 'DEV_RUN_JSON=%s\n' "$DEV_RUN_JSON" >> "$GITHUB_ENV"
 
       - name: Validate promotion commit
         id: commit
@@ -79,28 +85,20 @@ jobs:
           fi
           echo "commit_sha=$COMMIT_SHA" >> "$GITHUB_OUTPUT"
 
-      - name: Locate successful main dev deployment
+      - name: Locate exact successful main dev deployment
         id: dev_run
         env:
           GH_TOKEN: ${{ github.token }}
           COMMIT_SHA: ${{ steps.commit.outputs.commit_sha }}
+          DEV_RUN_ID: ${{ inputs.dev_run_id }}
         run: |
           set -euo pipefail
-          RUN_JSON=$(gh api \
-            "repos/${GITHUB_REPOSITORY}/actions/workflows/deploy-bff.yml/runs?event=push&status=completed&head_sha=${COMMIT_SHA}&per_page=100" \
-            | jq -ce --arg sha "$COMMIT_SHA" 'first(.workflow_runs[] | select(.event == "push" and .head_branch == "main" and .head_sha == $sha and .conclusion == "success")) // error("no successful main push run")')
-          RUN_ID=$(jq -er '.id | select(type == "number" and . > 0)' <<<"$RUN_JSON")
-          RUN_URL=$(jq -er '.html_url | select(type == "string" and startswith("https://"))' <<<"$RUN_JSON")
-          RUN_EVENT=$(jq -er '.event | select(. == "push")' <<<"$RUN_JSON")
-          RUN_HEAD_BRANCH=$(jq -er '.head_branch | select(. == "main")' <<<"$RUN_JSON")
-          RUN_HEAD_SHA=$(jq -er --arg sha "$COMMIT_SHA" '.head_sha | select(. == $sha)' <<<"$RUN_JSON")
-          RUN_CONCLUSION=$(jq -er '.conclusion | select(. == "success")' <<<"$RUN_JSON")
-          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
-          echo "run_url=$RUN_URL" >> "$GITHUB_OUTPUT"
-          echo "run_event=$RUN_EVENT" >> "$GITHUB_OUTPUT"
-          echo "run_head_branch=$RUN_HEAD_BRANCH" >> "$GITHUB_OUTPUT"
-          echo "run_head_sha=$RUN_HEAD_SHA" >> "$GITHUB_OUTPUT"
-          echo "run_conclusion=$RUN_CONCLUSION" >> "$GITHUB_OUTPUT"
+          if [[ ! "$DEV_RUN_ID" =~ ^[1-9][0-9]*$ ]]; then
+            echo "dev_run_id must be a positive integer"
+            exit 1
+          fi
+          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${DEV_RUN_ID}" > "$DEV_RUN_JSON"
+          echo "run_id=$DEV_RUN_ID" >> "$GITHUB_OUTPUT"
 
       - name: Download exact dev image digest
         id: image
@@ -122,41 +120,21 @@ jobs:
             echo "digest artifact contents are missing or unexpected"
             exit 1
           fi
-          python3 - "$DIGEST_FILE" "$GITHUB_OUTPUT" <<'PY'
-          import os
-          import re
-          import sys
-          from pathlib import Path
-
-          artifact_path, output_path = sys.argv[1:]
-          raw = Path(artifact_path).read_bytes()
-          if not raw.endswith(b"\n") or raw.endswith(b"\n\n") or b"\r" in raw:
-              raise SystemExit("digest artifact must use exactly three LF-terminated lines")
-          lines = raw[:-1].split(b"\n")
-          keys = (b"image_digest", b"query_config_revision", b"query_config_digest")
-          values = {}
-          for expected_key, line in zip(keys, lines):
-              if line.count(b"=") != 1:
-                  raise SystemExit("digest artifact contains a malformed line")
-              key, value = line.split(b"=", 1)
-              if key != expected_key or key in values or not value:
-                  raise SystemExit("digest artifact keys or line order are invalid")
-              values[key] = value
-          if len(lines) != len(keys) or set(values) != set(keys):
-              raise SystemExit("digest artifact must contain exactly the required keys")
-          digest_pattern = re.compile(rb"sha256:[0-9a-f]{64}\Z")
-          if not digest_pattern.fullmatch(values[b"image_digest"]):
-              raise SystemExit("image digest is missing or invalid")
-          if values[b"query_config_revision"] != os.environ["QUERY_STAGE_CONFIG_REVISION"].encode():
-              raise SystemExit("query config revision does not match the workflow artifact")
-          config_digest = values[b"query_config_digest"]
-          if not digest_pattern.fullmatch(config_digest) or config_digest != os.environ["QUERY_STAGE_CONFIG_DIGEST"].encode():
-              raise SystemExit("query config digest does not match the workflow artifact")
-          digest = values[b"image_digest"].decode("ascii")
-          image = f"{os.environ['AR_REPO']}/llm-wiki-bff@{digest}"
-          with Path(output_path).open("a", encoding="utf-8") as output:
-              output.write(f"digest={digest}\nimage={image}\nquery_config_revision={values[b'query_config_revision'].decode('ascii')}\nquery_config_digest={config_digest.decode('ascii')}\n")
-          PY
+          python3 scripts/validate_bff_promotion_contract.py validate-dev-receipt \
+            --receipt "$DIGEST_FILE" \
+            --run-json "$DEV_RUN_JSON" \
+            --expected-sha "$COMMIT_SHA" \
+            --expected-run-id "$DEV_RUN_ID" \
+            --expected-branch main \
+            --expected-event push \
+            --lifecycle production \
+            --component lwc-bff \
+            --repository "$GITHUB_REPOSITORY" \
+            --ar-repo "$AR_REPO" \
+            --query-config-revision "$QUERY_STAGE_CONFIG_REVISION" \
+            --query-config-digest "$QUERY_STAGE_CONFIG_DIGEST" \
+            --output "$RUNNER_TEMP/bff-production-readiness.json" \
+            --github-output "$GITHUB_OUTPUT"
 
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
@@ -217,12 +195,12 @@ jobs:
         env:
           COMMIT_SHA: ${{ steps.commit.outputs.commit_sha }}
           IMMUTABLE_IMAGE: ${{ steps.image.outputs.image }}
-          DEV_RUN_ID: ${{ steps.dev_run.outputs.run_id }}
-          DEV_RUN_URL: ${{ steps.dev_run.outputs.run_url }}
-          DEV_RUN_EVENT: ${{ steps.dev_run.outputs.run_event }}
-          DEV_RUN_HEAD_BRANCH: ${{ steps.dev_run.outputs.run_head_branch }}
-          DEV_RUN_HEAD_SHA: ${{ steps.dev_run.outputs.run_head_sha }}
-          DEV_RUN_CONCLUSION: ${{ steps.dev_run.outputs.run_conclusion }}
+          DEV_RUN_ID: ${{ steps.image.outputs.dev_run_id }}
+          DEV_RUN_URL: ${{ steps.image.outputs.dev_run_url }}
+          DEV_RUN_EVENT: ${{ steps.image.outputs.dev_run_event }}
+          DEV_RUN_HEAD_BRANCH: ${{ steps.image.outputs.dev_run_head_branch }}
+          DEV_RUN_HEAD_SHA: ${{ steps.image.outputs.dev_run_head_sha }}
+          DEV_RUN_CONCLUSION: ${{ steps.image.outputs.dev_run_conclusion }}
           ROLLBACK_ARTIFACT_NAME: ${{ steps.rollback.outputs.rollback_artifact_name }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           GITHUB_WORKFLOW: ${{ github.workflow }}
@@ -271,16 +249,12 @@ jobs:
         run: |
           set -euo pipefail
           FROZEN_READY_REVISION=$(jq -er '.ready_revision | select(type == "string" and length > 0)' "$ROLLBACK_CONTRACT")
-          if ! jq -e --arg ready_revision "$FROZEN_READY_REVISION" '
-            (.traffic | type == "array" and length == 1)
-            and (.traffic[0] | type == "object")
-            and ((.traffic[0] | keys | sort) == ["latest_revision", "percent", "revision_name"] or
-                 (.traffic[0] | keys | sort) == ["percent", "revision_name"])
-            and .traffic[0].revision_name == $ready_revision
-            and .traffic[0].percent == 100
-            and (.traffic[0].tag? == null)
-          ' "$ROLLBACK_CONTRACT" >/dev/null; then
-            echo "exactly one canonical rollback target is required: revision_name=$FROZEN_READY_REVISION, percent=100, no tag"
+          if ! python3 scripts/validate_bff_promotion_contract.py validate-traffic \
+            --traffic-file "$ROLLBACK_CONTRACT" \
+            --traffic-path traffic \
+            --traffic-mode artifact \
+            --recognized-revision "$FROZEN_READY_REVISION"; then
+            echo "frozen rollback traffic is not one recognized immutable 100-percent target"
             exit 1
           fi
           SERVICE_JSON=$(gcloud run services describe "$SERVICE_NAME" \
@@ -288,20 +262,18 @@ jobs:
             --project "$PROJECT_ID" \
             --format=json \
             --quiet)
-          if ! jq -e --arg ready_revision "$FROZEN_READY_REVISION" '
-            .status.latestCreatedRevisionName == $ready_revision
-            and .status.latestReadyRevisionName == $ready_revision
-            and (.status.traffic | type == "array" and length == 1)
-            and (.status.traffic[0] | type == "object")
-            and ((.status.traffic[0] | keys | sort) == ["latestRevision", "percent", "revisionName"] or
-                 (.status.traffic[0] | keys | sort) == ["percent", "revisionName"])
-            and .status.traffic[0].revisionName == $ready_revision
-            and .status.traffic[0].percent == 100
-            and ((.status.traffic[0] | has("latestRevision") | not) or
-                 (.status.traffic[0].latestRevision | type == "boolean" and . == true))
-            and (.status.traffic[0].tag? == null)
-          ' <<<"$SERVICE_JSON" >/dev/null; then
+          if ! jq -e --arg ready_revision "$FROZEN_READY_REVISION" \
+            '.status.latestCreatedRevisionName == $ready_revision and .status.latestReadyRevisionName == $ready_revision' \
+            <<<"$SERVICE_JSON" >/dev/null; then
             echo "live rollback state no longer matches the frozen ready revision or authoritative traffic"
+            exit 1
+          fi
+          if ! printf '%s\n' "$SERVICE_JSON" | python3 scripts/validate_bff_promotion_contract.py validate-traffic \
+            --traffic-file - \
+            --traffic-path status.traffic \
+            --traffic-mode provider-pre-mutation \
+            --recognized-revision "$FROZEN_READY_REVISION"; then
+            echo "live rollback traffic is not one recognized immutable 100-percent target"
             exit 1
           fi
           FROZEN_CREATED_REVISION=$(jq -er '.status.latestCreatedRevisionName | select(type == "string" and length > 0)' <<<"$SERVICE_JSON")
@@ -442,48 +414,40 @@ jobs:
           set -euo pipefail
           FROZEN_READY_REVISION=$(jq -er '.ready_revision | select(type == "string" and length > 0)' "$ROLLBACK_CONTRACT")
           validate_frozen_rollback_traffic() {
-            jq -e --arg ready_revision "$FROZEN_READY_REVISION" '
-              (.traffic | type == "array" and length == 1)
-              and (.traffic[0] | type == "object")
-              and ((.traffic[0] | keys | sort) == ["latest_revision", "percent", "revision_name"] or
-                   (.traffic[0] | keys | sort) == ["percent", "revision_name"])
-              and .traffic[0].revision_name == $ready_revision
-              and .traffic[0].percent == 100
-              and (.traffic[0].tag? == null)
-            ' "$ROLLBACK_CONTRACT" >/dev/null
+            python3 scripts/validate_bff_promotion_contract.py validate-traffic \
+              --traffic-file "$ROLLBACK_CONTRACT" \
+              --traffic-path traffic \
+              --traffic-mode artifact \
+              --recognized-revision "$FROZEN_READY_REVISION"
           }
           validate_restored_effective_traffic() {
-            jq -e --arg ready_revision "$FROZEN_READY_REVISION" '
-              (.status.traffic | type == "array" and length == 1)
-              and (.status.traffic[0] | type == "object")
-              and ((.status.traffic[0] | keys | sort) == ["percent", "revisionName"] or
-                   (.status.traffic[0] | keys | sort) == ["latestRevision", "percent", "revisionName"])
-              and .status.traffic[0].revisionName == $ready_revision
-              and .status.traffic[0].percent == 100
-              and ((.status.traffic[0].latestRevision? // false) == false)
-            ' <<<"$1" >/dev/null
+            printf '%s\n' "$1" | python3 scripts/validate_bff_promotion_contract.py validate-traffic \
+              --traffic-file - \
+              --traffic-path status.traffic \
+              --traffic-mode provider-post-rollback \
+              --recognized-revision "$FROZEN_READY_REVISION" \
+              --expected-revision "$FROZEN_READY_REVISION"
           }
           validate_effective_traffic() {
-            jq -e '
-              (.status.traffic | type == "array" and length == 1)
-              and (.status.traffic[0] | type == "object")
-              and ((.status.traffic[0] | keys | sort) == ["percent", "revisionName"] or
-                   (.status.traffic[0] | keys | sort) == ["latestRevision", "percent", "revisionName"])
-              and (.status.traffic[0].revisionName | type == "string" and length > 0)
-              and (.status.traffic[0].percent | type == "number" and . == 100)
-              and ((.status.traffic[0].latestRevision? // false) == false)
-            ' <<<"$1" >/dev/null
+            local revision
+            revision=$(jq -er '
+              .status as $status
+              | if ($status.latestReadyRevisionName | type) == "string"
+                and ($status.traffic | type) == "array"
+                and ($status.traffic | length) == 1
+                and $status.traffic[0].revisionName == $status.latestReadyRevisionName
+                then $status.latestReadyRevisionName
+                else empty
+                end
+            ' <<<"$1") || return 1
+            printf '%s\n' "$1" | python3 scripts/validate_bff_promotion_contract.py validate-traffic \
+              --traffic-file - \
+              --traffic-path status.traffic \
+              --traffic-mode provider-pre-mutation \
+              --recognized-revision "$revision"
           }
           validate_frozen_effective_traffic() {
-            jq -e --arg ready_revision "$FROZEN_READY_REVISION" '
-              (.status.traffic | type == "array" and length == 1)
-              and (.status.traffic[0] | type == "object")
-              and ((.status.traffic[0] | keys | sort) == ["percent", "revisionName"] or
-                   (.status.traffic[0] | keys | sort) == ["latestRevision", "percent", "revisionName"])
-              and .status.traffic[0].revisionName == $ready_revision
-              and .status.traffic[0].percent == 100
-              and ((.status.traffic[0].latestRevision? // false) == false)
-            ' <<<"$1" >/dev/null
+            validate_restored_effective_traffic "$1"
           }
           validate_frozen_rollback_traffic
           if ! SERVICE_JSON=$(gcloud run services describe "$SERVICE_NAME" \

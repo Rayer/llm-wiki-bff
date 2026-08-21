@@ -456,28 +456,50 @@ func TestCIWorkflowPushesAndPRsMainAndDevelop(t *testing.T) {
 	}
 }
 
-func TestCIMainFastForwardEligibilityGate(t *testing.T) {
-	contents := readWorkflow(t, ".github/workflows/ci.yml")
+func TestMainFastForwardEligibilityFollowsReadiness(t *testing.T) {
+	ci := readWorkflow(t, ".github/workflows/ci.yml")
+	if strings.Contains(ci, "main-fast-forward-eligible:") {
+		t.Fatal("CI must not publish the protected main gate")
+	}
+	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
 	job := workflowSection(t, contents, "  main-fast-forward-eligible:", "\n\n")
 	want := normalizeWorkflowContract(`
 main-fast-forward-eligible:
-  if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
-  needs: test
+  name: main-fast-forward-eligible
+  if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/develop' && needs.production-promotion-ready.result == 'success'
+  needs: [test-and-deploy, production-promotion-ready]
   runs-on: ubuntu-latest
+  permissions:
+    contents: read
   steps:
     - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       with:
         fetch-depth: 0
         persist-credentials: false
     - name: Verify main fast-forward eligibility
+      env:
+        CANDIDATE_SHA: ${{ needs.test-and-deploy.outputs.candidate_sha }}
       run: |
         set -euo pipefail
+        [[ "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]]
         git fetch --no-tags origin main develop
-        test "$(git rev-parse origin/develop)" = "$GITHUB_SHA"
-        git merge-base --is-ancestor origin/main "$GITHUB_SHA"
+	        test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+	        test "$(git rev-parse origin/develop)" = "$CANDIDATE_SHA"
+	        git merge-base --is-ancestor origin/main "$CANDIDATE_SHA"
 `)
 	if got := normalizeWorkflowContract(job); got != want {
 		t.Errorf("main fast-forward gate contract changed\n got:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+func TestMainFastForwardCandidateProducerIsDirectNeed(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
+	job := workflowSection(t, contents, "  main-fast-forward-eligible:", "\n\n")
+	if !strings.Contains(job, "CANDIDATE_SHA: ${{ needs.test-and-deploy.outputs.candidate_sha }}") {
+		t.Fatal("main fast-forward gate must use the test-and-deploy candidate output")
+	}
+	if !strings.Contains(job, "needs: [test-and-deploy, production-promotion-ready]") {
+		t.Fatal("main fast-forward candidate producer must be a direct dependency")
 	}
 }
 
@@ -493,7 +515,7 @@ func normalizeWorkflowContract(contents string) string {
 	return strings.Join(normalized, "\n")
 }
 
-func TestBFFDevWorkflowPushesMainOnlyAndSupportsManualDispatch(t *testing.T) {
+func TestBFFDevWorkflowPushesDevelopAndSupportsManualDispatch(t *testing.T) {
 	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
 	for _, want := range []string{
 		"  push:\n    branches: [main]",
@@ -1147,7 +1169,7 @@ func TestDeployWorkflowUsesImmutableCloudBuildResultDigest(t *testing.T) {
 		"status.imageDigest",
 		`verify_revision "$CREATED_REVISION" "$IMMUTABLE_IMAGE"`,
 		`(.status.imageDigest // "") == $image`,
-		`validate_exact_traffic "$CREATED_REVISION" "$SERVICE_JSON"`,
+		`validate_dev_service_traffic "$CREATED_REVISION" "$SERVICE_JSON"`,
 	} {
 		if !strings.Contains(contents, want) {
 			t.Errorf("deploy workflow is missing immutable build provenance contract %q", want)
@@ -1187,11 +1209,9 @@ func TestBFFDevWorkflowUsesCanonicalRevisionTransaction(t *testing.T) {
 	build := workflowSection(t, contents, "      - name: Build and deploy to Cloud Run", "      - name: Persist build image digest")
 	for _, want := range []string{
 		"concurrency:\n  group: deploy-bff-dev\n  cancel-in-progress: false",
-		"validate_exact_traffic() {",
-		".status.traffic as $status",
-		".spec.traffic as $spec",
-		"latestRevision // false",
-		"(($status[0].revisionName // \"\") == ($spec[0].revisionName // \"\"))",
+		"validate_dev_service_traffic() {",
+		"--compare-path spec.traffic",
+		"--traffic-mode provider-dev-convergence",
 		"PREVIOUS_ROLLBACK_REVISION_JSON=$(gcloud run revisions describe \"$PREVIOUS_ROLLBACK_REVISION\"",
 		"PREVIOUS_ROLLBACK_IMAGE=$(jq -er '.status.imageDigest // empty' <<<\"$PREVIOUS_ROLLBACK_REVISION_JSON\")",
 		"EXPECTED_IMAGE_PREFIX=\"${{ env.AR_REPO }}/llm-wiki-bff@\"",
@@ -1261,7 +1281,7 @@ func TestBFFDevWorkflowUsesCanonicalRevisionTransaction(t *testing.T) {
 		t.Fatal("BFF workflow must not fetch the remote late in the deploy step")
 	}
 	preCutoverReadAt := strings.LastIndex(build[:cutoverAt], `SERVICE_JSON=$(gcloud run services describe "${{ env.SERVICE_NAME }}"`)
-	preCutoverCheckAt := strings.LastIndex(build[:cutoverAt], `validate_exact_traffic "$PREVIOUS_ROLLBACK_REVISION" "$SERVICE_JSON"`)
+	preCutoverCheckAt := strings.LastIndex(build[:cutoverAt], `validate_dev_service_traffic "$PREVIOUS_ROLLBACK_REVISION" "$SERVICE_JSON"`)
 	if preCutoverReadAt < 0 || preCutoverCheckAt < 0 || !(preCutoverReadAt < preCutoverCheckAt && preCutoverCheckAt < contextAt) {
 		t.Fatal("BFF workflow must revalidate OLD traffic immediately before arming rollback and cutting over")
 	}
@@ -1352,19 +1372,20 @@ func TestBFFDevWorkflowUsesCanonicalRevisionTransaction(t *testing.T) {
 		"NEW_REVISION=\"${{ steps.build.outputs.new_revision }}\"",
 		"gcloud run services update-traffic \"${{ env.SERVICE_NAME }}\"",
 		"--to-revisions \"${PREVIOUS_REVISION}=100\"",
-		"validate_exact_traffic() {",
-		".status.traffic as $status",
+		"validate_dev_service_traffic() {",
+		"--compare-path spec.traffic",
+		"--traffic-mode provider-dev-convergence",
 		`SERVICE_JSON=$(gcloud run services describe "${{ env.SERVICE_NAME }}"`,
-		`validate_exact_traffic "$PREVIOUS_REVISION" "$SERVICE_JSON"`,
-		`validate_exact_traffic "$NEW_REVISION" "$SERVICE_JSON"`,
+		`validate_dev_service_traffic "$PREVIOUS_REVISION" "$SERVICE_JSON"`,
+		`validate_dev_service_traffic "$NEW_REVISION" "$SERVICE_JSON"`,
 	} {
 		if !strings.Contains(cleanup, want) {
 			t.Errorf("BFF cleanup step missing contract %q", want)
 		}
 	}
 	cleanupReadAt := strings.Index(cleanup, `SERVICE_JSON=$(gcloud run services describe "${{ env.SERVICE_NAME }}"`)
-	oldCheckAt := strings.Index(cleanup, `validate_exact_traffic "$PREVIOUS_REVISION" "$SERVICE_JSON"`)
-	newCheckAt := strings.Index(cleanup, `validate_exact_traffic "$NEW_REVISION" "$SERVICE_JSON"`)
+	oldCheckAt := strings.Index(cleanup, `validate_dev_service_traffic "$PREVIOUS_REVISION" "$SERVICE_JSON"`)
+	newCheckAt := strings.Index(cleanup, `validate_dev_service_traffic "$NEW_REVISION" "$SERVICE_JSON"`)
 	cleanupMutationAt := strings.Index(cleanup, "gcloud run services update-traffic")
 	if cleanupReadAt < 0 || oldCheckAt < 0 || newCheckAt < 0 || cleanupMutationAt < 0 || !(cleanupReadAt < oldCheckAt && oldCheckAt < newCheckAt && newCheckAt < cleanupMutationAt) {
 		t.Fatal("BFF cleanup must read and validate OLD/NEW traffic before mutation")
@@ -1399,12 +1420,11 @@ func TestReleaseWorkflowRequiresMainBuildProvenance(t *testing.T) {
 		`git cat-file -e "$COMMIT_SHA^{commit}"`,
 		`git merge-base --is-ancestor "$COMMIT_SHA" HEAD`,
 		"commit_sha is not an ancestor of main",
-		`.head_branch == "main"`,
-		".html_url",
-		"run_event=",
-		"run_head_branch=",
-		"run_head_sha=",
-		"run_conclusion=",
+		"dev_run_id",
+		`gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${DEV_RUN_ID}"`,
+		"scripts/validate_bff_promotion_contract.py validate-dev-receipt",
+		"--expected-branch main",
+		"--expected-event push",
 		"roles/run.jobsExecutorWithOverrides",
 		"get-iam-policy",
 		"scripts/render_bff_deployment_evidence.py prepare-rollback",
@@ -1417,7 +1437,7 @@ func TestReleaseWorkflowRequiresMainBuildProvenance(t *testing.T) {
 			t.Errorf("release workflow is missing main provenance contract %q", want)
 		}
 	}
-	for _, forbidden := range []string{"ref: develop", `origin/develop`, `.head_branch == "develop"`} {
+	for _, forbidden := range []string{"ref: develop", `origin/develop`} {
 		if strings.Contains(contents, forbidden) {
 			t.Fatalf("release workflow must not accept develop provenance %q", forbidden)
 		}
@@ -1441,7 +1461,7 @@ func TestReleaseWorkflowRequiresMainBuildProvenance(t *testing.T) {
 func TestReleaseWorkflowAuthenticatesOnlyAfterReadOnlyGatesAndHasOneProviderMutation(t *testing.T) {
 	contents := readWorkflow(t, ".github/workflows/release-bff.yml")
 	auth := strings.Index(contents, "- name: Authenticate to Google Cloud")
-	provenance := strings.Index(contents, "- name: Locate successful main dev deployment")
+	provenance := strings.Index(contents, "- name: Locate exact successful main dev deployment")
 	image := strings.Index(contents, "- name: Download exact dev image digest")
 	preflight := strings.Index(contents, "- name: Verify production IAM preflight")
 	deploy := strings.Index(contents, "gcloud run deploy")
@@ -1475,70 +1495,100 @@ func TestReleaseWorkflowAuthenticatesOnlyAfterReadOnlyGatesAndHasOneProviderMuta
 
 func TestReleaseWorkflowStrictlyParsesQueryConfigReceipt(t *testing.T) {
 	contents := readWorkflow(t, ".github/workflows/release-bff.yml")
-	const startMarker = "          python3 - \"$DIGEST_FILE\" \"$GITHUB_OUTPUT\" <<'PY'\n"
-	const endMarker = "          PY\n"
-	start := strings.Index(contents, startMarker)
-	if start < 0 {
-		t.Fatal("release workflow is missing the strict receipt parser")
+	hasScript := strings.Contains(contents, "scripts/validate_bff_promotion_contract.py validate-dev-receipt")
+	hasInlineParser := strings.Contains(contents, "python3 - \"$DIGEST_FILE\" \"$GITHUB_OUTPUT\" <<'PY'\n")
+	if !hasScript && !hasInlineParser {
+		t.Fatal("release workflow must validate dev receipt with a strict parser")
 	}
-	start += len(startMarker)
-	end := strings.Index(contents[start:], endMarker)
-	if end < 0 {
-		t.Fatal("release workflow receipt parser heredoc is unterminated")
-	}
-	parser := contents[start : start+end]
-	parserLines := strings.Split(parser, "\n")
-	for i, line := range parserLines {
-		parserLines[i] = strings.TrimPrefix(line, "          ")
-	}
-	parser = strings.Join(parserLines, "\n")
-
-	imageDigest := "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-	revision := "query-dev-2026-08-21.2"
-	configDigest := "sha256:75e4f76de991b496c503b42fd893d34408ddae726fe99003365a5c89b8e46642"
-	receipt := "image_digest=" + imageDigest + "\nquery_config_revision=" + revision + "\nquery_config_digest=" + configDigest + "\n"
-	run := func(t *testing.T, input string) ([]byte, string, error) {
-		t.Helper()
-		dir := t.TempDir()
-		artifact := filepath.Join(dir, "receipt.txt")
-		output := filepath.Join(dir, "github-output")
-		if err := os.WriteFile(artifact, []byte(input), 0600); err != nil {
-			t.Fatal(err)
-		}
-		cmd := exec.Command("python3", "-", artifact, output)
-		cmd.Stdin = strings.NewReader(parser)
-		cmd.Env = append(os.Environ(), "QUERY_STAGE_CONFIG_REVISION="+revision, "QUERY_STAGE_CONFIG_DIGEST="+configDigest, "AR_REPO=repo")
-		combined, err := cmd.CombinedOutput()
-		if err != nil {
-			return combined, "", err
-		}
-		contents, err := os.ReadFile(output)
-		return combined, string(contents), err
-	}
-	if output, written, err := run(t, receipt); err != nil {
-		t.Fatalf("valid receipt rejected: %v: %s", err, output)
-	} else if want := "digest=" + imageDigest + "\nimage=repo/llm-wiki-bff@" + imageDigest + "\nquery_config_revision=" + revision + "\nquery_config_digest=" + configDigest + "\n"; written != want {
-		t.Fatalf("parser output = %q, want %q", written, want)
-	}
-
-	for name, input := range map[string]string{
-		"duplicate":         receipt + "image_digest=" + imageDigest + "\n",
-		"unknown":           "image_digest=" + imageDigest + "\nunknown=value\nquery_config_digest=" + configDigest + "\n",
-		"missing":           "image_digest=" + imageDigest + "\nquery_config_revision=" + revision + "\n",
-		"malformed digest":  "image_digest=sha256:BAD\nquery_config_revision=" + revision + "\nquery_config_digest=" + configDigest + "\n",
-		"malformed key":     "image_digest=" + imageDigest + "\nquery_config_revision;evil=" + revision + "\nquery_config_digest=" + configDigest + "\n",
-		"trailing junk":     receipt + "junk\n",
-		"crlf":              strings.ReplaceAll(receipt, "\n", "\r\n"),
-		"bare cr":           strings.ReplaceAll(receipt, "\n", "\r"),
-		"shell content":     strings.Replace(receipt, imageDigest, imageDigest+";touch /tmp/pwned", 1),
-		"revision mismatch": strings.Replace(receipt, revision, "query-prod-2026.08.21", 1),
-		"digest mismatch":   strings.Replace(receipt, configDigest, "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", 1),
-	} {
-		t.Run(name, func(t *testing.T) {
-			if output, _, err := run(t, input); err == nil {
-				t.Fatalf("invalid receipt accepted: %s", output)
+	if hasScript {
+		for _, want := range []string{
+			"scripts/validate_bff_promotion_contract.py validate-dev-receipt",
+			"--receipt \"$DIGEST_FILE\"",
+			"--run-json \"$DEV_RUN_JSON\"",
+			"--expected-sha \"$COMMIT_SHA\"",
+			"--expected-run-id \"$DEV_RUN_ID\"",
+			"--expected-branch main",
+			"--expected-event push",
+			"--lifecycle production",
+			"--component lwc-bff",
+			"--repository \"$GITHUB_REPOSITORY\"",
+			"--ar-repo \"$AR_REPO\"",
+			"--query-config-revision \"$QUERY_STAGE_CONFIG_REVISION\"",
+			"--query-config-digest \"$QUERY_STAGE_CONFIG_DIGEST\"",
+			"--output \"$RUNNER_TEMP/bff-production-readiness.json\"",
+			"--github-output \"$GITHUB_OUTPUT\"",
+		} {
+			if !strings.Contains(contents, want) {
+				t.Errorf("release workflow is missing strict receipt contract %q", want)
 			}
-		})
+		}
+	}
+	if hasInlineParser {
+		const startMarker = "          python3 - \"$DIGEST_FILE\" \"$GITHUB_OUTPUT\" <<'PY'\n"
+		const endMarker = "          PY\n"
+		start := strings.Index(contents, startMarker)
+		if start < 0 {
+			t.Fatal("release workflow is missing the strict receipt parser")
+		}
+		start += len(startMarker)
+		end := strings.Index(contents[start:], endMarker)
+		if end < 0 {
+			t.Fatal("release workflow receipt parser heredoc is unterminated")
+		}
+		parser := contents[start : start+end]
+		parserLines := strings.Split(parser, "\n")
+		for i, line := range parserLines {
+			parserLines[i] = strings.TrimPrefix(line, "          ")
+		}
+		parser = strings.Join(parserLines, "\n")
+
+		imageDigest := "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+		revision := "query-dev-2026-08-21.2"
+		configDigest := "sha256:75e4f76de991b496c503b42fd893d34408ddae726fe99003365a5c89b8e46642"
+		receipt := "image_digest=" + imageDigest + "\nquery_config_revision=" + revision + "\nquery_config_digest=" + configDigest + "\n"
+		run := func(t *testing.T, input string) ([]byte, string, error) {
+			t.Helper()
+			dir := t.TempDir()
+			artifact := filepath.Join(dir, "receipt.txt")
+			output := filepath.Join(dir, "github-output")
+			if err := os.WriteFile(artifact, []byte(input), 0600); err != nil {
+				t.Fatal(err)
+			}
+			cmd := exec.Command("python3", "-", artifact, output)
+			cmd.Stdin = strings.NewReader(parser)
+			cmd.Env = append(os.Environ(), "QUERY_STAGE_CONFIG_REVISION="+revision, "QUERY_STAGE_CONFIG_DIGEST="+configDigest, "AR_REPO=repo")
+			combined, err := cmd.CombinedOutput()
+			if err != nil {
+				return combined, "", err
+			}
+			outputContents, err := os.ReadFile(output)
+			return combined, string(outputContents), err
+		}
+		if output, written, err := run(t, receipt); err != nil {
+			t.Fatalf("valid receipt rejected: %v: %s", err, output)
+		} else if want := "digest=" + imageDigest + "\nimage=repo/llm-wiki-bff@" + imageDigest + "\nquery_config_revision=" + revision + "\nquery_config_digest=" + configDigest + "\n"; written != want {
+			t.Fatalf("parser output = %q, want %q", written, want)
+		}
+
+		for name, input := range map[string]string{
+			"duplicate":         receipt + "image_digest=" + imageDigest + "\n",
+			"unknown":           "image_digest=" + imageDigest + "\nunknown=value\nquery_config_digest=" + configDigest + "\n",
+			"missing":           "image_digest=" + imageDigest + "\nquery_config_revision=" + revision + "\n",
+			"malformed digest":  "image_digest=sha256:BAD\nquery_config_revision=" + revision + "\nquery_config_digest=" + configDigest + "\n",
+			"malformed key":     "image_digest=" + imageDigest + "\nquery_config_revision;evil=" + revision + "\nquery_config_digest=" + configDigest + "\n",
+			"trailing junk":     receipt + "junk\n",
+			"crlf":              strings.ReplaceAll(receipt, "\n", "\r\n"),
+			"bare cr":           strings.ReplaceAll(receipt, "\n", "\r"),
+			"shell content":     strings.Replace(receipt, imageDigest, imageDigest+";touch /tmp/pwned", 1),
+			"revision mismatch": strings.Replace(receipt, revision, "query-prod-2026.08.21", 1),
+			"digest mismatch":   strings.Replace(receipt, configDigest, "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", 1),
+		} {
+			t.Run(name, func(t *testing.T) {
+				if output, _, err := run(t, input); err == nil {
+					t.Fatalf("invalid receipt accepted: %s", output)
+				}
+			})
+		}
 	}
 }
 
@@ -1613,10 +1663,10 @@ func TestReleaseWorkflowValidatesAndPersistsFrozenLiveRevisionBeforeMutation(t *
 		`SERVICE_JSON=$(gcloud run services describe "$SERVICE_NAME"`,
 		`.status.latestCreatedRevisionName == $ready_revision`,
 		`.status.latestReadyRevisionName == $ready_revision`,
-		`.status.traffic | type == "array" and length == 1`,
-		`.status.traffic[0].revisionName == $ready_revision`,
-		`.status.traffic[0].percent == 100`,
-		"((.status.traffic[0] | has(\"latestRevision\") | not) or\n                 (.status.traffic[0].latestRevision | type == \"boolean\" and . == true))",
+		"scripts/validate_bff_promotion_contract.py validate-traffic",
+		"--traffic-path status.traffic",
+		"--traffic-mode provider-pre-mutation",
+		"--recognized-revision \"$FROZEN_READY_REVISION\"",
 		`echo "FROZEN_CREATED_REVISION=$FROZEN_CREATED_REVISION" >> "$GITHUB_ENV"`,
 	} {
 		if !strings.Contains(validation, want) {
@@ -1681,10 +1731,11 @@ func TestReleaseWorkflowReconcilesFrozenRestoreRegardlessOfUpdateTrafficStatus(t
 		"while (( SECONDS < ROLLBACK_READBACK_DEADLINE )); do",
 		"gcloud run services describe \"$SERVICE_NAME\"",
 		"validate_restored_effective_traffic \"$SERVICE_JSON\"",
-		".status.traffic | type == \"array\" and length == 1",
-		"(.status.traffic[0] | keys | sort) == [\"percent\", \"revisionName\"]",
-		".status.traffic[0].revisionName == $ready_revision",
-		".status.traffic[0].percent == 100",
+		"scripts/validate_bff_promotion_contract.py validate-traffic",
+		"--traffic-path status.traffic",
+		"--traffic-mode provider-post-rollback",
+		"--expected-revision \"$FROZEN_READY_REVISION\"",
+		"--recognized-revision \"$FROZEN_READY_REVISION\"",
 		"echo \"frozen production traffic was not authoritative within timeout (update exit $ROLLBACK_EXIT)\"",
 		"echo \"restored effective routing: ${RESTORED_EFFECTIVE_REVISION}=${RESTORED_EFFECTIVE_PERCENT} (update exit $ROLLBACK_EXIT); preserving workflow failure\"",
 		"exit 1",
@@ -1703,12 +1754,125 @@ func TestCIWorkflowValidatesProductVersion(t *testing.T) {
 	for _, want := range []string{
 		"Validate product version",
 		"APP_VERSION=$(go run ./cmd/versioncheck VERSION)",
+		"python3 scripts/test_bff_promotion_contract.py",
 	} {
 		if !strings.Contains(contents, want) {
 			t.Errorf("CI workflow is missing VERSION validation contract %q", want)
 		}
 	}
 	assertWorkflowUsesCentralizedVersioncheck(t, contents)
+}
+
+func TestPromotionReadyJobIsSameRunExactAndReadOnly(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
+	jobStart := strings.Index(contents, "  production-promotion-ready:")
+	if jobStart < 0 {
+		t.Fatal("deploy workflow is missing production-promotion-ready job")
+	}
+	job := contents[jobStart:]
+	var document map[string]any
+	if err := yaml.Unmarshal([]byte(contents), &document); err != nil {
+		t.Fatalf("deploy workflow is not valid YAML: %v", err)
+	}
+	for _, want := range []string{
+		"name: production-promotion-ready",
+		"needs: test-and-deploy",
+		"github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/develop'",
+		"needs.test-and-deploy.result == 'success'",
+		"[[ \"$GITHUB_REF\" != \"refs/heads/develop\" ]]",
+		"DEVELOP_SHA=$(gh api \"repos/${GITHUB_REPOSITORY}/git/ref/heads/develop\" --jq .object.sha)",
+		"if [[ \"$DEVELOP_SHA\" != \"$CANDIDATE_SHA\" ]]",
+		"gh run download \"$DEV_RUN_ID\"",
+		"gh api \"repos/${GITHUB_REPOSITORY}/actions/runs/${DEV_RUN_ID}\" > \"$RUNNER_TEMP/bff-dev-run.json\"",
+		"bff-image-digest-$CANDIDATE_SHA",
+		"scripts/validate_bff_promotion_contract.py validate-dev-receipt",
+		"--expected-event workflow_dispatch",
+		"--lifecycle readiness",
+		"--producer-result \"${{ needs.test-and-deploy.result }}\"",
+		"--repository \"$GITHUB_REPOSITORY\"",
+		"--traffic-mode artifact",
+		"bff-production-promotion-ready-",
+		"actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
+	} {
+		if !strings.Contains(job, want) {
+			t.Errorf("same-run readiness job is missing exact contract %q", want)
+		}
+	}
+	for _, forbidden := range []string{
+		"workflow_run:",
+		"environment: production",
+		"google-github-actions/auth",
+		"gcloud run deploy",
+		"gcloud run services update-traffic",
+		"gcloud run services describe",
+		"id-token: write",
+		"checks.create",
+	} {
+		if strings.Contains(job, forbidden) {
+			t.Errorf("readiness job must remain read-only and same-run: found %q", forbidden)
+		}
+	}
+	if strings.Contains(job, "conclusion: \"success\"") {
+		t.Fatal("readiness must use actual in-progress run metadata, not synthesize success")
+	}
+	if strings.Count(contents, "QUERY_STAGE_CONFIG_REVISION:") != 1 || strings.Count(contents, "QUERY_STAGE_CONFIG_DIGEST:") != 1 {
+		t.Fatal("query config identity must have one workflow-level authority")
+	}
+}
+
+func TestPromotionReadyUsesWorkflowQueryConfigAuthority(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
+	job := workflowSection(t, contents, "  production-promotion-ready:", "  main-fast-forward-eligible:")
+	for _, name := range []string{"QUERY_STAGE_CONFIG_REVISION", "QUERY_STAGE_CONFIG_DIGEST"} {
+		if strings.Count(contents, name+":") != 1 || strings.Count(job, "$"+name) != 1 {
+			t.Fatalf("readiness query config reference must resolve to the one workflow-level %s", name)
+		}
+	}
+	for _, forbidden := range []string{"QUERY_CONFIG_REVISION", "QUERY_CONFIG_DIGEST"} {
+		if strings.Contains(job, forbidden) {
+			t.Fatalf("readiness must not use undefined query config alias %s", forbidden)
+		}
+	}
+}
+
+func TestDevReceiptProducerIsVersionedAndSelfBound(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
+	persist := workflowSection(t, contents, "      - name: Persist build image digest", "      - name: Upload image digest artifact")
+	for _, want := range []string{
+		"receipt_schema_version=1",
+		"component=lwc-bff",
+		"source_sha=%s",
+		"dev_run_id=%s",
+		"image_digest=%s",
+		"image_reference=%s",
+	} {
+		if !strings.Contains(persist, want) {
+			t.Errorf("DEV receipt producer is missing %q", want)
+		}
+	}
+}
+
+func TestDeployWorkflowRunBlocksAreExecutable(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
+	var document any
+	if err := yaml.Unmarshal([]byte(contents), &document); err != nil {
+		t.Fatalf("readiness workflow is not valid YAML: %v", err)
+	}
+	runBlockPattern := regexp.MustCompile(`(?m)^\s+run: \|\n((?:\s{10,}.+\n?)+)`)
+	runs := runBlockPattern.FindAllStringSubmatch(contents, -1)
+	if len(runs) == 0 {
+		t.Fatal("readiness workflow has no executable run blocks")
+	}
+	for _, run := range runs {
+		body := strings.TrimSpace(run[1])
+		body = regexp.MustCompile(`(?m)^ {10}`).ReplaceAllString(body, "")
+		body = regexp.MustCompile(`\$\{\{[^}]*\}\}`).ReplaceAllString(body, "workflow-expression")
+		cmd := exec.Command("bash", "-n")
+		cmd.Stdin = strings.NewReader(body)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("readiness workflow run block has invalid shell syntax: %v\n%s", err, output)
+		}
+	}
 }
 
 func assertWorkflowUsesCentralizedVersioncheck(t *testing.T, contents string) {

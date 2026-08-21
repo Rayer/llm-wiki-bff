@@ -1,0 +1,8 @@
+{
+  "traffic": [
+    {
+      "revision_name": "llm-wiki-bff-00001-old",
+      "percent": 100
+    }
+  ]
+}
