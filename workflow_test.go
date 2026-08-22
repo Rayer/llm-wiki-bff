@@ -917,18 +917,17 @@ exit 2
 	}
 }
 
-func canonicalPreBuildBoundary(t *testing.T) string {
+func canonicalPreBuildCaller(t *testing.T) string {
 	t.Helper()
 	body := workflowRunBlock(readWorkflow(t, ".github/workflows/deploy-bff.yml"), "Build and deploy to Cloud Run")
-	freshness := workflowMarkedSection(body, "# begin canonical develop freshness guard", "# end canonical develop freshness guard")
-	fn := workflowMarkedSection(body, "# begin current canonical CI run validator", "# end current canonical CI run validator")
-	preBuild := workflowMarkedSection(body, "# begin pre-build current CI check", "# end pre-build current CI check")
-	endMarker := "# end pre-build current CI check"
+	start := strings.Index(body, "# begin current canonical CI run validator")
+	endMarker := `echo "Submitted Cloud Build $BUILD_ID; waiting for completion…"`
 	end := strings.Index(body, endMarker)
-	if freshness == "" || fn == "" || preBuild == "" || end < 0 {
-		t.Fatal("production pre-build canonical freshness boundary is missing")
+	if start < 0 || end < start {
+		t.Fatal("production pre-build caller range is missing")
 	}
-	return fn + "\n" + freshness + "\n" + preBuild
+	caller := body[start : end+len(endMarker)]
+	return strings.ReplaceAll(caller, "${{ env.AR_REPO }}", "$AR_REPO")
 }
 
 func runCanonicalPreBuild(t *testing.T, developSHA, currentJSON string) (string, string) {
@@ -943,6 +942,7 @@ func runCanonicalPreBuild(t *testing.T, developSHA, currentJSON string) (string,
 	writeExecutable(t, filepath.Join(bin, "gcloud"), `#!/usr/bin/env bash
 set -euo pipefail
 printf 'gcloud %s\n' "$*" >> "$EVENT_LOG"
+printf '01234567-89ab-cdef-0123-456789abcdef\n'
 exit 0
 `)
 	writeExecutable(t, filepath.Join(bin, "gh"), `#!/usr/bin/env bash
@@ -959,11 +959,12 @@ case "$joined" in
   *) echo "unexpected gh invocation: $*" >&2; exit 2 ;;
 esac
 `)
-	script := "set -euo pipefail\n" + canonicalPreBuildBoundary(t) + "\ngcloud builds submit --quiet\n"
+	script := "set -euo pipefail\n" + canonicalPreBuildCaller(t) + "\n"
 	env := append(os.Environ(),
 		"PATH="+bin+":"+os.Getenv("PATH"), "CANDIDATE_SHA="+candidateSHA,
 		"GIT_SHA="+candidateSHA, "CI_RUN_ID=123", "CI_RUN_ATTEMPT=1",
 		"GITHUB_REPOSITORY=owner/repo", "RUNNER_TEMP="+t.TempDir(),
+		"AR_REPO=test.example/repo", "APP_VERSION=test", "GIT_BRANCH=develop", "GIT_TAG=",
 		"EVENT_LOG="+eventLog, "FAKE_DEVELOP_SHA="+developSHA,
 		"FAKE_CURRENT_RUN_JSON="+currentFile,
 	)
