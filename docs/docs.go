@@ -2092,11 +2092,17 @@ const docTemplate = `{
                 "ai_synth": {
                     "type": "string"
                 },
+                "answer_basis": {
+                    "type": "string"
+                },
                 "citations": {
                     "type": "array",
                     "items": {
                         "$ref": "#/definitions/search.Citation"
                     }
+                },
+                "disclosure_required": {
+                    "type": "boolean"
                 },
                 "expand": {
                     "$ref": "#/definitions/llm.ExpandResult"
@@ -2107,11 +2113,20 @@ const docTemplate = `{
                 "query": {
                     "type": "string"
                 },
+                "reason": {
+                    "type": "string"
+                },
                 "results": {
                     "type": "array",
                     "items": {
                         "$ref": "#/definitions/search.Result"
                     }
+                },
+                "status": {
+                    "type": "string"
+                },
+                "wiki_evidence_status": {
+                    "type": "string"
                 }
             }
         },

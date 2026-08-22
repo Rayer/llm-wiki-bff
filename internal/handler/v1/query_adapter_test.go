@@ -53,6 +53,13 @@ func TestV1QueryDelegatesTrimmedDefaultRequestAndScopedReader(t *testing.T) {
 	}
 }
 
+func TestMapQueryResultIncludesOptionalEvidenceMetadata(t *testing.T) {
+	response := mapQueryResult(query.Result{Query: "q", Mode: "full", AnswerBasis: "model_prior", WikiEvidenceStatus: "no_relevant_evidence", DisclosureRequired: true})
+	if response.AnswerBasis != "model_prior" || response.WikiEvidenceStatus != "no_relevant_evidence" || !response.DisclosureRequired {
+		t.Fatalf("response=%#v", response)
+	}
+}
+
 func TestV1QuerySetsOnlyAllowlistedRuntimeIdentityHeaders(t *testing.T) {
 	identity := query.RuntimeConfigIdentity{
 		ConfigRevision: "rev", ConfigDigest: "sha256:config", EffectiveConfigDigest: "sha256:effective",

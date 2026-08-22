@@ -31,6 +31,7 @@ type PublicQueryConfig struct {
 	SynthesisModel             string                    `json:"synthesis_model"`
 	SynthesisReasoning         string                    `json:"synthesis_reasoning"`
 	SynthesisTemperature       float64                   `json:"synthesis_temperature"`
+	NoEvidencePolicy           string                    `json:"no_evidence_policy"`
 	Options                    query.RuntimeQueryOptions `json:"options"`
 }
 
@@ -44,7 +45,8 @@ func PublicQueryConfigFromReadback(readback query.RuntimeConfigReadback) PublicQ
 		ExpansionReasoning: readback.ExpansionReasoning, ExpansionTemperature: readback.ExpansionTemperature,
 		SynthesisProvider: readback.SynthesisProvider, SynthesisModel: readback.SynthesisModel,
 		SynthesisReasoning: readback.SynthesisReasoning, SynthesisTemperature: readback.SynthesisTemperature,
-		Options: readback.Options,
+		NoEvidencePolicy: readback.NoEvidencePolicy,
+		Options:          readback.Options,
 	}
 }
 
@@ -80,14 +82,17 @@ type QueryRequest struct {
 
 // QueryResponse is the response for a query endpoint.
 type QueryResponse struct {
-	Query     string            `json:"query"`
-	Mode      string            `json:"mode"`
-	Results   []search.Result   `json:"results"`
-	Expand    *llm.ExpandResult `json:"expand,omitempty"`
-	AISynth   string            `json:"ai_synth,omitempty"`
-	Citations []search.Citation `json:"citations,omitempty"`
-	Status    string            `json:"status,omitempty"`
-	Reason    string            `json:"reason,omitempty"`
+	Query              string            `json:"query"`
+	Mode               string            `json:"mode"`
+	Results            []search.Result   `json:"results"`
+	Expand             *llm.ExpandResult `json:"expand,omitempty"`
+	AISynth            string            `json:"ai_synth,omitempty"`
+	Citations          []search.Citation `json:"citations,omitempty"`
+	Status             string            `json:"status,omitempty"`
+	Reason             string            `json:"reason,omitempty"`
+	AnswerBasis        string            `json:"answer_basis,omitempty"`
+	WikiEvidenceStatus string            `json:"wiki_evidence_status,omitempty"`
+	DisclosureRequired bool              `json:"disclosure_required,omitempty"`
 }
 
 // SourcesListResponse is the response for a sources list endpoint.

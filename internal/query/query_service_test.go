@@ -405,6 +405,71 @@ func TestServiceZeroResultsPreservesRankedResults(t *testing.T) {
 	}
 }
 
+func TestServiceModelPriorFallbackIsFullOnlyAndTyped(t *testing.T) {
+	transport := &promptCaptureTransport{}
+	previous := http.DefaultTransport
+	http.DefaultTransport = transport
+	t.Cleanup(func() { http.DefaultTransport = previous })
+
+	service := NewService(cache.New(), nil, llm.NewClient("test"))
+	ctx := WithRuntimeConfigIdentity(context.Background(), RuntimeConfigIdentity{NoEvidencePolicy: ModelPriorFallbackPolicy})
+	response := Result{Query: "coffee [CITATION_REF_reserved]", Mode: "full", Results: []search.Result{}, Status: "insufficient_evidence", Reason: "no_qualified_evidence"}
+	got, err := service.SynthesizeWithError(ctx, nil, Request{Query: response.Query, Mode: response.Mode}, response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.AISynth == "" || got.AnswerBasis != "model_prior" || got.WikiEvidenceStatus != "no_relevant_evidence" || !got.DisclosureRequired || got.Citations == nil || len(got.Citations) != 0 {
+		t.Fatalf("fallback result=%#v", got)
+	}
+	if strings.Contains(got.AISynth, "CITATION_REF_") || strings.Contains(transport.user, "CITATION_REF_") || strings.Contains(transport.user, "Wiki content") {
+		t.Fatalf("fallback prompt/answer retained reserved Wiki citation content: prompt=%q answer=%q", transport.user, got.AISynth)
+	}
+	wantPrompt, err := os.ReadFile(testdataFixturePath("full_model_prior_system_prompt.golden"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if transport.system != string(wantPrompt) {
+		t.Fatalf("model-prior prompt changed: got %q want %q", transport.system, string(wantPrompt))
+	}
+
+	transport.user = ""
+	wiki := response
+	wiki.Mode = "wiki"
+	got, err = service.SynthesizeWithError(ctx, nil, Request{Query: wiki.Query, Mode: wiki.Mode}, wiki)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.AISynth != "" || transport.user != "" {
+		t.Fatalf("Wiki zero-evidence unexpectedly synthesized: result=%#v prompt=%q", got, transport.user)
+	}
+}
+
+func TestServiceModelPriorFallbackFailureIsTechnical(t *testing.T) {
+	for _, body := range []string{
+		`provider-body-marker`,
+		`{"choices":[{"message":{"content":"   "}}]}`,
+	} {
+		t.Run(body, func(t *testing.T) {
+			previous := http.DefaultTransport
+			http.DefaultTransport = roundTripFunc(func(*http.Request) (*http.Response, error) {
+				status := http.StatusInternalServerError
+				if strings.HasPrefix(body, "{") {
+					status = http.StatusOK
+				}
+				return testHTTPResponse(status, body), nil
+			})
+			t.Cleanup(func() { http.DefaultTransport = previous })
+			service := NewService(cache.New(), nil, llm.NewClient("test-key-marker"))
+			ctx := WithRuntimeConfigIdentity(context.Background(), RuntimeConfigIdentity{NoEvidencePolicy: ModelPriorFallbackPolicy})
+			response := Result{Query: "private-query-marker", Mode: "full", Results: []search.Result{}, Status: "insufficient_evidence", Reason: "no_qualified_evidence"}
+			_, err := service.SynthesizeWithError(ctx, nil, Request{Query: response.Query, Mode: response.Mode}, response)
+			if err == nil || strings.Contains(err.Error(), "provider-body-marker") || strings.Contains(err.Error(), "private-query-marker") || strings.Contains(err.Error(), "test-key-marker") {
+				t.Fatalf("error=%v, want generic privacy-safe technical error", err)
+			}
+		})
+	}
+}
+
 func TestServiceSynthesisCancellationShortCircuitsZeroResultAndNoClient(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()

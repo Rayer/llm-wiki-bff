@@ -21,7 +21,7 @@ JOB = "olw-pipeline"
 SERVICE = "llm-wiki-bff"
 ARTIFACT = "bff-rollback-contract-" + "c" * 40
 EVIDENCE_ARTIFACT = "bff-deployment-evidence-" + "c" * 40
-QUERY_STAGE_CONFIG_PATH = "/app/configs/query/dev/query-dev-2026-08-21.2.json"
+QUERY_STAGE_CONFIG_PATH = "/app/configs/query/dev/query-dev-2026-08-22.1.json"
 PRIOR_QUERY_STAGE_CONFIG_PATH = "/app/configs/query/dev/query-dev-2026-08-21.1.json"
 LEGACY_QUERY_ENV_NAMES = [
     "QUERY_EXPANSION_MODEL", "QUERY_EXPANSION_REASONING", "ANSWER_SYNTHESIS_MODEL",
