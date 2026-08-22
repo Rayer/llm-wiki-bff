@@ -20,5 +20,7 @@ jobs:
           APP_VERSION=$(go run ./cmd/versioncheck VERSION)
       - name: Validate BFF promotion contract
         run: python3 scripts/test_bff_promotion_contract.py
+      - name: Validate Auth promotion contract
+        run: python3 scripts/test_auth_promotion_contract.py
       - run: go vet ./...
       - run: go test ./... -v -count=1 -race

@@ -698,9 +698,10 @@ jobs:
           if-no-files-found: error
           retention-days: 90
 
-      - name: Persist build image digest
+      - name: Persist Auth image receipt
         id: image_digest
         env:
+          AR_REPO: ${{ env.AR_REPO }}
           DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           set -euo pipefail
@@ -714,17 +715,25 @@ jobs:
             exit 1
           fi
           DIGEST_FILE="auth-image-digest-$COMMIT_SHA.txt"
-          printf '%s\n' "$DIGEST" > "$DIGEST_FILE"
+          printf '%s\n' \
+            "receipt_schema_version=1" \
+            "component=lwc-auth" \
+            "build_ref=develop" \
+            "source_sha=$COMMIT_SHA" \
+            "dev_run_id=$GITHUB_RUN_ID" \
+            "image_digest=$DIGEST" \
+            "image_reference=$AR_REPO/llm-wiki-auth@$DIGEST" \
+            > "$DIGEST_FILE"
           echo "commit_sha=$COMMIT_SHA" >> "$GITHUB_OUTPUT"
           echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
-          echo "digest_file=$DIGEST_FILE" >> "$GITHUB_OUTPUT"
-          echo "Persisted Cloud Build image digest $DIGEST"
+          echo "receipt_file=$DIGEST_FILE" >> "$GITHUB_OUTPUT"
+          echo "Persisted exact Auth image receipt for $COMMIT_SHA ($DIGEST)"
 
-      - name: Upload image digest artifact
+      - name: Upload Auth image receipt
         uses: actions/upload-artifact@v4
         with:
           name: auth-image-digest-${{ steps.image_digest.outputs.commit_sha }}
-          path: ${{ steps.image_digest.outputs.digest_file }}
+          path: ${{ steps.image_digest.outputs.receipt_file }}
           if-no-files-found: error
 
       - name: Tag deployed dev image (fail-closed)

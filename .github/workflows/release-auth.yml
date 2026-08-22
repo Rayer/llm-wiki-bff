@@ -1,0 +1,544 @@
+name: Promote Auth to Cloud Run (production)
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: Full lowercase commit SHA for the immutable Auth image built by canonical develop
+        required: true
+        type: string
+      dev_run_id:
+        description: Exact successful Auth DEV deployment run ID for this commit SHA
+        required: true
+        type: string
+
+env:
+  PROJECT_ID: llm-wiki-cloud
+  SERVICE_NAME: llm-wiki-auth
+  REGION: asia-east1
+  AR_REPO: asia-east1-docker.pkg.dev/llm-wiki-cloud/cloud-run-images
+  RUNTIME_SERVICE_ACCOUNT: lwc-auth-prod@llm-wiki-cloud.iam.gserviceaccount.com
+  FIRESTORE_DATABASE_ID: llm-wiki-cloud-prod
+  JWT_SECRET_NAME: jwt-secret-prod
+  AUTH_DOMAIN: auth.rayer.idv.tw
+  ALLOWED_ORIGINS: https://wiki.rayer.idv.tw,https://llm-wiki-frontend.vercel.app
+
+concurrency:
+  group: promote-auth-production
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    name: Promote immutable Auth image
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    environment: production
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Initialize Auth evidence paths
+        run: |
+          set -euo pipefail
+          EVIDENCE_DIR="$RUNNER_TEMP/auth-production-evidence"
+          mkdir -p "$EVIDENCE_DIR"
+          printf 'EVIDENCE_DIR=%s\nROLLBACK_CONTRACT=%s/rollback-contract.json\nEVIDENCE=%s/production-evidence.json\nDEV_RUN_JSON=%s/dev-run.json\nSERVICE_BEFORE=%s/service-before.json\nREVISION_BEFORE=%s/revision-before.json\nSERVICE_AFTER=%s/service-after.json\nREVISION_AFTER=%s/revision-after.json\nSERVICE_FINAL=%s/service-final.json\nREVISION_FINAL=%s/revision-final.json\nVERIFY_JSON=%s/verify.json\n' \
+            "$EVIDENCE_DIR" "$EVIDENCE_DIR" "$EVIDENCE_DIR" "$EVIDENCE_DIR" "$EVIDENCE_DIR" "$EVIDENCE_DIR" "$EVIDENCE_DIR" "$EVIDENCE_DIR" "$EVIDENCE_DIR" "$EVIDENCE_DIR" "$EVIDENCE_DIR" >> "$GITHUB_ENV"
+
+      - name: Validate exact main source
+        id: commit
+        env:
+          COMMIT_SHA: ${{ inputs.commit_sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$COMMIT_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "commit_sha must be a 40-character lowercase commit SHA"
+            exit 1
+          fi
+          if ! git cat-file -e "$COMMIT_SHA^{commit}"; then
+            echo "commit_sha does not identify a commit"
+            exit 1
+          fi
+          MAIN_SHA=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq .object.sha)
+          if [[ "$MAIN_SHA" != "$COMMIT_SHA" ]]; then
+            echo "current main must exactly equal commit_sha"
+            exit 1
+          fi
+          CHECKED_OUT_SHA=$(git rev-parse HEAD)
+          if [[ "$CHECKED_OUT_SHA" != "$COMMIT_SHA" ]]; then
+            echo "checked-out main does not exactly equal commit_sha"
+            exit 1
+          fi
+          echo "commit_sha=$COMMIT_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Validate exact DEV run provenance
+        id: dev_provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMIT_SHA: ${{ steps.commit.outputs.commit_sha }}
+          DEV_RUN_ID: ${{ inputs.dev_run_id }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$DEV_RUN_ID" =~ ^[1-9][0-9]*$ ]]; then
+            echo "dev_run_id must be a positive integer"
+            exit 1
+          fi
+          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${DEV_RUN_ID}" > "$DEV_RUN_JSON"
+          jq -e --arg sha "$COMMIT_SHA" --arg repository "$GITHUB_REPOSITORY" --argjson run_id "$DEV_RUN_ID" '
+            .id == $run_id and .path == ".github/workflows/deploy-auth.yml" and
+            .event == "workflow_dispatch" and .head_branch == "develop" and
+            .head_sha == $sha and .status == "completed" and .conclusion == "success" and
+            .html_url == ("https://github.com/" + $repository + "/actions/runs/" + ($run_id | tostring))
+          ' "$DEV_RUN_JSON" >/dev/null
+
+      - name: Download exact DEV Auth receipt
+        id: receipt
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMIT_SHA: ${{ steps.commit.outputs.commit_sha }}
+          DEV_RUN_ID: ${{ inputs.dev_run_id }}
+        run: |
+          set -euo pipefail
+          RECEIPT_DIR="$RUNNER_TEMP/auth-image-receipt"
+          rm -rf "$RECEIPT_DIR"
+          mkdir -p "$RECEIPT_DIR"
+          gh run download "$DEV_RUN_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            --name "auth-image-digest-$COMMIT_SHA" \
+            --dir "$RECEIPT_DIR"
+          mapfile -t RECEIPT_FILES < <(find "$RECEIPT_DIR" -type f -print)
+          if (( ${#RECEIPT_FILES[@]} != 1 )) || [[ "${RECEIPT_FILES[0]}" != "$RECEIPT_DIR/auth-image-digest-$COMMIT_SHA.txt" ]]; then
+            echo "DEV Auth receipt artifact must contain exactly auth-image-digest-$COMMIT_SHA.txt"
+            exit 1
+          fi
+          python3 scripts/validate_auth_promotion_contract.py \
+            --receipt "${RECEIPT_FILES[0]}" \
+            --run-json "$DEV_RUN_JSON" \
+            --expected-sha "$COMMIT_SHA" \
+            --expected-run-id "$DEV_RUN_ID" \
+            --repository "$GITHUB_REPOSITORY" \
+            --ar-repo "$AR_REPO" \
+            --output "$EVIDENCE_DIR/validated-receipt.json" \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+
+      - name: Verify production Auth prerequisites
+        id: preflight
+        run: |
+          set -euo pipefail
+          if ! gcloud iam service-accounts describe "$RUNTIME_SERVICE_ACCOUNT" --project "$PROJECT_ID" --format=json --quiet >/dev/null; then
+            echo "runtime service account is missing or unreadable; refusing to deploy"
+            exit 1
+          fi
+          if ! gcloud artifacts repositories describe cloud-run-images --location "$REGION" --project "$PROJECT_ID" --format=json --quiet >/dev/null; then
+            echo "Artifact Registry repository is missing or unreadable; refusing to deploy"
+            exit 1
+          fi
+          if ! gcloud firestore databases describe --database "$FIRESTORE_DATABASE_ID" --project "$PROJECT_ID" --format=json --quiet >/dev/null; then
+            echo "Firestore database is missing or unreadable; refusing to deploy"
+            exit 1
+          fi
+          if ! gcloud secrets describe "$JWT_SECRET_NAME" --project "$PROJECT_ID" --format=json --quiet >/dev/null; then
+            echo "JWT secret is missing or unreadable; refusing to deploy"
+            exit 1
+          fi
+          SECRET_IAM_POLICY=$(gcloud secrets get-iam-policy "$JWT_SECRET_NAME" --project "$PROJECT_ID" --format=json --quiet)
+          if ! jq -e --arg member "serviceAccount:$RUNTIME_SERVICE_ACCOUNT" \
+            'any(.bindings[]?; .role == "roles/secretmanager.secretAccessor" and any(.members[]?; . == $member))' \
+            <<<"$SECRET_IAM_POLICY" >/dev/null; then
+            echo "JWT secret accessor grant is missing; refusing to deploy"
+            exit 1
+          fi
+
+          SERVICE_ERROR="$EVIDENCE_DIR/service-error.txt"
+          if gcloud run services describe "$SERVICE_NAME" --region "$REGION" --project "$PROJECT_ID" --format=json --quiet > "$SERVICE_BEFORE" 2> "$SERVICE_ERROR"; then
+            BOOTSTRAP_EXISTING=true
+          elif grep -Eiq 'NOT_FOUND|not found|does not exist' "$SERVICE_ERROR"; then
+            BOOTSTRAP_EXISTING=false
+            : > "$SERVICE_BEFORE"
+          else
+            echo "Auth service read-back failed for a reason other than absence; refusing to deploy"
+            exit 1
+          fi
+          rm -f "$SERVICE_ERROR"
+          echo "bootstrap_existing=$BOOTSTRAP_EXISTING" >> "$GITHUB_OUTPUT"
+          echo "BOOTSTRAP_EXISTING=$BOOTSTRAP_EXISTING" >> "$GITHUB_ENV"
+
+          if [[ "$BOOTSTRAP_EXISTING" == true ]]; then
+            if ! SERVICE_URL=$(jq -er '.status.url | select(type == "string" and startswith("https://"))' "$SERVICE_BEFORE"); then
+              echo "existing Auth service URL is unreadable; refusing to deploy"
+              exit 1
+            fi
+            SERVICE_HOST="${SERVICE_URL#https://}"
+            if [[ "$SERVICE_HOST" != *.run.app ]]; then
+              echo "existing Auth service URL is not a Cloud Run run.app hostname"
+              exit 1
+            fi
+            if ! jq -e --arg member "allUsers" '
+            if (.bindings | type) != "array" then false
+              else ([.bindings[] | select(type == "object" and .role == "roles/run.invoker" and (.members | type) == "array" and (.members | index($member)))] as $public | (($public | length) == 1 and $public[0].condition? == null))
+              end' \
+              <(gcloud run services get-iam-policy "$SERVICE_NAME" --region "$REGION" --project "$PROJECT_ID" --format=json --quiet) >/dev/null; then
+              echo "existing Auth service does not have the required public invoker binding"
+              exit 1
+            fi
+            if ! jq -e '((.metadata.annotations["run.googleapis.com/ingress"] // .spec.ingress // "all") == "all")' "$SERVICE_BEFORE" >/dev/null; then
+              echo "existing Auth service ingress is not all"
+              exit 1
+            fi
+            if ! jq -e '
+              (.status.traffic | type == "array" and length == 1) and
+              (.status.traffic[0].percent == 100) and
+              (.status.traffic[0].revisionName | type == "string" and length > 0) and
+              (.status.traffic[0].tag == null)
+            ' "$SERVICE_BEFORE" >/dev/null; then
+              echo "existing Auth service must have exactly one untagged 100% serving revision"
+              exit 1
+            fi
+            PRIOR_SERVING_REVISION=$(jq -er '.status.traffic[0].revisionName' "$SERVICE_BEFORE")
+            gcloud run revisions describe "$PRIOR_SERVING_REVISION" --region "$REGION" --project "$PROJECT_ID" --format=json --quiet > "$REVISION_BEFORE"
+            PRIOR_IMAGE=$(jq -er '.status.imageDigest | select(test("^" + "'"$AR_REPO"'" + "/llm-wiki-auth@sha256:[0-9a-f]{64}$"))' "$REVISION_BEFORE")
+            ALLOWED_HOSTS_VALUE="$AUTH_DOMAIN,$SERVICE_HOST"
+            if ! jq -e --arg project "$PROJECT_ID" --arg database "$FIRESTORE_DATABASE_ID" --arg origins "$ALLOWED_ORIGINS" --arg hosts "$ALLOWED_HOSTS_VALUE" --arg commit_pattern '^[0-9a-f]{40}$' --arg secret "$JWT_SECRET_NAME" '
+              ([.spec.template.spec.containers[]?.env[]?] | length == 7) and
+              ([.spec.template.spec.containers[]?.env[]?.name] | sort == ["ALLOWED_HOSTS", "ALLOWED_ORIGINS", "DEV_JWT", "FIRESTORE_DATABASE_ID", "GCP_PROJECT", "JWT_SECRET", "LWC_SOURCE_COMMIT"]) and
+              (all(.spec.template.spec.containers[]?.env[]?;
+                if .name == "JWT_SECRET" then
+                  (.value == null and ((.valueFrom.secretKeyRef.name // .valueSource.secretKeyRef.secret) == $secret))
+                elif .name == "GCP_PROJECT" then
+                  (.value == $project and (.valueFrom? == null))
+                elif .name == "FIRESTORE_DATABASE_ID" then
+                  (.value == $database and (.valueFrom? == null))
+                elif .name == "ALLOWED_ORIGINS" then
+                  (.value == $origins and (.valueFrom? == null))
+                elif .name == "ALLOWED_HOSTS" then
+                  (.value == $hosts and (.valueFrom? == null))
+                elif .name == "DEV_JWT" then
+                  (.value == "false" and (.valueFrom? == null))
+                elif .name == "LWC_SOURCE_COMMIT" then
+                  ((.value | type) == "string" and (.value | test($commit_pattern)) and (.valueFrom? == null))
+                else false
+                end))
+            ' "$SERVICE_BEFORE" >/dev/null; then
+              echo "existing Auth service env is not the exact non-secret allowlist"
+              exit 1
+            fi
+            if ! jq -e '((.spec.template.metadata.annotations["autoscaling.knative.dev/maxScale"] // .spec.template.metadata.annotations["run.googleapis.com/maxScale"] // .spec.template.scaling.maxInstanceCount // "") | tostring) == "1"' "$SERVICE_BEFORE" >/dev/null; then
+              echo "existing max instances is not 1"
+              exit 1
+            fi
+            if ! jq -e '((.spec.template.metadata.annotations["run.googleapis.com/vpc-access-egress"] // .metadata.annotations["run.googleapis.com/vpc-access-egress"] // .spec.template.vpcAccess.egress // "") | tostring) == "private-ranges-only"' "$SERVICE_BEFORE" >/dev/null; then
+              echo "existing VPC egress is not private-ranges-only"
+              exit 1
+            fi
+            echo "PRIOR_SERVING_REVISION=$PRIOR_SERVING_REVISION" >> "$GITHUB_ENV"
+            echo "PRIOR_IMAGE=$PRIOR_IMAGE" >> "$GITHUB_ENV"
+            echo "ALLOWED_HOSTS_VALUE=$ALLOWED_HOSTS_VALUE" >> "$GITHUB_ENV"
+            jq -n \
+              --arg classification existing \
+              --arg service "$SERVICE_NAME" \
+              --arg prior_revision "$PRIOR_SERVING_REVISION" \
+              --arg prior_image "$PRIOR_IMAGE" \
+              --arg service_url "$SERVICE_URL" \
+              --argjson prior_traffic "$(jq -c '.status.traffic' "$SERVICE_BEFORE")" \
+              '{schema_version: 1, classification: $classification, service: $service, prior_service: true, prior_revision: $prior_revision, prior_image: $prior_image, prior_traffic: $prior_traffic, service_url: $service_url, rollback: "explicit prior 100% traffic"}' > "$ROLLBACK_CONTRACT"
+          else
+            echo "ALLOWED_HOSTS_VALUE=$AUTH_DOMAIN" >> "$GITHUB_ENV"
+            jq -n \
+              --arg classification bootstrap \
+              --arg service "$SERVICE_NAME" \
+              '{schema_version: 1, classification: $classification, service: $service, prior_service: false, prior_revision: null, prior_image: null, prior_traffic: [], service_url: null, rollback: "not applicable: no prior Auth service/revision; user traffic remains on legacy BFF until cutover"}' > "$ROLLBACK_CONTRACT"
+          fi
+
+      - name: Upload immutable Auth rollback contract
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: auth-production-rollback-${{ steps.commit.outputs.commit_sha }}
+          path: ${{ env.ROLLBACK_CONTRACT }}
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Deploy exact Auth image
+        id: deploy
+        env:
+          COMMIT_SHA: ${{ steps.commit.outputs.commit_sha }}
+          IMMUTABLE_IMAGE: ${{ steps.receipt.outputs.image }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          MAIN_SHA=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq .object.sha)
+          if [[ "$MAIN_SHA" != "$COMMIT_SHA" ]]; then
+            echo "current main changed before deploy; refusing to mutate production"
+            exit 1
+          fi
+          DEPLOY_PUBLIC_ARGS=()
+          if [[ "$BOOTSTRAP_EXISTING" == false ]]; then
+            DEPLOY_PUBLIC_ARGS=(--allow-unauthenticated)
+          fi
+          gcloud run deploy "$SERVICE_NAME" "${DEPLOY_PUBLIC_ARGS[@]}" \
+            --project "$PROJECT_ID" \
+            --image "$IMMUTABLE_IMAGE" \
+            --region "$REGION" \
+            --service-account "$RUNTIME_SERVICE_ACCOUNT" \
+            --network default --subnet default \
+            --vpc-egress private-ranges-only \
+            --ingress all \
+            --max-instances 1 \
+            --update-secrets "JWT_SECRET=$JWT_SECRET_NAME:latest" \
+            --set-env-vars "^@^GCP_PROJECT=$PROJECT_ID@FIRESTORE_DATABASE_ID=$FIRESTORE_DATABASE_ID@ALLOWED_ORIGINS=$ALLOWED_ORIGINS@ALLOWED_HOSTS=$ALLOWED_HOSTS_VALUE@DEV_JWT=false@LWC_SOURCE_COMMIT=$COMMIT_SHA" \
+            --quiet
+          if [[ "$BOOTSTRAP_EXISTING" == false ]]; then
+            SERVICE_URL=$(gcloud run services describe "$SERVICE_NAME" --region "$REGION" --project "$PROJECT_ID" --format='value(status.url)' --quiet)
+            SERVICE_HOST="${SERVICE_URL#https://}"
+            if [[ "$SERVICE_HOST" != *.run.app ]]; then
+              echo "new Auth service URL is not a Cloud Run run.app hostname"
+              exit 1
+            fi
+            ALLOWED_HOSTS_VALUE="$AUTH_DOMAIN,$SERVICE_HOST"
+            gcloud run services update "$SERVICE_NAME" --project "$PROJECT_ID" --region "$REGION" \
+              --update-secrets "JWT_SECRET=$JWT_SECRET_NAME:latest" \
+              --set-env-vars "^@^GCP_PROJECT=$PROJECT_ID@FIRESTORE_DATABASE_ID=$FIRESTORE_DATABASE_ID@ALLOWED_ORIGINS=$ALLOWED_ORIGINS@ALLOWED_HOSTS=$ALLOWED_HOSTS_VALUE@DEV_JWT=false@LWC_SOURCE_COMMIT=$COMMIT_SHA" --quiet
+            echo "ALLOWED_HOSTS_VALUE=$ALLOWED_HOSTS_VALUE" >> "$GITHUB_ENV"
+          fi
+          gcloud run services update-traffic "$SERVICE_NAME" --project "$PROJECT_ID" --region "$REGION" --to-latest --quiet
+
+      - name: Verify Auth production read-back
+        id: verify
+        if: ${{ always() && steps.deploy.outcome != 'skipped' }}
+        env:
+          COMMIT_SHA: ${{ steps.commit.outputs.commit_sha }}
+          IMMUTABLE_IMAGE: ${{ steps.receipt.outputs.image }}
+        run: |
+          set -euo pipefail
+          gcloud run services describe "$SERVICE_NAME" --region "$REGION" --project "$PROJECT_ID" --format=json --quiet > "$SERVICE_AFTER"
+          SERVICE_URL=$(jq -er '.status.url | select(type == "string" and startswith("https://"))' "$SERVICE_AFTER")
+          SERVICE_HOST="${SERVICE_URL#https://}"
+          [[ "$SERVICE_HOST" == *.run.app ]] || { echo "read-back service URL is not run.app"; exit 1; }
+          LATEST_CREATED=$(jq -er '.status.latestCreatedRevisionName | select(type == "string" and length > 0)' "$SERVICE_AFTER")
+          LATEST_READY=$(jq -er '.status.latestReadyRevisionName | select(type == "string" and length > 0)' "$SERVICE_AFTER")
+          SERVING_REVISION=$(jq -er 'if (.status.traffic | type) == "array" and (.status.traffic | length) == 1 and .status.traffic[0].percent == 100 and (.status.traffic[0].tag == null) then .status.traffic[0].revisionName else empty end' "$SERVICE_AFTER")
+          if [[ "$LATEST_CREATED" != "$LATEST_READY" || "$LATEST_READY" != "$SERVING_REVISION" ]]; then
+            echo "Auth read-back does not identify one exact ready/created/serving revision"
+            exit 1
+          fi
+          gcloud run revisions describe "$SERVING_REVISION" --region "$REGION" --project "$PROJECT_ID" --format=json --quiet > "$REVISION_AFTER"
+          DEPLOYED_IMAGE=$(jq -er '.status.imageDigest' "$REVISION_AFTER")
+          REVISION_TEMPLATE_IMAGE=$(jq -er '.spec.containers[0].image' "$REVISION_AFTER")
+          [[ "$DEPLOYED_IMAGE" == "$IMMUTABLE_IMAGE" && "$REVISION_TEMPLATE_IMAGE" == "$IMMUTABLE_IMAGE" ]] || { echo "Auth immutable image read-back mismatch"; exit 1; }
+          [[ "$(jq -er '.spec.serviceAccountName' "$REVISION_AFTER")" == "$RUNTIME_SERVICE_ACCOUNT" ]] || { echo "Auth runtime service account mismatch"; exit 1; }
+          ENV_JSON=$(jq -c '.spec.containers[0].env' "$REVISION_AFTER")
+          jq -e --arg project "$PROJECT_ID" --arg database "$FIRESTORE_DATABASE_ID" --arg origins "$ALLOWED_ORIGINS" --arg hosts "$AUTH_DOMAIN,$SERVICE_HOST" --arg commit "$COMMIT_SHA" --arg secret "$JWT_SECRET_NAME" '
+            (all(.[]; (.name | IN("GCP_PROJECT", "FIRESTORE_DATABASE_ID", "ALLOWED_ORIGINS", "ALLOWED_HOSTS", "DEV_JWT", "LWC_SOURCE_COMMIT", "JWT_SECRET")))) and
+            ([.[] | select(.name == "GCP_PROJECT" and .value == $project)] | length == 1) and
+            ([.[] | select(.name == "FIRESTORE_DATABASE_ID" and .value == $database)] | length == 1) and
+            ([.[] | select(.name == "ALLOWED_ORIGINS" and .value == $origins)] | length == 1) and
+            ([.[] | select(.name == "ALLOWED_HOSTS" and .value == $hosts)] | length == 1) and
+            ([.[] | select(.name == "DEV_JWT" and .value == "false")] | length == 1) and
+            ([.[] | select(.name == "LWC_SOURCE_COMMIT" and .value == $commit)] | length == 1) and
+            ([.[] | select(.name == "JWT_SECRET" and .value == null and ((.valueFrom.secretKeyRef.name // .valueSource.secretKeyRef.secret) == $secret))] | length == 1)
+          ' <<<"$ENV_JSON" >/dev/null
+          [[ "$(jq -er '(.metadata.annotations["run.googleapis.com/ingress"] // .spec.ingress // "all") | tostring' "$SERVICE_AFTER")" == all ]] || { echo "Auth ingress mismatch"; exit 1; }
+          [[ "$(jq -er '(.spec.template.metadata.annotations["run.googleapis.com/vpc-access-egress"] // .metadata.annotations["run.googleapis.com/vpc-access-egress"] // .spec.template.vpcAccess.egress // "") | tostring' "$SERVICE_AFTER")" == private-ranges-only ]] || { echo "Auth VPC egress mismatch"; exit 1; }
+          [[ "$(jq -er '(.spec.template.metadata.annotations["autoscaling.knative.dev/maxScale"] // .spec.template.metadata.annotations["run.googleapis.com/maxScale"] // .spec.template.scaling.maxInstanceCount // "") | tostring' "$SERVICE_AFTER")" == 1 ]] || { echo "Auth max instances mismatch"; exit 1; }
+          if ! jq -e --arg member "allUsers" '
+            if (.bindings | type) != "array" then false
+            else ([.bindings[] | select(type == "object" and .role == "roles/run.invoker" and (.members | type) == "array" and (.members | index($member)))] as $public | (($public | length) == 1 and $public[0].condition? == null))
+            end' \
+            <(gcloud run services get-iam-policy "$SERVICE_NAME" --region "$REGION" --project "$PROJECT_ID" --format=json --quiet) >/dev/null; then
+            echo "Auth public invoker read-back failed"
+            exit 1
+          fi
+          VERSION_BODY=$(mktemp)
+          VERSION_HEADERS=$(mktemp)
+          trap 'rm -f "$VERSION_BODY" "$VERSION_HEADERS"' EXIT
+          VERSION_STATUS=$(curl -sS --max-time 20 --connect-timeout 10 -H 'Cache-Control: no-cache' -D "$VERSION_HEADERS" -o "$VERSION_BODY" -w '%{http_code}' "$SERVICE_URL/api/v1/public/version")
+          HEALTH_STATUS=$(curl -sS --max-time 20 --connect-timeout 10 -o /dev/null -w '%{http_code}' "$SERVICE_URL/api/v1/public/healthz")
+          CACHE_CONTROL=$(awk 'BEGIN{IGNORECASE=1} /^Cache-Control:/ {sub(/^[^:]*:[[:space:]]*/, ""); sub(/[[:space:]]*\r$/, ""); print; exit}' "$VERSION_HEADERS")
+          [[ "$VERSION_STATUS" == 200 && "$HEALTH_STATUS" == 200 && "${CACHE_CONTROL,,}" == no-store ]] || { echo "Auth public API read-back failed"; exit 1; }
+          jq -e --arg commit "$COMMIT_SHA" --arg service "$SERVICE_NAME" --arg revision "$SERVING_REVISION" '.commit == $commit and .service == $service and .revision == $revision' "$VERSION_BODY" >/dev/null
+          jq -n --arg service_url "$SERVICE_URL" --arg service_host "$SERVICE_HOST" --arg created "$LATEST_CREATED" --arg ready "$LATEST_READY" --arg serving "$SERVING_REVISION" --arg image "$DEPLOYED_IMAGE" --arg traffic_revision "$SERVING_REVISION" --arg version_status "$VERSION_STATUS" --arg health_status "$HEALTH_STATUS" --arg cache_control "$CACHE_CONTROL" \
+            '{service_url: $service_url, service_host: $service_host, latest_created_revision: $created, latest_ready_revision: $ready, serving_revision: $serving, serving_image: $image, traffic: [{revisionName: $traffic_revision, percent: 100, tag: null}], version_http_status: ($version_status | tonumber), healthz_http_status: ($health_status | tonumber), version_cache_control: $cache_control, api_identity: "exact commit/service/revision"}' > "$VERIFY_JSON"
+
+      - name: Reconcile Auth deployment outcome
+        id: reconcile
+        if: always()
+        env:
+          COMMIT_SHA: ${{ steps.commit.outputs.commit_sha }}
+          IMMUTABLE_IMAGE: ${{ steps.receipt.outputs.image }}
+          DEV_RUN_ID: ${{ inputs.dev_run_id }}
+          SOURCE_VALIDATION_OUTCOME: ${{ steps.commit.outcome }}
+          DEV_PROVENANCE_OUTCOME: ${{ steps.dev_provenance.outcome }}
+          RECEIPT_VALIDATION_OUTCOME: ${{ steps.receipt.outcome }}
+          VALIDATED_DEV_WORKFLOW: ${{ steps.receipt.outputs.dev_workflow }}
+          VALIDATED_DEV_EVENT: ${{ steps.receipt.outputs.dev_event }}
+          VALIDATED_DEV_HEAD_BRANCH: ${{ steps.receipt.outputs.dev_head_branch }}
+          VALIDATED_DEV_HEAD_SHA: ${{ steps.receipt.outputs.dev_head_sha }}
+          VALIDATED_DEV_CONCLUSION: ${{ steps.receipt.outputs.dev_conclusion }}
+          VALIDATED_DEV_RUN_ID: ${{ steps.receipt.outputs.dev_run_id }}
+          VALIDATED_DEV_RUN_URL: ${{ steps.receipt.outputs.dev_run_url }}
+          DEPLOY_OUTCOME: ${{ steps.deploy.outcome }}
+          VERIFY_OUTCOME: ${{ steps.verify.outcome }}
+        run: |
+          set +e
+          ROLLBACK_ATTEMPTED=false
+          ROLLBACK_READBACK_CONFIRMED=false
+          ROLLBACK_RESULT=not_attempted
+          OUTCOME=failed
+          VALIDATION_OK=false
+          if [[ "$SOURCE_VALIDATION_OUTCOME" == success && "$DEV_PROVENANCE_OUTCOME" == success && "$RECEIPT_VALIDATION_OUTCOME" == success ]] \
+            && [[ "$VALIDATED_DEV_WORKFLOW" == .github/workflows/deploy-auth.yml ]] \
+            && [[ "$VALIDATED_DEV_EVENT" == workflow_dispatch ]] \
+            && [[ "$VALIDATED_DEV_HEAD_BRANCH" == develop ]] \
+            && [[ "$VALIDATED_DEV_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] \
+            && [[ "$VALIDATED_DEV_CONCLUSION" == success ]] \
+            && [[ "$VALIDATED_DEV_RUN_ID" =~ ^[1-9][0-9]*$ ]] \
+            && [[ -n "$VALIDATED_DEV_RUN_URL" ]] \
+            && [[ "$VALIDATED_DEV_HEAD_SHA" == "$COMMIT_SHA" ]]; then
+            VALIDATION_OK=true
+          fi
+          if [[ "$VALIDATION_OK" == true && "$DEPLOY_OUTCOME" == success && "$VERIFY_OUTCOME" == success ]]; then
+            OUTCOME=verified
+            ROLLBACK_RESULT=not_needed
+          elif [[ "$BOOTSTRAP_EXISTING" == true ]]; then
+            if [[ -n "${PRIOR_SERVING_REVISION:-}" ]]; then
+              CURRENT_SERVICE=$(gcloud run services describe "$SERVICE_NAME" --region "$REGION" --project "$PROJECT_ID" --format=json --quiet 2>/dev/null) || CURRENT_SERVICE=
+              PRIOR_TRAFFIC_OK=$(jq -r --arg revision "$PRIOR_SERVING_REVISION" '((.status.traffic | type) == "array" and (.status.traffic | length) == 1 and .status.traffic[0].revisionName == $revision and .status.traffic[0].percent == 100 and .status.traffic[0].tag == null)' <<<"$CURRENT_SERVICE" 2>/dev/null) || PRIOR_TRAFFIC_OK=false
+              if [[ "$PRIOR_TRAFFIC_OK" != true ]]; then
+                ROLLBACK_ATTEMPTED=true
+                gcloud run services update-traffic "$SERVICE_NAME" --project "$PROJECT_ID" --region "$REGION" --to-revisions "$PRIOR_SERVING_REVISION=100" --quiet
+                ROLLBACK_EXIT=$?
+                ROLLBACK_READBACK_DEADLINE=$((SECONDS + 240))
+                while (( SECONDS < ROLLBACK_READBACK_DEADLINE )); do
+                  if gcloud run services describe "$SERVICE_NAME" --region "$REGION" --project "$PROJECT_ID" --format=json --quiet > "$SERVICE_FINAL" 2>/dev/null \
+                    && jq -e --arg revision "$PRIOR_SERVING_REVISION" '((.status.traffic | type) == "array" and (.status.traffic | length) == 1 and .status.traffic[0].revisionName == $revision and .status.traffic[0].percent == 100 and .status.traffic[0].tag == null)' "$SERVICE_FINAL" >/dev/null 2>&1; then
+                    ROLLBACK_READBACK_CONFIRMED=true
+                    break
+                  fi
+                  sleep 5
+                done
+                if [[ "$ROLLBACK_READBACK_CONFIRMED" == true ]]; then
+                  ROLLBACK_RESULT=restored
+                else
+                  ROLLBACK_RESULT=failed
+                fi
+              else
+                ROLLBACK_RESULT=already_prior
+              fi
+            else
+              ROLLBACK_RESULT=failed
+            fi
+          else
+            # no prior Auth service/revision: failed bootstrap has no rollback claim;
+            # user traffic remains on legacy BFF until domain/frontend cutover.
+            ROLLBACK_RESULT=not_applicable_bootstrap
+          fi
+          : > "$SERVICE_FINAL"
+          gcloud run services describe "$SERVICE_NAME" --region "$REGION" --project "$PROJECT_ID" --format=json --quiet > "$SERVICE_FINAL" 2>/dev/null || : > "$SERVICE_FINAL"
+          if [[ -s "$SERVICE_FINAL" ]]; then SERVICE_FOR_EVIDENCE=$(<"$SERVICE_FINAL"); else SERVICE_FOR_EVIDENCE='{}'; fi
+          PROVIDER_AVAILABLE=$(jq -r 'type == "object" and (.status | type) == "object"' <<<"$SERVICE_FOR_EVIDENCE" 2>/dev/null) || PROVIDER_AVAILABLE=false
+          [[ "$PROVIDER_AVAILABLE" == true ]] || { PROVIDER_AVAILABLE=false; SERVICE_FOR_EVIDENCE='{}'; }
+          ACTUAL_TRAFFIC=$(jq -c 'if (.status.traffic | type) == "array" then .status.traffic else [] end' <<<"$SERVICE_FOR_EVIDENCE" 2>/dev/null); [[ "$ACTUAL_TRAFFIC" =~ ^\[ ]] || ACTUAL_TRAFFIC='[]'
+          ACTUAL_CREATED=$(jq -c '.status.latestCreatedRevisionName // null' <<<"$SERVICE_FOR_EVIDENCE" 2>/dev/null) || ACTUAL_CREATED=null
+          ACTUAL_READY=$(jq -c '.status.latestReadyRevisionName // null' <<<"$SERVICE_FOR_EVIDENCE" 2>/dev/null) || ACTUAL_READY=null
+          SERVICE_URL=$(jq -c '.status.url // null' <<<"$SERVICE_FOR_EVIDENCE" 2>/dev/null) || SERVICE_URL=null
+          ACTUAL_SERVING_REVISION=$(jq -r 'if (.status.traffic | type) == "array" and (.status.traffic | length) == 1 and .status.traffic[0].percent == 100 and .status.traffic[0].tag == null and (.status.traffic[0].revisionName | type) == "string" then .status.traffic[0].revisionName else empty end' <<<"$SERVICE_FOR_EVIDENCE" 2>/dev/null) || ACTUAL_SERVING_REVISION=
+          ACTUAL_SERVING_IMAGE=null
+          if [[ -n "$ACTUAL_SERVING_REVISION" ]]; then
+            if gcloud run revisions describe "$ACTUAL_SERVING_REVISION" --region "$REGION" --project "$PROJECT_ID" --format=json --quiet > "$REVISION_FINAL" 2>/dev/null; then
+              ACTUAL_SERVING_IMAGE=$(jq -c '.status.imageDigest // null' "$REVISION_FINAL" 2>/dev/null) || ACTUAL_SERVING_IMAGE=null
+            fi
+          fi
+          API_STATUS=unknown
+          if [[ "$VERIFY_OUTCOME" == success && -s "$VERIFY_JSON" ]]; then API_STATUS=verified; fi
+          PRIOR_REVISION_JSON=$(jq -c '.prior_revision // null' "$ROLLBACK_CONTRACT" 2>/dev/null) || PRIOR_REVISION_JSON=null
+          PRIOR_IMAGE_JSON=$(jq -c '.prior_image // null' "$ROLLBACK_CONTRACT" 2>/dev/null) || PRIOR_IMAGE_JSON=null
+          PRIOR_TRAFFIC_JSON=$(jq -c '.prior_traffic // []' "$ROLLBACK_CONTRACT" 2>/dev/null) || PRIOR_TRAFFIC_JSON='[]'
+          SOURCE_COMMIT_JSON=null
+          VALIDATED_IMAGE_JSON=null
+          DEV_RUN_JSON_ID=null
+          DEV_WORKFLOW_JSON=null
+          DEV_EVENT_JSON=null
+          DEV_HEAD_BRANCH_JSON=null
+          DEV_HEAD_SHA_JSON=null
+          DEV_CONCLUSION_JSON=null
+          DEV_RUN_URL_JSON=null
+          if [[ "$VALIDATION_OK" == true ]]; then
+            SOURCE_COMMIT_JSON=$(jq -Rn --arg value "$COMMIT_SHA" '$value')
+            DEV_RUN_JSON_ID="$VALIDATED_DEV_RUN_ID"
+            DEV_WORKFLOW_JSON=$(jq -Rn --arg value "$VALIDATED_DEV_WORKFLOW" '$value')
+            DEV_EVENT_JSON=$(jq -Rn --arg value "$VALIDATED_DEV_EVENT" '$value')
+            DEV_HEAD_BRANCH_JSON=$(jq -Rn --arg value "$VALIDATED_DEV_HEAD_BRANCH" '$value')
+            DEV_HEAD_SHA_JSON=$(jq -Rn --arg value "$VALIDATED_DEV_HEAD_SHA" '$value')
+            DEV_CONCLUSION_JSON=$(jq -Rn --arg value "$VALIDATED_DEV_CONCLUSION" '$value')
+            DEV_RUN_URL_JSON=$(jq -Rn --arg value "$VALIDATED_DEV_RUN_URL" '$value')
+            if [[ "$IMMUTABLE_IMAGE" =~ ^${AR_REPO}/llm-wiki-auth@sha256:[0-9a-f]{64}$ ]]; then
+              VALIDATED_IMAGE_JSON=$(jq -n --arg reference "$IMMUTABLE_IMAGE" --arg digest "${IMMUTABLE_IMAGE##*@}" '{reference: $reference, digest: $digest}')
+            fi
+          fi
+          if [[ "$BOOTSTRAP_EXISTING" == true ]]; then BOOTSTRAP_JSON=true; CLASSIFICATION=existing; else BOOTSTRAP_JSON=false; CLASSIFICATION=bootstrap; fi
+          if [[ "$ROLLBACK_ATTEMPTED" == true ]]; then ROLLBACK_ATTEMPTED_JSON=true; else ROLLBACK_ATTEMPTED_JSON=false; fi
+          if [[ "$ROLLBACK_READBACK_CONFIRMED" == true ]]; then ROLLBACK_READBACK_JSON=true; else ROLLBACK_READBACK_JSON=false; fi
+          jq -n \
+            --argjson schema 1 --arg project "$PROJECT_ID" --arg component lwc-auth --arg environment production --arg action promote \
+            --argjson commit "$SOURCE_COMMIT_JSON" --argjson dev_run "$DEV_RUN_JSON_ID" --argjson dev_url "$DEV_RUN_URL_JSON" \
+            --argjson dev_workflow "$DEV_WORKFLOW_JSON" --argjson dev_event "$DEV_EVENT_JSON" --argjson dev_head_branch "$DEV_HEAD_BRANCH_JSON" --argjson dev_head_sha "$DEV_HEAD_SHA_JSON" --argjson dev_conclusion "$DEV_CONCLUSION_JSON" \
+            --argjson image "$VALIDATED_IMAGE_JSON" --argjson bootstrap "$BOOTSTRAP_JSON" \
+            --arg bootstrap_classification "$CLASSIFICATION" \
+            --arg deploy "$DEPLOY_OUTCOME" --arg verify "$VERIFY_OUTCOME" --arg outcome "$OUTCOME" \
+            --arg source_validation "$SOURCE_VALIDATION_OUTCOME" --arg dev_validation "$DEV_PROVENANCE_OUTCOME" --arg receipt_validation "$RECEIPT_VALIDATION_OUTCOME" --arg validation "$VALIDATION_OK" \
+            --argjson provider_available "$PROVIDER_AVAILABLE" --argjson created "$ACTUAL_CREATED" --argjson ready "$ACTUAL_READY" --argjson service_url "$SERVICE_URL" --arg serving_revision "$ACTUAL_SERVING_REVISION" \
+            --argjson serving_image "$ACTUAL_SERVING_IMAGE" \
+            --argjson traffic "$ACTUAL_TRAFFIC" --argjson prior_revision "$PRIOR_REVISION_JSON" --argjson prior_image "$PRIOR_IMAGE_JSON" --argjson prior_traffic "$PRIOR_TRAFFIC_JSON" \
+            --argjson rollback_attempted "$ROLLBACK_ATTEMPTED_JSON" --argjson rollback_readback "$ROLLBACK_READBACK_JSON" --arg rollback_result "$ROLLBACK_RESULT" --arg api "$API_STATUS" \
+            '{schema_version: $schema, project: $project, component: $component, environment: $environment, action: $action, source: {commit_sha: $commit, ref: "refs/heads/main"}, dev_provenance: {workflow: $dev_workflow, event: $dev_event, head_branch: $dev_head_branch, head_sha: $dev_head_sha, conclusion: $dev_conclusion, run_id: $dev_run, run_url: $dev_url}, image: $image, bootstrap_existing: $bootstrap, bootstrap_classification: $bootstrap_classification, provider: {readback_available: $provider_available, latest_created_revision: $created, latest_ready_revision: $ready, service_url: $service_url, serving_revision: (if ($serving_revision | length) > 0 then $serving_revision else null end), serving_image: $serving_image, traffic: $traffic}, api: {conclusion: $api}, rollback: {prior_revision: $prior_revision, prior_image: $prior_image, prior_traffic: $prior_traffic, attempted: $rollback_attempted, readback_confirmed: $rollback_readback, result: $rollback_result}, outcome: {source_validation: $source_validation, dev_provenance_validation: $dev_validation, receipt_validation: $receipt_validation, validation: ($validation == "true"), deploy: $deploy, verify: $verify, result: $outcome}}' > "$EVIDENCE"
+          if [[ -s "$EVIDENCE" ]]; then
+            echo "promotion_status=$OUTCOME" >> "$GITHUB_OUTPUT"
+            echo "evidence=$EVIDENCE" >> "$GITHUB_OUTPUT"
+          else
+            echo "unable to create normalized Auth evidence" >&2
+            exit 1
+          fi
+
+      - name: Upload Auth production evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: auth-production-evidence-${{ steps.commit.outputs.commit_sha }}
+          path: ${{ steps.reconcile.outputs.evidence }}
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Fail if Auth promotion was not verified
+        if: always()
+        env:
+          DEPLOY_OUTCOME: ${{ steps.deploy.outcome }}
+          VERIFY_OUTCOME: ${{ steps.verify.outcome }}
+          PROMOTION_STATUS: ${{ steps.reconcile.outputs.promotion_status }}
+        run: |
+          set -euo pipefail
+          if [[ "$DEPLOY_OUTCOME" != success || "$VERIFY_OUTCOME" != success || "$PROMOTION_STATUS" != verified ]]; then
+            echo "Auth production promotion was not verified; inspect the normalized evidence and rollback result"
+            exit 1
+          fi
