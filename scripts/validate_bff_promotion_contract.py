@@ -10,7 +10,7 @@ import sys
 import tempfile
 
 
-RECEIPT_SCHEMA_VERSION = 2
+RECEIPT_SCHEMA_VERSION = 3
 PROMOTION_SCHEMA_VERSION = 1
 IMAGE_NAME = "llm-wiki-bff"
 WORKFLOW_PATH = ".github/workflows/deploy-bff.yml"
@@ -29,6 +29,8 @@ RECEIPT_KEYS = (
     "build_ref",
     "source_sha",
     "dev_run_id",
+    "ci_run_id",
+    "ci_run_attempt",
     "image_digest",
     "image_reference",
     "query_config_revision",
@@ -77,7 +79,7 @@ def read_receipt(path):
     except OSError as error:
         reject(f"receipt is unreadable: {error.__class__.__name__}")
     if not raw.endswith(b"\n") or raw.endswith(b"\n\n") or b"\r" in raw:
-        reject("receipt must use exactly nine LF-terminated lines")
+        reject(f"receipt must use exactly {len(RECEIPT_KEYS)} LF-terminated lines")
     lines = raw[:-1].split(b"\n")
     if len(lines) != len(RECEIPT_KEYS):
         reject("receipt must contain exactly the required fields")
@@ -195,6 +197,33 @@ def validate_canonical_ci_jobs(args):
         reject(f"{args.required_job} job did not conclude successfully")
 
 
+def validate_canonical_ci_attempt(args):
+    if args.expected_path != CANONICAL_CI_PATH:
+        reject("canonical CI workflow path is not accepted")
+    if args.expected_event != CANONICAL_CI_EVENT:
+        reject("canonical CI event is not accepted")
+    if args.expected_ref != CANONICAL_CI_REF:
+        reject("canonical CI ref is not accepted")
+    if not SHA_RE.fullmatch(args.expected_sha):
+        reject("canonical CI SHA is invalid")
+    run = read_json(args.run_json)
+    if not isinstance(run, dict):
+        reject("canonical CI attempt evidence must be an object")
+    if type(run.get("id")) is not int or run.get("id") != args.expected_run_id:
+        reject("canonical CI attempt run ID does not match")
+    if type(run.get("run_attempt")) is not int or run.get("run_attempt") != args.expected_run_attempt:
+        reject("canonical CI attempt does not match the pinned attempt")
+    if (
+        run.get("path") != args.expected_path
+        or run.get("event") != args.expected_event
+        or run.get("head_branch") != args.expected_ref
+        or run.get("head_sha") != args.expected_sha
+    ):
+        reject("canonical CI attempt identity does not match")
+    if run.get("status") != "completed" or run.get("conclusion") != "success":
+        reject("canonical CI attempt did not conclude successfully")
+
+
 def normalize_actions_page(args):
     if args.items_key not in ACTIONS_PAGE_ITEM_KEYS:
         reject("actions page items key is not accepted")
@@ -250,6 +279,16 @@ def validate_dev_receipt(args):
         reject("receipt source SHA does not match")
     if not RUN_ID_RE.fullmatch(values["dev_run_id"]) or int(values["dev_run_id"]) != args.expected_run_id:
         reject("receipt DEV run ID does not match")
+    if not RUN_ID_RE.fullmatch(values["ci_run_id"]):
+        reject("receipt canonical CI run ID is invalid")
+    if not RUN_ID_RE.fullmatch(values["ci_run_attempt"]):
+        reject("receipt canonical CI run attempt is invalid")
+    ci_run_id = int(values["ci_run_id"])
+    ci_run_attempt = int(values["ci_run_attempt"])
+    if args.expected_ci_run_id is not None and ci_run_id != args.expected_ci_run_id:
+        reject("receipt canonical CI run ID does not match")
+    if args.expected_ci_run_attempt is not None and ci_run_attempt != args.expected_ci_run_attempt:
+        reject("receipt canonical CI run attempt does not match")
     if not DIGEST_RE.fullmatch(values["image_digest"]):
         reject("receipt image digest is invalid")
     expected_image = f"{args.ar_repo}/{IMAGE_NAME}@{values['image_digest']}"
@@ -294,6 +333,8 @@ def validate_dev_receipt(args):
         "result": "ready",
         "source_sha": args.expected_sha,
         "dev_run_id": args.expected_run_id,
+        "ci_run_id": ci_run_id,
+        "ci_run_attempt": ci_run_attempt,
         "dev_run_url": run_url,
         "image_digest": values["image_digest"],
         "image_reference": values["image_reference"],
@@ -320,6 +361,7 @@ def validate_dev_receipt(args):
 
 def validate_production_readiness(args):
     readiness = read_json(args.readiness)
+    values = read_receipt(args.receipt)
     expected = {
         "schema_version": PROMOTION_SCHEMA_VERSION,
         "receipt_schema_version": RECEIPT_SCHEMA_VERSION,
@@ -328,9 +370,11 @@ def validate_production_readiness(args):
         "build_ref": args.expected_branch,
         "source_sha": args.expected_sha,
         "dev_run_id": args.expected_run_id,
+        "ci_run_id": int(values["ci_run_id"]),
+        "ci_run_attempt": int(values["ci_run_attempt"]),
         "dev_run_url": f"https://github.com/{args.repository}/actions/runs/{args.expected_run_id}",
-        "image_digest": read_receipt(args.receipt)["image_digest"],
-        "image_reference": f"{args.ar_repo}/{IMAGE_NAME}@{read_receipt(args.receipt)['image_digest']}",
+        "image_digest": values["image_digest"],
+        "image_reference": f"{args.ar_repo}/{IMAGE_NAME}@{values['image_digest']}",
     }
     if readiness != expected:
         reject("normalized readiness receipt does not match the validated DEV receipt")
@@ -452,6 +496,8 @@ def parser():
     receipt.add_argument("--ar-repo", required=True)
     receipt.add_argument("--query-config-revision", required=True)
     receipt.add_argument("--query-config-digest", required=True)
+    receipt.add_argument("--expected-ci-run-id", type=int)
+    receipt.add_argument("--expected-ci-run-attempt", type=int)
     receipt.add_argument("--output", required=True)
     receipt.add_argument("--github-output")
     readiness = subparsers.add_parser("validate-production-readiness")
@@ -485,6 +531,14 @@ def parser():
     ci_jobs.add_argument("--expected-run-id", required=True, type=int)
     ci_jobs.add_argument("--expected-run-attempt", required=True, type=int)
     ci_jobs.add_argument("--required-job", required=True)
+    ci_attempt = subparsers.add_parser("validate-canonical-ci-attempt")
+    ci_attempt.add_argument("--run-json", required=True)
+    ci_attempt.add_argument("--expected-sha", required=True)
+    ci_attempt.add_argument("--expected-path", required=True)
+    ci_attempt.add_argument("--expected-event", required=True)
+    ci_attempt.add_argument("--expected-ref", required=True)
+    ci_attempt.add_argument("--expected-run-id", required=True, type=int)
+    ci_attempt.add_argument("--expected-run-attempt", required=True, type=int)
     page = subparsers.add_parser("normalize-actions-page")
     page.add_argument("--page-json", required=True)
     page.add_argument("--items-key", required=True)
@@ -501,6 +555,10 @@ def main(argv=None):
         if args.mode == "validate-dev-receipt":
             if args.expected_run_id <= 0:
                 reject("expected DEV run ID is invalid")
+            if args.expected_ci_run_id is not None and args.expected_ci_run_id <= 0:
+                reject("expected canonical CI run ID is invalid")
+            if args.expected_ci_run_attempt is not None and args.expected_ci_run_attempt <= 0:
+                reject("expected canonical CI run attempt is invalid")
             validate_dev_receipt(args)
         elif args.mode == "validate-production-readiness":
             if args.expected_run_id <= 0 or not SHA_RE.fullmatch(args.expected_sha):
@@ -518,6 +576,12 @@ def main(argv=None):
             if args.expected_run_attempt <= 0:
                 reject("expected canonical CI run attempt is invalid")
             validate_canonical_ci_jobs(args)
+        elif args.mode == "validate-canonical-ci-attempt":
+            if args.expected_run_id <= 0:
+                reject("expected canonical CI run ID is invalid")
+            if args.expected_run_attempt <= 0:
+                reject("expected canonical CI run attempt is invalid")
+            validate_canonical_ci_attempt(args)
         elif args.mode == "normalize-actions-page":
             normalize_actions_page(args)
         elif args.mode == "validate-fast-forward-compare":

@@ -34,6 +34,8 @@ jobs:
 
     outputs:
       candidate_sha: ${{ steps.source.outputs.candidate_sha }}
+      ci_run_id: ${{ steps.canonical_ci.outputs.ci_run_id }}
+      ci_run_attempt: ${{ steps.canonical_ci.outputs.ci_run_attempt }}
 
     steps:
       - name: Checkout code
@@ -81,6 +83,7 @@ jobs:
           echo "candidate_sha=$CANDIDATE_SHA" >> "$GITHUB_OUTPUT"
 
       - name: Require exact canonical CI evidence
+        id: canonical_ci
         env:
           CANDIDATE_SHA: ${{ steps.source.outputs.candidate_sha }}
           GH_TOKEN: ${{ github.token }}
@@ -207,6 +210,8 @@ jobs:
             --expected-run-id "$CI_RUN_ID" \
             --expected-run-attempt "$CI_RUN_ATTEMPT" \
             --required-job test
+          echo "ci_run_id=$CI_RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "ci_run_attempt=$CI_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
 
       - name: Setup Go
         uses: actions/setup-go@v5
@@ -312,6 +317,9 @@ jobs:
           GIT_BRANCH: ${{ steps.identity.outputs.git_branch }}
           GIT_TAG: ${{ steps.identity.outputs.git_tag }}
           GH_TOKEN: ${{ github.token }}
+          CANDIDATE_SHA: ${{ steps.source.outputs.candidate_sha }}
+          CI_RUN_ID: ${{ steps.canonical_ci.outputs.ci_run_id }}
+          CI_RUN_ATTEMPT: ${{ steps.canonical_ci.outputs.ci_run_attempt }}
         run: |
           set -euo pipefail
           echo "previous_revision=" >> "$GITHUB_OUTPUT"
@@ -520,6 +528,80 @@ jobs:
             exit 1
           fi
 
+          # begin pinned canonical CI revalidation
+          if [[ ! "$CI_RUN_ID" =~ ^[1-9][0-9]*$ || ! "$CI_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]; then
+            echo "pinned canonical CI identity is invalid"
+            exit 1
+          fi
+          if [[ ! "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ || "$CANDIDATE_SHA" != "$GIT_SHA" ]]; then
+            echo "pinned candidate SHA does not match the built commit"
+            exit 1
+          fi
+          DEVELOP_SHA=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/develop" --jq .object.sha)
+          if [[ ! "$DEVELOP_SHA" =~ ^[0-9a-f]{40}$ || "$DEVELOP_SHA" != "$CANDIDATE_SHA" ]]; then
+            echo "canonical develop no longer matches the pinned candidate SHA"
+            exit 1
+          fi
+          ATTEMPT_JSON="$RUNNER_TEMP/canonical-ci-attempt.json"
+          rm -f "$ATTEMPT_JSON"
+          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${CI_RUN_ID}/attempts/${CI_RUN_ATTEMPT}" > "$ATTEMPT_JSON"
+          python3 scripts/validate_bff_promotion_contract.py validate-canonical-ci-attempt \
+            --run-json "$ATTEMPT_JSON" \
+            --expected-sha "$CANDIDATE_SHA" \
+            --expected-path ".github/workflows/ci.yml" \
+            --expected-event push \
+            --expected-ref develop \
+            --expected-run-id "$CI_RUN_ID" \
+            --expected-run-attempt "$CI_RUN_ATTEMPT"
+          CI_JOBS_JSON="$RUNNER_TEMP/canonical-ci-pre-mutation-jobs.json"
+          PAGES_FILE="$CI_JOBS_JSON.pages"
+          rm -f "$PAGES_FILE" "$CI_JOBS_JSON"
+          TOTAL=""
+          COLLECTED=0
+          PAGE=1
+          while :; do
+            PAGE_JSON="$RUNNER_TEMP/canonical-ci-pre-mutation-jobs-page.json"
+            PAGE_ITEMS="$RUNNER_TEMP/canonical-ci-pre-mutation-jobs-page-items.json"
+            PAGE_META="$RUNNER_TEMP/canonical-ci-pre-mutation-jobs-page-meta.txt"
+            rm -f "$PAGE_JSON" "$PAGE_ITEMS" "$PAGE_META"
+            gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${CI_RUN_ID}/attempts/${CI_RUN_ATTEMPT}/jobs?per_page=100&page=${PAGE}" > "$PAGE_JSON"
+            python3 scripts/validate_bff_promotion_contract.py normalize-actions-page \
+              --page-json "$PAGE_JSON" \
+              --items-key jobs \
+              --items-output "$PAGE_ITEMS" \
+              --metadata-output "$PAGE_META"
+            PAGE_TOTAL=$(sed -n 's/^total_count=//p' "$PAGE_META")
+            PAGE_COUNT=$(sed -n 's/^item_count=//p' "$PAGE_META")
+            if [[ ! "$PAGE_TOTAL" =~ ^(0|[1-9][0-9]*)$ || ! "$PAGE_COUNT" =~ ^(0|[1-9][0-9]*)$ ]]; then
+              echo "canonical CI page metadata is invalid"
+              exit 1
+            fi
+            if [[ -z "$TOTAL" ]]; then
+              TOTAL="$PAGE_TOTAL"
+            elif [[ "$TOTAL" != "$PAGE_TOTAL" ]]; then
+              echo "canonical CI job count changed while fetching evidence"
+              exit 1
+            fi
+            cat "$PAGE_ITEMS" >> "$PAGES_FILE"
+            COLLECTED=$((COLLECTED + PAGE_COUNT))
+            if (( COLLECTED == TOTAL )); then
+              jq -s 'add' "$PAGES_FILE" > "$CI_JOBS_JSON"
+              rm -f "$PAGES_FILE"
+              break
+            fi
+            if (( COLLECTED > TOTAL || PAGE_COUNT == 0 )); then
+              echo "canonical CI jobs listing was incomplete or malformed"
+              exit 1
+            fi
+            PAGE=$((PAGE + 1))
+          done
+          python3 scripts/validate_bff_promotion_contract.py validate-canonical-ci-jobs \
+            --jobs-json "$CI_JOBS_JSON" \
+            --expected-run-id "$CI_RUN_ID" \
+            --expected-run-attempt "$CI_RUN_ATTEMPT" \
+            --required-job test
+          # end pinned canonical CI revalidation
+
           echo "Deploying ${IMMUTABLE_IMAGE}…"
           gcloud run deploy "${{ env.SERVICE_NAME }}" \
             --image "$IMMUTABLE_IMAGE" \
@@ -717,6 +799,8 @@ jobs:
           DIGEST: ${{ steps.build.outputs.digest }}
           READBACK_REVISION: ${{ steps.query_config_readback.outputs.config_revision }}
           READBACK_DIGEST: ${{ steps.query_config_readback.outputs.config_digest }}
+          CI_RUN_ID: ${{ steps.canonical_ci.outputs.ci_run_id }}
+          CI_RUN_ATTEMPT: ${{ steps.canonical_ci.outputs.ci_run_attempt }}
         run: |
           set -euo pipefail
           COMMIT_SHA="${{ steps.identity.outputs.git_sha }}"
@@ -728,17 +812,23 @@ jobs:
             echo "Cloud Build image digest is missing or invalid"
             exit 1
           fi
+          if [[ ! "$CI_RUN_ID" =~ ^[1-9][0-9]*$ || ! "$CI_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]; then
+            echo "pinned canonical CI identity is invalid"
+            exit 1
+          fi
           if [[ "$READBACK_REVISION" != "$QUERY_STAGE_CONFIG_REVISION" || "$READBACK_DIGEST" != "$QUERY_STAGE_CONFIG_DIGEST" ]]; then
             echo "deployed query config readback identity is not the expected immutable artifact"
             exit 1
           fi
           DIGEST_FILE="bff-image-digest-$COMMIT_SHA.txt"
           {
-            printf 'receipt_schema_version=2\n'
+            printf 'receipt_schema_version=3\n'
             printf 'component=lwc-bff\n'
             printf 'build_ref=develop\n'
             printf 'source_sha=%s\n' "$COMMIT_SHA"
             printf 'dev_run_id=%s\n' "$GITHUB_RUN_ID"
+            printf 'ci_run_id=%s\n' "$CI_RUN_ID"
+            printf 'ci_run_attempt=%s\n' "$CI_RUN_ATTEMPT"
             printf 'image_digest=%s\n' "$DIGEST"
             printf 'image_reference=%s\n' "${{ env.AR_REPO }}/llm-wiki-bff@$DIGEST"
             printf 'query_config_revision=%s\n' "$READBACK_REVISION"
@@ -842,6 +932,8 @@ jobs:
     env:
       CANDIDATE_SHA: ${{ needs.test-and-deploy.outputs.candidate_sha }}
       DEV_RUN_ID: ${{ github.run_id }}
+      CI_RUN_ID: ${{ needs.test-and-deploy.outputs.ci_run_id }}
+      CI_RUN_ATTEMPT: ${{ needs.test-and-deploy.outputs.ci_run_attempt }}
       AR_REPO: asia-east1-docker.pkg.dev/llm-wiki-cloud/cloud-run-images
     steps:
       - name: Checkout exact candidate
@@ -907,6 +999,8 @@ jobs:
             --ar-repo "$AR_REPO" \
             --query-config-revision "$QUERY_STAGE_CONFIG_REVISION" \
             --query-config-digest "$QUERY_STAGE_CONFIG_DIGEST" \
+            --expected-ci-run-id "$CI_RUN_ID" \
+            --expected-ci-run-attempt "$CI_RUN_ATTEMPT" \
             --output "$RUNNER_TEMP/bff-production-promotion-ready.json"
 
       - name: Validate canonical rollback artifact

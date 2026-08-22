@@ -707,6 +707,140 @@ func TestCanonicalCIEvidenceBindsRunAttempt(t *testing.T) {
 	}
 }
 
+func TestPreMutationPinnedCanonicalCIRerunCannotDeploy(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
+	body := workflowRunBlock(contents, "Build and deploy to Cloud Run")
+	if body == "" {
+		t.Fatal("could not extract build and deploy run block")
+	}
+	const beginMarker = "# begin pinned canonical CI revalidation"
+	const endMarker = "# end pinned canonical CI revalidation"
+	begin := strings.Index(body, beginMarker)
+	end := strings.Index(body, endMarker)
+	deploy := strings.Index(body, "gcloud run deploy")
+	if begin < 0 || end < 0 || deploy < 0 || !(begin < end && end < deploy) {
+		t.Fatal("pinned canonical CI revalidation must run immediately before gcloud run deploy")
+	}
+	block := "set -euo pipefail\n" + body[begin:end]
+	for _, want := range []string{
+		`gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/develop"`,
+		"actions/runs/${CI_RUN_ID}/attempts/${CI_RUN_ATTEMPT}",
+		"validate-canonical-ci-attempt",
+		"actions/runs/${CI_RUN_ID}/attempts/${CI_RUN_ATTEMPT}/jobs",
+		"validate-canonical-ci-jobs",
+		"--expected-run-id \"$CI_RUN_ID\"",
+		"--expected-run-attempt \"$CI_RUN_ATTEMPT\"",
+	} {
+		if !strings.Contains(block, want) {
+			t.Errorf("pre-mutation revalidation is missing %q", want)
+		}
+	}
+	if strings.Contains(block, "actions/runs/${CI_RUN_ID}/jobs?") || strings.Contains(block, "gcloud run deploy") {
+		t.Fatal("pre-mutation revalidation must use the attempt-specific endpoint and must not mutate Cloud Run")
+	}
+
+	const sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	validRun := `{"id":123,"run_attempt":1,"path":".github/workflows/ci.yml","event":"push","head_branch":"develop","head_sha":"` + sha + `","status":"completed","conclusion":"success"}`
+	validJobs := `{"total_count":1,"jobs":[{"name":"test","run_id":123,"run_attempt":1,"status":"completed","conclusion":"success"}]}`
+	tests := []struct {
+		name     string
+		develop  string
+		runJSON  string
+		jobsJSON string
+	}{
+		{
+			name:     "in-progress attempt",
+			develop:  sha,
+			runJSON:  `{"id":123,"run_attempt":1,"path":".github/workflows/ci.yml","event":"push","head_branch":"develop","head_sha":"` + sha + `","status":"in_progress","conclusion":null}`,
+			jobsJSON: validJobs,
+		},
+		{
+			name:     "failed attempt",
+			develop:  sha,
+			runJSON:  `{"id":123,"run_attempt":1,"path":".github/workflows/ci.yml","event":"push","head_branch":"develop","head_sha":"` + sha + `","status":"completed","conclusion":"failure"}`,
+			jobsJSON: validJobs,
+		},
+		{
+			name:     "mismatched attempt",
+			develop:  sha,
+			runJSON:  `{"id":123,"run_attempt":2,"path":".github/workflows/ci.yml","event":"push","head_branch":"develop","head_sha":"` + sha + `","status":"completed","conclusion":"success"}`,
+			jobsJSON: validJobs,
+		},
+		{
+			name:     "changed develop SHA",
+			develop:  "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+			runJSON:  validRun,
+			jobsJSON: validJobs,
+		},
+		{
+			name:     "failed test job",
+			develop:  sha,
+			runJSON:  validRun,
+			jobsJSON: `{"total_count":1,"jobs":[{"name":"test","run_id":123,"run_attempt":1,"status":"completed","conclusion":"failure"}]}`,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			bin := t.TempDir()
+			runFile := filepath.Join(t.TempDir(), "run.json")
+			jobsFile := filepath.Join(t.TempDir(), "jobs.json")
+			if err := os.WriteFile(runFile, []byte(tc.runJSON), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(jobsFile, []byte(tc.jobsJSON), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			writeExecutable(t, filepath.Join(bin, "gh"), `#!/usr/bin/env bash
+set -euo pipefail
+joined="$*"
+if [[ "$joined" == *git/ref/heads/develop* ]]; then
+  printf '%s\n' "$FAKE_DEVELOP"
+  exit 0
+fi
+if [[ "$joined" == *"/jobs"* ]]; then
+  cat "$FAKE_JOBS_PAGE"
+  exit 0
+fi
+if [[ "$joined" == *"/attempts/"* ]]; then
+  cat "$FAKE_RUN_JSON"
+  exit 0
+fi
+echo "unexpected gh invocation: $*" >&2
+exit 2
+`)
+			env := append(os.Environ(),
+				"PATH="+bin+":"+os.Getenv("PATH"),
+				"CANDIDATE_SHA="+sha,
+				"GIT_SHA="+sha,
+				"CI_RUN_ID=123",
+				"CI_RUN_ATTEMPT=1",
+				"GITHUB_REPOSITORY=owner/repo",
+				"RUNNER_TEMP="+t.TempDir(),
+				"FAKE_DEVELOP="+tc.develop,
+				"FAKE_RUN_JSON="+runFile,
+				"FAKE_JOBS_PAGE="+jobsFile,
+			)
+			if err := runWorkflowBlock(t, block, env); err == nil {
+				t.Fatal("changed, in-progress, failed, or mismatched pinned CI attempt must not reach provider mutation")
+			}
+		})
+	}
+}
+
+func TestDevReceiptPinsCanonicalCIAttempt(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
+	persist := workflowSection(t, contents, "      - name: Persist build image digest", "      - name: Upload image digest artifact")
+	for _, want := range []string{
+		"receipt_schema_version=3",
+		"ci_run_id=%s",
+		"ci_run_attempt=%s",
+	} {
+		if !strings.Contains(persist, want) {
+			t.Errorf("DEV receipt must pin canonical CI attempt identity %q", want)
+		}
+	}
+}
+
 func TestPromotionReadyAndEligibilityAvoidFullHistoryCheckout(t *testing.T) {
 	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
 	ready := workflowSection(t, contents, "  production-promotion-ready:", "  main-fast-forward-eligible:")
@@ -2098,6 +2232,8 @@ func TestPromotionReadyJobIsSameRunExactAndReadOnly(t *testing.T) {
 		"scripts/validate_bff_promotion_contract.py validate-dev-receipt",
 		"--expected-event workflow_dispatch",
 		"--lifecycle readiness",
+		"--expected-ci-run-id \"$CI_RUN_ID\"",
+		"--expected-ci-run-attempt \"$CI_RUN_ATTEMPT\"",
 		"--producer-result \"${{ needs.test-and-deploy.result }}\"",
 		"--repository \"$GITHUB_REPOSITORY\"",
 		"--traffic-mode artifact",
@@ -2430,7 +2566,7 @@ func TestDevReceiptProducerIsVersionedAndSelfBound(t *testing.T) {
 	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
 	persist := workflowSection(t, contents, "      - name: Persist build image digest", "      - name: Upload image digest artifact")
 	for _, want := range []string{
-		"receipt_schema_version=2",
+		"receipt_schema_version=3",
 		"build_ref=develop",
 		"component=lwc-bff",
 		"source_sha=%s",

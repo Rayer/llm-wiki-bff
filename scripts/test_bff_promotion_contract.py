@@ -17,11 +17,13 @@ REVISION = "llm-wiki-bff-00001-old"
 
 def receipt():
     return (
-        "receipt_schema_version=2\n"
+        "receipt_schema_version=3\n"
         "component=lwc-bff\n"
         "build_ref=develop\n"
         f"source_sha={SHA}\n"
         f"dev_run_id={RUN_ID}\n"
+        f"ci_run_id={RUN_ID}\n"
+        "ci_run_attempt=1\n"
         f"image_digest={DIGEST}\n"
         f"image_reference={AR_REPO}/llm-wiki-bff@{DIGEST}\n"
         "query_config_revision=query-dev-2026-08-21.1\n"
@@ -102,12 +104,14 @@ class BFFPromotionContractTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(self.output.read_text()), {
             "schema_version": 1,
-            "receipt_schema_version": 2,
+            "receipt_schema_version": 3,
             "component": "lwc-bff",
             "build_ref": "develop",
             "result": "ready",
             "source_sha": SHA,
             "dev_run_id": RUN_ID,
+            "ci_run_id": RUN_ID,
+            "ci_run_attempt": 1,
             "dev_run_url": "https://github.com/Rayer/llm-wiki-bff/actions/runs/123",
             "image_digest": DIGEST,
             "image_reference": f"{AR_REPO}/llm-wiki-bff@{DIGEST}",
@@ -159,7 +163,7 @@ class BFFPromotionContractTest(unittest.TestCase):
             "wrong component": receipt().replace("component=lwc-bff", "component=worker"),
             "tag image": receipt().replace(f"image_reference={AR_REPO}/llm-wiki-bff@{DIGEST}", "repo/lwc-bff:latest"),
             "invalid digest": receipt().replace(DIGEST, "sha256:bad"),
-            "schema": receipt().replace("receipt_schema_version=2", "receipt_schema_version=1"),
+            "schema": receipt().replace("receipt_schema_version=3", "receipt_schema_version=1"),
         }
         for name, value in cases.items():
             with self.subTest(name=name):
@@ -172,7 +176,7 @@ class BFFPromotionContractTest(unittest.TestCase):
         path.write_bytes(receipt().rstrip("\n").encode())
         result = self.invoke_receipt(path)
         self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(result.stderr, "promotion contract rejected: receipt must use exactly nine LF-terminated lines\n")
+        self.assertEqual(result.stderr, "promotion contract rejected: receipt must use exactly 11 LF-terminated lines\n")
 
     def test_run_jobs_require_unique_successful_same_run_promotion_evidence(self):
         jobs = [
@@ -492,6 +496,39 @@ class BFFPromotionContractTest(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0, result.stderr)
                 self.assertFalse(items.exists())
                 self.assertFalse(metadata.exists())
+
+    def invoke_canonical_ci_attempt(self, run, **extra):
+        path = self.root / "ci-attempt.json"
+        if isinstance(run, str):
+            path.write_text(run)
+        else:
+            path.write_text(json.dumps(run))
+        return subprocess.run([
+            "python3", str(SCRIPT), "validate-canonical-ci-attempt",
+            "--run-json", str(path),
+            "--expected-sha", extra.get("expected_sha", SHA),
+            "--expected-path", extra.get("expected_path", ".github/workflows/ci.yml"),
+            "--expected-event", extra.get("expected_event", "push"),
+            "--expected-ref", extra.get("expected_ref", "develop"),
+            "--expected-run-id", str(extra.get("expected_run_id", RUN_ID)),
+            "--expected-run-attempt", str(extra.get("expected_run_attempt", 1)),
+        ], capture_output=True, text=True)
+
+    def test_canonical_ci_attempt_rejects_changed_in_progress_failed_and_mismatched(self):
+        accepted = self.canonical_ci_run()
+        self.assertEqual(self.invoke_canonical_ci_attempt(accepted).returncode, 0)
+        cases = {
+            "in-progress": self.canonical_ci_run(status="in_progress", conclusion=None),
+            "failed": self.canonical_ci_run(conclusion="failure"),
+            "skipped": self.canonical_ci_run(conclusion="skipped"),
+            "mismatched attempt": self.canonical_ci_run(run_attempt=2),
+            "mismatched run": self.canonical_ci_run(id=RUN_ID + 1),
+            "wrong sha": self.canonical_ci_run(head_sha="d" * 40),
+            "wrong event": self.canonical_ci_run(event="pull_request"),
+        }
+        for name, run in cases.items():
+            with self.subTest(name=name):
+                self.assertNotEqual(self.invoke_canonical_ci_attempt(run).returncode, 0)
 
     def test_fast_forward_compare_accepts_ahead_and_identical(self):
         self.assertEqual(self.invoke_fast_forward_compare({"status": "ahead", "ahead_by": 3, "behind_by": 0}).returncode, 0)
