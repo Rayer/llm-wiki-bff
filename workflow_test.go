@@ -81,7 +81,7 @@ func TestAuthDeploymentAndRollbackReconcileAfterAttemptedMutation(t *testing.T) 
 	strict := workflowSection(t, deploy, "      - name: Capture and verify Auth deployment evidence", "      - name: Reconcile Auth deployment outcome")
 	strictUpload := workflowSection(t, deploy, "      - name: Upload Auth deployment evidence", "      - name: Reconcile Auth deployment outcome")
 	reconcile := workflowSection(t, deploy, "      - name: Reconcile Auth deployment outcome", "      - name: Upload Auth deployment reconciliation")
-	reconcileUpload := workflowSection(t, deploy, "      - name: Upload Auth deployment reconciliation", "      - name: Persist build image digest")
+	reconcileUpload := workflowSection(t, deploy, "      - name: Upload Auth deployment reconciliation", "      - name: Persist Auth image receipt")
 	for _, want := range []string{
 		"if: ${{ always() && steps.deploy.outcome != 'skipped' }}",
 		"id: strict_verify",
@@ -783,7 +783,7 @@ func TestAuthPreflightUsesNamedFirestoreDatabaseAndSourceReconciliationIdentity(
 		t.Error("Auth Firestore preflight must not pass the database ID positionally")
 	}
 
-	reconcile := workflowSection(t, contents, "      - name: Reconcile Auth deployment outcome", "      - name: Persist build image digest")
+	reconcile := workflowSection(t, contents, "      - name: Reconcile Auth deployment outcome", "      - name: Persist Auth image receipt")
 	if want := "EVIDENCE_ID: ${{ steps.source.outputs.candidate_sha || format('run-{0}', github.run_id) }}"; !strings.Contains(reconcile, want) {
 		t.Fatalf("Auth reconciliation must prefer the validated source SHA and fall back to the run ID: missing %q", want)
 	}
@@ -830,7 +830,7 @@ func TestAuthPreflightUsesNamedFirestoreDatabaseAndSourceReconciliationIdentity(
 	if !strings.Contains(reconcile, `echo "evidence_id=$EVIDENCE_ID" >> "$GITHUB_OUTPUT"`) || !strings.Contains(reconcile, `echo "reconciliation=$RECONCILIATION" >> "$GITHUB_OUTPUT"`) {
 		t.Fatal("Auth reconciliation must output both its evidence ID and generated path")
 	}
-	reconcileUpload := workflowSection(t, contents, "      - name: Upload Auth deployment reconciliation", "      - name: Persist build image digest")
+	reconcileUpload := workflowSection(t, contents, "      - name: Upload Auth deployment reconciliation", "      - name: Persist Auth image receipt")
 	if !strings.Contains(reconcileUpload, "name: auth-deployment-reconciliation-${{ steps.reconcile.outputs.evidence_id }}") || !strings.Contains(reconcileUpload, "path: ${{ steps.reconcile.outputs.reconciliation }}") {
 		t.Fatal("Auth reconciliation upload must use the reconcile step outputs")
 	}
@@ -1852,6 +1852,7 @@ func TestCIWorkflowValidatesProductVersion(t *testing.T) {
 		"Validate product version",
 		"APP_VERSION=$(go run ./cmd/versioncheck VERSION)",
 		"python3 scripts/test_bff_promotion_contract.py",
+		"python3 scripts/test_auth_promotion_contract.py",
 	} {
 		if !strings.Contains(contents, want) {
 			t.Errorf("CI workflow is missing VERSION validation contract %q", want)
@@ -2192,7 +2193,7 @@ func TestDevReceiptProducerIsVersionedAndSelfBound(t *testing.T) {
 
 func TestDeployWorkflowRunBlocksAreExecutable(t *testing.T) {
 	runBlockPattern := regexp.MustCompile(`(?m)^\s+run: \|\n((?:\s{10,}.+\n?)+)`)
-	for _, path := range []string{".github/workflows/deploy-bff.yml", ".github/workflows/release-bff.yml"} {
+	for _, path := range []string{".github/workflows/deploy-bff.yml", ".github/workflows/release-bff.yml", ".github/workflows/deploy-auth.yml", ".github/workflows/release-auth.yml"} {
 		contents := readWorkflow(t, path)
 		var document any
 		if err := yaml.Unmarshal([]byte(contents), &document); err != nil {
@@ -2289,6 +2290,258 @@ func TestReleaseWorkflowPromotesExistingDigestWithoutRebuild(t *testing.T) {
 	}
 }
 
+func TestAuthDevWorkflowPublishesExactPromotionReceipt(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/deploy-auth.yml")
+	receipt := workflowRunStep(t, contents, "Persist Auth image receipt")
+	upload := workflowStep(t, contents, "Upload Auth image receipt")
+	for _, want := range []string{
+		"receipt_schema_version=1",
+		"component=lwc-auth",
+		"build_ref=develop",
+		"source_sha=$COMMIT_SHA",
+		"dev_run_id=$GITHUB_RUN_ID",
+		"image_digest=$DIGEST",
+		"image_reference=$AR_REPO/llm-wiki-auth@$DIGEST",
+	} {
+		if !strings.Contains(receipt, want) {
+			t.Errorf("Auth receipt producer is missing %q", want)
+		}
+	}
+	if !strings.Contains(receipt, "auth-image-digest-$COMMIT_SHA.txt") {
+		t.Fatal("Auth receipt must retain the deterministic exact-SHA artifact filename")
+	}
+	if !strings.Contains(upload, "name: auth-image-digest-${{ steps.image_digest.outputs.commit_sha }}") || !strings.Contains(upload, "path: ${{ steps.image_digest.outputs.receipt_file }}") {
+		t.Fatal("Auth receipt upload must publish the exact-SHA receipt artifact")
+	}
+	if strings.Contains(receipt, "gcloud builds submit") || strings.Contains(receipt, "gcloud run deploy") {
+		t.Fatal("receipt step must consume the already captured build digest")
+	}
+}
+
+func TestAuthProductionWorkflowIsExactDigestConsumer(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/release-auth.yml")
+	var workflow struct {
+		On struct {
+			Push             map[string]any `yaml:"push"`
+			WorkflowDispatch struct {
+				Inputs map[string]struct {
+					Required bool   `yaml:"required"`
+					Type     string `yaml:"type"`
+				} `yaml:"inputs"`
+			} `yaml:"workflow_dispatch"`
+		} `yaml:"on"`
+	}
+	if err := yaml.Unmarshal([]byte(contents), &workflow); err != nil {
+		t.Fatalf("release-auth workflow is not valid YAML: %v", err)
+	}
+	if len(workflow.On.Push) != 0 {
+		t.Fatal("Auth production workflow must not define a push trigger")
+	}
+	for _, name := range []string{"commit_sha", "dev_run_id"} {
+		input, ok := workflow.On.WorkflowDispatch.Inputs[name]
+		if !ok || !input.Required || input.Type != "string" {
+			t.Fatalf("workflow_dispatch.%s must be a required string input, got %#v", name, input)
+		}
+	}
+
+	var permissions struct {
+		Jobs map[string]struct {
+			If          string            `yaml:"if"`
+			Environment string            `yaml:"environment"`
+			Permissions map[string]string `yaml:"permissions"`
+		} `yaml:"jobs"`
+	}
+	if err := yaml.Unmarshal([]byte(contents), &permissions); err != nil {
+		t.Fatalf("release-auth job YAML is not valid: %v", err)
+	}
+	job, ok := permissions.Jobs["promote"]
+	if !ok || job.If != "github.ref == 'refs/heads/main'" || job.Environment != "production" {
+		t.Fatalf("Auth production job must be protected main + production environment: %#v", job)
+	}
+	if len(job.Permissions) != 3 || job.Permissions["contents"] != "read" || job.Permissions["actions"] != "read" || job.Permissions["id-token"] != "write" {
+		t.Fatalf("Auth production permissions are not least-privilege: %#v", job.Permissions)
+	}
+
+	commit := workflowRunStep(t, contents, "Validate exact main source")
+	for _, want := range []string{"gh api \"repos/${GITHUB_REPOSITORY}/git/ref/heads/main\"", `"$MAIN_SHA" != "$COMMIT_SHA"`, "git rev-parse HEAD", `"$CHECKED_OUT_SHA" != "$COMMIT_SHA"`} {
+		if !strings.Contains(commit, want) {
+			t.Errorf("main source validation is missing %q", want)
+		}
+	}
+	dev := workflowRunStep(t, contents, "Validate exact DEV run provenance")
+	for _, want := range []string{"actions/runs/${DEV_RUN_ID}", "deploy-auth.yml", "head_branch", "head_sha", "conclusion", "GITHUB_REPOSITORY"} {
+		if !strings.Contains(dev, want) {
+			t.Errorf("DEV provenance validation is missing %q", want)
+		}
+	}
+	receipt := workflowRunStep(t, contents, "Download exact DEV Auth receipt")
+	for _, want := range []string{"gh run download", "auth-image-digest-$COMMIT_SHA", "--name", "validate_auth_promotion_contract.py", "--expected-sha", "--expected-run-id"} {
+		if !strings.Contains(receipt, want) {
+			t.Errorf("DEV receipt download is missing %q", want)
+		}
+	}
+	for _, want := range []string{
+		"SERVICE_NAME: llm-wiki-auth\n",
+		"RUNTIME_SERVICE_ACCOUNT: lwc-auth-prod@llm-wiki-cloud.iam.gserviceaccount.com",
+		"FIRESTORE_DATABASE_ID: llm-wiki-cloud-prod",
+		"JWT_SECRET_NAME: jwt-secret-prod",
+		"AUTH_DOMAIN: auth.rayer.idv.tw",
+		"ALLOWED_ORIGINS: https://wiki.rayer.idv.tw,https://llm-wiki-frontend.vercel.app",
+		"DEV_JWT=false",
+		"--max-instances 1",
+		"asia-east1-docker.pkg.dev/llm-wiki-cloud/cloud-run-images",
+	} {
+		if !strings.Contains(contents, want) {
+			t.Errorf("Auth production workflow is missing constant %q", want)
+		}
+	}
+	if strings.Contains(contents, "gcloud builds submit") || strings.Contains(contents, "docker build") || strings.Contains(contents, "gcloud beta run domain-mappings") || strings.Contains(contents, "gcloud dns") {
+		t.Fatal("Auth production workflow must not rebuild, map domains, or mutate DNS")
+	}
+
+	preflight := workflowRunStep(t, contents, "Verify production Auth prerequisites")
+	for _, want := range []string{
+		"iam service-accounts describe",
+		"artifacts repositories describe",
+		"firestore databases describe",
+		"secrets describe",
+		"secrets get-iam-policy",
+		"roles/secretmanager.secretAccessor",
+		"bootstrap_existing",
+		"roles/run.invoker",
+		"run.googleapis.com/ingress",
+		"private-ranges-only",
+	} {
+		if !strings.Contains(preflight, want) {
+			t.Errorf("production Auth preflight is missing %q", want)
+		}
+	}
+
+	deploy := workflowRunStep(t, contents, "Deploy exact Auth image")
+	if !strings.Contains(deploy, "gcloud run deploy \"$SERVICE_NAME\"") || !strings.Contains(deploy, "--image \"$IMMUTABLE_IMAGE\"") {
+		t.Fatal("production Auth deployment must deploy the exact immutable image")
+	}
+	if strings.Contains(deploy, "gcloud builds submit") || strings.Contains(deploy, "docker build") || strings.Contains(deploy, "llm-wiki-auth:") || strings.Contains(deploy, "auth-dev") || strings.Contains(deploy, "auth.dev") {
+		t.Fatal("production Auth deployment must not rebuild or use DEV/mutable image identities")
+	}
+	rollback := workflowRunStep(t, contents, "Reconcile Auth deployment outcome")
+	for _, want := range []string{"BOOTSTRAP_EXISTING", "--to-revisions \"$PRIOR_SERVING_REVISION=100\"", "ROLLBACK_ATTEMPTED", "no prior Auth service/revision"} {
+		if !strings.Contains(rollback, want) {
+			t.Errorf("Auth rollback reconciliation is missing %q", want)
+		}
+	}
+	verify := workflowRunStep(t, contents, "Verify Auth production read-back")
+	for _, want := range []string{"status.url", "api/v1/public/healthz", "api/v1/public/version", "Cache-Control", "no-store", "LWC_SOURCE_COMMIT", "latestCreatedRevisionName", "status.traffic"} {
+		if !strings.Contains(verify, want) {
+			t.Errorf("Auth read-back gate is missing %q", want)
+		}
+	}
+	if strings.Contains(verify, "auth.rayer.idv.tw/api") || strings.Contains(verify, "auth-dev") || strings.Contains(verify, "auth.dev") {
+		t.Fatal("production Auth release gates must use the read-back run.app URL and exclude DEV domains")
+	}
+	for _, name := range []string{"Upload Auth production evidence", "Fail if Auth promotion was not verified"} {
+		workflowStep(t, contents, name)
+	}
+}
+
+func TestAuthProductionPromotionFindingsAreCausallyGuarded(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/release-auth.yml")
+	preflight := workflowRunStep(t, contents, "Verify production Auth prerequisites")
+	deploy := workflowRunStep(t, contents, "Deploy exact Auth image")
+	reconcile := workflowRunStep(t, contents, "Reconcile Auth deployment outcome")
+	steps := workflowStepNames(t, contents)
+	stepAt := func(name string) int {
+		for index, step := range steps {
+			if step == name {
+				return index
+			}
+		}
+		return -1
+	}
+	if stepAt("Verify production Auth prerequisites") >= stepAt("Deploy exact Auth image") {
+		t.Fatal("existing-service env and IAM validation must precede production mutation")
+	}
+	if !strings.Contains(preflight, "[.spec.template.spec.containers[]?.env[]?] | length == 7") ||
+		!strings.Contains(preflight, "[\"ALLOWED_HOSTS\", \"ALLOWED_ORIGINS\", \"DEV_JWT\", \"FIRESTORE_DATABASE_ID\", \"GCP_PROJECT\", \"JWT_SECRET\", \"LWC_SOURCE_COMMIT\"]") ||
+		!strings.Contains(preflight, "condition? == null") ||
+		!strings.Contains(preflight, "(.valueFrom.secretKeyRef.name // .valueSource.secretKeyRef.secret) == $secret") {
+		t.Fatal("preflight must enforce the exact existing env name/value/reference allowlist without exposing values")
+	}
+	setAt := strings.Index(deploy, "--set-env-vars")
+	if setAt < 0 || strings.Contains(deploy, "--clear-env-vars") || strings.Contains(deploy, "--update-env-vars") {
+		t.Fatal("deployment must replace the complete env set deterministically")
+	}
+	for _, iam := range []string{preflight, workflowRunStep(t, contents, "Verify Auth production read-back")} {
+		if strings.Contains(iam, "any(.members[]?; . == \"allUsers\")") || !strings.Contains(iam, "condition? == null") {
+			t.Fatal("public Auth IAM validation must require an unconditional allUsers binding")
+		}
+	}
+	if !strings.Contains(reconcile, "ROLLBACK_READBACK_DEADLINE") ||
+		!strings.Contains(reconcile, "ROLLBACK_READBACK_CONFIRMED=true") ||
+		!strings.Contains(reconcile, "if [[ \"$ROLLBACK_READBACK_CONFIRMED\" == true ]]; then") ||
+		!strings.Contains(reconcile, "gcloud run services describe \"$SERVICE_NAME\" --region \"$REGION\" --project \"$PROJECT_ID\" --format=json --quiet > \"$SERVICE_FINAL\"") ||
+		!strings.Contains(reconcile, "--to-revisions \"$PRIOR_SERVING_REVISION=100\"") {
+		t.Fatal("rollback success must require fresh authoritative prior-traffic read-back")
+	}
+	if restoredAt, confirmedAt := strings.Index(reconcile, "ROLLBACK_RESULT=restored"), strings.Index(reconcile, "ROLLBACK_READBACK_CONFIRMED=true"); restoredAt <= confirmedAt {
+		t.Fatal("rollback must classify restored only after the authoritative read-back flag")
+	}
+	if guardAt := strings.Index(reconcile, "if [[ \"$ROLLBACK_READBACK_CONFIRMED\" == true ]]; then"); guardAt < 0 || guardAt > strings.Index(reconcile, "ROLLBACK_RESULT=restored") {
+		t.Fatal("rollback restored classification must be controlled by the read-back guard")
+	}
+	evidenceAt := strings.Index(reconcile, "SERVICE_FOR_EVIDENCE=")
+	freshAt := strings.LastIndex(reconcile, "gcloud run services describe \"$SERVICE_NAME\"")
+	if evidenceAt < 0 || freshAt < 0 || freshAt > evidenceAt || strings.Contains(reconcile, "SERVICE_FOR_EVIDENCE=$(cat \"$SERVICE_AFTER\")") {
+		t.Fatal("final evidence must use a fresh post-rollback service read-back")
+	}
+	for _, want := range []string{"ACTUAL_SERVING_REVISION", "ACTUAL_SERVING_IMAGE", "serving_revision", "serving_image", "ROLLBACK_READBACK_JSON"} {
+		if !strings.Contains(reconcile, want) {
+			t.Errorf("final evidence is missing actual provider field %q", want)
+		}
+	}
+	for _, want := range []string{
+		"SOURCE_VALIDATION_OUTCOME: ${{ steps.commit.outcome }}",
+		"DEV_PROVENANCE_OUTCOME: ${{ steps.dev_provenance.outcome }}",
+		"RECEIPT_VALIDATION_OUTCOME: ${{ steps.receipt.outcome }}",
+		"VALIDATED_DEV_HEAD_SHA: ${{ steps.receipt.outputs.dev_head_sha }}",
+		"VALIDATED_DEV_CONCLUSION: ${{ steps.receipt.outputs.dev_conclusion }}",
+		"VALIDATION_OK=false",
+		"image: $image",
+		"dev_provenance: {workflow: $dev_workflow",
+	} {
+		if !strings.Contains(contents, want) {
+			t.Errorf("reconciliation is missing truthful validation flow %q", want)
+		}
+	}
+	if strings.Contains(reconcile, "head_branch: \"develop\"") || strings.Contains(reconcile, "conclusion: \"success\"") || strings.Contains(reconcile, "image: {digest: $digest, reference: $image}") {
+		t.Fatal("failure evidence must not hardcode successful DEV provenance or an unavailable image claim")
+	}
+}
+
+func TestAuthBootstrapSecondMutationPreservesJWTSecretReference(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/release-auth.yml")
+	deploy := workflowRunStep(t, contents, "Deploy exact Auth image")
+	bootstrapAt := strings.Index(deploy, `if [[ "$BOOTSTRAP_EXISTING" == false ]]; then`)
+	if bootstrapAt < 0 {
+		t.Fatal("Auth deployment is missing the bootstrap branch")
+	}
+	bootstrap := deploy[bootstrapAt:]
+	updateAt := strings.Index(bootstrap, `gcloud run services update "$SERVICE_NAME"`)
+	if updateAt < 0 {
+		t.Fatal("Auth bootstrap is missing its second service mutation")
+	}
+	update := bootstrap[updateAt:]
+	if !strings.Contains(update, `--update-secrets "JWT_SECRET=$JWT_SECRET_NAME:latest"`) {
+		t.Fatal("Auth bootstrap second mutation must preserve the exact JWT secret reference")
+	}
+	if !strings.Contains(update, "--set-env-vars") || strings.Contains(update, "--clear-env-vars") || strings.Contains(update, "--remove-env-vars") {
+		t.Fatal("Auth bootstrap second mutation must update non-secret env vars without clearing the secret")
+	}
+	if strings.Contains(update, "JWT_SECRET=") && !strings.Contains(update, `JWT_SECRET=$JWT_SECRET_NAME:latest`) {
+		t.Fatal("Auth bootstrap must not expose or replace the JWT secret value")
+	}
+}
+
 func readWorkflow(t *testing.T, path string) string {
 	t.Helper()
 	contents, err := os.ReadFile(path)
@@ -2296,6 +2549,81 @@ func readWorkflow(t *testing.T, path string) string {
 		t.Fatalf("read %s: %v", path, err)
 	}
 	return string(contents)
+}
+
+func workflowRunStep(t *testing.T, contents, name string) string {
+	t.Helper()
+	step := workflowStepNode(t, contents, name)
+	if step.Run == "" {
+		t.Fatalf("workflow step %q has no run block", name)
+	}
+	return step.Run
+}
+
+func workflowStep(t *testing.T, contents, name string) string {
+	t.Helper()
+	step := workflowStepNode(t, contents, name)
+	return step.Run + "\n" + step.Uses + "\n" + step.With
+}
+
+type workflowStepNodeValue struct {
+	Name string
+	Run  string
+	Uses string
+	With string
+}
+
+func workflowStepNode(t *testing.T, contents, name string) workflowStepNodeValue {
+	t.Helper()
+	var workflow struct {
+		Jobs map[string]struct {
+			Steps []struct {
+				Name string         `yaml:"name"`
+				Run  string         `yaml:"run"`
+				Uses string         `yaml:"uses"`
+				With map[string]any `yaml:"with"`
+			} `yaml:"steps"`
+		} `yaml:"jobs"`
+	}
+	if err := yaml.Unmarshal([]byte(contents), &workflow); err != nil {
+		t.Fatalf("workflow YAML is not valid: %v", err)
+	}
+	for _, job := range workflow.Jobs {
+		for _, step := range job.Steps {
+			if step.Name == name {
+				with, err := yaml.Marshal(step.With)
+				if err != nil {
+					t.Fatalf("marshal workflow step %q: %v", name, err)
+				}
+				return workflowStepNodeValue{Name: step.Name, Run: step.Run, Uses: step.Uses, With: string(with)}
+			}
+		}
+	}
+	t.Fatalf("workflow is missing step %q", name)
+	return workflowStepNodeValue{}
+}
+
+func workflowStepNames(t *testing.T, contents string) []string {
+	t.Helper()
+	var workflow struct {
+		Jobs map[string]struct {
+			Steps []struct {
+				Name string `yaml:"name"`
+			} `yaml:"steps"`
+		} `yaml:"jobs"`
+	}
+	if err := yaml.Unmarshal([]byte(contents), &workflow); err != nil {
+		t.Fatalf("workflow YAML is not valid: %v", err)
+	}
+	for _, job := range workflow.Jobs {
+		names := make([]string, 0, len(job.Steps))
+		for _, step := range job.Steps {
+			names = append(names, step.Name)
+		}
+		return names
+	}
+	t.Fatal("workflow has no jobs")
+	return nil
 }
 
 func workflowSection(t *testing.T, contents, start, end string) string {
@@ -2316,6 +2644,7 @@ func TestCloudRunWorkflowsUsePrivateRangesOnlyEgress(t *testing.T) {
 		".github/workflows/deploy-bff.yml",
 		".github/workflows/deploy-auth.yml",
 		".github/workflows/release-bff.yml",
+		".github/workflows/release-auth.yml",
 	} {
 		t.Run(workflow, func(t *testing.T) {
 			contents, err := os.ReadFile(workflow)
