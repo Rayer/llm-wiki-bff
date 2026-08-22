@@ -1,6 +1,8 @@
 package handler
 
 import (
+	"encoding/json"
+
 	"github.com/rayer/llm-wiki-bff/internal/gcs"
 	"github.com/rayer/llm-wiki-bff/internal/llm"
 	"github.com/rayer/llm-wiki-bff/internal/query"
@@ -93,6 +95,22 @@ type QueryResponse struct {
 	AnswerBasis        string            `json:"answer_basis,omitempty"`
 	WikiEvidenceStatus string            `json:"wiki_evidence_status,omitempty"`
 	DisclosureRequired bool              `json:"disclosure_required,omitempty"`
+}
+
+// MarshalJSON keeps citations optional for legacy responses while making the
+// model-prior contract explicit even when its citation set is empty.
+func (r QueryResponse) MarshalJSON() ([]byte, error) {
+	type responseAlias QueryResponse
+	data, err := json.Marshal(responseAlias(r))
+	if err != nil || r.Mode != "full" || r.Status != "insufficient_evidence" || r.Reason != "no_qualified_evidence" || r.AnswerBasis != "model_prior" || r.WikiEvidenceStatus != "no_relevant_evidence" || !r.DisclosureRequired || r.AISynth == "" {
+		return data, err
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(data, &object); err != nil {
+		return nil, err
+	}
+	object["citations"] = json.RawMessage("[]")
+	return json.Marshal(object)
 }
 
 // SourcesListResponse is the response for a sources list endpoint.

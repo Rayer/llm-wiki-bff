@@ -23,6 +23,7 @@ ARTIFACT = "bff-rollback-contract-" + "c" * 40
 EVIDENCE_ARTIFACT = "bff-deployment-evidence-" + "c" * 40
 QUERY_STAGE_CONFIG_PATH = "/app/configs/query/dev/query-dev-2026-08-22.1.json"
 PRIOR_QUERY_STAGE_CONFIG_PATH = "/app/configs/query/dev/query-dev-2026-08-21.1.json"
+PRIOR_QUERY_STAGE_CONFIG_PATH_2 = "/app/configs/query/dev/query-dev-2026-08-21.2.json"
 LEGACY_QUERY_ENV_NAMES = [
     "QUERY_EXPANSION_MODEL", "QUERY_EXPANSION_REASONING", "ANSWER_SYNTHESIS_MODEL",
     "ANSWER_SYNTHESIS_REASONING", "QUERY_SELECTION_LIMIT", "QUERY_SELECTION_EXPLORATION_SLOTS",
@@ -213,6 +214,13 @@ class BFFDeploymentEvidenceTest(unittest.TestCase):
             next(entry for entry in json.loads(rollback.read_text())["config"]["env"] if entry["name"] == "QUERY_STAGE_CONFIG_PATH")["value"],
             PRIOR_QUERY_STAGE_CONFIG_PATH,
         )
+
+    def test_production_prior_2026_08_21_2_revision_builds_rollback_contract(self):
+        self.prior_revision_path.write_text((FIXTURES / "bff-revision-before-2026-08-21.2.json").read_text())
+        result, rollback = self.prepare()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        saved = json.loads(rollback.read_text())
+        self.assertEqual(saved["config"]["env"][-1], {"name": "QUERY_STAGE_CONFIG_PATH", "value": PRIOR_QUERY_STAGE_CONFIG_PATH_2})
 
     def test_prior_sealed_config_allowlist_and_saved_rollback_are_closed(self):
         for value in (QUERY_STAGE_CONFIG_PATH, "/app/configs/query/dev/query-dev-2026-08-21.3.json"):

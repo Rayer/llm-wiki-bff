@@ -1265,7 +1265,7 @@ const docTemplate = `{
                         "ProjectHeader": []
                     }
                 ],
-                "description": "Full-text search across sources and concepts. Mode \"wiki\" returns raw results, \"full\" adds AI-synthesized answer.",
+                "description": "Full-text search across sources and concepts. Mode \"wiki\" returns raw results, \"full\" adds AI-synthesized answer. Model-prior full responses with insufficient_evidence/no_qualified_evidence include citations:[] and the model-prior evidence metadata; legacy nil citations remain omitted.",
                 "consumes": [
                     "application/json"
                 ],
