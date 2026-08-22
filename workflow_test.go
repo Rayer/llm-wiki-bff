@@ -719,10 +719,11 @@ func TestPreMutationPinnedCanonicalCIRerunCannotDeploy(t *testing.T) {
 	end := strings.Index(body, endMarker)
 	deploy := strings.Index(body, "gcloud run deploy")
 	fn := workflowMarkedSection(body, "# begin current canonical CI run validator", "# end current canonical CI run validator")
-	if begin < 0 || end < 0 || deploy < 0 || fn == "" || !(begin < end && end < deploy) {
+	freshness := workflowMarkedSection(body, "# begin canonical develop freshness guard", "# end canonical develop freshness guard")
+	if begin < 0 || end < 0 || deploy < 0 || fn == "" || freshness == "" || !(begin < end && end < deploy) {
 		t.Fatal("pinned canonical CI revalidation must run immediately before gcloud run deploy")
 	}
-	block := "set -euo pipefail\n" + fn + "\n" + body[begin:end]
+	block := "set -euo pipefail\n" + freshness + "\n" + fn + "\n" + body[begin:end]
 	for _, want := range []string{
 		`gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/develop"`,
 		`gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${CI_RUN_ID}" >`,
@@ -1008,6 +1009,140 @@ exit 2
 	logged, _ := os.ReadFile(gcloudLog)
 	if strings.Contains(string(logged), "run deploy") {
 		t.Fatal("gcloud run deploy must not run when current CI attempt changed after jobs pagination")
+	}
+}
+
+func TestCanonicalDevelopAdvanceAfterJobsCannotDeploy(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
+	body := workflowRunBlock(contents, "Build and deploy to Cloud Run")
+	fn := workflowMarkedSection(body, "# begin current canonical CI run validator", "# end current canonical CI run validator")
+	block := workflowMarkedSection(body, "# begin pinned canonical CI revalidation", "# end pinned canonical CI revalidation")
+	if fn == "" || block == "" {
+		t.Fatal("canonical freshness sections are missing")
+	}
+
+	const sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	validAttempt := `{"id":123,"run_attempt":1,"path":".github/workflows/ci.yml","event":"push","head_branch":"develop","head_sha":"` + sha + `","status":"completed","conclusion":"success"}`
+	validJobs := `{"total_count":1,"jobs":[{"name":"test","run_id":123,"run_attempt":1,"status":"completed","conclusion":"success"}]}`
+	develop := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	log := filepath.Join(t.TempDir(), "provider.log")
+	bin := t.TempDir()
+	attemptFile := filepath.Join(t.TempDir(), "attempt.json")
+	jobsFile := filepath.Join(t.TempDir(), "jobs.json")
+	if err := os.WriteFile(attemptFile, []byte(validAttempt), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(jobsFile, []byte(validJobs), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeExecutable(t, filepath.Join(bin, "gcloud"), `#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$PROVIDER_LOG"
+exit 0
+`)
+	writeExecutable(t, filepath.Join(bin, "gh"), `#!/usr/bin/env bash
+set -euo pipefail
+joined="$*"
+if [[ "$joined" == *git/ref/heads/develop* ]]; then
+  count_file="$RUNNER_TEMP/develop-count"
+  count=0
+  [[ -f "$count_file" ]] && count=$(<"$count_file")
+  count=$((count + 1))
+  printf '%s' "$count" > "$count_file"
+  sha="$CANDIDATE_SHA"
+  (( count >= 2 )) && sha="$ADVANCED_SHA"
+  printf '{"ref":"refs/heads/develop","object":{"sha":"%s","type":"commit"}}\n' "$sha"
+  exit 0
+fi
+if [[ "$joined" == *"/jobs"* ]]; then
+  cat "$FAKE_JOBS_PAGE"
+  exit 0
+fi
+if [[ "$joined" == *"/attempts/"* ]]; then
+  cat "$FAKE_ATTEMPT_JSON"
+  exit 0
+fi
+if [[ "$joined" == *"/actions/runs/"* ]]; then
+  cat "$FAKE_ATTEMPT_JSON"
+  exit 0
+fi
+echo "unexpected gh invocation: $*" >&2
+exit 2
+`)
+	script := "set -euo pipefail\n" + fn + "\n" + block + "\ngcloud run deploy --quiet\n"
+	env := append(os.Environ(),
+		"PATH="+bin+":"+os.Getenv("PATH"), "CANDIDATE_SHA="+sha, "GIT_SHA="+sha,
+		"ADVANCED_SHA="+develop, "CI_RUN_ID=123", "CI_RUN_ATTEMPT=1", "GITHUB_REPOSITORY=owner/repo",
+		"RUNNER_TEMP="+t.TempDir(), "PROVIDER_LOG="+log, "FAKE_ATTEMPT_JSON="+attemptFile, "FAKE_JOBS_PAGE="+jobsFile,
+	)
+	if err := runWorkflowBlock(t, script, env); err == nil {
+		t.Fatal("canonical develop advance after jobs must fail closed")
+	}
+	provider, _ := os.ReadFile(log)
+	if strings.Contains(string(provider), "run deploy") {
+		t.Fatal("gcloud run deploy must not run after canonical develop advances")
+	}
+}
+
+func TestCurrentCanonicalCIRerunAfterRevisionReadbackCannotUpdateTraffic(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
+	body := workflowRunBlock(contents, "Build and deploy to Cloud Run")
+	fn := workflowMarkedSection(body, "# begin current canonical CI run validator", "# end current canonical CI run validator")
+	mutateAt := strings.Index(body, "--to-revisions \"${CREATED_REVISION}=100\"")
+	start := strings.LastIndex(body[:mutateAt], "validate_current_canonical_develop \"$RUNNER_TEMP/canonical-ci-current-run-pre-cutover.json\"")
+	if start < 0 {
+		start = strings.LastIndex(body[:mutateAt], "echo \"previous_revision=")
+	}
+	mutate := strings.Index(body[start:], "--to-revisions \"${CREATED_REVISION}=100\"")
+	if mutate >= 0 {
+		mutate += start
+	}
+	if fn == "" || start < 0 || mutate <= start {
+		t.Fatal("revision readback and cutover sections are missing")
+	}
+
+	log := filepath.Join(t.TempDir(), "provider.log")
+	bin := t.TempDir()
+	writeExecutable(t, filepath.Join(bin, "gcloud"), `#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "$PROVIDER_LOG"
+joined="$*"
+if [[ "$joined" == *"run services describe"* ]]; then
+  printf '%s\n' '{"status":{"latestCreatedRevisionName":"new-revision","latestReadyRevisionName":"new-revision","traffic":[{"revisionName":"old-revision","percent":100}]},"spec":{"traffic":[{"revisionName":"old-revision","percent":100]}}}'
+elif [[ "$joined" == *"run revisions describe"* ]]; then
+  printf '%s\n' '{"status":{"imageDigest":"repo@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","conditions":[{"type":"Ready","status":"True"},{"type":"ContainerReady","status":"True"}]}}'
+fi
+`)
+	writeExecutable(t, filepath.Join(bin, "gh"), `#!/usr/bin/env bash
+set -euo pipefail
+joined="$*"
+if [[ "$joined" == *"/actions/runs/"* ]]; then
+  printf '%s\n' '{"id":123,"run_attempt":2,"path":".github/workflows/ci.yml","event":"push","head_branch":"develop","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","status":"in_progress","conclusion":null}'
+  exit 0
+fi
+echo "unexpected gh invocation: $*" >&2
+exit 2
+`)
+	section := body[start:mutate]
+	section = strings.NewReplacer(
+		"${{ env.SERVICE_NAME }}", "$SERVICE_NAME", "${{ env.REGION }}", "$REGION", "${{ env.PROJECT_ID }}", "$PROJECT_ID",
+	).Replace(section)
+	helpers := body[strings.Index(body, "validate_dev_service_traffic()"):strings.Index(body, "rollback_traffic()")]
+	script := "set -euo pipefail\n" + helpers + "\n" + fn + "\nCREATED_REVISION=new-revision\nPREVIOUS_ROLLBACK_REVISION=old-revision\nIMMUTABLE_IMAGE=repo@sha256:" + strings.Repeat("b", 64) + "\ngcloud run deploy service --no-traffic\ngcloud run revisions describe new-revision\ngcloud run services describe service\n" + section
+	env := append(os.Environ(),
+		"PATH="+bin+":"+os.Getenv("PATH"), "CANDIDATE_SHA="+strings.Repeat("a", 40), "GIT_SHA="+strings.Repeat("a", 40),
+		"CI_RUN_ID=123", "CI_RUN_ATTEMPT=1", "GITHUB_REPOSITORY=owner/repo", "RUNNER_TEMP="+t.TempDir(),
+		"PROVIDER_LOG="+log, "GITHUB_OUTPUT="+filepath.Join(t.TempDir(), "github-output"), "IMMUTABLE_IMAGE=repo@sha256:"+strings.Repeat("b", 64), "PREVIOUS_CREATED_REVISION=old-created",
+		"PREVIOUS_ROLLBACK_REVISION=old-revision", "SERVICE_NAME=service", "REGION=region", "PROJECT_ID=project",
+	)
+	if err := runWorkflowBlock(t, script, env); err == nil {
+		t.Fatal("current attempt change after revision readback must fail closed")
+	}
+	provider, _ := os.ReadFile(log)
+	if !strings.Contains(string(provider), "run services describe") {
+		t.Fatalf("provider-shaped fake did not reach revision readback: %s", provider)
+	}
+	if strings.Contains(string(provider), "update-traffic") {
+		t.Fatal("gcloud update-traffic must not run after current attempt changes")
 	}
 }
 
