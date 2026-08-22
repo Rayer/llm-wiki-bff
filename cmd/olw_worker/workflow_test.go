@@ -20,13 +20,11 @@ func TestDeployWorkerWorkflowContract(t *testing.T) {
 		t.Fatal(err)
 	}
 	workflow := string(data)
-	for _, want := range []string{
-		"push:\n    branches: [main]",
-		"workflow_dispatch:",
-	} {
-		if !strings.Contains(workflow, want) {
-			t.Fatalf("worker dev workflow is missing trigger contract %q", want)
-		}
+	if strings.Contains(workflow, "push:\n    branches: [main]") || strings.Contains(workflow, "branches: [main]") {
+		t.Fatal("worker dev workflow must not trigger on push to main")
+	}
+	if !strings.Contains(workflow, "workflow_dispatch:") {
+		t.Fatal("worker dev workflow is missing workflow_dispatch")
 	}
 	for _, want := range []string{
 		"group: deploy-olw-pipeline-dev",
@@ -75,8 +73,8 @@ func TestDeployWorkerWorkflowContract(t *testing.T) {
 		t.Fatal("dev workflow must read back the exact secret-backed DEEPSEEK_API_KEY contract")
 	}
 	if !strings.Contains(workflow, `case "${GITHUB_REF_NAME}" in
-            develop|main) SOURCE_BRANCH="${GITHUB_REF_NAME}" ;;`) {
-		t.Fatal("worker workflow must allow only develop and main runtime sources")
+            develop) SOURCE_BRANCH="develop" ;;`) {
+		t.Fatal("worker workflow must allow only canonical develop as the runtime source")
 	}
 	if strings.Contains(workflow, "feature|develop|main)") || strings.Contains(workflow, "*) SOURCE_BRANCH") {
 		t.Fatal("worker workflow must fail closed for arbitrary source refs")
@@ -147,8 +145,7 @@ func TestWorkerPromotionWorkflowsContract(t *testing.T) {
 	for _, want := range []string{
 		"SOURCE_BRANCH=",
 		"case \"${GITHUB_REF_NAME}\" in",
-		"develop|main)",
-		"GITHUB_SHA",
+		"develop) SOURCE_BRANCH=\"develop\"",
 		"worker-image-digest-${SHA}.txt",
 		"sha256:[0-9a-f]{64}",
 		"immutable_image=${AR_REPO}/olw-pipeline@${DIGEST}",
@@ -168,6 +165,9 @@ func TestWorkerPromotionWorkflowsContract(t *testing.T) {
 	if strings.Contains(release, "git fetch") {
 		t.Fatal("manual promotion must validate source ancestry locally without a post-checkout fetch")
 	}
+	if strings.Contains(release, "event=push") || strings.Contains(release, ".head_branch == \"main\"") {
+		t.Fatal("release workflow must not locate a main-push DEV worker run")
+	}
 
 	for _, want := range []string{
 		"commit_sha:",
@@ -182,10 +182,9 @@ func TestWorkerPromotionWorkflowsContract(t *testing.T) {
 		"persist-credentials: false",
 		"uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093",
 		"uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f",
-		"git merge-base --is-ancestor",
-		"git merge-base --is-ancestor \"$COMMIT_SHA\" HEAD",
-		"event=push&status=completed&head_sha=${COMMIT_SHA}",
-		".head_branch == \"main\"",
+		"current main must exactly equal commit_sha",
+		"event=workflow_dispatch&status=completed&head_sha=${COMMIT_SHA}",
+		".head_branch == \"develop\"",
 		"worker-image-digest-$COMMIT_SHA",
 		"sha256:[0-9a-f]{64}",
 		"olw-pipeline@${DIGEST}",

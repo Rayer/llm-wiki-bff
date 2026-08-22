@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       commit_sha:
-        description: Full lowercase commit SHA for an image already built by the main dev workflow
+        description: Full lowercase commit SHA for an image already built by canonical develop dispatch
         required: true
         type: string
 
@@ -52,6 +52,7 @@ jobs:
         id: commit
         env:
           COMMIT_SHA: ${{ inputs.commit_sha }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           if [[ ! "$COMMIT_SHA" =~ ^[0-9a-f]{40}$ ]]; then
@@ -66,13 +67,18 @@ jobs:
             echo "commit_sha does not identify a commit"
             exit 1
           fi
-          if ! git merge-base --is-ancestor "$COMMIT_SHA" HEAD; then
-            echo "commit_sha is not an ancestor of the checked-out main commit"
+          MAIN_SHA=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq .object.sha)
+          if [[ "$MAIN_SHA" != "$COMMIT_SHA" ]]; then
+            echo "current main must exactly equal commit_sha"
+            exit 1
+          fi
+          if [[ "$(git rev-parse HEAD)" != "$COMMIT_SHA" ]]; then
+            echo "checked-out main HEAD must exactly equal commit_sha"
             exit 1
           fi
           echo "commit_sha=$COMMIT_SHA" >> "$GITHUB_OUTPUT"
 
-      - name: Locate successful main dev deployment
+      - name: Locate successful canonical develop DEV deployment
         id: dev_run
         env:
           GH_TOKEN: ${{ github.token }}
@@ -80,8 +86,8 @@ jobs:
         run: |
           set -euo pipefail
           RUN_JSON=$(gh api \
-            "repos/${GITHUB_REPOSITORY}/actions/workflows/deploy-worker.yml/runs?event=push&status=completed&head_sha=${COMMIT_SHA}&per_page=100" \
-            | jq -ce --arg sha "$COMMIT_SHA" 'first(.workflow_runs[] | select(.event == "push" and .head_branch == "main" and .head_sha == $sha and .conclusion == "success")) // error("no successful main push run")')
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/deploy-worker.yml/runs?event=workflow_dispatch&status=completed&head_sha=${COMMIT_SHA}&per_page=100" \
+            | jq -ce --arg sha "$COMMIT_SHA" 'first(.workflow_runs[] | select(.event == "workflow_dispatch" and .head_branch == "develop" and .head_sha == $sha and .conclusion == "success")) // error("no successful canonical develop dispatch run")')
           RUN_ID=$(jq -er '.id | select(type == "number" and . > 0)' <<<"$RUN_JSON")
           RUN_URL=$(jq -er '.html_url | select(type == "string" and startswith("https://"))' <<<"$RUN_JSON")
           echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
