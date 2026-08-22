@@ -280,20 +280,30 @@ definitions:
     properties:
       ai_synth:
         type: string
+      answer_basis:
+        type: string
       citations:
         items:
           $ref: '#/definitions/search.Citation'
         type: array
+      disclosure_required:
+        type: boolean
       expand:
         $ref: '#/definitions/llm.ExpandResult'
       mode:
         type: string
       query:
         type: string
+      reason:
+        type: string
       results:
         items:
           $ref: '#/definitions/search.Result'
         type: array
+      status:
+        type: string
+      wiki_evidence_status:
+        type: string
     type: object
   handler.ReadyResponse:
     properties:
@@ -1377,7 +1387,9 @@ paths:
       consumes:
       - application/json
       description: Full-text search across sources and concepts. Mode "wiki" returns
-        raw results, "full" adds AI-synthesized answer.
+        raw results, "full" adds AI-synthesized answer. Model-prior full responses
+        with insufficient_evidence/no_qualified_evidence include citations:[] and
+        the model-prior evidence metadata; legacy nil citations remain omitted.
       parameters:
       - description: Search query and mode
         in: body

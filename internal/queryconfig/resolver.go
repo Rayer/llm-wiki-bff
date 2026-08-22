@@ -45,6 +45,7 @@ type EffectiveConfig struct {
 	SynthesisModel             string
 	SynthesisReasoning         string
 	SynthesisTemperature       float64
+	NoEvidencePolicy           string
 	BindingSource              string
 	ExactBinding               bool
 	InputGenerationIdentity    GenerationIdentity
@@ -180,7 +181,8 @@ func (r *Resolver) makeEffective(identity GenerationIdentity, profile queryquali
 		ExpansionReasoning: stages.QueryExpander.Reasoning, ExpansionTemperature: stages.QueryExpander.Temperature,
 		SynthesisImplementation: stages.AnswerSynthesizer.Implementation, SynthesisProvider: stages.AnswerSynthesizer.Provider, SynthesisModel: stages.AnswerSynthesizer.Model,
 		SynthesisReasoning: stages.AnswerSynthesizer.Reasoning, SynthesisTemperature: stages.AnswerSynthesizer.Temperature,
-		BindingSource: source, ExactBinding: exact, InputGenerationIdentity: identity,
+		NoEvidencePolicy: stages.AnswerSynthesizer.NoEvidencePolicy,
+		BindingSource:    source, ExactBinding: exact, InputGenerationIdentity: identity,
 	}
 	effective.EffectiveConfigDigest = digestEffective(effective)
 	return effective
@@ -204,6 +206,7 @@ func (e EffectiveConfig) RuntimeConfigIdentity() query.RuntimeConfigIdentity {
 		ExpansionModel: e.ExpansionModel, ExpansionReasoning: e.ExpansionReasoning, ExpansionTemperature: e.ExpansionTemperature,
 		SynthesisImplementation: e.SynthesisImplementation, SynthesisProvider: e.SynthesisProvider, SynthesisModel: e.SynthesisModel, SynthesisReasoning: e.SynthesisReasoning,
 		SynthesisTemperature: e.SynthesisTemperature, SelectionLimit: e.Options.SelectionLimit, ExplorationSlots: e.Options.ExplorationSlots,
+		NoEvidencePolicy:  e.NoEvidencePolicy,
 		EvidenceThreshold: e.Options.EvidenceThreshold, KeywordsPerAttempt: e.Options.KeywordsPerAttempt,
 		ExpansionAttempts: e.Options.ExpansionAttempts, RareDocumentFrequency: e.Options.RareDocumentFrequency,
 	}

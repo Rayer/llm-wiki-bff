@@ -30,6 +30,7 @@ const (
 	AnswerSynthesizerImplementation = "citation-answer-synthesis-v1"
 	SeedPolicy                      = "query-derived-or-explicit-v1"
 	NoEvidencePolicy                = "typed-insufficient-evidence-terminal-v1"
+	ModelPriorFallbackPolicy        = "full-model-prior-fallback-v1"
 
 	SourceLegacyCompatibility        = "legacy_compatibility"
 	SourceCorpusDerivedApproximation = "corpus_derived_approximation"
@@ -348,7 +349,7 @@ func validateStages(stages Stages) error {
 		return errors.New("invalid result_selector")
 	}
 	synthesizer := stages.AnswerSynthesizer
-	if synthesizer.Provider != ProviderDeepSeek || synthesizer.Implementation != AnswerSynthesizerImplementation || synthesizer.Model != "deepseek-v4-pro" || (synthesizer.Reasoning != "none" && synthesizer.Reasoning != "low" && synthesizer.Reasoning != "high" && synthesizer.Reasoning != "max") || synthesizer.Temperature != 0 || synthesizer.NoEvidencePolicy != NoEvidencePolicy {
+	if synthesizer.Provider != ProviderDeepSeek || synthesizer.Implementation != AnswerSynthesizerImplementation || synthesizer.Model != "deepseek-v4-pro" || (synthesizer.Reasoning != "none" && synthesizer.Reasoning != "low" && synthesizer.Reasoning != "high" && synthesizer.Reasoning != "max") || synthesizer.Temperature != 0 || (synthesizer.NoEvidencePolicy != NoEvidencePolicy && synthesizer.NoEvidencePolicy != ModelPriorFallbackPolicy) {
 		return errors.New("invalid answer_synthesizer provider/implementation/model/reasoning/temperature")
 	}
 	for name, value := range map[string]string{"default_profile_id": expander.DefaultProfileID, "default_prompt_id": expander.DefaultPromptID, "default_profile_digest": expander.DefaultProfileDigest, "default_prompt_digest": expander.DefaultPromptDigest} {

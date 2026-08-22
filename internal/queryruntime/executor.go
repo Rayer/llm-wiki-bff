@@ -71,6 +71,7 @@ func newExecutor(config queryconfig.Config, conceptCache *cache.Cache, expansion
 			ExpansionReasoning: defaultConfig.ExpansionReasoning, ExpansionTemperature: defaultConfig.ExpansionTemperature,
 			SynthesisProvider: defaultConfig.SynthesisProvider, SynthesisModel: defaultConfig.SynthesisModel,
 			SynthesisReasoning: defaultConfig.SynthesisReasoning, SynthesisTemperature: defaultConfig.SynthesisTemperature,
+			NoEvidencePolicy: defaultConfig.NoEvidencePolicy,
 			Options: query.RuntimeQueryOptions{
 				SelectionLimit: defaultConfig.Options.SelectionLimit, ExplorationSlots: defaultConfig.Options.ExplorationSlots,
 				EvidenceThreshold: defaultConfig.Options.EvidenceThreshold, KeywordsPerAttempt: defaultConfig.Options.KeywordsPerAttempt,

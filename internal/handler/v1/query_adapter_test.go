@@ -53,6 +53,13 @@ func TestV1QueryDelegatesTrimmedDefaultRequestAndScopedReader(t *testing.T) {
 	}
 }
 
+func TestMapQueryResultIncludesOptionalEvidenceMetadata(t *testing.T) {
+	response := mapQueryResult(query.Result{Query: "q", Mode: "full", AnswerBasis: "model_prior", WikiEvidenceStatus: "no_relevant_evidence", DisclosureRequired: true})
+	if response.AnswerBasis != "model_prior" || response.WikiEvidenceStatus != "no_relevant_evidence" || !response.DisclosureRequired {
+		t.Fatalf("response=%#v", response)
+	}
+}
+
 func TestV1QuerySetsOnlyAllowlistedRuntimeIdentityHeaders(t *testing.T) {
 	identity := query.RuntimeConfigIdentity{
 		ConfigRevision: "rev", ConfigDigest: "sha256:config", EffectiveConfigDigest: "sha256:effective",
@@ -241,6 +248,55 @@ func TestV1QueryResponseMatchesApplicationResult(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, mapQueryResult(result)) {
 		t.Fatalf("handler/application mismatch: handler=%#v application=%#v", got, result)
+	}
+}
+
+func TestV1QueryModelPriorNoEvidenceSerializesExplicitEmptyCitations(t *testing.T) {
+	root := newQueryAdapterRoot(t)
+	h := New(root, nil, search.NewIndex(), cache.New(), nil, nil)
+	h.queryExecutor = &recordingQueryExecutor{result: query.Result{
+		Query: "unsupported", Mode: "full", Results: []search.Result{}, Citations: []search.Citation{},
+		AISynth: "model prior answer", Status: "insufficient_evidence", Reason: "no_qualified_evidence",
+		AnswerBasis: "model_prior", WikiEvidenceStatus: "no_relevant_evidence", DisclosureRequired: true,
+	}}
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/api/v1/query", strings.NewReader(`{"q":"unsupported","mode":"full"}`))
+	c.Set("userID", "user")
+	c.Set("projectID", "project")
+	h.Query(c)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	var wire map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &wire); err != nil {
+		t.Fatal(err)
+	}
+	if citations, ok := wire["citations"]; !ok || !reflect.DeepEqual(citations, []any{}) {
+		t.Fatalf("citations = %#v, present=%v, want literal []: body=%s", citations, ok, recorder.Body.String())
+	}
+	for key, want := range map[string]any{
+		"ai_synth": "model prior answer", "status": "insufficient_evidence", "reason": "no_qualified_evidence",
+		"answer_basis": "model_prior", "wiki_evidence_status": "no_relevant_evidence", "disclosure_required": true,
+	} {
+		if wire[key] != want {
+			t.Fatalf("%s = %#v, want %#v; body=%s", key, wire[key], want, recorder.Body.String())
+		}
+	}
+}
+
+func TestLegacyQueryResponseStillOmitsNilCitations(t *testing.T) {
+	data, err := json.Marshal(handler.QueryResponse{Query: "q", Mode: "wiki", Results: []search.Result{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wire map[string]any
+	if err := json.Unmarshal(data, &wire); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := wire["citations"]; ok {
+		t.Fatalf("legacy nil citations unexpectedly became present: %s", data)
 	}
 }
 

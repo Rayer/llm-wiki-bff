@@ -44,7 +44,7 @@ func TestDefaultProductionQueryCompositionUsesProductionExecutor(t *testing.T) {
 
 func TestConfiguredProductionQueryCompositionLoadsImmutableRuntime(t *testing.T) {
 	executor, err := newProductionQueryExecutor(config.Config{
-		QueryStageConfigPath: "../../configs/query/dev/query-dev-2026-08-21.2.json",
+		QueryStageConfigPath: "../../configs/query/dev/query-dev-2026-08-22.1.json",
 		DeepSeekAPIKey:       "test-key",
 	}, conceptcache.New())
 	if err != nil {
@@ -55,13 +55,13 @@ func TestConfiguredProductionQueryCompositionLoadsImmutableRuntime(t *testing.T)
 		t.Fatalf("configured executor=%T, want *queryruntime.Executor", executor)
 	}
 	readback := runtime.Readback()
-	if readback.SchemaVersion != 2 || readback.ConfigRevision != "query-dev-2026-08-21.2" || readback.ConfigDigest != "sha256:75e4f76de991b496c503b42fd893d34408ddae726fe99003365a5c89b8e46642" || readback.DefaultProfileID != "platform-owned-lifestyle-v1" || readback.DefaultPromptID != "minimal-v1" || readback.ExpansionModel != "deepseek-v4-flash" || readback.SynthesisModel != "deepseek-v4-pro" || readback.Options.SelectionLimit != 10 || readback.BindingCount != 3 || readback.DistinctServiceCompositionCount != 2 {
+	if readback.SchemaVersion != 2 || readback.ConfigRevision != "query-dev-2026-08-22.1" || readback.ConfigDigest != "sha256:04dd36a4446043f225f651caaae1bf73c605106b99a23acbbc98cac09c6c4942" || readback.DefaultProfileID != "platform-owned-lifestyle-v1" || readback.DefaultPromptID != "minimal-v1" || readback.ExpansionModel != "deepseek-v4-flash" || readback.SynthesisModel != "deepseek-v4-pro" || readback.NoEvidencePolicy != "full-model-prior-fallback-v1" || readback.Options.SelectionLimit != 10 || readback.BindingCount != 3 || readback.DistinctServiceCompositionCount != 2 {
 		t.Fatalf("readback=%+v", readback)
 	}
 }
 
 func TestInjectedStageConfigDoesNotReadArtifactAgain(t *testing.T) {
-	source := "../../configs/query/dev/query-dev-2026-08-21.2.json"
+	source := "../../configs/query/dev/query-dev-2026-08-22.1.json"
 	data, err := os.ReadFile(source)
 	if err != nil {
 		t.Fatal(err)
