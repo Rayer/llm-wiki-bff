@@ -870,6 +870,7 @@ func TestCurrentCanonicalCIRerunBeforeBuildCannotSubmit(t *testing.T) {
 	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
 	body := workflowRunBlock(contents, "Build and deploy to Cloud Run")
 	fn := workflowMarkedSection(body, "# begin current canonical CI run validator", "# end current canonical CI run validator")
+	freshness := workflowMarkedSection(body, "# begin canonical develop freshness guard", "# end canonical develop freshness guard")
 	preBuild := workflowMarkedSection(body, "# begin pre-build current CI check", "# end pre-build current CI check")
 	submit := strings.Index(body, "gcloud builds submit")
 	preBuildCall := strings.Index(body, "canonical-ci-current-run-pre-build.json")
@@ -882,6 +883,7 @@ func TestCurrentCanonicalCIRerunBeforeBuildCannotSubmit(t *testing.T) {
 	gcloudLog := filepath.Join(t.TempDir(), "gcloud.log")
 	bin := t.TempDir()
 	currentFile := filepath.Join(t.TempDir(), "current.json")
+	ghLog := filepath.Join(t.TempDir(), "gh.log")
 	if err := os.WriteFile(currentFile, []byte(currentInProgress), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -892,6 +894,11 @@ exit 0
 	writeExecutable(t, filepath.Join(bin, "gh"), `#!/usr/bin/env bash
 set -euo pipefail
 joined="$*"
+printf '%s\n' "$*" >> "$GH_LOG"
+if [[ "$joined" == *git/ref/heads/develop* ]]; then
+  printf '{"ref":"refs/heads/develop","object":{"sha":"%s","type":"commit"}}\n' "$CANDIDATE_SHA"
+  exit 0
+fi
 if [[ "$joined" == *"/jobs"* || "$joined" == *"/attempts/"* ]]; then
   echo "pre-build check must not fetch attempt jobs" >&2
   exit 2
@@ -903,7 +910,7 @@ fi
 echo "unexpected gh invocation: $*" >&2
 exit 2
 `)
-	script := "set -euo pipefail\n" + fn + "\nvalidate_current_canonical_develop() { return 0; }\n" + preBuild + "\ngcloud builds submit --quiet\n"
+	script := "set -euo pipefail\n" + freshness + "\n" + fn + "\n" + preBuild + "\ngcloud builds submit --quiet\n"
 	env := append(os.Environ(),
 		"PATH="+bin+":"+os.Getenv("PATH"),
 		"CANDIDATE_SHA="+sha,
@@ -912,13 +919,25 @@ exit 2
 		"GITHUB_REPOSITORY=owner/repo",
 		"RUNNER_TEMP="+t.TempDir(),
 		"GCLOUD_LOG="+gcloudLog,
+		"GH_LOG="+ghLog,
 		"FAKE_CURRENT_RUN_JSON="+currentFile,
 	)
-	if err := runWorkflowBlock(t, script, env); err == nil {
+	cmd := exec.Command("bash", "-c", script)
+	cmd.Env = env
+	raw, runErr := cmd.CombinedOutput()
+	output := string(raw)
+	if runErr == nil {
 		t.Fatal("current attempt 2 before build must fail closed")
 	}
+	if strings.Contains(output, "command not found") || !strings.Contains(output, "canonical CI attempt does not match") {
+		t.Fatalf("expected real current-run freshness failure, got: %s", output)
+	}
+	ghLogged, _ := os.ReadFile(ghLog)
+	if !strings.Contains(string(ghLogged), "/actions/runs/") {
+		t.Fatal("pre-build current-run guard must call the current-run endpoint")
+	}
 	logged, _ := os.ReadFile(gcloudLog)
-	if strings.Contains(string(logged), "builds submit") {
+	if strings.Contains(string(logged), "builds submit") || strings.Contains(string(logged), "command not found") {
 		t.Fatal("gcloud builds submit must not run when current CI attempt changed before build")
 	}
 }
@@ -932,7 +951,6 @@ func TestCanonicalDevelopAdvanceBeforeBuildCannotSubmit(t *testing.T) {
 	if fn == "" || freshness == "" || preBuild == "" {
 		t.Fatal("pre-build canonical freshness sections are missing")
 	}
-
 	const sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	develop := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 	log := filepath.Join(t.TempDir(), "provider.log")
@@ -952,7 +970,14 @@ set -euo pipefail
 printf '%s\n' "$*" >> "$GH_LOG"
 joined="$*"
 if [[ "$joined" == *git/ref/heads/develop* ]]; then
-  printf '{"ref":"refs/heads/develop","object":{"sha":"%s","type":"commit"}}\n' "$ADVANCED_SHA"
+	count_file="$RUNNER_TEMP/develop-count"
+	count=0
+	[[ -f "$count_file" ]] && count=$(<"$count_file")
+	count=$((count + 1))
+	printf '%s' "$count" > "$count_file"
+	sha="$CANDIDATE_SHA"
+	if (( count >= 2 )); then sha="$ADVANCED_SHA"; fi
+  printf '{"ref":"refs/heads/develop","object":{"sha":"%s","type":"commit"}}\n' "$sha"
 elif [[ "$joined" == *"/actions/runs/"* ]]; then
   cat "$FAKE_CURRENT_RUN_JSON"
 else
@@ -960,7 +985,9 @@ else
   exit 2
 fi
 `)
-	script := "set -euo pipefail\n" + freshness + "\n" + fn + "\nvalidate_current_canonical_develop() { return 0; }\n" + preBuild + "\ngcloud builds submit --quiet\n"
+	script := "set -euo pipefail\n" + freshness + "\n" + fn + "\n" +
+		"validate_canonical_develop_candidate \"$RUNNER_TEMP/baseline-ref.json\" \"$RUNNER_TEMP/baseline-ref.sha\"\n" +
+		"validate_canonical_develop_candidate \"$RUNNER_TEMP/final-ref.json\" \"$RUNNER_TEMP/final-ref.sha\"\n" + preBuild + "\ngcloud builds submit --quiet\n"
 	env := append(os.Environ(),
 		"PATH="+bin+":"+os.Getenv("PATH"), "CANDIDATE_SHA="+sha,
 		"CI_RUN_ID=123", "CI_RUN_ATTEMPT=1", "GITHUB_REPOSITORY=owner/repo",
@@ -968,20 +995,27 @@ fi
 		"STDERR_LOG="+stderrLog,
 		"ADVANCED_SHA="+develop, "FAKE_CURRENT_RUN_JSON="+currentFile,
 	)
-	if err := runWorkflowBlock(t, script+" 2>\"$STDERR_LOG\"\n", env); err == nil {
-		t.Fatal("canonical develop advance before build must fail closed")
+	cmd := exec.Command("bash", "-c", script)
+	cmd.Env = env
+	raw, runErr := cmd.CombinedOutput()
+	output := string(raw)
+	if runErr == nil {
+		t.Fatalf("canonical develop advance before build must fail closed; output=%s", output)
 	}
 	ghLogged, _ := os.ReadFile(ghLog)
-	if !strings.Contains(string(ghLogged), "git/ref/heads/develop") {
-		t.Fatal("pre-build guard must call the canonical develop ref endpoint")
+	ghLogString := string(ghLogged)
+	if strings.Count(ghLogString, "git/ref/heads/develop") != 2 || strings.Contains(ghLogString, "/actions/runs/") {
+		t.Fatal("pre-build develop freshness must reject the changed develop ref before current-run validation")
+	}
+	if strings.Contains(output, "command not found") {
+		t.Fatalf("expected real develop freshness failure, got shell construction error: %s", output)
+	}
+	if !strings.Contains(string(contents), "canonical develop no longer matches the pinned candidate SHA") {
+		t.Fatal("canonical develop guard must retain its exact stale-evidence cause")
 	}
 	provider, _ := os.ReadFile(log)
 	if strings.Contains(string(provider), "builds submit") || strings.Contains(string(provider), "command not found") {
 		t.Fatalf("pre-build guard reached forbidden mutation or shell construction failure: %s", provider)
-	}
-	stderr, _ := os.ReadFile(stderrLog)
-	if strings.Contains(string(stderr), "command not found") {
-		t.Fatal("pre-build guard must execute defined helpers")
 	}
 }
 
@@ -1041,13 +1075,13 @@ if [[ "$joined" == *"/attempts/"* ]]; then
   exit 0
 fi
 if [[ "$joined" == *"/actions/runs/"* ]]; then
-  cat "$FAKE_CURRENT_RUN_JSON"
+	cat "$FAKE_CURRENT_RUN_JSON"
   exit 0
 fi
 echo "unexpected gh invocation: $*" >&2
 exit 2
 `)
-	script := "set -euo pipefail\n" + freshness + "\n" + fn + "\nvalidate_current_canonical_develop() { return 0; }\n" + block + "\ngcloud run deploy --quiet\n"
+	script := "set -euo pipefail\n" + freshness + "\n" + fn + "\n" + block + "\ngcloud run deploy --quiet\n"
 	env := append(os.Environ(),
 		"PATH="+bin+":"+os.Getenv("PATH"),
 		"CANDIDATE_SHA="+sha,
@@ -1067,7 +1101,8 @@ exit 2
 	raw, runErr := cmd.CombinedOutput()
 	output := string(raw)
 	if runErr == nil {
-		t.Fatal("current attempt 2 after jobs must fail closed")
+		gh, _ := os.ReadFile(ghLog)
+		t.Fatalf("current attempt 2 after jobs must fail closed; output=%s gh=%s", output, gh)
 	}
 	ghLogged, _ := os.ReadFile(ghLog)
 	if strings.Count(string(ghLogged), "git/ref/heads/develop") == 0 {
@@ -1138,13 +1173,8 @@ exit 0
 set -euo pipefail
 printf '%s\n' "$*" >> "$GH_LOG"
 joined="$*"
-if [[ "$joined" == *git/ref/heads/develop* ]]; then
-  count_file="$RUNNER_TEMP/develop-count"
-  count=0
-  [[ -f "$count_file" ]] && count=$(<"$count_file")
-  count=$((count + 1))
-  printf '%s' "$count" > "$count_file"
-  sha="$ADVANCED_SHA"
+	if [[ "$joined" == *git/ref/heads/develop* ]]; then
+	  sha="$ADVANCED_SHA"
   printf '{"ref":"refs/heads/develop","object":{"sha":"%s","type":"commit"}}\n' "$sha"
   exit 0
 fi
@@ -1157,13 +1187,18 @@ if [[ "$joined" == *"/attempts/"* ]]; then
   exit 0
 fi
 if [[ "$joined" == *"/actions/runs/"* ]]; then
-  cat "$FAKE_CURRENT_RUN_JSON"
+  count_file="$RUNNER_TEMP/current-count"
+  count=0
+  [[ -f "$count_file" ]] && count=$(<"$count_file")
+  count=$((count + 1))
+  printf '%s' "$count" > "$count_file"
+  if (( count == 1 )); then cat "$FAKE_CURRENT_VALID_JSON"; else cat "$FAKE_CURRENT_RUN_JSON"; fi
   exit 0
 fi
 echo "unexpected gh invocation: $*" >&2
 exit 2
 `)
-	script := "set -euo pipefail\n" + freshness + "\n" + fn + "\nvalidate_current_canonical_develop() { return 0; }\n" + block + "\ngcloud run deploy --quiet\n"
+	script := "set -euo pipefail\n" + freshness + "\n" + fn + "\n" + block + "\ngcloud run deploy --quiet\n"
 	env := append(os.Environ(),
 		"PATH="+bin+":"+os.Getenv("PATH"), "CANDIDATE_SHA="+sha, "GIT_SHA="+sha,
 		"ADVANCED_SHA="+develop, "CI_RUN_ID=123", "CI_RUN_ATTEMPT=1", "GITHUB_REPOSITORY=owner/repo",
@@ -1175,12 +1210,16 @@ exit 2
 	raw, runErr := cmd.CombinedOutput()
 	output := string(raw)
 	if runErr == nil {
-		t.Fatal("canonical develop advance after jobs must fail closed")
+		gh, _ := os.ReadFile(ghLog)
+		t.Fatalf("canonical develop advance after jobs must fail closed; output=%s gh=%s", output, gh)
 	}
 	ghLogged, _ := os.ReadFile(ghLog)
 	ghLogString := string(ghLogged)
 	if !strings.Contains(ghLogString, "git/ref/heads/develop") || !strings.Contains(ghLogString, "/actions/runs/") {
 		t.Fatal("canonical develop and current-run endpoints must be called")
+	}
+	if strings.Count(ghLogString, "git/ref/heads/develop") != 1 {
+		t.Fatal("canonical develop must be read at the post-jobs guard boundary")
 	}
 	if strings.Contains(ghLogString, "command not found") {
 		t.Fatal("command not found is not an acceptable failure signal for this test")

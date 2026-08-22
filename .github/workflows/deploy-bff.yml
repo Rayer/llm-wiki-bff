@@ -447,7 +447,7 @@ jobs:
           # end canonical develop freshness guard
 
           # begin pre-build current CI check
-          validate_current_canonical_develop "$RUNNER_TEMP/canonical-ci-current-run-pre-build.json"
+          validate_current_canonical_ci_run "$RUNNER_TEMP/canonical-ci-current-run-pre-build.json"
           # end pre-build current CI check
 
           IMAGE="${{ env.AR_REPO }}/llm-wiki-bff:$GIT_SHA"
