@@ -99,17 +99,29 @@ jobs:
           COLLECTED=0
           PAGE=1
           while :; do
-            RESPONSE=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${CANDIDATE_SHA}&event=push&per_page=100&page=${PAGE}")
-            PAGE_TOTAL=$(jq -er '.total_count | select(type == "number" and . >= 0 and floor == .)' <<<"$RESPONSE")
-            PAGE_RUNS=$(jq -cer '.workflow_runs | select(type == "array")' <<<"$RESPONSE")
-            PAGE_COUNT=$(jq -er 'length' <<<"$PAGE_RUNS")
+            PAGE_JSON="$RUNNER_TEMP/canonical-ci-runs-page.json"
+            PAGE_ITEMS="$RUNNER_TEMP/canonical-ci-runs-page-items.json"
+            PAGE_META="$RUNNER_TEMP/canonical-ci-runs-page-meta.txt"
+            rm -f "$PAGE_JSON" "$PAGE_ITEMS" "$PAGE_META"
+            gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${CANDIDATE_SHA}&event=push&per_page=100&page=${PAGE}" > "$PAGE_JSON"
+            python3 scripts/validate_bff_promotion_contract.py normalize-actions-page \
+              --page-json "$PAGE_JSON" \
+              --items-key workflow_runs \
+              --items-output "$PAGE_ITEMS" \
+              --metadata-output "$PAGE_META"
+            PAGE_TOTAL=$(sed -n 's/^total_count=//p' "$PAGE_META")
+            PAGE_COUNT=$(sed -n 's/^item_count=//p' "$PAGE_META")
+            if [[ ! "$PAGE_TOTAL" =~ ^(0|[1-9][0-9]*)$ || ! "$PAGE_COUNT" =~ ^(0|[1-9][0-9]*)$ ]]; then
+              echo "canonical CI page metadata is invalid"
+              exit 1
+            fi
             if [[ -z "$TOTAL" ]]; then
               TOTAL="$PAGE_TOTAL"
             elif [[ "$TOTAL" != "$PAGE_TOTAL" ]]; then
               echo "canonical CI run count changed while fetching evidence"
               exit 1
             fi
-            printf '%s\n' "$PAGE_RUNS" >> "$PAGES_FILE"
+            cat "$PAGE_ITEMS" >> "$PAGES_FILE"
             COLLECTED=$((COLLECTED + PAGE_COUNT))
             if (( COLLECTED == TOTAL )); then
               jq -s 'add' "$PAGES_FILE" > "$CI_RUNS_JSON"
@@ -129,9 +141,24 @@ jobs:
             --expected-event push \
             --expected-ref develop \
             --output "$CI_RUN_ID_FILE"
-          CI_RUN_ID=$(tr -d '[:space:]' < "$CI_RUN_ID_FILE")
-          if [[ ! "$CI_RUN_ID" =~ ^[1-9][0-9]*$ ]]; then
-            echo "canonical CI run ID is invalid"
+          CI_RUN_ID=""
+          CI_RUN_ATTEMPT=""
+          while IFS= read -r line; do
+            case "$line" in
+              run_id=*)
+                CI_RUN_ID="${line#run_id=}"
+                ;;
+              run_attempt=*)
+                CI_RUN_ATTEMPT="${line#run_attempt=}"
+                ;;
+              *)
+                echo "canonical CI run identity is malformed"
+                exit 1
+                ;;
+            esac
+          done < "$CI_RUN_ID_FILE"
+          if [[ ! "$CI_RUN_ID" =~ ^[1-9][0-9]*$ || ! "$CI_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]; then
+            echo "canonical CI run identity is invalid"
             exit 1
           fi
           PAGES_FILE="$CI_JOBS_JSON.pages"
@@ -140,17 +167,29 @@ jobs:
           COLLECTED=0
           PAGE=1
           while :; do
-            RESPONSE=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${CI_RUN_ID}/jobs?per_page=100&page=${PAGE}")
-            PAGE_TOTAL=$(jq -er '.total_count | select(type == "number" and . >= 0 and floor == .)' <<<"$RESPONSE")
-            PAGE_JOBS=$(jq -cer '.jobs | select(type == "array")' <<<"$RESPONSE")
-            PAGE_COUNT=$(jq -er 'length' <<<"$PAGE_JOBS")
+            PAGE_JSON="$RUNNER_TEMP/canonical-ci-jobs-page.json"
+            PAGE_ITEMS="$RUNNER_TEMP/canonical-ci-jobs-page-items.json"
+            PAGE_META="$RUNNER_TEMP/canonical-ci-jobs-page-meta.txt"
+            rm -f "$PAGE_JSON" "$PAGE_ITEMS" "$PAGE_META"
+            gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${CI_RUN_ID}/attempts/${CI_RUN_ATTEMPT}/jobs?per_page=100&page=${PAGE}" > "$PAGE_JSON"
+            python3 scripts/validate_bff_promotion_contract.py normalize-actions-page \
+              --page-json "$PAGE_JSON" \
+              --items-key jobs \
+              --items-output "$PAGE_ITEMS" \
+              --metadata-output "$PAGE_META"
+            PAGE_TOTAL=$(sed -n 's/^total_count=//p' "$PAGE_META")
+            PAGE_COUNT=$(sed -n 's/^item_count=//p' "$PAGE_META")
+            if [[ ! "$PAGE_TOTAL" =~ ^(0|[1-9][0-9]*)$ || ! "$PAGE_COUNT" =~ ^(0|[1-9][0-9]*)$ ]]; then
+              echo "canonical CI page metadata is invalid"
+              exit 1
+            fi
             if [[ -z "$TOTAL" ]]; then
               TOTAL="$PAGE_TOTAL"
             elif [[ "$TOTAL" != "$PAGE_TOTAL" ]]; then
               echo "canonical CI job count changed while fetching evidence"
               exit 1
             fi
-            printf '%s\n' "$PAGE_JOBS" >> "$PAGES_FILE"
+            cat "$PAGE_ITEMS" >> "$PAGES_FILE"
             COLLECTED=$((COLLECTED + PAGE_COUNT))
             if (( COLLECTED == TOTAL )); then
               jq -s 'add' "$PAGES_FILE" > "$CI_JOBS_JSON"
@@ -166,6 +205,7 @@ jobs:
           python3 scripts/validate_bff_promotion_contract.py validate-canonical-ci-jobs \
             --jobs-json "$CI_JOBS_JSON" \
             --expected-run-id "$CI_RUN_ID" \
+            --expected-run-attempt "$CI_RUN_ATTEMPT" \
             --required-job test
 
       - name: Setup Go

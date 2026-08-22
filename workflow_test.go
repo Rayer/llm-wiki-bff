@@ -578,8 +578,12 @@ func TestDeployBFFWorkflowRequiresExactCanonicalCIAndDoesNotRerunTests(t *testin
 		"--expected-event push",
 		"--expected-ref develop",
 		"--expected-sha \"$CANDIDATE_SHA\"",
-		"actions/runs/${CI_RUN_ID}/jobs",
+		"normalize-actions-page",
+		"--items-key workflow_runs",
+		"--items-key jobs",
+		"actions/runs/${CI_RUN_ID}/attempts/${CI_RUN_ATTEMPT}/jobs",
 		"validate-canonical-ci-jobs",
+		"--expected-run-attempt \"$CI_RUN_ATTEMPT\"",
 		"--required-job test",
 	} {
 		if !strings.Contains(ciBlock, want) {
@@ -594,10 +598,112 @@ func TestDeployBFFWorkflowRequiresExactCanonicalCIAndDoesNotRerunTests(t *testin
 		"pull_request",
 		"--status success",
 		"gh run list",
+		`<<<"$RESPONSE"`,
+		"jq -cer '.workflow_runs",
+		"jq -cer '.jobs",
 	} {
 		if strings.Contains(ciBlock, forbidden) {
 			t.Errorf("canonical CI evidence must not accept merely latest green CI via %q", forbidden)
 		}
+	}
+}
+
+func TestCanonicalCIEvidenceRejectsDuplicateKeyRawPages(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
+	body := workflowRunBlock(contents, "Require exact canonical CI evidence")
+	if body == "" {
+		t.Fatal("could not extract canonical CI evidence run block")
+	}
+
+	const sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	validRun := `{"id":123,"run_attempt":1,"path":".github/workflows/ci.yml","event":"push","head_branch":"develop","head_sha":"` + sha + `","status":"completed","conclusion":"success"}`
+	validRunsPage := `{"total_count":1,"workflow_runs":[` + validRun + `]}`
+	validJobsPage := `{"total_count":1,"jobs":[{"name":"test","run_id":123,"run_attempt":1,"status":"completed","conclusion":"success"}]}`
+
+	tests := []struct {
+		name           string
+		runsPage       string
+		jobsPage       string
+		forbiddenFiles []string
+	}{
+		{
+			name:           "top-level duplicate total_count",
+			runsPage:       `{"total_count":0,"workflow_runs":[` + validRun + `],"total_count":1}`,
+			jobsPage:       validJobsPage,
+			forbiddenFiles: []string{"canonical-ci-runs.json", "canonical-ci-run-id.txt", "canonical-ci-jobs.json"},
+		},
+		{
+			name:           "page duplicate workflow_runs",
+			runsPage:       `{"total_count":1,"workflow_runs":[],"workflow_runs":[` + validRun + `]}`,
+			jobsPage:       validJobsPage,
+			forbiddenFiles: []string{"canonical-ci-runs.json", "canonical-ci-run-id.txt", "canonical-ci-jobs.json"},
+		},
+		{
+			name:           "run duplicate conclusion",
+			runsPage:       `{"total_count":1,"workflow_runs":[{"id":123,"run_attempt":1,"path":".github/workflows/ci.yml","event":"push","head_branch":"develop","head_sha":"` + sha + `","status":"completed","conclusion":"failure","conclusion":"success"}]}`,
+			jobsPage:       validJobsPage,
+			forbiddenFiles: []string{"canonical-ci-runs.json", "canonical-ci-run-id.txt", "canonical-ci-jobs.json"},
+		},
+		{
+			name:           "job duplicate conclusion",
+			runsPage:       validRunsPage,
+			jobsPage:       `{"total_count":1,"jobs":[{"name":"test","run_id":123,"run_attempt":1,"status":"completed","conclusion":"failure","conclusion":"success"}]}`,
+			forbiddenFiles: []string{"canonical-ci-jobs.json"},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			bin := t.TempDir()
+			runsPage := filepath.Join(t.TempDir(), "runs.json")
+			jobsPage := filepath.Join(t.TempDir(), "jobs.json")
+			if err := os.WriteFile(runsPage, []byte(tc.runsPage), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(jobsPage, []byte(tc.jobsPage), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			writeExecutable(t, filepath.Join(bin, "gh"), `#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$*" == *"/jobs"* ]]; then
+  cat "$FAKE_JOBS_PAGE"
+  exit 0
+fi
+cat "$FAKE_RUNS_PAGE"
+`)
+			runnerTemp := t.TempDir()
+			env := append(os.Environ(),
+				"PATH="+bin+":"+os.Getenv("PATH"),
+				"CANDIDATE_SHA="+sha,
+				"GITHUB_REPOSITORY=owner/repo",
+				"RUNNER_TEMP="+runnerTemp,
+				"FAKE_RUNS_PAGE="+runsPage,
+				"FAKE_JOBS_PAGE="+jobsPage,
+			)
+			if err := runWorkflowBlock(t, body, env); err == nil {
+				t.Fatal("duplicate-key raw Actions page must fail closed")
+			}
+			for _, name := range tc.forbiddenFiles {
+				if _, err := os.Stat(filepath.Join(runnerTemp, name)); err == nil {
+					t.Fatalf("normalized evidence %s must not exist after duplicate-key raw page", name)
+				}
+			}
+		})
+	}
+}
+
+func TestCanonicalCIEvidenceBindsRunAttempt(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
+	ciBlock := workflowSection(t, contents, "      - name: Require exact canonical CI evidence", "      - name: Setup Go")
+	for _, want := range []string{
+		"actions/runs/${CI_RUN_ID}/attempts/${CI_RUN_ATTEMPT}/jobs",
+		"--expected-run-attempt",
+	} {
+		if !strings.Contains(ciBlock, want) {
+			t.Errorf("canonical CI evidence is missing attempt identity %q", want)
+		}
+	}
+	if strings.Contains(ciBlock, "actions/runs/${CI_RUN_ID}/jobs?") {
+		t.Fatal("canonical CI jobs must not use the latest-attempt endpoint")
 	}
 }
 

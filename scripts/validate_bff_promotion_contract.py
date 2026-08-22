@@ -22,6 +22,7 @@ CANONICAL_CI_PATH = ".github/workflows/ci.yml"
 CANONICAL_CI_EVENT = "push"
 CANONICAL_CI_REF = "develop"
 CANONICAL_CI_JOB = "test"
+ACTIONS_PAGE_ITEM_KEYS = ("workflow_runs", "jobs")
 RECEIPT_KEYS = (
     "receipt_schema_version",
     "component",
@@ -161,11 +162,12 @@ def validate_canonical_ci_run(args):
     if len(successful) != 1:
         reject("canonical CI must contain exactly one successful matching run")
     run_id = _positive_int(successful[0].get("id"), "canonical CI run ID is invalid")
+    run_attempt = _positive_int(successful[0].get("run_attempt"), "canonical CI run attempt is invalid")
     destination = Path(args.output)
     if destination.exists():
         reject("canonical CI run ID output already exists")
     try:
-        destination.write_text(f"{run_id}\n", encoding="ascii")
+        destination.write_text(f"run_id={run_id}\nrun_attempt={run_attempt}\n", encoding="ascii")
     except OSError as error:
         reject(f"output is unwritable: {error.__class__.__name__}")
 
@@ -185,10 +187,38 @@ def validate_canonical_ci_jobs(args):
     if len(matches) != 1:
         reject(f"canonical CI must contain exactly one {args.required_job} job")
     job = matches[0]
-    if job.get("run_id") != args.expected_run_id:
+    if type(job.get("run_id")) is not int or job.get("run_id") != args.expected_run_id:
         reject("canonical CI job belongs to a different run")
+    if type(job.get("run_attempt")) is not int or job.get("run_attempt") != args.expected_run_attempt:
+        reject("canonical CI job belongs to a different run attempt")
     if job.get("status") != "completed" or job.get("conclusion") != "success":
         reject(f"{args.required_job} job did not conclude successfully")
+
+
+def normalize_actions_page(args):
+    if args.items_key not in ACTIONS_PAGE_ITEM_KEYS:
+        reject("actions page items key is not accepted")
+    page = read_json(args.page_json)
+    if not isinstance(page, dict):
+        reject("actions page evidence must be an object")
+    total = page.get("total_count")
+    if type(total) is not int or total < 0:
+        reject("actions page total_count is malformed")
+    items = page.get(args.items_key)
+    if not isinstance(items, list):
+        reject("actions page items must be an array")
+    for item in items:
+        if not isinstance(item, dict):
+            reject("actions page item is malformed")
+    items_path = Path(args.items_output)
+    metadata_path = Path(args.metadata_output)
+    if items_path.exists() or metadata_path.exists():
+        reject("actions page output already exists")
+    write_json(args.items_output, items)
+    try:
+        metadata_path.write_text(f"total_count={total}\nitem_count={len(items)}\n", encoding="ascii")
+    except OSError as error:
+        reject(f"output is unwritable: {error.__class__.__name__}")
 
 
 def validate_fast_forward_compare(args):
@@ -453,7 +483,13 @@ def parser():
     ci_jobs = subparsers.add_parser("validate-canonical-ci-jobs")
     ci_jobs.add_argument("--jobs-json", required=True)
     ci_jobs.add_argument("--expected-run-id", required=True, type=int)
+    ci_jobs.add_argument("--expected-run-attempt", required=True, type=int)
     ci_jobs.add_argument("--required-job", required=True)
+    page = subparsers.add_parser("normalize-actions-page")
+    page.add_argument("--page-json", required=True)
+    page.add_argument("--items-key", required=True)
+    page.add_argument("--items-output", required=True)
+    page.add_argument("--metadata-output", required=True)
     compare = subparsers.add_parser("validate-fast-forward-compare")
     compare.add_argument("--compare-json", required=True)
     return parser
@@ -479,7 +515,11 @@ def main(argv=None):
         elif args.mode == "validate-canonical-ci-jobs":
             if args.expected_run_id <= 0:
                 reject("expected canonical CI run ID is invalid")
+            if args.expected_run_attempt <= 0:
+                reject("expected canonical CI run attempt is invalid")
             validate_canonical_ci_jobs(args)
+        elif args.mode == "normalize-actions-page":
+            normalize_actions_page(args)
         elif args.mode == "validate-fast-forward-compare":
             validate_fast_forward_compare(args)
         else:
