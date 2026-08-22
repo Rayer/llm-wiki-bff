@@ -718,13 +718,15 @@ func TestPreMutationPinnedCanonicalCIRerunCannotDeploy(t *testing.T) {
 	begin := strings.Index(body, beginMarker)
 	end := strings.Index(body, endMarker)
 	deploy := strings.Index(body, "gcloud run deploy")
-	if begin < 0 || end < 0 || deploy < 0 || !(begin < end && end < deploy) {
+	fn := workflowMarkedSection(body, "# begin current canonical CI run validator", "# end current canonical CI run validator")
+	if begin < 0 || end < 0 || deploy < 0 || fn == "" || !(begin < end && end < deploy) {
 		t.Fatal("pinned canonical CI revalidation must run immediately before gcloud run deploy")
 	}
-	block := "set -euo pipefail\n" + body[begin:end]
+	block := "set -euo pipefail\n" + fn + "\n" + body[begin:end]
 	for _, want := range []string{
 		`gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/develop"`,
 		`gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${CI_RUN_ID}" >`,
+		"canonical-ci-current-run-pre-deploy.json",
 		"actions/runs/${CI_RUN_ID}/attempts/${CI_RUN_ATTEMPT}",
 		"validate-canonical-ci-attempt",
 		"actions/runs/${CI_RUN_ID}/attempts/${CI_RUN_ATTEMPT}/jobs",
@@ -860,6 +862,152 @@ exit 2
 				t.Fatal("changed, in-progress, failed, or mismatched current CI attempt must not reach provider mutation")
 			}
 		})
+	}
+}
+
+func TestCurrentCanonicalCIRerunBeforeBuildCannotSubmit(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
+	body := workflowRunBlock(contents, "Build and deploy to Cloud Run")
+	fn := workflowMarkedSection(body, "# begin current canonical CI run validator", "# end current canonical CI run validator")
+	preBuild := workflowMarkedSection(body, "# begin pre-build current CI check", "# end pre-build current CI check")
+	submit := strings.Index(body, "gcloud builds submit")
+	preBuildCall := strings.Index(body, "canonical-ci-current-run-pre-build.json")
+	if fn == "" || preBuild == "" || submit < 0 || preBuildCall < 0 || preBuildCall > submit {
+		t.Fatal("current canonical CI run must be validated before gcloud builds submit")
+	}
+
+	const sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	currentInProgress := `{"id":123,"run_attempt":2,"path":".github/workflows/ci.yml","event":"push","head_branch":"develop","head_sha":"` + sha + `","status":"in_progress","conclusion":null}`
+	gcloudLog := filepath.Join(t.TempDir(), "gcloud.log")
+	bin := t.TempDir()
+	currentFile := filepath.Join(t.TempDir(), "current.json")
+	if err := os.WriteFile(currentFile, []byte(currentInProgress), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeExecutable(t, filepath.Join(bin, "gcloud"), `#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$GCLOUD_LOG"
+exit 0
+`)
+	writeExecutable(t, filepath.Join(bin, "gh"), `#!/usr/bin/env bash
+set -euo pipefail
+joined="$*"
+if [[ "$joined" == *"/jobs"* || "$joined" == *"/attempts/"* ]]; then
+  echo "pre-build check must not fetch attempt jobs" >&2
+  exit 2
+fi
+if [[ "$joined" == *"/actions/runs/"* ]]; then
+  cat "$FAKE_CURRENT_RUN_JSON"
+  exit 0
+fi
+echo "unexpected gh invocation: $*" >&2
+exit 2
+`)
+	script := "set -euo pipefail\n" + fn + "\n" + preBuild + "\ngcloud builds submit --quiet\n"
+	env := append(os.Environ(),
+		"PATH="+bin+":"+os.Getenv("PATH"),
+		"CANDIDATE_SHA="+sha,
+		"CI_RUN_ID=123",
+		"CI_RUN_ATTEMPT=1",
+		"GITHUB_REPOSITORY=owner/repo",
+		"RUNNER_TEMP="+t.TempDir(),
+		"GCLOUD_LOG="+gcloudLog,
+		"FAKE_CURRENT_RUN_JSON="+currentFile,
+	)
+	if err := runWorkflowBlock(t, script, env); err == nil {
+		t.Fatal("current attempt 2 before build must fail closed")
+	}
+	logged, _ := os.ReadFile(gcloudLog)
+	if strings.Contains(string(logged), "builds submit") {
+		t.Fatal("gcloud builds submit must not run when current CI attempt changed before build")
+	}
+}
+
+func TestCurrentCanonicalCIRerunAfterJobsCannotDeploy(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
+	body := workflowRunBlock(contents, "Build and deploy to Cloud Run")
+	fn := workflowMarkedSection(body, "# begin current canonical CI run validator", "# end current canonical CI run validator")
+	block := workflowMarkedSection(body, "# begin pinned canonical CI revalidation", "# end pinned canonical CI revalidation")
+	jobsAt := strings.Index(body, "validate-canonical-ci-jobs")
+	preDeployAt := strings.Index(body, "canonical-ci-current-run-pre-deploy.json")
+	deployAt := strings.Index(body, "gcloud run deploy")
+	if fn == "" || block == "" || jobsAt < 0 || preDeployAt < 0 || deployAt < 0 || !(jobsAt < preDeployAt && preDeployAt < deployAt) {
+		t.Fatal("current canonical CI run must be reread after jobs and immediately before gcloud run deploy")
+	}
+	if tail := body[preDeployAt:deployAt]; strings.Contains(tail, "gh api") {
+		t.Fatal("no intervening GitHub evidence fetch is allowed between the final current-run reread and gcloud run deploy")
+	}
+
+	const sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	validAttempt := `{"id":123,"run_attempt":1,"path":".github/workflows/ci.yml","event":"push","head_branch":"develop","head_sha":"` + sha + `","status":"completed","conclusion":"success"}`
+	validJobs := `{"total_count":1,"jobs":[{"name":"test","run_id":123,"run_attempt":1,"status":"completed","conclusion":"success"}]}`
+	currentLater := `{"id":123,"run_attempt":2,"path":".github/workflows/ci.yml","event":"push","head_branch":"develop","head_sha":"` + sha + `","status":"in_progress","conclusion":null}`
+	gcloudLog := filepath.Join(t.TempDir(), "gcloud.log")
+	ghLog := filepath.Join(t.TempDir(), "gh.log")
+	bin := t.TempDir()
+	attemptFile := filepath.Join(t.TempDir(), "attempt.json")
+	currentFile := filepath.Join(t.TempDir(), "current.json")
+	jobsFile := filepath.Join(t.TempDir(), "jobs.json")
+	if err := os.WriteFile(attemptFile, []byte(validAttempt), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(currentFile, []byte(currentLater), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(jobsFile, []byte(validJobs), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeExecutable(t, filepath.Join(bin, "gcloud"), `#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$GCLOUD_LOG"
+exit 0
+`)
+	writeExecutable(t, filepath.Join(bin, "gh"), `#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "$GH_LOG"
+joined="$*"
+if [[ "$joined" == *git/ref/heads/develop* ]]; then
+  printf '{"ref":"refs/heads/develop","object":{"sha":"%s","type":"commit"}}\n' "$CANDIDATE_SHA"
+  exit 0
+fi
+if [[ "$joined" == *"/jobs"* ]]; then
+  cat "$FAKE_JOBS_PAGE"
+  exit 0
+fi
+if [[ "$joined" == *"/attempts/"* ]]; then
+  cat "$FAKE_ATTEMPT_JSON"
+  exit 0
+fi
+if [[ "$joined" == *"/actions/runs/"* ]]; then
+  cat "$FAKE_CURRENT_RUN_JSON"
+  exit 0
+fi
+echo "unexpected gh invocation: $*" >&2
+exit 2
+`)
+	script := "set -euo pipefail\n" + fn + "\n" + block + "\ngcloud run deploy --quiet\n"
+	env := append(os.Environ(),
+		"PATH="+bin+":"+os.Getenv("PATH"),
+		"CANDIDATE_SHA="+sha,
+		"GIT_SHA="+sha,
+		"CI_RUN_ID=123",
+		"CI_RUN_ATTEMPT=1",
+		"GITHUB_REPOSITORY=owner/repo",
+		"RUNNER_TEMP="+t.TempDir(),
+		"GCLOUD_LOG="+gcloudLog,
+		"GH_LOG="+ghLog,
+		"FAKE_ATTEMPT_JSON="+attemptFile,
+		"FAKE_CURRENT_RUN_JSON="+currentFile,
+		"FAKE_JOBS_PAGE="+jobsFile,
+	)
+	if err := runWorkflowBlock(t, script, env); err == nil {
+		t.Fatal("current attempt 2 after jobs must fail closed")
+	}
+	ghLogged, _ := os.ReadFile(ghLog)
+	if !strings.Contains(string(ghLogged), "/jobs") {
+		t.Fatal("attempt-specific jobs must be fetched before the final current-run reread")
+	}
+	logged, _ := os.ReadFile(gcloudLog)
+	if strings.Contains(string(logged), "run deploy") {
+		t.Fatal("gcloud run deploy must not run when current CI attempt changed after jobs pagination")
 	}
 }
 
@@ -2609,6 +2757,15 @@ exit 2
 			}
 		})
 	}
+}
+
+func workflowMarkedSection(body, begin, end string) string {
+	start := strings.Index(body, begin)
+	stop := strings.Index(body, end)
+	if start < 0 || stop < 0 || start >= stop {
+		return ""
+	}
+	return body[start:stop]
 }
 
 func workflowRunBlock(contents, stepName string) string {

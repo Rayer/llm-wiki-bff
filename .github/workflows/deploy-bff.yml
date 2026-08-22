@@ -391,6 +391,34 @@ jobs:
             return 1
           }
 
+          # begin current canonical CI run validator
+          validate_current_canonical_ci_run() {
+            local dest="$1"
+            if [[ ! "$CI_RUN_ID" =~ ^[1-9][0-9]*$ || ! "$CI_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]; then
+              echo "pinned canonical CI identity is invalid"
+              return 1
+            fi
+            if [[ ! "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "candidate SHA must be a 40-character lowercase commit SHA"
+              return 1
+            fi
+            rm -f "$dest"
+            gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${CI_RUN_ID}" > "$dest"
+            python3 scripts/validate_bff_promotion_contract.py validate-canonical-ci-attempt \
+              --run-json "$dest" \
+              --expected-sha "$CANDIDATE_SHA" \
+              --expected-path ".github/workflows/ci.yml" \
+              --expected-event push \
+              --expected-ref develop \
+              --expected-run-id "$CI_RUN_ID" \
+              --expected-run-attempt "$CI_RUN_ATTEMPT"
+          }
+          # end current canonical CI run validator
+
+          # begin pre-build current CI check
+          validate_current_canonical_ci_run "$RUNNER_TEMP/canonical-ci-current-run-pre-build.json"
+          # end pre-build current CI check
+
           IMAGE="${{ env.AR_REPO }}/llm-wiki-bff:$GIT_SHA"
           echo "Building ${IMAGE}…"
           BUILD_ID=$(gcloud builds submit \
@@ -556,17 +584,6 @@ jobs:
             echo "canonical develop no longer matches the pinned candidate SHA"
             exit 1
           fi
-          CURRENT_RUN_JSON="$RUNNER_TEMP/canonical-ci-current-run.json"
-          rm -f "$CURRENT_RUN_JSON"
-          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${CI_RUN_ID}" > "$CURRENT_RUN_JSON"
-          python3 scripts/validate_bff_promotion_contract.py validate-canonical-ci-attempt \
-            --run-json "$CURRENT_RUN_JSON" \
-            --expected-sha "$CANDIDATE_SHA" \
-            --expected-path ".github/workflows/ci.yml" \
-            --expected-event push \
-            --expected-ref develop \
-            --expected-run-id "$CI_RUN_ID" \
-            --expected-run-attempt "$CI_RUN_ATTEMPT"
           ATTEMPT_JSON="$RUNNER_TEMP/canonical-ci-attempt.json"
           rm -f "$ATTEMPT_JSON"
           gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${CI_RUN_ID}/attempts/${CI_RUN_ATTEMPT}" > "$ATTEMPT_JSON"
@@ -625,6 +642,7 @@ jobs:
             --expected-run-id "$CI_RUN_ID" \
             --expected-run-attempt "$CI_RUN_ATTEMPT" \
             --required-job test
+          validate_current_canonical_ci_run "$RUNNER_TEMP/canonical-ci-current-run-pre-deploy.json"
           # end pinned canonical CI revalidation
 
           echo "Deploying ${IMMUTABLE_IMAGE}…"
