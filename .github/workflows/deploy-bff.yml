@@ -415,8 +415,39 @@ jobs:
           }
           # end current canonical CI run validator
 
+          # begin canonical develop freshness guard
+          validate_canonical_develop_candidate() {
+            if [[ ! "$CI_RUN_ID" =~ ^[1-9][0-9]*$ || ! "$CI_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]; then
+              echo "pinned canonical CI identity is invalid"
+              return 1
+            fi
+            if [[ ! "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "candidate SHA must be a 40-character lowercase commit SHA"
+              return 1
+            fi
+            local ref_json="$1"
+            local sha_file="$2"
+            rm -f "$ref_json" "$sha_file"
+            gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/develop" > "$ref_json"
+            python3 scripts/validate_bff_promotion_contract.py extract-git-ref-sha \
+              --ref-json "$ref_json" \
+              --output "$sha_file"
+            local develop_sha
+            develop_sha=$(tr -d '[:space:]' < "$sha_file")
+            if [[ ! "$develop_sha" =~ ^[0-9a-f]{40}$ || "$develop_sha" != "$CANDIDATE_SHA" ]]; then
+              echo "canonical develop no longer matches the pinned candidate SHA"
+              return 1
+            fi
+          }
+
+          validate_current_canonical_develop() {
+            validate_canonical_develop_candidate "$RUNNER_TEMP/canonical-develop-ref.json" "$RUNNER_TEMP/canonical-develop-ref.sha"
+            validate_current_canonical_ci_run "$1"
+          }
+          # end canonical develop freshness guard
+
           # begin pre-build current CI check
-          validate_current_canonical_ci_run "$RUNNER_TEMP/canonical-ci-current-run-pre-build.json"
+          validate_current_canonical_develop "$RUNNER_TEMP/canonical-ci-current-run-pre-build.json"
           # end pre-build current CI check
 
           IMAGE="${{ env.AR_REPO }}/llm-wiki-bff:$GIT_SHA"
@@ -572,18 +603,6 @@ jobs:
             echo "pinned candidate SHA does not match the built commit"
             exit 1
           fi
-          DEVELOP_REF_JSON="$RUNNER_TEMP/canonical-develop-ref.json"
-          DEVELOP_REF_SHA="$RUNNER_TEMP/canonical-develop-ref.sha"
-          rm -f "$DEVELOP_REF_JSON" "$DEVELOP_REF_SHA"
-          gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/develop" > "$DEVELOP_REF_JSON"
-          python3 scripts/validate_bff_promotion_contract.py extract-git-ref-sha \
-            --ref-json "$DEVELOP_REF_JSON" \
-            --output "$DEVELOP_REF_SHA"
-          DEVELOP_SHA=$(tr -d '[:space:]' < "$DEVELOP_REF_SHA")
-          if [[ ! "$DEVELOP_SHA" =~ ^[0-9a-f]{40}$ || "$DEVELOP_SHA" != "$CANDIDATE_SHA" ]]; then
-            echo "canonical develop no longer matches the pinned candidate SHA"
-            exit 1
-          fi
           ATTEMPT_JSON="$RUNNER_TEMP/canonical-ci-attempt.json"
           rm -f "$ATTEMPT_JSON"
           gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${CI_RUN_ID}/attempts/${CI_RUN_ATTEMPT}" > "$ATTEMPT_JSON"
@@ -642,7 +661,7 @@ jobs:
             --expected-run-id "$CI_RUN_ID" \
             --expected-run-attempt "$CI_RUN_ATTEMPT" \
             --required-job test
-          validate_current_canonical_ci_run "$RUNNER_TEMP/canonical-ci-current-run-pre-deploy.json"
+          validate_current_canonical_develop "$RUNNER_TEMP/canonical-ci-current-run-pre-deploy.json"
           # end pinned canonical CI revalidation
 
           echo "Deploying ${IMMUTABLE_IMAGE}…"
@@ -697,6 +716,8 @@ jobs:
             echo "Cloud Run traffic changed before cutover; refusing to mutate traffic."
             exit 1
           fi
+
+          validate_current_canonical_develop "$RUNNER_TEMP/canonical-ci-current-run-pre-cutover.json"
 
           echo "previous_revision=$PREVIOUS_ROLLBACK_REVISION" >> "$GITHUB_OUTPUT"
           echo "new_revision=$CREATED_REVISION" >> "$GITHUB_OUTPUT"
