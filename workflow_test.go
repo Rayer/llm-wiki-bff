@@ -30,8 +30,8 @@ func TestDevWorkflowManualDispatchRequiresCanonicalDevelopSHA(t *testing.T) {
 	if err := yaml.Unmarshal([]byte(contents), &workflow); err != nil {
 		t.Fatalf("deploy workflow is not valid YAML: %v", err)
 	}
-	if got, want := strings.Join(workflow.On.Push.Branches, ","), "main"; got != want {
-		t.Fatalf("automatic push branches = %q, want %q", got, want)
+	if got := strings.Join(workflow.On.Push.Branches, ","); got != "" {
+		t.Fatalf("BFF DEV workflow must not trigger on push, got %q", got)
 	}
 	commitInput, ok := workflow.On.WorkflowDispatch.Inputs["commit_sha"]
 	if !ok || !commitInput.Required || commitInput.Type != "string" {
@@ -60,8 +60,6 @@ func TestDevWorkflowManualDispatchRequiresCanonicalDevelopSHA(t *testing.T) {
 		"git rev-parse origin/develop",
 		`input commit SHA does not match checked-out HEAD`,
 		`input commit SHA does not match current origin/develop`,
-		`"$EVENT_NAME" == "push"`,
-		`"$GITHUB_SHA"`,
 	} {
 		if !strings.Contains(source, want) {
 			t.Errorf("source validation is missing %q", want)
@@ -549,7 +547,6 @@ func TestMainFastForwardCandidateProducerIsDirectNeed(t *testing.T) {
 func TestBFFDevWorkflowPushesDevelopAndSupportsManualDispatch(t *testing.T) {
 	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
 	for _, want := range []string{
-		"  push:\n    branches: [main]",
 		"  workflow_dispatch:",
 	} {
 		if !strings.Contains(contents, want) {
@@ -1220,18 +1217,35 @@ func TestDeployWorkflowUsesImmutableCloudBuildResultDigest(t *testing.T) {
 	}
 }
 
-func TestBFFDevImageTagIsRunScopedAndImmutable(t *testing.T) {
+func TestBFFDevWorkflowHasNoRunScopedObservabilityTag(t *testing.T) {
 	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
-	tagStep := workflowSection(t, contents, "      - name: Tag deployed dev image (fail-closed)", "      - name: Show deployment info")
-	want := `DEV_IMAGE_TAG="${{ env.AR_REPO }}/llm-wiki-bff:dev-${{ steps.identity.outputs.git_sha }}-${{ github.run_id }}-${{ github.run_attempt }}"`
-	if !strings.Contains(tagStep, want) {
-		t.Fatalf("BFF DEV tag must include commit SHA, run ID, and run attempt: missing %q", want)
+	if strings.Contains(contents, "gcloud artifacts docker tags add") || strings.Contains(contents, ":dev-${{") {
+		t.Fatal("BFF DEV workflow must not mutate or consume run-scoped observability tags")
 	}
-	if strings.Contains(tagStep, `:dev-${{ steps.identity.outputs.git_sha }}"`) {
-		t.Fatal("BFF DEV tag must not be commit-only scoped")
-	}
-	if !strings.Contains(tagStep, "gcloud artifacts docker tags add") {
-		t.Fatal("BFF DEV tag step must add the immutable image tag")
+}
+
+func TestRemovedBFFObservabilityTagsHaveNoRepositoryConsumer(t *testing.T) {
+	for _, root := range []string{".github", "docs", "scripts"} {
+		err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+			if err != nil || info.IsDir() || path == "scripts/test_bff_promotion_contract.py" || path == "scripts/test_bff_deployment_evidence.py" {
+				return err
+			}
+			contents, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			text := string(contents)
+			if strings.Contains(text, "llm-wiki-bff:dev-") || strings.Contains(text, "llm-wiki-bff:prod-") {
+				t.Fatalf("removed BFF observability tag remains referenced by %s", path)
+			}
+			if (path == ".github/workflows/deploy-bff.yml" || path == ".github/workflows/release-bff.yml") && strings.Contains(text, "gcloud artifacts docker tags add") {
+				t.Fatalf("removed BFF observability tag mutation remains in %s", path)
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 
@@ -1386,14 +1400,13 @@ func TestBFFDevWorkflowUsesCanonicalRevisionTransaction(t *testing.T) {
 	stepDeployAt := strings.Index(contents, "      - name: Build and deploy to Cloud Run")
 	persistAt := strings.Index(contents, "      - name: Persist build image digest")
 	uploadAt := strings.Index(contents, "      - name: Upload image digest artifact")
-	tagAt := strings.Index(contents, "      - name: Tag deployed dev image (fail-closed)")
 	showAt := strings.Index(contents, "      - name: Show deployment info")
 	cleanupAt := strings.Index(contents, "      - name: Restore BFF traffic on post-cutover failure")
-	if preAt < 0 || stepDeployAt < 0 || persistAt < 0 || uploadAt < 0 || tagAt < 0 || showAt < 0 || cleanupAt < 0 {
+	if preAt < 0 || stepDeployAt < 0 || persistAt < 0 || uploadAt < 0 || showAt < 0 || cleanupAt < 0 {
 		t.Fatalf("BFF workflow is missing required step anchors")
 	}
-	if !(preAt < stepDeployAt && stepDeployAt < persistAt && persistAt < uploadAt && uploadAt < tagAt && tagAt < showAt && showAt < cleanupAt) {
-		t.Fatalf("BFF traffic safety flow must run: IAM preflight < deploy < persist < upload < tag < show < cleanup")
+	if !(preAt < stepDeployAt && stepDeployAt < persistAt && persistAt < uploadAt && uploadAt < showAt && showAt < cleanupAt) {
+		t.Fatalf("BFF traffic safety flow must run: IAM preflight < deploy < persist < upload < show < cleanup")
 	}
 
 	cleanup := contents[cleanupAt:]
@@ -1449,13 +1462,15 @@ func TestReleaseWorkflowRequiresMainBuildProvenance(t *testing.T) {
 		"actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
 		"# v4.6.2",
 		`git cat-file -e "$COMMIT_SHA^{commit}"`,
-		`git merge-base --is-ancestor "$COMMIT_SHA" HEAD`,
-		"commit_sha is not an ancestor of main",
+		`MAIN_SHA=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq .object.sha)`,
+		"current main must exactly equal commit_sha",
 		"dev_run_id",
 		`gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${DEV_RUN_ID}"`,
 		"scripts/validate_bff_promotion_contract.py validate-dev-receipt",
-		"--expected-branch main",
-		"--expected-event push",
+		"--expected-branch develop",
+		"--expected-event workflow_dispatch",
+		"validate-production-readiness",
+		"bff-production-promotion-ready-$COMMIT_SHA",
 		"roles/run.jobsExecutorWithOverrides",
 		"get-iam-policy",
 		"scripts/render_bff_deployment_evidence.py prepare-rollback",
@@ -1467,14 +1482,6 @@ func TestReleaseWorkflowRequiresMainBuildProvenance(t *testing.T) {
 		if !strings.Contains(contents, want) {
 			t.Errorf("release workflow is missing main provenance contract %q", want)
 		}
-	}
-	for _, forbidden := range []string{"ref: develop", `origin/develop`} {
-		if strings.Contains(contents, forbidden) {
-			t.Fatalf("release workflow must not accept develop provenance %q", forbidden)
-		}
-	}
-	if strings.Contains(contents, "git fetch") {
-		t.Fatal("release workflow must validate promotion ancestry from the full local checkout")
 	}
 	checkoutStart := strings.Index(contents, "      - name: Checkout main")
 	checkoutEnd := strings.Index(contents, "      - name: Initialize deployment evidence paths")
@@ -1509,14 +1516,15 @@ func TestReleaseWorkflowCreatesEvidenceDirectoryBeforeDevRunReceiptWrite(t *test
 func TestReleaseWorkflowAuthenticatesOnlyAfterReadOnlyGatesAndHasOneProviderMutation(t *testing.T) {
 	contents := readWorkflow(t, ".github/workflows/release-bff.yml")
 	auth := strings.Index(contents, "- name: Authenticate to Google Cloud")
-	provenance := strings.Index(contents, "- name: Locate exact successful main dev deployment")
-	image := strings.Index(contents, "- name: Download exact dev image digest")
+	provenance := strings.Index(contents, "- name: Locate exact successful canonical develop DEV deployment")
+	jobs := strings.Index(contents, "- name: Validate exact successful DEV promotion jobs")
+	image := strings.Index(contents, "- name: Download exact DEV receipt and readiness evidence")
 	preflight := strings.Index(contents, "- name: Verify production IAM preflight")
 	deploy := strings.Index(contents, "gcloud run deploy")
-	if auth < 0 || provenance < 0 || image < 0 || preflight < 0 || deploy < 0 {
+	if auth < 0 || provenance < 0 || jobs < 0 || image < 0 || preflight < 0 || deploy < 0 {
 		t.Fatal("release workflow is missing the source, provenance, IAM, or deploy gates")
 	}
-	if auth < provenance || auth < image || auth > preflight || preflight > deploy {
+	if auth < provenance || auth < jobs || auth < image || auth > preflight || preflight > deploy {
 		t.Fatal("release authentication/deploy order is not fail-closed")
 	}
 	serviceIAM := strings.Index(contents, "gcloud run services get-iam-policy")
@@ -1536,8 +1544,48 @@ func TestReleaseWorkflowAuthenticatesOnlyAfterReadOnlyGatesAndHasOneProviderMuta
 	if strings.Count(contents, "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02") != 2 {
 		t.Fatal("production BFF release must upload exactly two pinned artifacts")
 	}
-	if strings.Index(contents, "Tag promoted production image") < strings.Index(contents, "Upload normalized deployment evidence") {
-		t.Fatal("production image tag must follow evidence upload")
+	if strings.Contains(contents, "gcloud artifacts docker tags add") || strings.Contains(contents, ":prod-${COMMIT_SHA}") {
+		t.Fatal("production workflow must not mutate or consume removed observability tags")
+	}
+}
+
+func TestReleaseWorkflowRequiresCompleteSameRunJobEvidenceBeforeAuth(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/release-bff.yml")
+	start := strings.Index(contents, "- name: Validate exact successful DEV promotion jobs")
+	auth := strings.Index(contents, "- name: Authenticate to Google Cloud")
+	if start < 0 || auth < 0 || start >= auth {
+		t.Fatal("release workflow must validate DEV job evidence before cloud authentication")
+	}
+	section := contents[start:auth]
+	for _, want := range []string{
+		`gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${DEV_RUN_ID}/jobs?per_page=100&page=${PAGE}"`,
+		`PAGE_TOTAL=$(jq -er '.total_count`,
+		`if (( COLLECTED == TOTAL )); then`,
+		`if (( COLLECTED > TOTAL || PAGE_COUNT == 0 )); then`,
+		`jq -s 'add' "$PAGES_FILE" > "$DEV_JOBS_JSON"`,
+		"validate-run-jobs",
+		`--jobs-json "$DEV_JOBS_JSON"`,
+		`--expected-run-id "$DEV_RUN_ID"`,
+	} {
+		if !strings.Contains(section, want) {
+			t.Errorf("release workflow is missing complete same-run jobs contract %q", want)
+		}
+	}
+}
+
+func TestReleaseWorkflowRereadsMainImmediatelyBeforeDeploy(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/release-bff.yml")
+	start := strings.Index(contents, "- name: Deploy existing immutable image to Cloud Run")
+	if start < 0 {
+		t.Fatal("release workflow is missing deploy step")
+	}
+	section := contents[start:]
+	read := strings.Index(section, `MAIN_SHA=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq .object.sha)`)
+	check := strings.Index(section, `if [[ "$MAIN_SHA" != "$COMMIT_SHA" ]]; then`)
+	marker := strings.Index(section, `echo "deploy_started=true" >> "$GITHUB_OUTPUT"`)
+	deploy := strings.Index(section, `gcloud run deploy "$SERVICE_NAME"`)
+	if read < 0 || check < 0 || marker < 0 || deploy < 0 || !(read < check && check < marker && marker < deploy) {
+		t.Fatal("deploy step must reread and verify main before marking and performing its Cloud Run mutation")
 	}
 }
 
@@ -1555,15 +1603,16 @@ func TestReleaseWorkflowStrictlyParsesQueryConfigReceipt(t *testing.T) {
 			"--run-json \"$DEV_RUN_JSON\"",
 			"--expected-sha \"$COMMIT_SHA\"",
 			"--expected-run-id \"$DEV_RUN_ID\"",
-			"--expected-branch main",
-			"--expected-event push",
+			"--expected-branch develop",
+			"--expected-event workflow_dispatch",
 			"--lifecycle production",
 			"--component lwc-bff",
 			"--repository \"$GITHUB_REPOSITORY\"",
 			"--ar-repo \"$AR_REPO\"",
 			"--query-config-revision \"$QUERY_STAGE_CONFIG_REVISION\"",
 			"--query-config-digest \"$QUERY_STAGE_CONFIG_DIGEST\"",
-			"--output \"$RUNNER_TEMP/bff-production-readiness.json\"",
+			"--output \"$RUNNER_TEMP/validated-bff-dev-receipt.json\"",
+			"validate-production-readiness",
 			"--github-output \"$GITHUB_OUTPUT\"",
 		} {
 			if !strings.Contains(contents, want) {
@@ -2127,7 +2176,8 @@ func TestDevReceiptProducerIsVersionedAndSelfBound(t *testing.T) {
 	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
 	persist := workflowSection(t, contents, "      - name: Persist build image digest", "      - name: Upload image digest artifact")
 	for _, want := range []string{
-		"receipt_schema_version=1",
+		"receipt_schema_version=2",
+		"build_ref=develop",
 		"component=lwc-bff",
 		"source_sha=%s",
 		"dev_run_id=%s",
@@ -2141,24 +2191,26 @@ func TestDevReceiptProducerIsVersionedAndSelfBound(t *testing.T) {
 }
 
 func TestDeployWorkflowRunBlocksAreExecutable(t *testing.T) {
-	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
-	var document any
-	if err := yaml.Unmarshal([]byte(contents), &document); err != nil {
-		t.Fatalf("readiness workflow is not valid YAML: %v", err)
-	}
 	runBlockPattern := regexp.MustCompile(`(?m)^\s+run: \|\n((?:\s{10,}.+\n?)+)`)
-	runs := runBlockPattern.FindAllStringSubmatch(contents, -1)
-	if len(runs) == 0 {
-		t.Fatal("readiness workflow has no executable run blocks")
-	}
-	for _, run := range runs {
-		body := strings.TrimSpace(run[1])
-		body = regexp.MustCompile(`(?m)^ {10}`).ReplaceAllString(body, "")
-		body = regexp.MustCompile(`\$\{\{[^}]*\}\}`).ReplaceAllString(body, "workflow-expression")
-		cmd := exec.Command("bash", "-n")
-		cmd.Stdin = strings.NewReader(body)
-		if output, err := cmd.CombinedOutput(); err != nil {
-			t.Fatalf("readiness workflow run block has invalid shell syntax: %v\n%s", err, output)
+	for _, path := range []string{".github/workflows/deploy-bff.yml", ".github/workflows/release-bff.yml"} {
+		contents := readWorkflow(t, path)
+		var document any
+		if err := yaml.Unmarshal([]byte(contents), &document); err != nil {
+			t.Fatalf("%s is not valid YAML: %v", path, err)
+		}
+		runs := runBlockPattern.FindAllStringSubmatch(contents, -1)
+		if len(runs) == 0 {
+			t.Fatalf("%s has no executable run blocks", path)
+		}
+		for _, run := range runs {
+			body := strings.TrimSpace(run[1])
+			body = regexp.MustCompile(`(?m)^ {10}`).ReplaceAllString(body, "")
+			body = regexp.MustCompile(`\$\{\{[^}]*\}\}`).ReplaceAllString(body, "workflow-expression")
+			cmd := exec.Command("bash", "-n")
+			cmd.Stdin = strings.NewReader(body)
+			if output, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("%s run block has invalid shell syntax: %v\n%s", path, err, output)
+			}
 		}
 	}
 }
@@ -2227,7 +2279,6 @@ func TestReleaseWorkflowPromotesExistingDigestWithoutRebuild(t *testing.T) {
 	for _, want := range []string{
 		"gcloud run deploy \"$SERVICE_NAME\" \\",
 		"--image \"$IMMUTABLE_IMAGE\"",
-		"gcloud artifacts docker tags add",
 	} {
 		if !strings.Contains(contents, want) {
 			t.Errorf("release workflow is missing digest promotion contract %q", want)

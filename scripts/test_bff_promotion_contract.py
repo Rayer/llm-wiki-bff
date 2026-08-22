@@ -17,8 +17,9 @@ REVISION = "llm-wiki-bff-00001-old"
 
 def receipt():
     return (
-        "receipt_schema_version=1\n"
+        "receipt_schema_version=2\n"
         "component=lwc-bff\n"
+        "build_ref=develop\n"
         f"source_sha={SHA}\n"
         f"dev_run_id={RUN_ID}\n"
         f"image_digest={DIGEST}\n"
@@ -88,13 +89,22 @@ class BFFPromotionContractTest(unittest.TestCase):
             command.extend(["--compare-path", compare_path])
         return subprocess.run(command, capture_output=True, text=True)
 
+    def invoke_run_jobs(self, jobs):
+        path = self.root / "jobs.json"
+        path.write_text(json.dumps(jobs))
+        return subprocess.run([
+            "python3", str(SCRIPT), "validate-run-jobs",
+            "--jobs-json", str(path), "--expected-run-id", str(RUN_ID),
+        ], capture_output=True, text=True)
+
     def test_real_receipt_shape_normalizes_exact_identity(self):
         result = self.invoke_receipt()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(self.output.read_text()), {
             "schema_version": 1,
-            "receipt_schema_version": 1,
+            "receipt_schema_version": 2,
             "component": "lwc-bff",
+            "build_ref": "develop",
             "result": "ready",
             "source_sha": SHA,
             "dev_run_id": RUN_ID,
@@ -120,6 +130,21 @@ class BFFPromotionContractTest(unittest.TestCase):
         self.assertIn("dev_run_url=https://github.com/Rayer/llm-wiki-bff/actions/runs/123\n", github_output.read_text())
         self.assertEqual(self.output.read_text().count("\n"), 1)
 
+    def test_production_readiness_must_be_the_exact_normalized_develop_receipt(self):
+        self.assertEqual(self.invoke_receipt().returncode, 0)
+        command = [
+            "python3", str(SCRIPT), "validate-production-readiness",
+            "--readiness", str(self.output), "--expected-sha", SHA,
+            "--expected-run-id", str(RUN_ID), "--expected-branch", "develop",
+            "--component", "lwc-bff", "--repository", "Rayer/llm-wiki-bff",
+            "--ar-repo", AR_REPO, "--receipt", str(self.receipt_path),
+        ]
+        self.assertEqual(subprocess.run(command, capture_output=True, text=True).returncode, 0)
+        readiness = json.loads(self.output.read_text())
+        readiness["build_ref"] = "main"
+        self.output.write_text(json.dumps(readiness))
+        self.assertNotEqual(subprocess.run(command, capture_output=True, text=True).returncode, 0)
+
     def test_receipt_rejects_unknown_missing_trailing_duplicate_ambiguous_and_identity_fields(self):
         cases = {
             "unknown": receipt().replace("component=lwc-bff\n", "unknown=value\n"),
@@ -134,13 +159,37 @@ class BFFPromotionContractTest(unittest.TestCase):
             "wrong component": receipt().replace("component=lwc-bff", "component=worker"),
             "tag image": receipt().replace(f"image_reference={AR_REPO}/llm-wiki-bff@{DIGEST}", "repo/lwc-bff:latest"),
             "invalid digest": receipt().replace(DIGEST, "sha256:bad"),
-            "schema": receipt().replace("receipt_schema_version=1", "receipt_schema_version=2"),
+            "schema": receipt().replace("receipt_schema_version=2", "receipt_schema_version=1"),
         }
         for name, value in cases.items():
             with self.subTest(name=name):
                 path = self.root / f"{name}.txt"
                 path.write_bytes(value.encode())
                 self.assertNotEqual(self.invoke_receipt(path).returncode, 0)
+
+    def test_receipt_line_count_diagnostic_names_nine_lines(self):
+        path = self.root / "unterminated-receipt.txt"
+        path.write_bytes(receipt().rstrip("\n").encode())
+        result = self.invoke_receipt(path)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stderr, "promotion contract rejected: receipt must use exactly nine LF-terminated lines\n")
+
+    def test_run_jobs_require_unique_successful_same_run_promotion_evidence(self):
+        jobs = [
+            {"name": "production-promotion-ready", "run_id": RUN_ID, "status": "completed", "conclusion": "success"},
+            {"name": "main-fast-forward-eligible", "run_id": RUN_ID, "status": "completed", "conclusion": "success"},
+        ]
+        self.assertEqual(self.invoke_run_jobs(jobs).returncode, 0)
+        cases = {
+            "missing": jobs[:1],
+            "skipped": [{**jobs[1], "conclusion": "skipped"}, jobs[0]],
+            "failed": [{**jobs[0], "conclusion": "failure"}, jobs[1]],
+            "duplicate": jobs + [jobs[0]],
+            "wrong run": [{**jobs[0], "run_id": RUN_ID + 1}, jobs[1]],
+        }
+        for name, value in cases.items():
+            with self.subTest(name=name):
+                self.assertNotEqual(self.invoke_run_jobs(value).returncode, 0)
 
     def test_receipt_rejects_noncanonical_run_url_without_writing_output(self):
         original = json.loads(self.run_path.read_text())

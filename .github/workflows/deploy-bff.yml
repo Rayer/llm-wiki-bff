@@ -1,8 +1,6 @@
 name: Deploy BFF to Cloud Run (dev)
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
     inputs:
       commit_sha:
@@ -70,12 +68,6 @@ jobs:
               echo "input commit SHA does not match current origin/develop"
               exit 1
             fi
-          elif [[ "$EVENT_NAME" == "push" ]]; then
-            if [[ ! "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]; then
-              echo "github.sha must be a 40-character lowercase commit SHA"
-              exit 1
-            fi
-            CANDIDATE_SHA="$GITHUB_SHA"
           else
             echo "unsupported deployment event: $EVENT_NAME"
             exit 1
@@ -621,8 +613,9 @@ jobs:
           fi
           DIGEST_FILE="bff-image-digest-$COMMIT_SHA.txt"
           {
-            printf 'receipt_schema_version=1\n'
+            printf 'receipt_schema_version=2\n'
             printf 'component=lwc-bff\n'
+            printf 'build_ref=develop\n'
             printf 'source_sha=%s\n' "$COMMIT_SHA"
             printf 'dev_run_id=%s\n' "$GITHUB_RUN_ID"
             printf 'image_digest=%s\n' "$DIGEST"
@@ -643,17 +636,6 @@ jobs:
           name: bff-image-digest-${{ steps.image_digest.outputs.commit_sha }}
           path: ${{ steps.image_digest.outputs.digest_file }}
           if-no-files-found: error
-
-      - name: Tag deployed dev image (fail-closed)
-        env:
-          IMMUTABLE_IMAGE: ${{ env.AR_REPO }}/llm-wiki-bff@${{ steps.image_digest.outputs.digest }}
-        run: |
-          set -euo pipefail
-          DEV_IMAGE_TAG="${{ env.AR_REPO }}/llm-wiki-bff:dev-${{ steps.identity.outputs.git_sha }}-${{ github.run_id }}-${{ github.run_attempt }}"
-          gcloud artifacts docker tags add \
-            "$IMMUTABLE_IMAGE" \
-            "$DEV_IMAGE_TAG" \
-            --quiet
 
       - name: Show deployment info
         run: |

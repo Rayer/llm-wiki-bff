@@ -10,13 +10,18 @@ import sys
 import tempfile
 
 
-RECEIPT_SCHEMA_VERSION = 1
+RECEIPT_SCHEMA_VERSION = 2
 PROMOTION_SCHEMA_VERSION = 1
 IMAGE_NAME = "llm-wiki-bff"
 WORKFLOW_PATH = ".github/workflows/deploy-bff.yml"
+REQUIRED_RUN_JOBS = (
+    "production-promotion-ready",
+    "main-fast-forward-eligible",
+)
 RECEIPT_KEYS = (
     "receipt_schema_version",
     "component",
+    "build_ref",
     "source_sha",
     "dev_run_id",
     "image_digest",
@@ -67,7 +72,7 @@ def read_receipt(path):
     except OSError as error:
         reject(f"receipt is unreadable: {error.__class__.__name__}")
     if not raw.endswith(b"\n") or raw.endswith(b"\n\n") or b"\r" in raw:
-        reject("receipt must use exactly eight LF-terminated lines")
+        reject("receipt must use exactly nine LF-terminated lines")
     lines = raw[:-1].split(b"\n")
     if len(lines) != len(RECEIPT_KEYS):
         reject("receipt must contain exactly the required fields")
@@ -91,12 +96,35 @@ def read_receipt(path):
     return values
 
 
+def validate_run_jobs(args):
+    jobs = read_json(args.jobs_json)
+    if not isinstance(jobs, list):
+        reject("DEV run jobs evidence must be an array")
+    matches = {name: [] for name in REQUIRED_RUN_JOBS}
+    for job in jobs:
+        if not isinstance(job, dict):
+            reject("DEV run job evidence is malformed")
+        name = job.get("name")
+        if name in matches:
+            matches[name].append(job)
+    for name, evidence in matches.items():
+        if len(evidence) != 1:
+            reject(f"DEV run must contain exactly one {name} job")
+        job = evidence[0]
+        if job.get("run_id") != args.expected_run_id:
+            reject(f"{name} job belongs to a different run")
+        if job.get("status") != "completed" or job.get("conclusion") != "success":
+            reject(f"{name} job did not conclude successfully")
+
+
 def validate_dev_receipt(args):
     values = read_receipt(args.receipt)
     if values["receipt_schema_version"] != str(RECEIPT_SCHEMA_VERSION):
         reject("receipt schema version is unsupported")
     if values["component"] != args.component:
         reject("receipt component does not match")
+    if values["build_ref"] != args.expected_branch:
+        reject("receipt build ref does not match")
     if not SHA_RE.fullmatch(values["source_sha"]) or values["source_sha"] != args.expected_sha:
         reject("receipt source SHA does not match")
     if not RUN_ID_RE.fullmatch(values["dev_run_id"]) or int(values["dev_run_id"]) != args.expected_run_id:
@@ -141,6 +169,7 @@ def validate_dev_receipt(args):
         "schema_version": PROMOTION_SCHEMA_VERSION,
         "receipt_schema_version": RECEIPT_SCHEMA_VERSION,
         "component": args.component,
+        "build_ref": values["build_ref"],
         "result": "ready",
         "source_sha": args.expected_sha,
         "dev_run_id": args.expected_run_id,
@@ -156,6 +185,7 @@ def validate_dev_receipt(args):
                 ("dev_run_id", str(args.expected_run_id)),
                 ("dev_run_url", run_url),
                 ("dev_run_event", args.expected_event),
+                ("build_ref", values["build_ref"]),
                 ("dev_run_head_branch", args.expected_branch),
                 ("dev_run_head_sha", args.expected_sha),
                 ("dev_run_conclusion", "success"),
@@ -165,6 +195,24 @@ def validate_dev_receipt(args):
                 ("query_config_digest", values["query_config_digest"]),
             ):
                 output.write(f"{key}={value}\n")
+
+
+def validate_production_readiness(args):
+    readiness = read_json(args.readiness)
+    expected = {
+        "schema_version": PROMOTION_SCHEMA_VERSION,
+        "receipt_schema_version": RECEIPT_SCHEMA_VERSION,
+        "component": args.component,
+        "result": "ready",
+        "build_ref": args.expected_branch,
+        "source_sha": args.expected_sha,
+        "dev_run_id": args.expected_run_id,
+        "dev_run_url": f"https://github.com/{args.repository}/actions/runs/{args.expected_run_id}",
+        "image_digest": read_receipt(args.receipt)["image_digest"],
+        "image_reference": f"{args.ar_repo}/{IMAGE_NAME}@{read_receipt(args.receipt)['image_digest']}",
+    }
+    if readiness != expected:
+        reject("normalized readiness receipt does not match the validated DEV receipt")
 
 
 def path_value(document, path):
@@ -285,6 +333,15 @@ def parser():
     receipt.add_argument("--query-config-digest", required=True)
     receipt.add_argument("--output", required=True)
     receipt.add_argument("--github-output")
+    readiness = subparsers.add_parser("validate-production-readiness")
+    readiness.add_argument("--readiness", required=True)
+    readiness.add_argument("--expected-sha", required=True)
+    readiness.add_argument("--expected-run-id", required=True, type=int)
+    readiness.add_argument("--expected-branch", required=True)
+    readiness.add_argument("--component", required=True)
+    readiness.add_argument("--repository", required=True)
+    readiness.add_argument("--ar-repo", required=True)
+    readiness.add_argument("--receipt", required=True)
     traffic = subparsers.add_parser("validate-traffic")
     traffic.add_argument("--traffic-file", required=True)
     traffic.add_argument("--traffic-path", required=True)
@@ -292,6 +349,9 @@ def parser():
     traffic.add_argument("--compare-path")
     traffic.add_argument("--expected-revision")
     traffic.add_argument("--recognized-revision", action="append", default=[])
+    jobs = subparsers.add_parser("validate-run-jobs")
+    jobs.add_argument("--jobs-json", required=True)
+    jobs.add_argument("--expected-run-id", required=True, type=int)
     return parser
 
 
@@ -302,6 +362,14 @@ def main(argv=None):
             if args.expected_run_id <= 0:
                 reject("expected DEV run ID is invalid")
             validate_dev_receipt(args)
+        elif args.mode == "validate-production-readiness":
+            if args.expected_run_id <= 0 or not SHA_RE.fullmatch(args.expected_sha):
+                reject("expected readiness identity is invalid")
+            validate_production_readiness(args)
+        elif args.mode == "validate-run-jobs":
+            if args.expected_run_id <= 0:
+                reject("expected DEV run ID is invalid")
+            validate_run_jobs(args)
         else:
             if args.traffic_mode == "provider-dev-convergence" and not args.compare_path:
                 reject("DEV convergence validation requires a comparison path")
