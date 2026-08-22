@@ -492,8 +492,8 @@ func TestMainFastForwardEligibilityFollowsReadiness(t *testing.T) {
 	if strings.Contains(pendingBlock, "needs.test-and-deploy.outputs.candidate_sha") || !strings.Contains(pendingBlock, "EVENT_SHA: ${{ github.sha }}") || !strings.Contains(pendingBlock, "GH_TOKEN: ${{ github.token }}") {
 		t.Fatal("pending publication must use only the trusted event SHA and workflow token")
 	}
-	if !strings.Contains(job[checkout:fresh], "ref: ${{ github.sha }}") || !strings.Contains(job[checkout:fresh], "fetch-depth: 0") || !strings.Contains(job[checkout:fresh], "persist-credentials: false") {
-		t.Fatal("checkout must use the exact event SHA without persisted credentials")
+	if !strings.Contains(job[checkout:fresh], "ref: ${{ github.sha }}") || !strings.Contains(job[checkout:fresh], "fetch-depth: 1") || strings.Contains(job[checkout:fresh], "fetch-depth: 0") || !strings.Contains(job[checkout:fresh], "persist-credentials: false") {
+		t.Fatal("checkout must use the exact event SHA with a bounded fetch and without persisted credentials")
 	}
 	freshBlock := job[fresh:success]
 	for _, want := range []string{
@@ -501,6 +501,7 @@ func TestMainFastForwardEligibilityFollowsReadiness(t *testing.T) {
 		"CANDIDATE_SHA: ${{ needs.test-and-deploy.outputs.candidate_sha }}",
 		"TEST_DEPLOY_RESULT: ${{ needs.test-and-deploy.result }}",
 		"READINESS_RESULT: ${{ needs.production-promotion-ready.result }}",
+		"GH_TOKEN: ${{ github.token }}",
 	} {
 		if !strings.Contains(freshBlock, want) {
 			t.Errorf("fresh eligibility gate is missing %q", want)
@@ -538,9 +539,115 @@ func TestMainFastForwardCandidateProducerIsDirectNeed(t *testing.T) {
 	}
 	resultCheck := strings.Index(fresh, `if [[ "$TEST_DEPLOY_RESULT" != "success" || "$READINESS_RESULT" != "success" ]]; then`)
 	candidateCheck := strings.Index(fresh, `if [[ ! "$CANDIDATE_SHA" =~`)
-	remoteCheck := strings.Index(fresh, "git fetch --no-tags origin main develop")
+	remoteCheck := strings.Index(fresh, `gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/develop"`)
 	if resultCheck < 0 || candidateCheck < 0 || remoteCheck < 0 || !(resultCheck < candidateCheck && resultCheck < remoteCheck) {
 		t.Fatal("fresh verification must check upstream results before candidate and remote gates")
+	}
+}
+
+func TestDeployBFFWorkflowRequiresExactCanonicalCIAndDoesNotRerunTests(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
+	producer := workflowSection(t, contents, "  test-and-deploy:", "  production-promotion-ready:")
+	for _, forbidden := range []string{
+		"go test ./...",
+		"go vet ./...",
+		"- name: Run Go tests",
+		"- name: Run Go vet",
+	} {
+		if strings.Contains(producer, forbidden) {
+			t.Errorf("producer must not rerun %q after canonical CI", forbidden)
+		}
+	}
+
+	source := strings.Index(producer, "- name: Validate deployment source")
+	ci := strings.Index(producer, "- name: Require exact canonical CI evidence")
+	gate := strings.Index(producer, "- name: Verify immutable DEV query stage artifact")
+	auth := strings.Index(producer, "- name: Authenticate to Google Cloud")
+	if source < 0 || ci < 0 || gate < 0 || auth < 0 || !(source < ci && ci < gate && gate < auth) {
+		t.Fatal("canonical CI evidence must follow source validation and precede query-config and cloud authentication")
+	}
+	ciBlock := producer[ci:gate]
+	for _, want := range []string{
+		"CANDIDATE_SHA: ${{ steps.source.outputs.candidate_sha }}",
+		"GH_TOKEN: ${{ github.token }}",
+		"actions/workflows/ci.yml/runs",
+		"head_sha=${CANDIDATE_SHA}",
+		"event=push",
+		"validate-canonical-ci-run",
+		`--expected-path ".github/workflows/ci.yml"`,
+		"--expected-event push",
+		"--expected-ref develop",
+		"--expected-sha \"$CANDIDATE_SHA\"",
+		"actions/runs/${CI_RUN_ID}/jobs",
+		"validate-canonical-ci-jobs",
+		"--required-job test",
+	} {
+		if !strings.Contains(ciBlock, want) {
+			t.Errorf("canonical CI evidence is missing %q", want)
+		}
+	}
+	if !strings.Contains(producer, "actions: read") {
+		t.Fatal("producer must read Actions to verify canonical CI")
+	}
+	for _, forbidden := range []string{
+		"workflow_dispatch",
+		"pull_request",
+		"--status success",
+		"gh run list",
+	} {
+		if strings.Contains(ciBlock, forbidden) {
+			t.Errorf("canonical CI evidence must not accept merely latest green CI via %q", forbidden)
+		}
+	}
+}
+
+func TestPromotionReadyAndEligibilityAvoidFullHistoryCheckout(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
+	ready := workflowSection(t, contents, "  production-promotion-ready:", "  main-fast-forward-eligible:")
+	eligibleStart := strings.Index(contents, "  main-fast-forward-eligible:")
+	if eligibleStart < 0 {
+		t.Fatal("workflow is missing main-fast-forward-eligible job")
+	}
+	eligible := contents[eligibleStart:]
+	for name, job := range map[string]string{
+		"production-promotion-ready": ready,
+		"main-fast-forward-eligible": eligible,
+	} {
+		if strings.Contains(job, "fetch-depth: 0") {
+			t.Errorf("%s must not use full-history checkout", name)
+		}
+		if !strings.Contains(job, "fetch-depth: 1") {
+			t.Errorf("%s must use a bounded exact-ref checkout", name)
+		}
+	}
+}
+
+func TestMainFastForwardEligibilityUsesBoundedCompareAPI(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
+	fresh := workflowRunBlock(contents, "Verify exact candidate and main fast-forward eligibility")
+	final := workflowRunBlock(contents, "Publish successful main fast-forward eligibility status")
+	if fresh == "" || final == "" {
+		t.Fatal("could not extract eligibility run blocks")
+	}
+	for name, block := range map[string]string{"fresh": fresh, "final": final} {
+		if strings.Contains(block, "git fetch") || strings.Contains(block, "git merge-base") {
+			t.Errorf("%s eligibility must not prove ancestry via full-history fetch or merge-base", name)
+		}
+		for _, want := range []string{
+			`gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/develop"`,
+			"compare/main...${EVENT_SHA}?per_page=1",
+			"validate-fast-forward-compare",
+		} {
+			if !strings.Contains(block, want) {
+				t.Errorf("%s eligibility is missing bounded compare contract %q", name, want)
+			}
+		}
+	}
+	finalPost := strings.Index(final, "gh api --method POST")
+	develop := strings.Index(final, "git/ref/heads/develop")
+	compare := strings.Index(final, "validate-fast-forward-compare")
+	if finalPost < 0 || develop < 0 || compare < 0 || develop > finalPost || compare > finalPost {
+		t.Fatal("canonical develop reread and compare must precede success publication")
 	}
 }
 
@@ -1961,10 +2068,10 @@ func TestMainFastForwardEligibilityPublishesExactCommitStatus(t *testing.T) {
 		}
 	}
 	for _, want := range []string{
-		"git fetch --no-tags origin main develop",
 		"git rev-parse HEAD",
-		"git rev-parse origin/develop",
-		"git merge-base --is-ancestor origin/main \"$EVENT_SHA\"",
+		`gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/develop"`,
+		"compare/main...${EVENT_SHA}?per_page=1",
+		"validate-fast-forward-compare",
 		"gh api --method POST \"repos/${GITHUB_REPOSITORY}/statuses/$EVENT_SHA\"",
 		"-f state=success",
 		"-f context=main-fast-forward-eligible",
@@ -2007,7 +2114,12 @@ func TestMainFastForwardEligibilityPublishesExactCommitStatus(t *testing.T) {
 	if finalPost < 0 || strings.Contains(final[finalPost:], "|") || strings.Contains(final[finalPost:], "jq") {
 		t.Fatal("success publication must be one unvalidated gh API command")
 	}
-	for _, check := range []string{"git fetch --no-tags origin main develop", "git rev-parse HEAD", "git rev-parse origin/develop", "git merge-base --is-ancestor origin/main \"$EVENT_SHA\""} {
+	for _, check := range []string{
+		"git rev-parse HEAD",
+		`gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/develop"`,
+		"compare/main...${EVENT_SHA}?per_page=1",
+		"validate-fast-forward-compare",
+	} {
 		if strings.Index(final, check) > finalPost {
 			t.Fatalf("final remote or ancestry check %q must precede the success POST", check)
 		}
@@ -2015,8 +2127,11 @@ func TestMainFastForwardEligibilityPublishesExactCommitStatus(t *testing.T) {
 	if !strings.HasSuffix(strings.TrimSpace(final), `-f description="exact candidate is eligible for a main fast-forward"`) {
 		t.Fatal("success POST must be the final shell action")
 	}
-	if strings.Contains(pendingRun, "jq") || strings.Contains(pendingRun, ".sha") || strings.Contains(freshRun, "gh api") {
-		t.Fatal("pending and fresh verification must not validate provider response schemas or publish status")
+	if strings.Contains(pendingRun, "jq") || strings.Contains(pendingRun, ".sha") {
+		t.Fatal("pending publication must not validate provider response schemas")
+	}
+	if strings.Contains(freshRun, "--method POST") || strings.Contains(freshRun, "state=success") {
+		t.Fatal("fresh verification must not publish status")
 	}
 	if strings.Count(contents, "statuses: write") != 1 || strings.Contains(contents[:strings.Index(contents, "  main-fast-forward-eligible:")], "statuses: write") {
 		t.Fatal("statuses: write must be limited to the main fast-forward job")
@@ -2055,6 +2170,8 @@ func TestMainFastForwardEligibilityNegativePathsDoNotPublishSuccess(t *testing.T
 		{name: "wrong candidate", candidate: other, head: event, develop: event, upstream: "success", wantAccepted: "pending,failure", wantFreshRun: true, wantCleanupRun: true},
 		{name: "malformed candidate", candidate: "not-a-sha", head: event, develop: event, upstream: "success", wantAccepted: "pending,failure", wantFreshRun: true, wantCleanupRun: true},
 		{name: "ancestry failure", candidate: event, head: event, develop: event, ancestry: "fail", upstream: "success", wantAccepted: "pending,failure", wantFreshRun: true, wantCleanupRun: true},
+		{name: "compare API failure", candidate: event, head: event, develop: event, ghMode: "fail_compare", upstream: "success", wantAccepted: "pending,failure", wantFreshRun: true, wantCleanupRun: true},
+		{name: "malformed compare", candidate: event, head: event, develop: event, ghMode: "malformed_compare", upstream: "success", wantAccepted: "pending,failure", wantFreshRun: true, wantCleanupRun: true},
 		{name: "pending API failure", candidate: event, head: event, develop: event, ghMode: "fail_pending", upstream: "success", wantAccepted: "failure", wantCleanupRun: true},
 		{name: "cleanup API failure", candidate: event, head: event, develop: event, ghMode: "fail_failure", upstream: "failure", wantAccepted: "pending", wantFreshRun: true, wantCleanupRun: true},
 		{name: "success API failure", candidate: event, head: event, develop: event, ghMode: "fail_success", upstream: "success", wantAccepted: "pending,failure", wantFreshRun: true, wantFinalRun: true, wantCleanupRun: true},
@@ -2065,27 +2182,57 @@ func TestMainFastForwardEligibilityNegativePathsDoNotPublishSuccess(t *testing.T
 			writeExecutable(t, filepath.Join(bin, "git"), `#!/usr/bin/env bash
 set -euo pipefail
 case "$1 ${2:-}" in
-  fetch\ *) exit 0 ;;
   rev-parse\ HEAD) printf '%s\n' "$FAKE_HEAD" ;;
-  rev-parse\ origin/develop) printf '%s\n' "$FAKE_DEVELOP" ;;
-  merge-base\ --is-ancestor) [[ "${FAKE_ANCESTRY:-}" != fail ]] ;;
   *) echo "unexpected git invocation: $*" >&2; exit 2 ;;
 esac
 `)
 			writeExecutable(t, filepath.Join(bin, "gh"), `#!/usr/bin/env bash
 set -euo pipefail
 state=""
-for arg in "$@"; do
+jq_expr=""
+args=("$@")
+for i in "${!args[@]}"; do
+  arg="${args[$i]}"
   [[ "$arg" == state=* ]] && state="${arg#state=}"
+  if [[ "$arg" == "--jq" ]]; then
+    jq_expr="${args[$((i+1))]:-}"
+  fi
 done
-case "${GH_MODE:-}" in
-  fail_pending) [[ "$state" != pending ]] || exit 1 ;;
-  fail_success) [[ "$state" != success ]] || exit 1 ;;
-  fail_failure) [[ "$state" != failure ]] || exit 1 ;;
-esac
-printf '%s\n' "$state" >> "$GH_ACCEPTED_LOG"
+joined="$*"
+if [[ -n "$state" ]]; then
+  case "${GH_MODE:-}" in
+    fail_pending) [[ "$state" != pending ]] || exit 1 ;;
+    fail_success) [[ "$state" != success ]] || exit 1 ;;
+    fail_failure) [[ "$state" != failure ]] || exit 1 ;;
+  esac
+  printf '%s\n' "$state" >> "$GH_ACCEPTED_LOG"
+  exit 0
+fi
+if [[ "$joined" == *git/ref/heads/develop* ]]; then
+  if [[ "$jq_expr" == ".object.sha" ]]; then
+    printf '%s\n' "$FAKE_DEVELOP"
+    exit 0
+  fi
+  printf '{"object":{"sha":"%s"}}\n' "$FAKE_DEVELOP"
+  exit 0
+fi
+if [[ "$joined" == *compare/main...* ]]; then
+  case "${GH_MODE:-}" in
+    fail_compare) exit 1 ;;
+    malformed_compare) printf '{\n'; exit 0 ;;
+  esac
+  if [[ "${FAKE_ANCESTRY:-}" == fail ]]; then
+    printf '{"status":"diverged","ahead_by":1,"behind_by":1}\n'
+    exit 0
+  fi
+  printf '{"status":"ahead","ahead_by":1,"behind_by":0}\n'
+  exit 0
+fi
+echo "unexpected gh invocation: $*" >&2
+exit 2
 `)
 			log := filepath.Join(t.TempDir(), "accepted-status.log")
+			runnerTemp := t.TempDir()
 			env := append(os.Environ(),
 				"PATH="+bin+":"+os.Getenv("PATH"),
 				"EVENT_SHA="+event,
@@ -2098,6 +2245,7 @@ printf '%s\n' "$state" >> "$GH_ACCEPTED_LOG"
 				"GH_MODE="+tc.ghMode,
 				"GH_ACCEPTED_LOG="+log,
 				"GITHUB_REPOSITORY=owner/repo",
+				"RUNNER_TEMP="+runnerTemp,
 			)
 			pendingErr := runWorkflowBlock(t, pending, env)
 			freshRan := false

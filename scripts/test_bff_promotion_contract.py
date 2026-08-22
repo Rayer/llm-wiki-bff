@@ -297,6 +297,152 @@ class BFFPromotionContractTest(unittest.TestCase):
             "--recognized-revision", REVISION,
         ], capture_output=True, text=True)
 
+    def invoke_canonical_ci_run(self, runs, **extra):
+        path = self.root / "ci-runs.json"
+        output = self.root / "ci-run-id.txt"
+        if isinstance(runs, str):
+            path.write_text(runs)
+        else:
+            path.write_text(json.dumps(runs))
+        command = [
+            "python3", str(SCRIPT), "validate-canonical-ci-run",
+            "--runs-json", str(path),
+            "--expected-sha", extra.pop("expected_sha", SHA),
+            "--expected-path", extra.pop("expected_path", ".github/workflows/ci.yml"),
+            "--expected-event", extra.pop("expected_event", "push"),
+            "--expected-ref", extra.pop("expected_ref", "develop"),
+            "--output", str(output),
+        ]
+        result = subprocess.run(command, capture_output=True, text=True)
+        return result, output
+
+    def invoke_canonical_ci_jobs(self, jobs, **extra):
+        path = self.root / "ci-jobs.json"
+        path.write_text(json.dumps(jobs) if not isinstance(jobs, str) else jobs)
+        return subprocess.run([
+            "python3", str(SCRIPT), "validate-canonical-ci-jobs",
+            "--jobs-json", str(path),
+            "--expected-run-id", str(extra.get("expected_run_id", RUN_ID)),
+            "--required-job", extra.get("required_job", "test"),
+        ], capture_output=True, text=True)
+
+    def invoke_fast_forward_compare(self, document):
+        path = self.root / "compare.json"
+        if isinstance(document, str):
+            path.write_text(document)
+        else:
+            path.write_text(json.dumps(document))
+        return subprocess.run([
+            "python3", str(SCRIPT), "validate-fast-forward-compare",
+            "--compare-json", str(path),
+        ], capture_output=True, text=True)
+
+    def canonical_ci_run(self, **overrides):
+        run = {
+            "id": RUN_ID,
+            "path": ".github/workflows/ci.yml",
+            "event": "push",
+            "head_branch": "develop",
+            "head_sha": SHA,
+            "status": "completed",
+            "conclusion": "success",
+        }
+        run.update(overrides)
+        return run
+
+    def test_canonical_ci_run_accepts_exact_identity(self):
+        result, output = self.invoke_canonical_ci_run([self.canonical_ci_run()])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(output.read_text(), f"{RUN_ID}\n")
+
+    def test_canonical_ci_run_rejects_wrong_path_event_ref_sha(self):
+        cases = {
+            "path": self.canonical_ci_run(path=".github/workflows/deploy-bff.yml"),
+            "event": self.canonical_ci_run(event="pull_request"),
+            "ref": self.canonical_ci_run(head_branch="main"),
+            "sha": self.canonical_ci_run(head_sha="d" * 40),
+            "dispatch": self.canonical_ci_run(event="workflow_dispatch"),
+        }
+        for name, run in cases.items():
+            with self.subTest(name=name):
+                result, output = self.invoke_canonical_ci_run([run])
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(output.exists())
+
+    def test_canonical_ci_run_rejects_latest_green_failed_skipped_and_duplicates(self):
+        latest_green = self.canonical_ci_run(id=999, head_sha="e" * 40)
+        failed = self.canonical_ci_run(conclusion="failure")
+        skipped = self.canonical_ci_run(conclusion="skipped")
+        incomplete = self.canonical_ci_run(status="in_progress", conclusion=None)
+        duplicate = [self.canonical_ci_run(), self.canonical_ci_run(id=RUN_ID + 1)]
+        cases = {
+            "latest green": [latest_green],
+            "failed": [failed],
+            "skipped": [skipped],
+            "incomplete": [incomplete],
+            "duplicate success": duplicate,
+            "empty": [],
+        }
+        for name, runs in cases.items():
+            with self.subTest(name=name):
+                result, output = self.invoke_canonical_ci_run(runs)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(output.exists())
+
+    def test_canonical_ci_run_accepts_successful_rerun_after_failed_attempt(self):
+        failed = self.canonical_ci_run(id=RUN_ID + 1, conclusion="failure")
+        result, output = self.invoke_canonical_ci_run([failed, self.canonical_ci_run()])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(output.read_text(), f"{RUN_ID}\n")
+
+    def test_canonical_ci_run_rejects_cli_identity_mismatch(self):
+        result, output = self.invoke_canonical_ci_run(
+            [self.canonical_ci_run()], expected_event="pull_request")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(output.exists())
+
+    def test_canonical_ci_jobs_require_unique_successful_test_job(self):
+        jobs = [{"name": "test", "run_id": RUN_ID, "status": "completed", "conclusion": "success"}]
+        self.assertEqual(self.invoke_canonical_ci_jobs(jobs).returncode, 0)
+        cases = {
+            "missing": [],
+            "skipped": [{**jobs[0], "conclusion": "skipped"}],
+            "failed": [{**jobs[0], "conclusion": "failure"}],
+            "incomplete": [{**jobs[0], "status": "in_progress", "conclusion": None}],
+            "duplicate": jobs + jobs,
+            "wrong run": [{**jobs[0], "run_id": RUN_ID + 1}],
+            "wrong name": [{**jobs[0], "name": "lint"}],
+        }
+        for name, value in cases.items():
+            with self.subTest(name=name):
+                self.assertNotEqual(self.invoke_canonical_ci_jobs(value).returncode, 0)
+
+    def test_fast_forward_compare_accepts_ahead_and_identical(self):
+        self.assertEqual(self.invoke_fast_forward_compare({"status": "ahead", "ahead_by": 3, "behind_by": 0}).returncode, 0)
+        self.assertEqual(self.invoke_fast_forward_compare({"status": "identical", "ahead_by": 0, "behind_by": 0}).returncode, 0)
+
+    def test_fast_forward_compare_rejects_non_ancestor_and_malformed(self):
+        cases = {
+            "behind": {"status": "behind", "ahead_by": 0, "behind_by": 2},
+            "diverged": {"status": "diverged", "ahead_by": 1, "behind_by": 1},
+            "ahead behind": {"status": "ahead", "ahead_by": 1, "behind_by": 1},
+            "identical ahead": {"status": "identical", "ahead_by": 2, "behind_by": 0},
+            "ahead zero": {"status": "ahead", "ahead_by": 0, "behind_by": 0},
+            "bool behind": {"status": "ahead", "ahead_by": 1, "behind_by": False},
+            "string behind": {"status": "ahead", "ahead_by": 1, "behind_by": "0"},
+            "missing": {"status": "ahead", "ahead_by": 1},
+            "array": [],
+        }
+        for name, document in cases.items():
+            with self.subTest(name=name):
+                self.assertNotEqual(self.invoke_fast_forward_compare(document).returncode, 0)
+        malformed = self.root / "malformed-compare.json"
+        malformed.write_text("{")
+        self.assertNotEqual(self.invoke_fast_forward_compare("{").returncode, 0)
+        duplicate = '{"status":"ahead","ahead_by":1,"behind_by":0,"status":"ahead"}'
+        self.assertNotEqual(self.invoke_fast_forward_compare(duplicate).returncode, 0)
+        self.assertNotEqual(self.invoke_fast_forward_compare('{"status":"ahead","ahead_by":1,"behind_by":NaN}').returncode, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

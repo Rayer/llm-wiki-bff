@@ -43,13 +43,9 @@ func TestDeployBFFWorkflowUsesOnlyImmutableStageConfig(t *testing.T) {
 			t.Fatalf("artifact gate missing %q", required)
 		}
 	}
-	tests := strings.Index(workflow, "- name: Run Go tests")
-	if tests < 0 || tests >= gate {
-		t.Fatal("Run Go tests step is missing or out of order")
-	}
-	testsBlock := workflow[tests:gate]
-	if !strings.Contains(testsBlock, "QUERY_STAGE_CONFIG_PATH: \"\"") {
-		t.Fatal("Run Go tests step must clear deployment query stage config path")
+	ci := strings.Index(workflow, "- name: Require exact canonical CI evidence")
+	if ci < 0 || ci >= gate {
+		t.Fatal("canonical CI evidence step is missing or out of order")
 	}
 
 	deploy := strings.Index(workflow, "gcloud run deploy")

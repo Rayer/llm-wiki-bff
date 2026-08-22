@@ -18,6 +18,10 @@ REQUIRED_RUN_JOBS = (
     "production-promotion-ready",
     "main-fast-forward-eligible",
 )
+CANONICAL_CI_PATH = ".github/workflows/ci.yml"
+CANONICAL_CI_EVENT = "push"
+CANONICAL_CI_REF = "develop"
+CANONICAL_CI_JOB = "test"
 RECEIPT_KEYS = (
     "receipt_schema_version",
     "component",
@@ -115,6 +119,93 @@ def validate_run_jobs(args):
             reject(f"{name} job belongs to a different run")
         if job.get("status") != "completed" or job.get("conclusion") != "success":
             reject(f"{name} job did not conclude successfully")
+
+
+def _positive_int(value, message):
+    if type(value) is not int or value <= 0:
+        reject(message)
+    return value
+
+
+def _non_negative_int(value, message):
+    if type(value) is not int or value < 0:
+        reject(message)
+    return value
+
+
+def validate_canonical_ci_run(args):
+    if args.expected_path != CANONICAL_CI_PATH:
+        reject("canonical CI workflow path is not accepted")
+    if args.expected_event != CANONICAL_CI_EVENT:
+        reject("canonical CI event is not accepted")
+    if args.expected_ref != CANONICAL_CI_REF:
+        reject("canonical CI ref is not accepted")
+    if not SHA_RE.fullmatch(args.expected_sha):
+        reject("canonical CI SHA is invalid")
+    runs = read_json(args.runs_json)
+    if not isinstance(runs, list):
+        reject("canonical CI runs evidence must be an array")
+    successful = []
+    for run in runs:
+        if not isinstance(run, dict):
+            reject("canonical CI run evidence is malformed")
+        if (
+            run.get("path") != args.expected_path
+            or run.get("event") != args.expected_event
+            or run.get("head_branch") != args.expected_ref
+            or run.get("head_sha") != args.expected_sha
+        ):
+            continue
+        if run.get("status") == "completed" and run.get("conclusion") == "success":
+            successful.append(run)
+    if len(successful) != 1:
+        reject("canonical CI must contain exactly one successful matching run")
+    run_id = _positive_int(successful[0].get("id"), "canonical CI run ID is invalid")
+    destination = Path(args.output)
+    if destination.exists():
+        reject("canonical CI run ID output already exists")
+    try:
+        destination.write_text(f"{run_id}\n", encoding="ascii")
+    except OSError as error:
+        reject(f"output is unwritable: {error.__class__.__name__}")
+
+
+def validate_canonical_ci_jobs(args):
+    if args.required_job != CANONICAL_CI_JOB:
+        reject("canonical CI required job is not accepted")
+    jobs = read_json(args.jobs_json)
+    if not isinstance(jobs, list):
+        reject("canonical CI jobs evidence must be an array")
+    matches = []
+    for job in jobs:
+        if not isinstance(job, dict):
+            reject("canonical CI job evidence is malformed")
+        if job.get("name") == args.required_job:
+            matches.append(job)
+    if len(matches) != 1:
+        reject(f"canonical CI must contain exactly one {args.required_job} job")
+    job = matches[0]
+    if job.get("run_id") != args.expected_run_id:
+        reject("canonical CI job belongs to a different run")
+    if job.get("status") != "completed" or job.get("conclusion") != "success":
+        reject(f"{args.required_job} job did not conclude successfully")
+
+
+def validate_fast_forward_compare(args):
+    compare = read_json(args.compare_json)
+    if not isinstance(compare, dict):
+        reject("compare evidence must be an object")
+    status = compare.get("status")
+    if status not in ("ahead", "identical"):
+        reject("candidate is not a fast-forward of main")
+    behind = compare.get("behind_by")
+    if type(behind) is not int or behind != 0:
+        reject("candidate is behind main or compare evidence is malformed")
+    ahead = _non_negative_int(compare.get("ahead_by"), "compare ahead_by is malformed")
+    if status == "identical" and ahead != 0:
+        reject("identical compare must not be ahead")
+    if status == "ahead" and ahead < 1:
+        reject("ahead compare must have commits")
 
 
 def validate_dev_receipt(args):
@@ -352,6 +443,19 @@ def parser():
     jobs = subparsers.add_parser("validate-run-jobs")
     jobs.add_argument("--jobs-json", required=True)
     jobs.add_argument("--expected-run-id", required=True, type=int)
+    ci_run = subparsers.add_parser("validate-canonical-ci-run")
+    ci_run.add_argument("--runs-json", required=True)
+    ci_run.add_argument("--expected-sha", required=True)
+    ci_run.add_argument("--expected-path", required=True)
+    ci_run.add_argument("--expected-event", required=True)
+    ci_run.add_argument("--expected-ref", required=True)
+    ci_run.add_argument("--output", required=True)
+    ci_jobs = subparsers.add_parser("validate-canonical-ci-jobs")
+    ci_jobs.add_argument("--jobs-json", required=True)
+    ci_jobs.add_argument("--expected-run-id", required=True, type=int)
+    ci_jobs.add_argument("--required-job", required=True)
+    compare = subparsers.add_parser("validate-fast-forward-compare")
+    compare.add_argument("--compare-json", required=True)
     return parser
 
 
@@ -370,6 +474,14 @@ def main(argv=None):
             if args.expected_run_id <= 0:
                 reject("expected DEV run ID is invalid")
             validate_run_jobs(args)
+        elif args.mode == "validate-canonical-ci-run":
+            validate_canonical_ci_run(args)
+        elif args.mode == "validate-canonical-ci-jobs":
+            if args.expected_run_id <= 0:
+                reject("expected canonical CI run ID is invalid")
+            validate_canonical_ci_jobs(args)
+        elif args.mode == "validate-fast-forward-compare":
+            validate_fast_forward_compare(args)
         else:
             if args.traffic_mode == "provider-dev-convergence" and not args.compare_path:
                 reject("DEV convergence validation requires a comparison path")
