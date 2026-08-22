@@ -1,8 +1,6 @@
 name: Deploy OLW worker to Cloud Run (dev)
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
     inputs:
       commit_sha:
@@ -25,7 +23,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.commit_sha || github.sha }}
+          ref: ${{ inputs.commit_sha }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -39,30 +37,23 @@ jobs:
           GITHUB_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
-            if [[ "$REF" != "refs/heads/develop" || "$REF_NAME" != "develop" ]]; then
-              echo "manual deployment must use the canonical develop branch"
-              exit 1
-            fi
-            if [[ ! "$COMMIT_SHA" =~ ^[0-9a-f]{40}$ ]]; then
-              echo "malformed commit_sha: must be a 40-character lowercase commit SHA"
-              exit 1
-            fi
-            CANDIDATE_SHA="$COMMIT_SHA"
-            git fetch origin develop --force --no-tags
-            REMOTE_DEVELOP_SHA=$(git rev-parse origin/develop)
-            if [[ "$CANDIDATE_SHA" != "$REMOTE_DEVELOP_SHA" ]]; then
-              echo "input commit SHA does not match current origin/develop"
-              exit 1
-            fi
-          elif [[ "$EVENT_NAME" == "push" ]]; then
-            if [[ ! "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]; then
-              echo "github.sha must be a 40-character lowercase commit SHA"
-              exit 1
-            fi
-            CANDIDATE_SHA="$GITHUB_SHA"
-          else
+          if [[ "$EVENT_NAME" != "workflow_dispatch" ]]; then
             echo "unsupported deployment event: $EVENT_NAME"
+            exit 1
+          fi
+          if [[ "$REF" != "refs/heads/develop" || "$REF_NAME" != "develop" ]]; then
+            echo "manual deployment must use the canonical develop branch"
+            exit 1
+          fi
+          if [[ ! "$COMMIT_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "malformed commit_sha: must be a 40-character lowercase commit SHA"
+            exit 1
+          fi
+          CANDIDATE_SHA="$COMMIT_SHA"
+          git fetch origin develop --force --no-tags
+          REMOTE_DEVELOP_SHA=$(git rev-parse origin/develop)
+          if [[ "$CANDIDATE_SHA" != "$REMOTE_DEVELOP_SHA" ]]; then
+            echo "input commit SHA does not match current origin/develop"
             exit 1
           fi
           CHECKED_OUT_SHA=$(git rev-parse HEAD)
@@ -180,7 +171,7 @@ jobs:
             exit 1
           fi
           case "${GITHUB_REF_NAME}" in
-            develop|main) SOURCE_BRANCH="${GITHUB_REF_NAME}" ;;
+            develop) SOURCE_BRANCH="develop" ;;
             *) echo "unsupported source branch: ${GITHUB_REF_NAME}"; exit 1 ;;
           esac
           git fetch --no-tags origin "${SOURCE_BRANCH}"

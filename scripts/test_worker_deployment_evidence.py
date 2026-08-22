@@ -81,8 +81,8 @@ class WorkerDeploymentEvidenceTest(unittest.TestCase):
             "source": {"commit_sha": "c" * 40, "ref": "refs/heads/main"},
             "dev_provenance": {
                 "workflow": "deploy-worker.yml",
-                "event": "push",
-                "head_branch": "main",
+                "event": "workflow_dispatch",
+                "head_branch": "develop",
                 "head_sha": "c" * 40,
                 "conclusion": "success",
                 "run_id": 123,
@@ -255,6 +255,7 @@ class WorkerDeploymentEvidenceTest(unittest.TestCase):
             "unsupported component": lambda m: m.update(component="other-worker"),
             "unsupported environment": lambda m: m.update(environment="staging"),
             "unsupported action": lambda m: m.update(action="rollback"),
+            "main-push provenance event": lambda m: m["dev_provenance"].update(event="push", head_branch="main"),
             "caller-supplied verification timestamp": lambda m: m.update(
                 provider_verification={"result": "verified", "checked_at": "1970-01-01T00:00:00Z"}
             ),

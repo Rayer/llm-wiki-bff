@@ -475,9 +475,9 @@ def validate_metadata(metadata, args):
         reject("source ref is invalid")
 
     provenance = metadata_value(metadata, "dev_provenance")
-    if provenance.get("workflow") != "deploy-worker.yml" or provenance.get("event") != "push":
+    if provenance.get("workflow") != "deploy-worker.yml" or provenance.get("event") != "workflow_dispatch":
         reject("dev provenance workflow or event is invalid")
-    if provenance.get("head_branch") != "main" or provenance.get("head_sha") != commit_sha:
+    if provenance.get("head_branch") != "develop" or provenance.get("head_sha") != commit_sha:
         reject("dev provenance does not match the source commit")
     if provenance.get("conclusion") != "success":
         reject("dev provenance run was not successful")

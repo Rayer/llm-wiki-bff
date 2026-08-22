@@ -156,8 +156,8 @@ func TestWorkerDevWorkflowBindsManualDispatchToExactCanonicalDevelopSHA(t *testi
 	if err := yaml.Unmarshal([]byte(contents), &workflow); err != nil {
 		t.Fatalf("deploy workflow is not valid YAML: %v", err)
 	}
-	if got, want := strings.Join(workflow.On.Push.Branches, ","), "main"; got != want {
-		t.Fatalf("automatic push branches = %q, want %q", got, want)
+	if len(workflow.On.Push.Branches) != 0 {
+		t.Fatalf("automatic push branches = %q, want none", strings.Join(workflow.On.Push.Branches, ","))
 	}
 	commitInput, ok := workflow.On.WorkflowDispatch.Inputs["commit_sha"]
 	if !ok || !commitInput.Required || commitInput.Type != "string" {
@@ -166,7 +166,7 @@ func TestWorkerDevWorkflowBindsManualDispatchToExactCanonicalDevelopSHA(t *testi
 
 	checkout := workflowSection(t, contents, "      - uses: actions/checkout@v4", "      - name: Set up Go")
 	for _, want := range []string{
-		"ref: ${{ github.event_name == 'workflow_dispatch' && inputs.commit_sha || github.sha }}",
+		"ref: ${{ inputs.commit_sha }}",
 		"fetch-depth: 0",
 		"persist-credentials: false",
 	} {
@@ -177,7 +177,7 @@ func TestWorkerDevWorkflowBindsManualDispatchToExactCanonicalDevelopSHA(t *testi
 
 	source := workflowSection(t, contents, "      - name: Validate deployment source", "      - name: Set up Go")
 	for _, want := range []string{
-		`if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then`,
+		`if [[ "$EVENT_NAME" != "workflow_dispatch" ]]; then`,
 		`"$REF" != "refs/heads/develop"`,
 		`"$REF_NAME" != "develop"`,
 		`^[0-9a-f]{40}$`,
@@ -187,8 +187,7 @@ func TestWorkerDevWorkflowBindsManualDispatchToExactCanonicalDevelopSHA(t *testi
 		"git rev-parse origin/develop",
 		`input commit SHA does not match checked-out HEAD`,
 		`input commit SHA does not match current origin/develop`,
-		`"$EVENT_NAME" == "push"`,
-		`"$GITHUB_SHA"`,
+		`unsupported deployment event`,
 	} {
 		if !strings.Contains(source, want) {
 			t.Errorf("source validation is missing %q", want)
@@ -199,10 +198,13 @@ func TestWorkerDevWorkflowBindsManualDispatchToExactCanonicalDevelopSHA(t *testi
 		t.Fatal("worker workflow is missing the runtime update step")
 	}
 	runtime := contents[runtimeAt:]
-	for _, want := range []string{`case "${GITHUB_REF_NAME}" in`, "develop|main)"} {
+	for _, want := range []string{`case "${GITHUB_REF_NAME}" in`, `develop) SOURCE_BRANCH="develop"`} {
 		if !strings.Contains(runtime, want) {
-			t.Errorf("worker runtime is missing push branch contract %q", want)
+			t.Errorf("worker runtime is missing develop-only branch contract %q", want)
 		}
+	}
+	if strings.Contains(runtime, "develop|main)") {
+		t.Fatal("worker runtime must not accept main as a DEV source")
 	}
 
 	sourceAt := strings.Index(contents, "      - name: Validate deployment source")
