@@ -14,6 +14,11 @@ import (
 
 type runtimeConfigIdentityContextKey struct{}
 
+const (
+	ModelPriorFallbackPolicy = "full-model-prior-fallback-v1"
+	ModelPriorPromptID       = "full-model-prior-v1"
+)
+
 func WithRuntimeConfigIdentity(ctx context.Context, identity RuntimeConfigIdentity) context.Context {
 	return context.WithValue(ctx, runtimeConfigIdentityContextKey{}, identity)
 }
@@ -43,6 +48,9 @@ type Result struct {
 	Citations             []search.Citation
 	Status                string
 	Reason                string
+	AnswerBasis           string                 `json:"answer_basis,omitempty"`
+	WikiEvidenceStatus    string                 `json:"wiki_evidence_status,omitempty"`
+	DisclosureRequired    bool                   `json:"disclosure_required,omitempty"`
 	RuntimeConfigIdentity *RuntimeConfigIdentity `json:"-"`
 }
 
@@ -79,6 +87,7 @@ type RuntimeConfigIdentity struct {
 	ExpansionAttempts          int     `json:"expansion_attempts"`
 	RareDocumentFrequency      int     `json:"rare_document_frequency"`
 	SynthesisProvider          string  `json:"synthesis_provider"`
+	NoEvidencePolicy           string  `json:"no_evidence_policy"`
 }
 
 // RuntimeConfigReadback is the sanitized global identity of a sealed runtime.
@@ -100,6 +109,7 @@ type RuntimeConfigReadback struct {
 	SynthesisModel                  string              `json:"synthesis_model"`
 	SynthesisReasoning              string              `json:"synthesis_reasoning"`
 	SynthesisTemperature            float64             `json:"synthesis_temperature"`
+	NoEvidencePolicy                string              `json:"no_evidence_policy"`
 	Options                         RuntimeQueryOptions `json:"options"`
 	BindingCount                    int                 `json:"binding_count"`
 	DistinctServiceCompositionCount int                 `json:"distinct_service_composition_count"`
@@ -211,7 +221,35 @@ func (s *Service) SynthesizeWithError(ctx context.Context, reader cache.Reader, 
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return response, ctxErr
 	}
-	if s.llm == nil || len(response.Results) == 0 {
+	identity, _ := RuntimeConfigIdentityFromContext(ctx)
+	modelPrior := request.Mode == "full" && response.Status == "insufficient_evidence" && response.Reason == "no_qualified_evidence" && identity.NoEvidencePolicy == ModelPriorFallbackPolicy
+	if s.llm == nil || (len(response.Results) == 0 && !modelPrior) {
+		return response, nil
+	}
+	if modelPrior {
+		synthesisCtx := ctx
+		if recorder := ReceiptRecorderFromContext(ctx); recorder != nil {
+			synthesisCtx = recorder.StartStage(ctx, "answer_synthesis_model_prior", "deepseek", s.llm.Model(), string(s.llm.Reasoning()))
+		}
+		answer, err := s.llm.Chat(synthesisCtx, buildModelPriorSystemPrompt(), buildModelPriorUserPrompt(request.Query))
+		if err != nil {
+			FinishStage(synthesisCtx, "failure")
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return response, ctxErr
+			}
+			return response, errors.New("model-prior synthesis failed")
+		}
+		answer = strings.TrimSpace(search.NeutralizeCitationReferences(answer))
+		if answer == "" {
+			FinishStage(synthesisCtx, "failure")
+			return response, errors.New("model-prior synthesis returned blank content")
+		}
+		FinishStage(synthesisCtx, "success")
+		response.AISynth = answer
+		response.AnswerBasis = "model_prior"
+		response.WikiEvidenceStatus = "no_relevant_evidence"
+		response.DisclosureRequired = true
+		response.Citations = []search.Citation{}
 		return response, nil
 	}
 
@@ -328,6 +366,14 @@ func buildUserPrompt(query string, contexts []string) string {
 		builder.WriteString(ctx)
 	}
 	return builder.String()
+}
+
+func buildModelPriorSystemPrompt() string {
+	return "Prompt contract: " + ModelPriorPromptID + ". You are a knowledgeable assistant answering from general model knowledge. No Wiki content or Wiki evidence is available. Answer the user's question directly and cautiously. Do not claim or imply that any statement is supported by a Wiki, and do not provide citations or citation-like references."
+}
+
+func buildModelPriorUserPrompt(query string) string {
+	return "User question: " + search.NeutralizeCitationReferences(query)
 }
 
 func min(a, b int) int {

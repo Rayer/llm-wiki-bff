@@ -1,6 +1,6 @@
 {
   "metadata": {
-    "name": "llm-wiki-bff-00002-new",
+    "name": "llm-wiki-bff-00001-old",
     "annotations": {
       "run.googleapis.com/vpc-access-egress": "private-ranges-only",
       "run.googleapis.com/network-interfaces": "[{\"network\":\"default\",\"subnetwork\":\"default\"}]"
@@ -10,7 +10,7 @@
     "serviceAccountName": "lwc-bff-prod@llm-wiki-cloud.iam.gserviceaccount.com",
     "containers": [
       {
-        "image": "asia-east1-docker.pkg.dev/llm-wiki-cloud/cloud-run-images/llm-wiki-bff@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "image": "asia-east1-docker.pkg.dev/llm-wiki-cloud/cloud-run-images/llm-wiki-bff@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "env": [
           {"name": "GCP_PROJECT", "value": "llm-wiki-cloud"},
           {"name": "BUCKET", "value": "llm-wiki-data"},
@@ -18,7 +18,7 @@
           {"name": "PIPELINE_JOB_URL", "value": "https://run.googleapis.com/v2/projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline:run"},
           {"name": "ALLOWED_ORIGINS", "value": "https://wiki.rayer.idv.tw,https://llm-wiki-frontend.vercel.app"},
           {"name": "DEV_JWT", "value": "false"},
-          {"name": "QUERY_STAGE_CONFIG_PATH", "value": "/app/configs/query/dev/query-dev-2026-08-22.1.json"},
+          {"name": "QUERY_STAGE_CONFIG_PATH", "value": "/app/configs/query/dev/query-dev-2026-08-21.2.json"},
           {"name": "JWT_SECRET", "valueFrom": {"secretKeyRef": {"name": "jwt-secret-prod", "key": "latest"}}},
           {"name": "DEEPSEEK_API_KEY", "valueFrom": {"secretKeyRef": {"name": "deepseek-apikey", "key": "latest"}}},
           {"name": "USER_ID", "value": "test-user"},
@@ -28,6 +28,6 @@
     ]
   },
   "status": {
-    "imageDigest": "asia-east1-docker.pkg.dev/llm-wiki-cloud/cloud-run-images/llm-wiki-bff@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    "imageDigest": "asia-east1-docker.pkg.dev/llm-wiki-cloud/cloud-run-images/llm-wiki-bff@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
   }
 }

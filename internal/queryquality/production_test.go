@@ -2,13 +2,47 @@ package queryquality_test
 
 import (
 	"context"
+	"io"
+	"net/http"
+	"strings"
 	"sync"
 	"testing"
 
 	"github.com/rayer/llm-wiki-bff/internal/cache"
+	"github.com/rayer/llm-wiki-bff/internal/llm"
 	"github.com/rayer/llm-wiki-bff/internal/query"
 	"github.com/rayer/llm-wiki-bff/internal/queryquality"
 )
+
+type noEvidenceSynthesisTransport func(*http.Request) (*http.Response, error)
+
+func (f noEvidenceSynthesisTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	return f(r)
+}
+
+func TestProductionFullNoEvidenceUsesModelPriorFallback(t *testing.T) {
+	previous := http.DefaultTransport
+	http.DefaultTransport = noEvidenceSynthesisTransport(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"choices":[{"message":{"content":"prior answer"}}]}`)), Header: make(http.Header)}, nil
+	})
+	t.Cleanup(func() { http.DefaultTransport = previous })
+
+	synthesizer := query.NewService(cache.New(), nil, llm.NewClient("test"))
+	executor, err := queryquality.NewStrictProductionExecutorWithQueryServiceConfig(
+		cache.New(), nil, nil, synthesizer, queryquality.DefaultRetrievalProfile(), queryquality.StructuredPlanPromptID, queryquality.DefaultOptions(), query.RuntimeConfigIdentity{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := query.WithRuntimeConfigIdentity(context.Background(), query.RuntimeConfigIdentity{NoEvidencePolicy: query.ModelPriorFallbackPolicy})
+	result, err := executor.Execute(ctx, &jsonlReader{data: []byte(`{"slug":"unrelated","title":"Unrelated","body":"unrelated"}` + "\n")}, query.Request{Query: "missing", Mode: "full"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Results) != 0 || result.Status != "insufficient_evidence" || result.Reason != "no_qualified_evidence" || result.AISynth != "prior answer" {
+		t.Fatalf("result=%#v, want zero results with non-empty model-prior synthesis", result)
+	}
+}
 
 type countingProvider struct {
 	mu     sync.Mutex

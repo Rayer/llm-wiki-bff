@@ -1265,7 +1265,7 @@ const docTemplate = `{
                         "ProjectHeader": []
                     }
                 ],
-                "description": "Full-text search across sources and concepts. Mode \"wiki\" returns raw results, \"full\" adds AI-synthesized answer.",
+                "description": "Full-text search across sources and concepts. Mode \"wiki\" returns raw results, \"full\" adds AI-synthesized answer. Model-prior full responses with insufficient_evidence/no_qualified_evidence include citations:[] and the model-prior evidence metadata; legacy nil citations remain omitted.",
                 "consumes": [
                     "application/json"
                 ],
@@ -2092,11 +2092,17 @@ const docTemplate = `{
                 "ai_synth": {
                     "type": "string"
                 },
+                "answer_basis": {
+                    "type": "string"
+                },
                 "citations": {
                     "type": "array",
                     "items": {
                         "$ref": "#/definitions/search.Citation"
                     }
+                },
+                "disclosure_required": {
+                    "type": "boolean"
                 },
                 "expand": {
                     "$ref": "#/definitions/llm.ExpandResult"
@@ -2107,11 +2113,20 @@ const docTemplate = `{
                 "query": {
                     "type": "string"
                 },
+                "reason": {
+                    "type": "string"
+                },
                 "results": {
                     "type": "array",
                     "items": {
                         "$ref": "#/definitions/search.Result"
                     }
+                },
+                "status": {
+                    "type": "string"
+                },
+                "wiki_evidence_status": {
+                    "type": "string"
                 }
             }
         },
