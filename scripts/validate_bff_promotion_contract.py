@@ -250,6 +250,25 @@ def normalize_actions_page(args):
         reject(f"output is unwritable: {error.__class__.__name__}")
 
 
+def extract_git_ref_sha(args):
+    ref = read_json(args.ref_json)
+    if not isinstance(ref, dict):
+        reject("git ref evidence must be an object")
+    obj = ref.get("object")
+    if not isinstance(obj, dict):
+        reject("git ref object is malformed")
+    sha = obj.get("sha")
+    if not isinstance(sha, str) or not SHA_RE.fullmatch(sha):
+        reject("git ref SHA is invalid")
+    destination = Path(args.output)
+    if destination.exists():
+        reject("git ref SHA output already exists")
+    try:
+        destination.write_text(sha + "\n", encoding="ascii")
+    except OSError as error:
+        reject(f"output is unwritable: {error.__class__.__name__}")
+
+
 def validate_fast_forward_compare(args):
     compare = read_json(args.compare_json)
     if not isinstance(compare, dict):
@@ -546,6 +565,9 @@ def parser():
     page.add_argument("--metadata-output", required=True)
     compare = subparsers.add_parser("validate-fast-forward-compare")
     compare.add_argument("--compare-json", required=True)
+    git_ref = subparsers.add_parser("extract-git-ref-sha")
+    git_ref.add_argument("--ref-json", required=True)
+    git_ref.add_argument("--output", required=True)
     return parser
 
 
@@ -586,6 +608,8 @@ def main(argv=None):
             normalize_actions_page(args)
         elif args.mode == "validate-fast-forward-compare":
             validate_fast_forward_compare(args)
+        elif args.mode == "extract-git-ref-sha":
+            extract_git_ref_sha(args)
         else:
             if args.traffic_mode == "provider-dev-convergence" and not args.compare_path:
                 reject("DEV convergence validation requires a comparison path")

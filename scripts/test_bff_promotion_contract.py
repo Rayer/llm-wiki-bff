@@ -530,6 +530,43 @@ class BFFPromotionContractTest(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertNotEqual(self.invoke_canonical_ci_attempt(run).returncode, 0)
 
+    def invoke_extract_git_ref_sha(self, document):
+        path = self.root / "git-ref.json"
+        output = self.root / "git-ref.sha"
+        if isinstance(document, str):
+            path.write_text(document)
+        else:
+            path.write_text(json.dumps(document))
+        result = subprocess.run([
+            "python3", str(SCRIPT), "extract-git-ref-sha",
+            "--ref-json", str(path),
+            "--output", str(output),
+        ], capture_output=True, text=True)
+        return result, output
+
+    def test_extract_git_ref_sha_accepts_unique_object(self):
+        result, output = self.invoke_extract_git_ref_sha({
+            "ref": "refs/heads/develop",
+            "object": {"sha": SHA, "type": "commit"},
+        })
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(output.read_text(), SHA + "\n")
+
+    def test_extract_git_ref_sha_rejects_duplicate_malformed_and_trailing(self):
+        cases = {
+            "duplicate sha": '{"object":{"type":"commit","sha":"%s","sha":"%s"}}' % ("d" * 40, SHA),
+            "duplicate object": '{"object":{"sha":"%s"},"object":{"sha":"%s"}}' % ("d" * 40, SHA),
+            "trailing": '{"object":{"sha":"%s"}} {}' % SHA,
+            "nonfinite": '{"object":{"sha":NaN}}',
+            "missing": {"ref": "refs/heads/develop"},
+            "array": [],
+        }
+        for name, document in cases.items():
+            with self.subTest(name=name):
+                result, output = self.invoke_extract_git_ref_sha(document)
+                self.assertNotEqual(result.returncode, 0, result.stderr)
+                self.assertFalse(output.exists())
+
     def test_fast_forward_compare_accepts_ahead_and_identical(self):
         self.assertEqual(self.invoke_fast_forward_compare({"status": "ahead", "ahead_by": 3, "behind_by": 0}).returncode, 0)
         self.assertEqual(self.invoke_fast_forward_compare({"status": "identical", "ahead_by": 0, "behind_by": 0}).returncode, 0)

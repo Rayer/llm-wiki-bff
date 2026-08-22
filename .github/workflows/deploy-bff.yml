@@ -515,10 +515,17 @@ jobs:
             exit 1
           fi
 
-          if ! REMOTE_SHA=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${GITHUB_REF_NAME}" --jq .object.sha); then
+          REMOTE_REF_JSON="$RUNNER_TEMP/canonical-remote-ref.json"
+          REMOTE_REF_SHA="$RUNNER_TEMP/canonical-remote-ref.sha"
+          rm -f "$REMOTE_REF_JSON" "$REMOTE_REF_SHA"
+          if ! gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${GITHUB_REF_NAME}" > "$REMOTE_REF_JSON"; then
             echo "Unable to read remote ${GITHUB_REF_NAME}; refusing to deploy."
             exit 1
           fi
+          python3 scripts/validate_bff_promotion_contract.py extract-git-ref-sha \
+            --ref-json "$REMOTE_REF_JSON" \
+            --output "$REMOTE_REF_SHA"
+          REMOTE_SHA=$(tr -d '[:space:]' < "$REMOTE_REF_SHA")
           if [[ ! "$REMOTE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
             echo "Remote ${GITHUB_REF_NAME} returned an invalid commit SHA; refusing to deploy."
             exit 1
@@ -537,11 +544,29 @@ jobs:
             echo "pinned candidate SHA does not match the built commit"
             exit 1
           fi
-          DEVELOP_SHA=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/develop" --jq .object.sha)
+          DEVELOP_REF_JSON="$RUNNER_TEMP/canonical-develop-ref.json"
+          DEVELOP_REF_SHA="$RUNNER_TEMP/canonical-develop-ref.sha"
+          rm -f "$DEVELOP_REF_JSON" "$DEVELOP_REF_SHA"
+          gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/develop" > "$DEVELOP_REF_JSON"
+          python3 scripts/validate_bff_promotion_contract.py extract-git-ref-sha \
+            --ref-json "$DEVELOP_REF_JSON" \
+            --output "$DEVELOP_REF_SHA"
+          DEVELOP_SHA=$(tr -d '[:space:]' < "$DEVELOP_REF_SHA")
           if [[ ! "$DEVELOP_SHA" =~ ^[0-9a-f]{40}$ || "$DEVELOP_SHA" != "$CANDIDATE_SHA" ]]; then
             echo "canonical develop no longer matches the pinned candidate SHA"
             exit 1
           fi
+          CURRENT_RUN_JSON="$RUNNER_TEMP/canonical-ci-current-run.json"
+          rm -f "$CURRENT_RUN_JSON"
+          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${CI_RUN_ID}" > "$CURRENT_RUN_JSON"
+          python3 scripts/validate_bff_promotion_contract.py validate-canonical-ci-attempt \
+            --run-json "$CURRENT_RUN_JSON" \
+            --expected-sha "$CANDIDATE_SHA" \
+            --expected-path ".github/workflows/ci.yml" \
+            --expected-event push \
+            --expected-ref develop \
+            --expected-run-id "$CI_RUN_ID" \
+            --expected-run-attempt "$CI_RUN_ATTEMPT"
           ATTEMPT_JSON="$RUNNER_TEMP/canonical-ci-attempt.json"
           rm -f "$ATTEMPT_JSON"
           gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${CI_RUN_ID}/attempts/${CI_RUN_ATTEMPT}" > "$ATTEMPT_JSON"
@@ -957,8 +982,15 @@ jobs:
             exit 1
           fi
           test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
-          DEVELOP_SHA=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/develop" --jq .object.sha)
-          if [[ "$DEVELOP_SHA" != "$CANDIDATE_SHA" ]]; then
+          DEVELOP_REF_JSON="$RUNNER_TEMP/canonical-develop-ref.json"
+          DEVELOP_REF_SHA="$RUNNER_TEMP/canonical-develop-ref.sha"
+          rm -f "$DEVELOP_REF_JSON" "$DEVELOP_REF_SHA"
+          gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/develop" > "$DEVELOP_REF_JSON"
+          python3 scripts/validate_bff_promotion_contract.py extract-git-ref-sha \
+            --ref-json "$DEVELOP_REF_JSON" \
+            --output "$DEVELOP_REF_SHA"
+          DEVELOP_SHA=$(tr -d '[:space:]' < "$DEVELOP_REF_SHA")
+          if [[ ! "$DEVELOP_SHA" =~ ^[0-9a-f]{40}$ || "$DEVELOP_SHA" != "$CANDIDATE_SHA" ]]; then
             echo "develop advanced before readiness; refusing to certify an older SHA"
             exit 1
           fi
@@ -1080,7 +1112,14 @@ jobs:
             echo "checked-out HEAD does not match the event SHA"
             exit 1
           fi
-          DEVELOP_SHA=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/develop" --jq .object.sha)
+          DEVELOP_REF_JSON="$RUNNER_TEMP/canonical-develop-ref.json"
+          DEVELOP_REF_SHA="$RUNNER_TEMP/canonical-develop-ref.sha"
+          rm -f "$DEVELOP_REF_JSON" "$DEVELOP_REF_SHA"
+          gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/develop" > "$DEVELOP_REF_JSON"
+          python3 scripts/validate_bff_promotion_contract.py extract-git-ref-sha \
+            --ref-json "$DEVELOP_REF_JSON" \
+            --output "$DEVELOP_REF_SHA"
+          DEVELOP_SHA=$(tr -d '[:space:]' < "$DEVELOP_REF_SHA")
           if [[ ! "$DEVELOP_SHA" =~ ^[0-9a-f]{40}$ ]]; then
             echo "canonical develop returned an invalid commit SHA"
             exit 1
@@ -1108,7 +1147,14 @@ jobs:
             echo "checked-out HEAD changed before success publication"
             exit 1
           fi
-          DEVELOP_SHA=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/develop" --jq .object.sha)
+          DEVELOP_REF_JSON="$RUNNER_TEMP/canonical-develop-ref.json"
+          DEVELOP_REF_SHA="$RUNNER_TEMP/canonical-develop-ref.sha"
+          rm -f "$DEVELOP_REF_JSON" "$DEVELOP_REF_SHA"
+          gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/develop" > "$DEVELOP_REF_JSON"
+          python3 scripts/validate_bff_promotion_contract.py extract-git-ref-sha \
+            --ref-json "$DEVELOP_REF_JSON" \
+            --output "$DEVELOP_REF_SHA"
+          DEVELOP_SHA=$(tr -d '[:space:]' < "$DEVELOP_REF_SHA")
           if [[ ! "$DEVELOP_SHA" =~ ^[0-9a-f]{40}$ ]]; then
             echo "canonical develop returned an invalid commit SHA"
             exit 1

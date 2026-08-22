@@ -724,6 +724,7 @@ func TestPreMutationPinnedCanonicalCIRerunCannotDeploy(t *testing.T) {
 	block := "set -euo pipefail\n" + body[begin:end]
 	for _, want := range []string{
 		`gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/develop"`,
+		`gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${CI_RUN_ID}" >`,
 		"actions/runs/${CI_RUN_ID}/attempts/${CI_RUN_ATTEMPT}",
 		"validate-canonical-ci-attempt",
 		"actions/runs/${CI_RUN_ID}/attempts/${CI_RUN_ATTEMPT}/jobs",
@@ -740,51 +741,77 @@ func TestPreMutationPinnedCanonicalCIRerunCannotDeploy(t *testing.T) {
 	}
 
 	const sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-	validRun := `{"id":123,"run_attempt":1,"path":".github/workflows/ci.yml","event":"push","head_branch":"develop","head_sha":"` + sha + `","status":"completed","conclusion":"success"}`
+	validAttempt := `{"id":123,"run_attempt":1,"path":".github/workflows/ci.yml","event":"push","head_branch":"develop","head_sha":"` + sha + `","status":"completed","conclusion":"success"}`
 	validJobs := `{"total_count":1,"jobs":[{"name":"test","run_id":123,"run_attempt":1,"status":"completed","conclusion":"success"}]}`
+	currentInProgress := `{"id":123,"run_attempt":2,"path":".github/workflows/ci.yml","event":"push","head_branch":"develop","head_sha":"` + sha + `","status":"in_progress","conclusion":null}`
+	currentFailed := `{"id":123,"run_attempt":2,"path":".github/workflows/ci.yml","event":"push","head_branch":"develop","head_sha":"` + sha + `","status":"completed","conclusion":"failure"}`
 	tests := []struct {
-		name     string
-		develop  string
-		runJSON  string
-		jobsJSON string
+		name        string
+		develop     string
+		attemptJSON string
+		currentJSON string
+		jobsJSON    string
 	}{
 		{
-			name:     "in-progress attempt",
-			develop:  sha,
-			runJSON:  `{"id":123,"run_attempt":1,"path":".github/workflows/ci.yml","event":"push","head_branch":"develop","head_sha":"` + sha + `","status":"in_progress","conclusion":null}`,
-			jobsJSON: validJobs,
+			name:        "current run in-progress attempt 2",
+			develop:     sha,
+			attemptJSON: validAttempt,
+			currentJSON: currentInProgress,
+			jobsJSON:    validJobs,
 		},
 		{
-			name:     "failed attempt",
-			develop:  sha,
-			runJSON:  `{"id":123,"run_attempt":1,"path":".github/workflows/ci.yml","event":"push","head_branch":"develop","head_sha":"` + sha + `","status":"completed","conclusion":"failure"}`,
-			jobsJSON: validJobs,
+			name:        "current run failed attempt 2",
+			develop:     sha,
+			attemptJSON: validAttempt,
+			currentJSON: currentFailed,
+			jobsJSON:    validJobs,
 		},
 		{
-			name:     "mismatched attempt",
-			develop:  sha,
-			runJSON:  `{"id":123,"run_attempt":2,"path":".github/workflows/ci.yml","event":"push","head_branch":"develop","head_sha":"` + sha + `","status":"completed","conclusion":"success"}`,
-			jobsJSON: validJobs,
+			name:        "in-progress pinned attempt",
+			develop:     sha,
+			attemptJSON: `{"id":123,"run_attempt":1,"path":".github/workflows/ci.yml","event":"push","head_branch":"develop","head_sha":"` + sha + `","status":"in_progress","conclusion":null}`,
+			currentJSON: validAttempt,
+			jobsJSON:    validJobs,
 		},
 		{
-			name:     "changed develop SHA",
-			develop:  "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-			runJSON:  validRun,
-			jobsJSON: validJobs,
+			name:        "failed pinned attempt",
+			develop:     sha,
+			attemptJSON: `{"id":123,"run_attempt":1,"path":".github/workflows/ci.yml","event":"push","head_branch":"develop","head_sha":"` + sha + `","status":"completed","conclusion":"failure"}`,
+			currentJSON: validAttempt,
+			jobsJSON:    validJobs,
 		},
 		{
-			name:     "failed test job",
-			develop:  sha,
-			runJSON:  validRun,
-			jobsJSON: `{"total_count":1,"jobs":[{"name":"test","run_id":123,"run_attempt":1,"status":"completed","conclusion":"failure"}]}`,
+			name:        "changed develop SHA",
+			develop:     "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+			attemptJSON: validAttempt,
+			currentJSON: validAttempt,
+			jobsJSON:    validJobs,
+		},
+		{
+			name:        "failed test job",
+			develop:     sha,
+			attemptJSON: validAttempt,
+			currentJSON: validAttempt,
+			jobsJSON:    `{"total_count":1,"jobs":[{"name":"test","run_id":123,"run_attempt":1,"status":"completed","conclusion":"failure"}]}`,
+		},
+		{
+			name:        "current run duplicate conclusion",
+			develop:     sha,
+			attemptJSON: validAttempt,
+			currentJSON: `{"id":123,"run_attempt":1,"path":".github/workflows/ci.yml","event":"push","head_branch":"develop","head_sha":"` + sha + `","status":"completed","conclusion":"failure","conclusion":"success"}`,
+			jobsJSON:    validJobs,
 		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			bin := t.TempDir()
-			runFile := filepath.Join(t.TempDir(), "run.json")
+			attemptFile := filepath.Join(t.TempDir(), "attempt.json")
+			currentFile := filepath.Join(t.TempDir(), "current.json")
 			jobsFile := filepath.Join(t.TempDir(), "jobs.json")
-			if err := os.WriteFile(runFile, []byte(tc.runJSON), 0o600); err != nil {
+			if err := os.WriteFile(attemptFile, []byte(tc.attemptJSON), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(currentFile, []byte(tc.currentJSON), 0o600); err != nil {
 				t.Fatal(err)
 			}
 			if err := os.WriteFile(jobsFile, []byte(tc.jobsJSON), 0o600); err != nil {
@@ -794,7 +821,11 @@ func TestPreMutationPinnedCanonicalCIRerunCannotDeploy(t *testing.T) {
 set -euo pipefail
 joined="$*"
 if [[ "$joined" == *git/ref/heads/develop* ]]; then
-  printf '%s\n' "$FAKE_DEVELOP"
+  if [[ "$joined" == *"--jq"* ]]; then
+    printf '%s\n' "$FAKE_DEVELOP"
+    exit 0
+  fi
+  printf '{"ref":"refs/heads/develop","object":{"sha":"%s","type":"commit"}}\n' "$FAKE_DEVELOP"
   exit 0
 fi
 if [[ "$joined" == *"/jobs"* ]]; then
@@ -802,7 +833,11 @@ if [[ "$joined" == *"/jobs"* ]]; then
   exit 0
 fi
 if [[ "$joined" == *"/attempts/"* ]]; then
-  cat "$FAKE_RUN_JSON"
+  cat "$FAKE_ATTEMPT_JSON"
+  exit 0
+fi
+if [[ "$joined" == *"/actions/runs/"* ]]; then
+  cat "$FAKE_CURRENT_RUN_JSON"
   exit 0
 fi
 echo "unexpected gh invocation: $*" >&2
@@ -817,13 +852,63 @@ exit 2
 				"GITHUB_REPOSITORY=owner/repo",
 				"RUNNER_TEMP="+t.TempDir(),
 				"FAKE_DEVELOP="+tc.develop,
-				"FAKE_RUN_JSON="+runFile,
+				"FAKE_ATTEMPT_JSON="+attemptFile,
+				"FAKE_CURRENT_RUN_JSON="+currentFile,
 				"FAKE_JOBS_PAGE="+jobsFile,
 			)
 			if err := runWorkflowBlock(t, block, env); err == nil {
-				t.Fatal("changed, in-progress, failed, or mismatched pinned CI attempt must not reach provider mutation")
+				t.Fatal("changed, in-progress, failed, or mismatched current CI attempt must not reach provider mutation")
 			}
 		})
+	}
+}
+
+func TestDeployBFFCanonicalRefReadsStrictDecode(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
+	if strings.Contains(contents, "--jq .object.sha") {
+		t.Error("canonical git ref reads must not use last-key-wins jq")
+	}
+	for _, want := range []string{
+		"extract-git-ref-sha",
+		`git/ref/heads/develop`,
+		`git/ref/heads/${GITHUB_REF_NAME}`,
+	} {
+		if !strings.Contains(contents, want) {
+			t.Errorf("canonical git ref reads are missing %q", want)
+		}
+	}
+
+	const sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	const other = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	raw := `{"ref":"refs/heads/develop","object":{"type":"commit","sha":"` + other + `","sha":"` + sha + `"}}`
+	body := workflowRunBlock(contents, "Verify exact candidate and main fast-forward eligibility")
+	readAt := strings.Index(body, "git/ref/heads/develop")
+	cutAt := strings.Index(body, "COMPARE_FILE=")
+	start := strings.LastIndex(body[:readAt+1], "DEVELOP_REF_JSON=")
+	if readAt < 0 || cutAt < 0 || start < 0 || readAt > cutAt || start > readAt {
+		t.Fatal("eligibility must read canonical develop before compare")
+	}
+	snippet := "set -euo pipefail\n" + body[start:cutAt]
+	bin := t.TempDir()
+	writeExecutable(t, filepath.Join(bin, "gh"), `#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$*" == *"--jq"* ]]; then
+  printf '%s\n' "$FAKE_LAST_SHA"
+  exit 0
+fi
+printf '%s\n' "$FAKE_REF_JSON"
+`)
+	env := append(os.Environ(),
+		"PATH="+bin+":"+os.Getenv("PATH"),
+		"EVENT_SHA="+sha,
+		"CANDIDATE_SHA="+sha,
+		"GITHUB_REPOSITORY=owner/repo",
+		"RUNNER_TEMP="+t.TempDir(),
+		"FAKE_LAST_SHA="+sha,
+		"FAKE_REF_JSON="+raw,
+	)
+	if err := runWorkflowBlock(t, snippet, env); err == nil {
+		t.Fatal("duplicate git ref SHA keys must fail closed before eligibility success")
 	}
 }
 
@@ -1623,8 +1708,8 @@ func TestBFFDevWorkflowUsesCanonicalRevisionTransaction(t *testing.T) {
 		"echo \"new_revision=$CREATED_REVISION\" >> \"$GITHUB_OUTPUT\"",
 		"echo \"traffic_mutated=true\" >> \"$GITHUB_OUTPUT\"",
 		"GH_TOKEN: ${{ github.token }}",
-		`gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${GITHUB_REF_NAME}" --jq .object.sha`,
-		`REMOTE_SHA=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${GITHUB_REF_NAME}" --jq .object.sha)`,
+		`gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${GITHUB_REF_NAME}"`,
+		"extract-git-ref-sha",
 		`[[ ! "$REMOTE_SHA" =~ ^[0-9a-f]{40}$ ]]`,
 		"Cloud Run traffic changed before cutover; refusing to mutate traffic.",
 		"--remove-env-vars",
@@ -1665,7 +1750,7 @@ func TestBFFDevWorkflowUsesCanonicalRevisionTransaction(t *testing.T) {
 		t.Fatal("BFF workflow must identify and verify the new revision, persist rollback context, then cut over and verify latestReady")
 	}
 	ghTokenAt := strings.Index(build, "GH_TOKEN: ${{ github.token }}")
-	remoteCheckAt := strings.Index(build, `REMOTE_SHA=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${GITHUB_REF_NAME}" --jq .object.sha)`)
+	remoteCheckAt := strings.Index(build, `gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${GITHUB_REF_NAME}"`)
 	if ghTokenAt < 0 || remoteCheckAt < 0 || !(ghTokenAt < remoteCheckAt && remoteCheckAt < deployAt) {
 		t.Fatal("BFF workflow must use GH_TOKEN and revalidate the exact remote ref immediately before deploy")
 	}
@@ -2224,8 +2309,9 @@ func TestPromotionReadyJobIsSameRunExactAndReadOnly(t *testing.T) {
 		"github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/develop'",
 		"needs.test-and-deploy.result == 'success'",
 		"[[ \"$GITHUB_REF\" != \"refs/heads/develop\" ]]",
-		"DEVELOP_SHA=$(gh api \"repos/${GITHUB_REPOSITORY}/git/ref/heads/develop\" --jq .object.sha)",
-		"if [[ \"$DEVELOP_SHA\" != \"$CANDIDATE_SHA\" ]]",
+		"extract-git-ref-sha",
+		`gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/develop"`,
+		"if [[ ! \"$DEVELOP_SHA\" =~ ^[0-9a-f]{40}$ || \"$DEVELOP_SHA\" != \"$CANDIDATE_SHA\" ]]",
 		"gh run download \"$DEV_RUN_ID\"",
 		"gh api \"repos/${GITHUB_REPOSITORY}/actions/runs/${DEV_RUN_ID}\" > \"$RUNNER_TEMP/bff-dev-run.json\"",
 		"bff-image-digest-$CANDIDATE_SHA",
