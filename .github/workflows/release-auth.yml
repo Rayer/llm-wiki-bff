@@ -175,7 +175,7 @@ jobs:
           SERVICE_ERROR="$EVIDENCE_DIR/service-error.txt"
           if gcloud run services describe "$SERVICE_NAME" --region "$REGION" --project "$PROJECT_ID" --format=json --quiet > "$SERVICE_BEFORE" 2> "$SERVICE_ERROR"; then
             BOOTSTRAP_EXISTING=true
-          elif grep -Eiq 'NOT_FOUND|not found|does not exist' "$SERVICE_ERROR"; then
+          elif python3 scripts/classify_cloud_run_service.py --service-name "$SERVICE_NAME" --stderr-file "$SERVICE_ERROR"; then
             BOOTSTRAP_EXISTING=false
             : > "$SERVICE_BEFORE"
           else
