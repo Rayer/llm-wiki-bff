@@ -17,11 +17,13 @@ REVISION = "llm-wiki-bff-00001-old"
 
 def receipt():
     return (
-        "receipt_schema_version=2\n"
+        "receipt_schema_version=3\n"
         "component=lwc-bff\n"
         "build_ref=develop\n"
         f"source_sha={SHA}\n"
         f"dev_run_id={RUN_ID}\n"
+        f"ci_run_id={RUN_ID}\n"
+        "ci_run_attempt=1\n"
         f"image_digest={DIGEST}\n"
         f"image_reference={AR_REPO}/llm-wiki-bff@{DIGEST}\n"
         "query_config_revision=query-dev-2026-08-21.1\n"
@@ -102,12 +104,14 @@ class BFFPromotionContractTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(self.output.read_text()), {
             "schema_version": 1,
-            "receipt_schema_version": 2,
+            "receipt_schema_version": 3,
             "component": "lwc-bff",
             "build_ref": "develop",
             "result": "ready",
             "source_sha": SHA,
             "dev_run_id": RUN_ID,
+            "ci_run_id": RUN_ID,
+            "ci_run_attempt": 1,
             "dev_run_url": "https://github.com/Rayer/llm-wiki-bff/actions/runs/123",
             "image_digest": DIGEST,
             "image_reference": f"{AR_REPO}/llm-wiki-bff@{DIGEST}",
@@ -159,7 +163,7 @@ class BFFPromotionContractTest(unittest.TestCase):
             "wrong component": receipt().replace("component=lwc-bff", "component=worker"),
             "tag image": receipt().replace(f"image_reference={AR_REPO}/llm-wiki-bff@{DIGEST}", "repo/lwc-bff:latest"),
             "invalid digest": receipt().replace(DIGEST, "sha256:bad"),
-            "schema": receipt().replace("receipt_schema_version=2", "receipt_schema_version=1"),
+            "schema": receipt().replace("receipt_schema_version=3", "receipt_schema_version=1"),
         }
         for name, value in cases.items():
             with self.subTest(name=name):
@@ -172,7 +176,7 @@ class BFFPromotionContractTest(unittest.TestCase):
         path.write_bytes(receipt().rstrip("\n").encode())
         result = self.invoke_receipt(path)
         self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(result.stderr, "promotion contract rejected: receipt must use exactly nine LF-terminated lines\n")
+        self.assertEqual(result.stderr, "promotion contract rejected: receipt must use exactly 11 LF-terminated lines\n")
 
     def test_run_jobs_require_unique_successful_same_run_promotion_evidence(self):
         jobs = [
@@ -296,6 +300,298 @@ class BFFPromotionContractTest(unittest.TestCase):
             "--traffic-path", "traffic", "--traffic-mode", mode,
             "--recognized-revision", REVISION,
         ], capture_output=True, text=True)
+
+    def invoke_canonical_ci_run(self, runs, **extra):
+        path = self.root / "ci-runs.json"
+        output = self.root / "ci-run-id.txt"
+        if isinstance(runs, str):
+            path.write_text(runs)
+        else:
+            path.write_text(json.dumps(runs))
+        command = [
+            "python3", str(SCRIPT), "validate-canonical-ci-run",
+            "--runs-json", str(path),
+            "--expected-sha", extra.pop("expected_sha", SHA),
+            "--expected-path", extra.pop("expected_path", ".github/workflows/ci.yml"),
+            "--expected-event", extra.pop("expected_event", "push"),
+            "--expected-ref", extra.pop("expected_ref", "develop"),
+            "--output", str(output),
+        ]
+        result = subprocess.run(command, capture_output=True, text=True)
+        return result, output
+
+    def invoke_canonical_ci_jobs(self, jobs, **extra):
+        path = self.root / "ci-jobs.json"
+        path.write_text(json.dumps(jobs) if not isinstance(jobs, str) else jobs)
+        return subprocess.run([
+            "python3", str(SCRIPT), "validate-canonical-ci-jobs",
+            "--jobs-json", str(path),
+            "--expected-run-id", str(extra.get("expected_run_id", RUN_ID)),
+            "--expected-run-attempt", str(extra.get("expected_run_attempt", 1)),
+            "--required-job", extra.get("required_job", "test"),
+        ], capture_output=True, text=True)
+
+    def invoke_fast_forward_compare(self, document):
+        path = self.root / "compare.json"
+        if isinstance(document, str):
+            path.write_text(document)
+        else:
+            path.write_text(json.dumps(document))
+        return subprocess.run([
+            "python3", str(SCRIPT), "validate-fast-forward-compare",
+            "--compare-json", str(path),
+        ], capture_output=True, text=True)
+
+    def canonical_ci_run(self, **overrides):
+        run = {
+            "id": RUN_ID,
+            "run_attempt": 1,
+            "path": ".github/workflows/ci.yml",
+            "event": "push",
+            "head_branch": "develop",
+            "head_sha": SHA,
+            "status": "completed",
+            "conclusion": "success",
+        }
+        run.update(overrides)
+        return run
+
+    def test_canonical_ci_run_accepts_exact_identity(self):
+        result, output = self.invoke_canonical_ci_run([self.canonical_ci_run()])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(output.read_text(), f"run_id={RUN_ID}\nrun_attempt=1\n")
+
+    def test_canonical_ci_run_rejects_wrong_path_event_ref_sha(self):
+        cases = {
+            "path": self.canonical_ci_run(path=".github/workflows/deploy-bff.yml"),
+            "event": self.canonical_ci_run(event="pull_request"),
+            "ref": self.canonical_ci_run(head_branch="main"),
+            "sha": self.canonical_ci_run(head_sha="d" * 40),
+            "dispatch": self.canonical_ci_run(event="workflow_dispatch"),
+        }
+        for name, run in cases.items():
+            with self.subTest(name=name):
+                result, output = self.invoke_canonical_ci_run([run])
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(output.exists())
+
+    def test_canonical_ci_run_rejects_latest_green_failed_skipped_and_duplicates(self):
+        latest_green = self.canonical_ci_run(id=999, head_sha="e" * 40)
+        failed = self.canonical_ci_run(conclusion="failure")
+        skipped = self.canonical_ci_run(conclusion="skipped")
+        incomplete = self.canonical_ci_run(status="in_progress", conclusion=None)
+        duplicate = [self.canonical_ci_run(), self.canonical_ci_run(id=RUN_ID + 1)]
+        cases = {
+            "latest green": [latest_green],
+            "failed": [failed],
+            "skipped": [skipped],
+            "incomplete": [incomplete],
+            "duplicate success": duplicate,
+            "empty": [],
+        }
+        for name, runs in cases.items():
+            with self.subTest(name=name):
+                result, output = self.invoke_canonical_ci_run(runs)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(output.exists())
+
+    def test_canonical_ci_run_accepts_successful_rerun_after_failed_attempt(self):
+        failed = self.canonical_ci_run(id=RUN_ID + 1, conclusion="failure")
+        result, output = self.invoke_canonical_ci_run([failed, self.canonical_ci_run()])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(output.read_text(), f"run_id={RUN_ID}\nrun_attempt=1\n")
+
+    def test_canonical_ci_run_rejects_cli_identity_mismatch(self):
+        result, output = self.invoke_canonical_ci_run(
+            [self.canonical_ci_run()], expected_event="pull_request")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(output.exists())
+
+    def test_canonical_ci_jobs_require_unique_successful_test_job(self):
+        jobs = [{"name": "test", "run_id": RUN_ID, "run_attempt": 1, "status": "completed", "conclusion": "success"}]
+        self.assertEqual(self.invoke_canonical_ci_jobs(jobs).returncode, 0)
+        cases = {
+            "missing": [],
+            "skipped": [{**jobs[0], "conclusion": "skipped"}],
+            "failed": [{**jobs[0], "conclusion": "failure"}],
+            "incomplete": [{**jobs[0], "status": "in_progress", "conclusion": None}],
+            "duplicate": jobs + jobs,
+            "wrong run": [{**jobs[0], "run_id": RUN_ID + 1}],
+            "wrong name": [{**jobs[0], "name": "lint"}],
+        }
+        for name, value in cases.items():
+            with self.subTest(name=name):
+                self.assertNotEqual(self.invoke_canonical_ci_jobs(value).returncode, 0)
+
+    def test_canonical_ci_run_rejects_missing_invalid_run_attempt(self):
+        missing = self.canonical_ci_run()
+        del missing["run_attempt"]
+        cases = {
+            "missing": missing,
+            "zero": self.canonical_ci_run(run_attempt=0),
+            "negative": self.canonical_ci_run(run_attempt=-1),
+            "string": self.canonical_ci_run(run_attempt="1"),
+            "bool": self.canonical_ci_run(run_attempt=True),
+        }
+        for name, run in cases.items():
+            with self.subTest(name=name):
+                result, output = self.invoke_canonical_ci_run([run])
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(output.exists())
+
+    def test_canonical_ci_jobs_reject_mismatched_missing_invalid_run_attempt(self):
+        base = {"name": "test", "run_id": RUN_ID, "status": "completed", "conclusion": "success"}
+        cases = {
+            "missing": [base],
+            "zero": [{**base, "run_attempt": 0}],
+            "negative": [{**base, "run_attempt": -1}],
+            "string": [{**base, "run_attempt": "1"}],
+            "bool": [{**base, "run_attempt": True}],
+            "mismatch": [{**base, "run_attempt": 2}],
+        }
+        for name, jobs in cases.items():
+            with self.subTest(name=name):
+                self.assertNotEqual(self.invoke_canonical_ci_jobs(jobs, expected_run_attempt=1).returncode, 0)
+
+    def invoke_normalize_actions_page(self, document, items_key="workflow_runs"):
+        page = self.root / "actions-page.json"
+        items = self.root / "actions-page-items.json"
+        metadata = self.root / "actions-page-meta.txt"
+        if isinstance(document, str):
+            page.write_text(document)
+        else:
+            page.write_text(json.dumps(document))
+        result = subprocess.run([
+            "python3", str(SCRIPT), "normalize-actions-page",
+            "--page-json", str(page),
+            "--items-key", items_key,
+            "--items-output", str(items),
+            "--metadata-output", str(metadata),
+        ], capture_output=True, text=True)
+        return result, items, metadata
+
+    def test_normalize_actions_page_accepts_unique_page(self):
+        result, items, metadata = self.invoke_normalize_actions_page(
+            {"total_count": 1, "workflow_runs": [{"id": 1, "run_attempt": 1}]})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(items.read_text()), [{"id": 1, "run_attempt": 1}])
+        self.assertEqual(metadata.read_text(), "total_count=1\nitem_count=1\n")
+
+    def test_normalize_actions_page_rejects_duplicate_keys_before_outputs(self):
+        cases = {
+            "top-level": '{"total_count":1,"workflow_runs":[{"id":1}],"total_count":1}',
+            "page items": '{"total_count":1,"workflow_runs":[],"workflow_runs":[{"id":1}]}',
+            "run": '{"total_count":1,"workflow_runs":[{"id":1,"conclusion":"failure","conclusion":"success"}]}',
+            "job": '{"total_count":1,"jobs":[{"name":"test","conclusion":"failure","conclusion":"success"}]}',
+        }
+        keys = {
+            "top-level": "workflow_runs",
+            "page items": "workflow_runs",
+            "run": "workflow_runs",
+            "job": "jobs",
+        }
+        for name, raw in cases.items():
+            with self.subTest(name=name):
+                result, items, metadata = self.invoke_normalize_actions_page(raw, items_key=keys[name])
+                self.assertNotEqual(result.returncode, 0, result.stderr)
+                self.assertFalse(items.exists())
+                self.assertFalse(metadata.exists())
+
+    def invoke_canonical_ci_attempt(self, run, **extra):
+        path = self.root / "ci-attempt.json"
+        if isinstance(run, str):
+            path.write_text(run)
+        else:
+            path.write_text(json.dumps(run))
+        return subprocess.run([
+            "python3", str(SCRIPT), "validate-canonical-ci-attempt",
+            "--run-json", str(path),
+            "--expected-sha", extra.get("expected_sha", SHA),
+            "--expected-path", extra.get("expected_path", ".github/workflows/ci.yml"),
+            "--expected-event", extra.get("expected_event", "push"),
+            "--expected-ref", extra.get("expected_ref", "develop"),
+            "--expected-run-id", str(extra.get("expected_run_id", RUN_ID)),
+            "--expected-run-attempt", str(extra.get("expected_run_attempt", 1)),
+        ], capture_output=True, text=True)
+
+    def test_canonical_ci_attempt_rejects_changed_in_progress_failed_and_mismatched(self):
+        accepted = self.canonical_ci_run()
+        self.assertEqual(self.invoke_canonical_ci_attempt(accepted).returncode, 0)
+        cases = {
+            "in-progress": self.canonical_ci_run(status="in_progress", conclusion=None),
+            "failed": self.canonical_ci_run(conclusion="failure"),
+            "skipped": self.canonical_ci_run(conclusion="skipped"),
+            "mismatched attempt": self.canonical_ci_run(run_attempt=2),
+            "mismatched run": self.canonical_ci_run(id=RUN_ID + 1),
+            "wrong sha": self.canonical_ci_run(head_sha="d" * 40),
+            "wrong event": self.canonical_ci_run(event="pull_request"),
+        }
+        for name, run in cases.items():
+            with self.subTest(name=name):
+                self.assertNotEqual(self.invoke_canonical_ci_attempt(run).returncode, 0)
+
+    def invoke_extract_git_ref_sha(self, document):
+        path = self.root / "git-ref.json"
+        output = self.root / "git-ref.sha"
+        if isinstance(document, str):
+            path.write_text(document)
+        else:
+            path.write_text(json.dumps(document))
+        result = subprocess.run([
+            "python3", str(SCRIPT), "extract-git-ref-sha",
+            "--ref-json", str(path),
+            "--output", str(output),
+        ], capture_output=True, text=True)
+        return result, output
+
+    def test_extract_git_ref_sha_accepts_unique_object(self):
+        result, output = self.invoke_extract_git_ref_sha({
+            "ref": "refs/heads/develop",
+            "object": {"sha": SHA, "type": "commit"},
+        })
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(output.read_text(), SHA + "\n")
+
+    def test_extract_git_ref_sha_rejects_duplicate_malformed_and_trailing(self):
+        cases = {
+            "duplicate sha": '{"object":{"type":"commit","sha":"%s","sha":"%s"}}' % ("d" * 40, SHA),
+            "duplicate object": '{"object":{"sha":"%s"},"object":{"sha":"%s"}}' % ("d" * 40, SHA),
+            "trailing": '{"object":{"sha":"%s"}} {}' % SHA,
+            "nonfinite": '{"object":{"sha":NaN}}',
+            "missing": {"ref": "refs/heads/develop"},
+            "array": [],
+        }
+        for name, document in cases.items():
+            with self.subTest(name=name):
+                result, output = self.invoke_extract_git_ref_sha(document)
+                self.assertNotEqual(result.returncode, 0, result.stderr)
+                self.assertFalse(output.exists())
+
+    def test_fast_forward_compare_accepts_ahead_and_identical(self):
+        self.assertEqual(self.invoke_fast_forward_compare({"status": "ahead", "ahead_by": 3, "behind_by": 0}).returncode, 0)
+        self.assertEqual(self.invoke_fast_forward_compare({"status": "identical", "ahead_by": 0, "behind_by": 0}).returncode, 0)
+
+    def test_fast_forward_compare_rejects_non_ancestor_and_malformed(self):
+        cases = {
+            "behind": {"status": "behind", "ahead_by": 0, "behind_by": 2},
+            "diverged": {"status": "diverged", "ahead_by": 1, "behind_by": 1},
+            "ahead behind": {"status": "ahead", "ahead_by": 1, "behind_by": 1},
+            "identical ahead": {"status": "identical", "ahead_by": 2, "behind_by": 0},
+            "ahead zero": {"status": "ahead", "ahead_by": 0, "behind_by": 0},
+            "bool behind": {"status": "ahead", "ahead_by": 1, "behind_by": False},
+            "string behind": {"status": "ahead", "ahead_by": 1, "behind_by": "0"},
+            "missing": {"status": "ahead", "ahead_by": 1},
+            "array": [],
+        }
+        for name, document in cases.items():
+            with self.subTest(name=name):
+                self.assertNotEqual(self.invoke_fast_forward_compare(document).returncode, 0)
+        malformed = self.root / "malformed-compare.json"
+        malformed.write_text("{")
+        self.assertNotEqual(self.invoke_fast_forward_compare("{").returncode, 0)
+        duplicate = '{"status":"ahead","ahead_by":1,"behind_by":0,"status":"ahead"}'
+        self.assertNotEqual(self.invoke_fast_forward_compare(duplicate).returncode, 0)
+        self.assertNotEqual(self.invoke_fast_forward_compare('{"status":"ahead","ahead_by":1,"behind_by":NaN}').returncode, 0)
 
 
 if __name__ == "__main__":

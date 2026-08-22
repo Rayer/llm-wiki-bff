@@ -29,10 +29,13 @@ jobs:
 
     permissions:
       contents: read
+      actions: read
       id-token: write
 
     outputs:
       candidate_sha: ${{ steps.source.outputs.candidate_sha }}
+      ci_run_id: ${{ steps.canonical_ci.outputs.ci_run_id }}
+      ci_run_attempt: ${{ steps.canonical_ci.outputs.ci_run_attempt }}
 
     steps:
       - name: Checkout code
@@ -79,19 +82,142 @@ jobs:
           fi
           echo "candidate_sha=$CANDIDATE_SHA" >> "$GITHUB_OUTPUT"
 
+      - name: Require exact canonical CI evidence
+        id: canonical_ci
+        env:
+          CANDIDATE_SHA: ${{ steps.source.outputs.candidate_sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "candidate SHA must be a 40-character lowercase commit SHA"
+            exit 1
+          fi
+          CI_RUNS_JSON="$RUNNER_TEMP/canonical-ci-runs.json"
+          CI_RUN_ID_FILE="$RUNNER_TEMP/canonical-ci-run-id.txt"
+          CI_JOBS_JSON="$RUNNER_TEMP/canonical-ci-jobs.json"
+          PAGES_FILE="$CI_RUNS_JSON.pages"
+          rm -f "$PAGES_FILE" "$CI_RUNS_JSON" "$CI_RUN_ID_FILE" "$CI_JOBS_JSON"
+          TOTAL=""
+          COLLECTED=0
+          PAGE=1
+          while :; do
+            PAGE_JSON="$RUNNER_TEMP/canonical-ci-runs-page.json"
+            PAGE_ITEMS="$RUNNER_TEMP/canonical-ci-runs-page-items.json"
+            PAGE_META="$RUNNER_TEMP/canonical-ci-runs-page-meta.txt"
+            rm -f "$PAGE_JSON" "$PAGE_ITEMS" "$PAGE_META"
+            gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${CANDIDATE_SHA}&event=push&per_page=100&page=${PAGE}" > "$PAGE_JSON"
+            python3 scripts/validate_bff_promotion_contract.py normalize-actions-page \
+              --page-json "$PAGE_JSON" \
+              --items-key workflow_runs \
+              --items-output "$PAGE_ITEMS" \
+              --metadata-output "$PAGE_META"
+            PAGE_TOTAL=$(sed -n 's/^total_count=//p' "$PAGE_META")
+            PAGE_COUNT=$(sed -n 's/^item_count=//p' "$PAGE_META")
+            if [[ ! "$PAGE_TOTAL" =~ ^(0|[1-9][0-9]*)$ || ! "$PAGE_COUNT" =~ ^(0|[1-9][0-9]*)$ ]]; then
+              echo "canonical CI page metadata is invalid"
+              exit 1
+            fi
+            if [[ -z "$TOTAL" ]]; then
+              TOTAL="$PAGE_TOTAL"
+            elif [[ "$TOTAL" != "$PAGE_TOTAL" ]]; then
+              echo "canonical CI run count changed while fetching evidence"
+              exit 1
+            fi
+            cat "$PAGE_ITEMS" >> "$PAGES_FILE"
+            COLLECTED=$((COLLECTED + PAGE_COUNT))
+            if (( COLLECTED == TOTAL )); then
+              jq -s 'add' "$PAGES_FILE" > "$CI_RUNS_JSON"
+              rm -f "$PAGES_FILE"
+              break
+            fi
+            if (( COLLECTED > TOTAL || PAGE_COUNT == 0 )); then
+              echo "canonical CI runs listing was incomplete or malformed"
+              exit 1
+            fi
+            PAGE=$((PAGE + 1))
+          done
+          python3 scripts/validate_bff_promotion_contract.py validate-canonical-ci-run \
+            --runs-json "$CI_RUNS_JSON" \
+            --expected-sha "$CANDIDATE_SHA" \
+            --expected-path ".github/workflows/ci.yml" \
+            --expected-event push \
+            --expected-ref develop \
+            --output "$CI_RUN_ID_FILE"
+          CI_RUN_ID=""
+          CI_RUN_ATTEMPT=""
+          while IFS= read -r line; do
+            case "$line" in
+              run_id=*)
+                CI_RUN_ID="${line#run_id=}"
+                ;;
+              run_attempt=*)
+                CI_RUN_ATTEMPT="${line#run_attempt=}"
+                ;;
+              *)
+                echo "canonical CI run identity is malformed"
+                exit 1
+                ;;
+            esac
+          done < "$CI_RUN_ID_FILE"
+          if [[ ! "$CI_RUN_ID" =~ ^[1-9][0-9]*$ || ! "$CI_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]; then
+            echo "canonical CI run identity is invalid"
+            exit 1
+          fi
+          PAGES_FILE="$CI_JOBS_JSON.pages"
+          rm -f "$PAGES_FILE"
+          TOTAL=""
+          COLLECTED=0
+          PAGE=1
+          while :; do
+            PAGE_JSON="$RUNNER_TEMP/canonical-ci-jobs-page.json"
+            PAGE_ITEMS="$RUNNER_TEMP/canonical-ci-jobs-page-items.json"
+            PAGE_META="$RUNNER_TEMP/canonical-ci-jobs-page-meta.txt"
+            rm -f "$PAGE_JSON" "$PAGE_ITEMS" "$PAGE_META"
+            gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${CI_RUN_ID}/attempts/${CI_RUN_ATTEMPT}/jobs?per_page=100&page=${PAGE}" > "$PAGE_JSON"
+            python3 scripts/validate_bff_promotion_contract.py normalize-actions-page \
+              --page-json "$PAGE_JSON" \
+              --items-key jobs \
+              --items-output "$PAGE_ITEMS" \
+              --metadata-output "$PAGE_META"
+            PAGE_TOTAL=$(sed -n 's/^total_count=//p' "$PAGE_META")
+            PAGE_COUNT=$(sed -n 's/^item_count=//p' "$PAGE_META")
+            if [[ ! "$PAGE_TOTAL" =~ ^(0|[1-9][0-9]*)$ || ! "$PAGE_COUNT" =~ ^(0|[1-9][0-9]*)$ ]]; then
+              echo "canonical CI page metadata is invalid"
+              exit 1
+            fi
+            if [[ -z "$TOTAL" ]]; then
+              TOTAL="$PAGE_TOTAL"
+            elif [[ "$TOTAL" != "$PAGE_TOTAL" ]]; then
+              echo "canonical CI job count changed while fetching evidence"
+              exit 1
+            fi
+            cat "$PAGE_ITEMS" >> "$PAGES_FILE"
+            COLLECTED=$((COLLECTED + PAGE_COUNT))
+            if (( COLLECTED == TOTAL )); then
+              jq -s 'add' "$PAGES_FILE" > "$CI_JOBS_JSON"
+              rm -f "$PAGES_FILE"
+              break
+            fi
+            if (( COLLECTED > TOTAL || PAGE_COUNT == 0 )); then
+              echo "canonical CI jobs listing was incomplete or malformed"
+              exit 1
+            fi
+            PAGE=$((PAGE + 1))
+          done
+          python3 scripts/validate_bff_promotion_contract.py validate-canonical-ci-jobs \
+            --jobs-json "$CI_JOBS_JSON" \
+            --expected-run-id "$CI_RUN_ID" \
+            --expected-run-attempt "$CI_RUN_ATTEMPT" \
+            --required-job test
+          echo "ci_run_id=$CI_RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "ci_run_attempt=$CI_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
           go-version: '1.26'
           cache: true
-
-      - name: Run Go tests
-        env:
-          QUERY_STAGE_CONFIG_PATH: ""
-        run: go test ./... -count=1
-
-      - name: Run Go vet
-        run: go vet ./...
 
       - name: Verify immutable DEV query stage artifact
         run: |
@@ -191,6 +317,9 @@ jobs:
           GIT_BRANCH: ${{ steps.identity.outputs.git_branch }}
           GIT_TAG: ${{ steps.identity.outputs.git_tag }}
           GH_TOKEN: ${{ github.token }}
+          CANDIDATE_SHA: ${{ steps.source.outputs.candidate_sha }}
+          CI_RUN_ID: ${{ steps.canonical_ci.outputs.ci_run_id }}
+          CI_RUN_ATTEMPT: ${{ steps.canonical_ci.outputs.ci_run_attempt }}
         run: |
           set -euo pipefail
           echo "previous_revision=" >> "$GITHUB_OUTPUT"
@@ -261,6 +390,34 @@ jobs:
             echo "Traffic restore to $target_revision did not become authoritative within timeout (update exit $ROLLBACK_EXIT)."
             return 1
           }
+
+          # begin current canonical CI run validator
+          validate_current_canonical_ci_run() {
+            local dest="$1"
+            if [[ ! "$CI_RUN_ID" =~ ^[1-9][0-9]*$ || ! "$CI_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]; then
+              echo "pinned canonical CI identity is invalid"
+              return 1
+            fi
+            if [[ ! "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "candidate SHA must be a 40-character lowercase commit SHA"
+              return 1
+            fi
+            rm -f "$dest"
+            gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${CI_RUN_ID}" > "$dest"
+            python3 scripts/validate_bff_promotion_contract.py validate-canonical-ci-attempt \
+              --run-json "$dest" \
+              --expected-sha "$CANDIDATE_SHA" \
+              --expected-path ".github/workflows/ci.yml" \
+              --expected-event push \
+              --expected-ref develop \
+              --expected-run-id "$CI_RUN_ID" \
+              --expected-run-attempt "$CI_RUN_ATTEMPT"
+          }
+          # end current canonical CI run validator
+
+          # begin pre-build current CI check
+          validate_current_canonical_ci_run "$RUNNER_TEMP/canonical-ci-current-run-pre-build.json"
+          # end pre-build current CI check
 
           IMAGE="${{ env.AR_REPO }}/llm-wiki-bff:$GIT_SHA"
           echo "Building ${IMAGE}…"
@@ -386,10 +543,17 @@ jobs:
             exit 1
           fi
 
-          if ! REMOTE_SHA=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${GITHUB_REF_NAME}" --jq .object.sha); then
+          REMOTE_REF_JSON="$RUNNER_TEMP/canonical-remote-ref.json"
+          REMOTE_REF_SHA="$RUNNER_TEMP/canonical-remote-ref.sha"
+          rm -f "$REMOTE_REF_JSON" "$REMOTE_REF_SHA"
+          if ! gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${GITHUB_REF_NAME}" > "$REMOTE_REF_JSON"; then
             echo "Unable to read remote ${GITHUB_REF_NAME}; refusing to deploy."
             exit 1
           fi
+          python3 scripts/validate_bff_promotion_contract.py extract-git-ref-sha \
+            --ref-json "$REMOTE_REF_JSON" \
+            --output "$REMOTE_REF_SHA"
+          REMOTE_SHA=$(tr -d '[:space:]' < "$REMOTE_REF_SHA")
           if [[ ! "$REMOTE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
             echo "Remote ${GITHUB_REF_NAME} returned an invalid commit SHA; refusing to deploy."
             exit 1
@@ -398,6 +562,88 @@ jobs:
             echo "Remote ${GITHUB_REF_NAME} no longer matches the deployment commit; refusing to deploy."
             exit 1
           fi
+
+          # begin pinned canonical CI revalidation
+          if [[ ! "$CI_RUN_ID" =~ ^[1-9][0-9]*$ || ! "$CI_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]; then
+            echo "pinned canonical CI identity is invalid"
+            exit 1
+          fi
+          if [[ ! "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ || "$CANDIDATE_SHA" != "$GIT_SHA" ]]; then
+            echo "pinned candidate SHA does not match the built commit"
+            exit 1
+          fi
+          DEVELOP_REF_JSON="$RUNNER_TEMP/canonical-develop-ref.json"
+          DEVELOP_REF_SHA="$RUNNER_TEMP/canonical-develop-ref.sha"
+          rm -f "$DEVELOP_REF_JSON" "$DEVELOP_REF_SHA"
+          gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/develop" > "$DEVELOP_REF_JSON"
+          python3 scripts/validate_bff_promotion_contract.py extract-git-ref-sha \
+            --ref-json "$DEVELOP_REF_JSON" \
+            --output "$DEVELOP_REF_SHA"
+          DEVELOP_SHA=$(tr -d '[:space:]' < "$DEVELOP_REF_SHA")
+          if [[ ! "$DEVELOP_SHA" =~ ^[0-9a-f]{40}$ || "$DEVELOP_SHA" != "$CANDIDATE_SHA" ]]; then
+            echo "canonical develop no longer matches the pinned candidate SHA"
+            exit 1
+          fi
+          ATTEMPT_JSON="$RUNNER_TEMP/canonical-ci-attempt.json"
+          rm -f "$ATTEMPT_JSON"
+          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${CI_RUN_ID}/attempts/${CI_RUN_ATTEMPT}" > "$ATTEMPT_JSON"
+          python3 scripts/validate_bff_promotion_contract.py validate-canonical-ci-attempt \
+            --run-json "$ATTEMPT_JSON" \
+            --expected-sha "$CANDIDATE_SHA" \
+            --expected-path ".github/workflows/ci.yml" \
+            --expected-event push \
+            --expected-ref develop \
+            --expected-run-id "$CI_RUN_ID" \
+            --expected-run-attempt "$CI_RUN_ATTEMPT"
+          CI_JOBS_JSON="$RUNNER_TEMP/canonical-ci-pre-mutation-jobs.json"
+          PAGES_FILE="$CI_JOBS_JSON.pages"
+          rm -f "$PAGES_FILE" "$CI_JOBS_JSON"
+          TOTAL=""
+          COLLECTED=0
+          PAGE=1
+          while :; do
+            PAGE_JSON="$RUNNER_TEMP/canonical-ci-pre-mutation-jobs-page.json"
+            PAGE_ITEMS="$RUNNER_TEMP/canonical-ci-pre-mutation-jobs-page-items.json"
+            PAGE_META="$RUNNER_TEMP/canonical-ci-pre-mutation-jobs-page-meta.txt"
+            rm -f "$PAGE_JSON" "$PAGE_ITEMS" "$PAGE_META"
+            gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${CI_RUN_ID}/attempts/${CI_RUN_ATTEMPT}/jobs?per_page=100&page=${PAGE}" > "$PAGE_JSON"
+            python3 scripts/validate_bff_promotion_contract.py normalize-actions-page \
+              --page-json "$PAGE_JSON" \
+              --items-key jobs \
+              --items-output "$PAGE_ITEMS" \
+              --metadata-output "$PAGE_META"
+            PAGE_TOTAL=$(sed -n 's/^total_count=//p' "$PAGE_META")
+            PAGE_COUNT=$(sed -n 's/^item_count=//p' "$PAGE_META")
+            if [[ ! "$PAGE_TOTAL" =~ ^(0|[1-9][0-9]*)$ || ! "$PAGE_COUNT" =~ ^(0|[1-9][0-9]*)$ ]]; then
+              echo "canonical CI page metadata is invalid"
+              exit 1
+            fi
+            if [[ -z "$TOTAL" ]]; then
+              TOTAL="$PAGE_TOTAL"
+            elif [[ "$TOTAL" != "$PAGE_TOTAL" ]]; then
+              echo "canonical CI job count changed while fetching evidence"
+              exit 1
+            fi
+            cat "$PAGE_ITEMS" >> "$PAGES_FILE"
+            COLLECTED=$((COLLECTED + PAGE_COUNT))
+            if (( COLLECTED == TOTAL )); then
+              jq -s 'add' "$PAGES_FILE" > "$CI_JOBS_JSON"
+              rm -f "$PAGES_FILE"
+              break
+            fi
+            if (( COLLECTED > TOTAL || PAGE_COUNT == 0 )); then
+              echo "canonical CI jobs listing was incomplete or malformed"
+              exit 1
+            fi
+            PAGE=$((PAGE + 1))
+          done
+          python3 scripts/validate_bff_promotion_contract.py validate-canonical-ci-jobs \
+            --jobs-json "$CI_JOBS_JSON" \
+            --expected-run-id "$CI_RUN_ID" \
+            --expected-run-attempt "$CI_RUN_ATTEMPT" \
+            --required-job test
+          validate_current_canonical_ci_run "$RUNNER_TEMP/canonical-ci-current-run-pre-deploy.json"
+          # end pinned canonical CI revalidation
 
           echo "Deploying ${IMMUTABLE_IMAGE}…"
           gcloud run deploy "${{ env.SERVICE_NAME }}" \
@@ -596,6 +842,8 @@ jobs:
           DIGEST: ${{ steps.build.outputs.digest }}
           READBACK_REVISION: ${{ steps.query_config_readback.outputs.config_revision }}
           READBACK_DIGEST: ${{ steps.query_config_readback.outputs.config_digest }}
+          CI_RUN_ID: ${{ steps.canonical_ci.outputs.ci_run_id }}
+          CI_RUN_ATTEMPT: ${{ steps.canonical_ci.outputs.ci_run_attempt }}
         run: |
           set -euo pipefail
           COMMIT_SHA="${{ steps.identity.outputs.git_sha }}"
@@ -607,17 +855,23 @@ jobs:
             echo "Cloud Build image digest is missing or invalid"
             exit 1
           fi
+          if [[ ! "$CI_RUN_ID" =~ ^[1-9][0-9]*$ || ! "$CI_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]; then
+            echo "pinned canonical CI identity is invalid"
+            exit 1
+          fi
           if [[ "$READBACK_REVISION" != "$QUERY_STAGE_CONFIG_REVISION" || "$READBACK_DIGEST" != "$QUERY_STAGE_CONFIG_DIGEST" ]]; then
             echo "deployed query config readback identity is not the expected immutable artifact"
             exit 1
           fi
           DIGEST_FILE="bff-image-digest-$COMMIT_SHA.txt"
           {
-            printf 'receipt_schema_version=2\n'
+            printf 'receipt_schema_version=3\n'
             printf 'component=lwc-bff\n'
             printf 'build_ref=develop\n'
             printf 'source_sha=%s\n' "$COMMIT_SHA"
             printf 'dev_run_id=%s\n' "$GITHUB_RUN_ID"
+            printf 'ci_run_id=%s\n' "$CI_RUN_ID"
+            printf 'ci_run_attempt=%s\n' "$CI_RUN_ATTEMPT"
             printf 'image_digest=%s\n' "$DIGEST"
             printf 'image_reference=%s\n' "${{ env.AR_REPO }}/llm-wiki-bff@$DIGEST"
             printf 'query_config_revision=%s\n' "$READBACK_REVISION"
@@ -721,13 +975,15 @@ jobs:
     env:
       CANDIDATE_SHA: ${{ needs.test-and-deploy.outputs.candidate_sha }}
       DEV_RUN_ID: ${{ github.run_id }}
+      CI_RUN_ID: ${{ needs.test-and-deploy.outputs.ci_run_id }}
+      CI_RUN_ATTEMPT: ${{ needs.test-and-deploy.outputs.ci_run_attempt }}
       AR_REPO: asia-east1-docker.pkg.dev/llm-wiki-cloud/cloud-run-images
     steps:
       - name: Checkout exact candidate
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ needs.test-and-deploy.outputs.candidate_sha }}
-          fetch-depth: 0
+          fetch-depth: 1
           persist-credentials: false
 
       - name: Verify exact canonical develop head
@@ -744,8 +1000,15 @@ jobs:
             exit 1
           fi
           test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
-          DEVELOP_SHA=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/develop" --jq .object.sha)
-          if [[ "$DEVELOP_SHA" != "$CANDIDATE_SHA" ]]; then
+          DEVELOP_REF_JSON="$RUNNER_TEMP/canonical-develop-ref.json"
+          DEVELOP_REF_SHA="$RUNNER_TEMP/canonical-develop-ref.sha"
+          rm -f "$DEVELOP_REF_JSON" "$DEVELOP_REF_SHA"
+          gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/develop" > "$DEVELOP_REF_JSON"
+          python3 scripts/validate_bff_promotion_contract.py extract-git-ref-sha \
+            --ref-json "$DEVELOP_REF_JSON" \
+            --output "$DEVELOP_REF_SHA"
+          DEVELOP_SHA=$(tr -d '[:space:]' < "$DEVELOP_REF_SHA")
+          if [[ ! "$DEVELOP_SHA" =~ ^[0-9a-f]{40}$ || "$DEVELOP_SHA" != "$CANDIDATE_SHA" ]]; then
             echo "develop advanced before readiness; refusing to certify an older SHA"
             exit 1
           fi
@@ -786,6 +1049,8 @@ jobs:
             --ar-repo "$AR_REPO" \
             --query-config-revision "$QUERY_STAGE_CONFIG_REVISION" \
             --query-config-digest "$QUERY_STAGE_CONFIG_DIGEST" \
+            --expected-ci-run-id "$CI_RUN_ID" \
+            --expected-ci-run-attempt "$CI_RUN_ATTEMPT" \
             --output "$RUNNER_TEMP/bff-production-promotion-ready.json"
 
       - name: Validate canonical rollback artifact
@@ -833,7 +1098,7 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ github.sha }}
-          fetch-depth: 0
+          fetch-depth: 1
           persist-credentials: false
 
       - name: Verify exact candidate and main fast-forward eligibility
@@ -842,6 +1107,7 @@ jobs:
           CANDIDATE_SHA: ${{ needs.test-and-deploy.outputs.candidate_sha }}
           TEST_DEPLOY_RESULT: ${{ needs.test-and-deploy.result }}
           READINESS_RESULT: ${{ needs.production-promotion-ready.result }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           if [[ "$TEST_DEPLOY_RESULT" != "success" || "$READINESS_RESULT" != "success" ]]; then
@@ -864,12 +1130,26 @@ jobs:
             echo "checked-out HEAD does not match the event SHA"
             exit 1
           fi
-          git fetch --no-tags origin main develop
-          if [[ "$(git rev-parse origin/develop)" != "$EVENT_SHA" ]]; then
+          DEVELOP_REF_JSON="$RUNNER_TEMP/canonical-develop-ref.json"
+          DEVELOP_REF_SHA="$RUNNER_TEMP/canonical-develop-ref.sha"
+          rm -f "$DEVELOP_REF_JSON" "$DEVELOP_REF_SHA"
+          gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/develop" > "$DEVELOP_REF_JSON"
+          python3 scripts/validate_bff_promotion_contract.py extract-git-ref-sha \
+            --ref-json "$DEVELOP_REF_JSON" \
+            --output "$DEVELOP_REF_SHA"
+          DEVELOP_SHA=$(tr -d '[:space:]' < "$DEVELOP_REF_SHA")
+          if [[ ! "$DEVELOP_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "canonical develop returned an invalid commit SHA"
+            exit 1
+          fi
+          if [[ "$DEVELOP_SHA" != "$EVENT_SHA" ]]; then
             echo "develop advanced before fresh eligibility verification"
             exit 1
           fi
-          git merge-base --is-ancestor origin/main "$EVENT_SHA"
+          COMPARE_FILE="$RUNNER_TEMP/bff-fast-forward-compare.json"
+          gh api "repos/${GITHUB_REPOSITORY}/compare/main...${EVENT_SHA}?per_page=1" > "$COMPARE_FILE"
+          python3 scripts/validate_bff_promotion_contract.py validate-fast-forward-compare \
+            --compare-json "$COMPARE_FILE"
 
       - name: Publish successful main fast-forward eligibility status
         env:
@@ -881,16 +1161,30 @@ jobs:
             echo "event SHA must be a 40-character lowercase commit SHA"
             exit 1
           fi
-          git fetch --no-tags origin main develop
           if [[ "$(git rev-parse HEAD)" != "$EVENT_SHA" ]]; then
             echo "checked-out HEAD changed before success publication"
             exit 1
           fi
-          if [[ "$(git rev-parse origin/develop)" != "$EVENT_SHA" ]]; then
+          DEVELOP_REF_JSON="$RUNNER_TEMP/canonical-develop-ref.json"
+          DEVELOP_REF_SHA="$RUNNER_TEMP/canonical-develop-ref.sha"
+          rm -f "$DEVELOP_REF_JSON" "$DEVELOP_REF_SHA"
+          gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/develop" > "$DEVELOP_REF_JSON"
+          python3 scripts/validate_bff_promotion_contract.py extract-git-ref-sha \
+            --ref-json "$DEVELOP_REF_JSON" \
+            --output "$DEVELOP_REF_SHA"
+          DEVELOP_SHA=$(tr -d '[:space:]' < "$DEVELOP_REF_SHA")
+          if [[ ! "$DEVELOP_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "canonical develop returned an invalid commit SHA"
+            exit 1
+          fi
+          if [[ "$DEVELOP_SHA" != "$EVENT_SHA" ]]; then
             echo "develop advanced before success publication"
             exit 1
           fi
-          git merge-base --is-ancestor origin/main "$EVENT_SHA"
+          COMPARE_FILE="$RUNNER_TEMP/bff-fast-forward-compare-final.json"
+          gh api "repos/${GITHUB_REPOSITORY}/compare/main...${EVENT_SHA}?per_page=1" > "$COMPARE_FILE"
+          python3 scripts/validate_bff_promotion_contract.py validate-fast-forward-compare \
+            --compare-json "$COMPARE_FILE"
           gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/$EVENT_SHA" \
             -f state=success \
             -f context=main-fast-forward-eligible \

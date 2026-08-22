@@ -492,8 +492,8 @@ func TestMainFastForwardEligibilityFollowsReadiness(t *testing.T) {
 	if strings.Contains(pendingBlock, "needs.test-and-deploy.outputs.candidate_sha") || !strings.Contains(pendingBlock, "EVENT_SHA: ${{ github.sha }}") || !strings.Contains(pendingBlock, "GH_TOKEN: ${{ github.token }}") {
 		t.Fatal("pending publication must use only the trusted event SHA and workflow token")
 	}
-	if !strings.Contains(job[checkout:fresh], "ref: ${{ github.sha }}") || !strings.Contains(job[checkout:fresh], "fetch-depth: 0") || !strings.Contains(job[checkout:fresh], "persist-credentials: false") {
-		t.Fatal("checkout must use the exact event SHA without persisted credentials")
+	if !strings.Contains(job[checkout:fresh], "ref: ${{ github.sha }}") || !strings.Contains(job[checkout:fresh], "fetch-depth: 1") || strings.Contains(job[checkout:fresh], "fetch-depth: 0") || !strings.Contains(job[checkout:fresh], "persist-credentials: false") {
+		t.Fatal("checkout must use the exact event SHA with a bounded fetch and without persisted credentials")
 	}
 	freshBlock := job[fresh:success]
 	for _, want := range []string{
@@ -501,6 +501,7 @@ func TestMainFastForwardEligibilityFollowsReadiness(t *testing.T) {
 		"CANDIDATE_SHA: ${{ needs.test-and-deploy.outputs.candidate_sha }}",
 		"TEST_DEPLOY_RESULT: ${{ needs.test-and-deploy.result }}",
 		"READINESS_RESULT: ${{ needs.production-promotion-ready.result }}",
+		"GH_TOKEN: ${{ github.token }}",
 	} {
 		if !strings.Contains(freshBlock, want) {
 			t.Errorf("fresh eligibility gate is missing %q", want)
@@ -538,9 +539,588 @@ func TestMainFastForwardCandidateProducerIsDirectNeed(t *testing.T) {
 	}
 	resultCheck := strings.Index(fresh, `if [[ "$TEST_DEPLOY_RESULT" != "success" || "$READINESS_RESULT" != "success" ]]; then`)
 	candidateCheck := strings.Index(fresh, `if [[ ! "$CANDIDATE_SHA" =~`)
-	remoteCheck := strings.Index(fresh, "git fetch --no-tags origin main develop")
+	remoteCheck := strings.Index(fresh, `gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/develop"`)
 	if resultCheck < 0 || candidateCheck < 0 || remoteCheck < 0 || !(resultCheck < candidateCheck && resultCheck < remoteCheck) {
 		t.Fatal("fresh verification must check upstream results before candidate and remote gates")
+	}
+}
+
+func TestDeployBFFWorkflowRequiresExactCanonicalCIAndDoesNotRerunTests(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
+	producer := workflowSection(t, contents, "  test-and-deploy:", "  production-promotion-ready:")
+	for _, forbidden := range []string{
+		"go test ./...",
+		"go vet ./...",
+		"- name: Run Go tests",
+		"- name: Run Go vet",
+	} {
+		if strings.Contains(producer, forbidden) {
+			t.Errorf("producer must not rerun %q after canonical CI", forbidden)
+		}
+	}
+
+	source := strings.Index(producer, "- name: Validate deployment source")
+	ci := strings.Index(producer, "- name: Require exact canonical CI evidence")
+	gate := strings.Index(producer, "- name: Verify immutable DEV query stage artifact")
+	auth := strings.Index(producer, "- name: Authenticate to Google Cloud")
+	if source < 0 || ci < 0 || gate < 0 || auth < 0 || !(source < ci && ci < gate && gate < auth) {
+		t.Fatal("canonical CI evidence must follow source validation and precede query-config and cloud authentication")
+	}
+	ciBlock := producer[ci:gate]
+	for _, want := range []string{
+		"CANDIDATE_SHA: ${{ steps.source.outputs.candidate_sha }}",
+		"GH_TOKEN: ${{ github.token }}",
+		"actions/workflows/ci.yml/runs",
+		"head_sha=${CANDIDATE_SHA}",
+		"event=push",
+		"validate-canonical-ci-run",
+		`--expected-path ".github/workflows/ci.yml"`,
+		"--expected-event push",
+		"--expected-ref develop",
+		"--expected-sha \"$CANDIDATE_SHA\"",
+		"normalize-actions-page",
+		"--items-key workflow_runs",
+		"--items-key jobs",
+		"actions/runs/${CI_RUN_ID}/attempts/${CI_RUN_ATTEMPT}/jobs",
+		"validate-canonical-ci-jobs",
+		"--expected-run-attempt \"$CI_RUN_ATTEMPT\"",
+		"--required-job test",
+	} {
+		if !strings.Contains(ciBlock, want) {
+			t.Errorf("canonical CI evidence is missing %q", want)
+		}
+	}
+	if !strings.Contains(producer, "actions: read") {
+		t.Fatal("producer must read Actions to verify canonical CI")
+	}
+	for _, forbidden := range []string{
+		"workflow_dispatch",
+		"pull_request",
+		"--status success",
+		"gh run list",
+		`<<<"$RESPONSE"`,
+		"jq -cer '.workflow_runs",
+		"jq -cer '.jobs",
+	} {
+		if strings.Contains(ciBlock, forbidden) {
+			t.Errorf("canonical CI evidence must not accept merely latest green CI via %q", forbidden)
+		}
+	}
+}
+
+func TestCanonicalCIEvidenceRejectsDuplicateKeyRawPages(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
+	body := workflowRunBlock(contents, "Require exact canonical CI evidence")
+	if body == "" {
+		t.Fatal("could not extract canonical CI evidence run block")
+	}
+
+	const sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	validRun := `{"id":123,"run_attempt":1,"path":".github/workflows/ci.yml","event":"push","head_branch":"develop","head_sha":"` + sha + `","status":"completed","conclusion":"success"}`
+	validRunsPage := `{"total_count":1,"workflow_runs":[` + validRun + `]}`
+	validJobsPage := `{"total_count":1,"jobs":[{"name":"test","run_id":123,"run_attempt":1,"status":"completed","conclusion":"success"}]}`
+
+	tests := []struct {
+		name           string
+		runsPage       string
+		jobsPage       string
+		forbiddenFiles []string
+	}{
+		{
+			name:           "top-level duplicate total_count",
+			runsPage:       `{"total_count":0,"workflow_runs":[` + validRun + `],"total_count":1}`,
+			jobsPage:       validJobsPage,
+			forbiddenFiles: []string{"canonical-ci-runs.json", "canonical-ci-run-id.txt", "canonical-ci-jobs.json"},
+		},
+		{
+			name:           "page duplicate workflow_runs",
+			runsPage:       `{"total_count":1,"workflow_runs":[],"workflow_runs":[` + validRun + `]}`,
+			jobsPage:       validJobsPage,
+			forbiddenFiles: []string{"canonical-ci-runs.json", "canonical-ci-run-id.txt", "canonical-ci-jobs.json"},
+		},
+		{
+			name:           "run duplicate conclusion",
+			runsPage:       `{"total_count":1,"workflow_runs":[{"id":123,"run_attempt":1,"path":".github/workflows/ci.yml","event":"push","head_branch":"develop","head_sha":"` + sha + `","status":"completed","conclusion":"failure","conclusion":"success"}]}`,
+			jobsPage:       validJobsPage,
+			forbiddenFiles: []string{"canonical-ci-runs.json", "canonical-ci-run-id.txt", "canonical-ci-jobs.json"},
+		},
+		{
+			name:           "job duplicate conclusion",
+			runsPage:       validRunsPage,
+			jobsPage:       `{"total_count":1,"jobs":[{"name":"test","run_id":123,"run_attempt":1,"status":"completed","conclusion":"failure","conclusion":"success"}]}`,
+			forbiddenFiles: []string{"canonical-ci-jobs.json"},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			bin := t.TempDir()
+			runsPage := filepath.Join(t.TempDir(), "runs.json")
+			jobsPage := filepath.Join(t.TempDir(), "jobs.json")
+			if err := os.WriteFile(runsPage, []byte(tc.runsPage), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(jobsPage, []byte(tc.jobsPage), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			writeExecutable(t, filepath.Join(bin, "gh"), `#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$*" == *"/jobs"* ]]; then
+  cat "$FAKE_JOBS_PAGE"
+  exit 0
+fi
+cat "$FAKE_RUNS_PAGE"
+`)
+			runnerTemp := t.TempDir()
+			env := append(os.Environ(),
+				"PATH="+bin+":"+os.Getenv("PATH"),
+				"CANDIDATE_SHA="+sha,
+				"GITHUB_REPOSITORY=owner/repo",
+				"RUNNER_TEMP="+runnerTemp,
+				"FAKE_RUNS_PAGE="+runsPage,
+				"FAKE_JOBS_PAGE="+jobsPage,
+			)
+			if err := runWorkflowBlock(t, body, env); err == nil {
+				t.Fatal("duplicate-key raw Actions page must fail closed")
+			}
+			for _, name := range tc.forbiddenFiles {
+				if _, err := os.Stat(filepath.Join(runnerTemp, name)); err == nil {
+					t.Fatalf("normalized evidence %s must not exist after duplicate-key raw page", name)
+				}
+			}
+		})
+	}
+}
+
+func TestCanonicalCIEvidenceBindsRunAttempt(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
+	ciBlock := workflowSection(t, contents, "      - name: Require exact canonical CI evidence", "      - name: Setup Go")
+	for _, want := range []string{
+		"actions/runs/${CI_RUN_ID}/attempts/${CI_RUN_ATTEMPT}/jobs",
+		"--expected-run-attempt",
+	} {
+		if !strings.Contains(ciBlock, want) {
+			t.Errorf("canonical CI evidence is missing attempt identity %q", want)
+		}
+	}
+	if strings.Contains(ciBlock, "actions/runs/${CI_RUN_ID}/jobs?") {
+		t.Fatal("canonical CI jobs must not use the latest-attempt endpoint")
+	}
+}
+
+func TestPreMutationPinnedCanonicalCIRerunCannotDeploy(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
+	body := workflowRunBlock(contents, "Build and deploy to Cloud Run")
+	if body == "" {
+		t.Fatal("could not extract build and deploy run block")
+	}
+	const beginMarker = "# begin pinned canonical CI revalidation"
+	const endMarker = "# end pinned canonical CI revalidation"
+	begin := strings.Index(body, beginMarker)
+	end := strings.Index(body, endMarker)
+	deploy := strings.Index(body, "gcloud run deploy")
+	fn := workflowMarkedSection(body, "# begin current canonical CI run validator", "# end current canonical CI run validator")
+	if begin < 0 || end < 0 || deploy < 0 || fn == "" || !(begin < end && end < deploy) {
+		t.Fatal("pinned canonical CI revalidation must run immediately before gcloud run deploy")
+	}
+	block := "set -euo pipefail\n" + fn + "\n" + body[begin:end]
+	for _, want := range []string{
+		`gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/develop"`,
+		`gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${CI_RUN_ID}" >`,
+		"canonical-ci-current-run-pre-deploy.json",
+		"actions/runs/${CI_RUN_ID}/attempts/${CI_RUN_ATTEMPT}",
+		"validate-canonical-ci-attempt",
+		"actions/runs/${CI_RUN_ID}/attempts/${CI_RUN_ATTEMPT}/jobs",
+		"validate-canonical-ci-jobs",
+		"--expected-run-id \"$CI_RUN_ID\"",
+		"--expected-run-attempt \"$CI_RUN_ATTEMPT\"",
+	} {
+		if !strings.Contains(block, want) {
+			t.Errorf("pre-mutation revalidation is missing %q", want)
+		}
+	}
+	if strings.Contains(block, "actions/runs/${CI_RUN_ID}/jobs?") || strings.Contains(block, "gcloud run deploy") {
+		t.Fatal("pre-mutation revalidation must use the attempt-specific endpoint and must not mutate Cloud Run")
+	}
+
+	const sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	validAttempt := `{"id":123,"run_attempt":1,"path":".github/workflows/ci.yml","event":"push","head_branch":"develop","head_sha":"` + sha + `","status":"completed","conclusion":"success"}`
+	validJobs := `{"total_count":1,"jobs":[{"name":"test","run_id":123,"run_attempt":1,"status":"completed","conclusion":"success"}]}`
+	currentInProgress := `{"id":123,"run_attempt":2,"path":".github/workflows/ci.yml","event":"push","head_branch":"develop","head_sha":"` + sha + `","status":"in_progress","conclusion":null}`
+	currentFailed := `{"id":123,"run_attempt":2,"path":".github/workflows/ci.yml","event":"push","head_branch":"develop","head_sha":"` + sha + `","status":"completed","conclusion":"failure"}`
+	tests := []struct {
+		name        string
+		develop     string
+		attemptJSON string
+		currentJSON string
+		jobsJSON    string
+	}{
+		{
+			name:        "current run in-progress attempt 2",
+			develop:     sha,
+			attemptJSON: validAttempt,
+			currentJSON: currentInProgress,
+			jobsJSON:    validJobs,
+		},
+		{
+			name:        "current run failed attempt 2",
+			develop:     sha,
+			attemptJSON: validAttempt,
+			currentJSON: currentFailed,
+			jobsJSON:    validJobs,
+		},
+		{
+			name:        "in-progress pinned attempt",
+			develop:     sha,
+			attemptJSON: `{"id":123,"run_attempt":1,"path":".github/workflows/ci.yml","event":"push","head_branch":"develop","head_sha":"` + sha + `","status":"in_progress","conclusion":null}`,
+			currentJSON: validAttempt,
+			jobsJSON:    validJobs,
+		},
+		{
+			name:        "failed pinned attempt",
+			develop:     sha,
+			attemptJSON: `{"id":123,"run_attempt":1,"path":".github/workflows/ci.yml","event":"push","head_branch":"develop","head_sha":"` + sha + `","status":"completed","conclusion":"failure"}`,
+			currentJSON: validAttempt,
+			jobsJSON:    validJobs,
+		},
+		{
+			name:        "changed develop SHA",
+			develop:     "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+			attemptJSON: validAttempt,
+			currentJSON: validAttempt,
+			jobsJSON:    validJobs,
+		},
+		{
+			name:        "failed test job",
+			develop:     sha,
+			attemptJSON: validAttempt,
+			currentJSON: validAttempt,
+			jobsJSON:    `{"total_count":1,"jobs":[{"name":"test","run_id":123,"run_attempt":1,"status":"completed","conclusion":"failure"}]}`,
+		},
+		{
+			name:        "current run duplicate conclusion",
+			develop:     sha,
+			attemptJSON: validAttempt,
+			currentJSON: `{"id":123,"run_attempt":1,"path":".github/workflows/ci.yml","event":"push","head_branch":"develop","head_sha":"` + sha + `","status":"completed","conclusion":"failure","conclusion":"success"}`,
+			jobsJSON:    validJobs,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			bin := t.TempDir()
+			attemptFile := filepath.Join(t.TempDir(), "attempt.json")
+			currentFile := filepath.Join(t.TempDir(), "current.json")
+			jobsFile := filepath.Join(t.TempDir(), "jobs.json")
+			if err := os.WriteFile(attemptFile, []byte(tc.attemptJSON), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(currentFile, []byte(tc.currentJSON), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(jobsFile, []byte(tc.jobsJSON), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			writeExecutable(t, filepath.Join(bin, "gh"), `#!/usr/bin/env bash
+set -euo pipefail
+joined="$*"
+if [[ "$joined" == *git/ref/heads/develop* ]]; then
+  if [[ "$joined" == *"--jq"* ]]; then
+    printf '%s\n' "$FAKE_DEVELOP"
+    exit 0
+  fi
+  printf '{"ref":"refs/heads/develop","object":{"sha":"%s","type":"commit"}}\n' "$FAKE_DEVELOP"
+  exit 0
+fi
+if [[ "$joined" == *"/jobs"* ]]; then
+  cat "$FAKE_JOBS_PAGE"
+  exit 0
+fi
+if [[ "$joined" == *"/attempts/"* ]]; then
+  cat "$FAKE_ATTEMPT_JSON"
+  exit 0
+fi
+if [[ "$joined" == *"/actions/runs/"* ]]; then
+  cat "$FAKE_CURRENT_RUN_JSON"
+  exit 0
+fi
+echo "unexpected gh invocation: $*" >&2
+exit 2
+`)
+			env := append(os.Environ(),
+				"PATH="+bin+":"+os.Getenv("PATH"),
+				"CANDIDATE_SHA="+sha,
+				"GIT_SHA="+sha,
+				"CI_RUN_ID=123",
+				"CI_RUN_ATTEMPT=1",
+				"GITHUB_REPOSITORY=owner/repo",
+				"RUNNER_TEMP="+t.TempDir(),
+				"FAKE_DEVELOP="+tc.develop,
+				"FAKE_ATTEMPT_JSON="+attemptFile,
+				"FAKE_CURRENT_RUN_JSON="+currentFile,
+				"FAKE_JOBS_PAGE="+jobsFile,
+			)
+			if err := runWorkflowBlock(t, block, env); err == nil {
+				t.Fatal("changed, in-progress, failed, or mismatched current CI attempt must not reach provider mutation")
+			}
+		})
+	}
+}
+
+func TestCurrentCanonicalCIRerunBeforeBuildCannotSubmit(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
+	body := workflowRunBlock(contents, "Build and deploy to Cloud Run")
+	fn := workflowMarkedSection(body, "# begin current canonical CI run validator", "# end current canonical CI run validator")
+	preBuild := workflowMarkedSection(body, "# begin pre-build current CI check", "# end pre-build current CI check")
+	submit := strings.Index(body, "gcloud builds submit")
+	preBuildCall := strings.Index(body, "canonical-ci-current-run-pre-build.json")
+	if fn == "" || preBuild == "" || submit < 0 || preBuildCall < 0 || preBuildCall > submit {
+		t.Fatal("current canonical CI run must be validated before gcloud builds submit")
+	}
+
+	const sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	currentInProgress := `{"id":123,"run_attempt":2,"path":".github/workflows/ci.yml","event":"push","head_branch":"develop","head_sha":"` + sha + `","status":"in_progress","conclusion":null}`
+	gcloudLog := filepath.Join(t.TempDir(), "gcloud.log")
+	bin := t.TempDir()
+	currentFile := filepath.Join(t.TempDir(), "current.json")
+	if err := os.WriteFile(currentFile, []byte(currentInProgress), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeExecutable(t, filepath.Join(bin, "gcloud"), `#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$GCLOUD_LOG"
+exit 0
+`)
+	writeExecutable(t, filepath.Join(bin, "gh"), `#!/usr/bin/env bash
+set -euo pipefail
+joined="$*"
+if [[ "$joined" == *"/jobs"* || "$joined" == *"/attempts/"* ]]; then
+  echo "pre-build check must not fetch attempt jobs" >&2
+  exit 2
+fi
+if [[ "$joined" == *"/actions/runs/"* ]]; then
+  cat "$FAKE_CURRENT_RUN_JSON"
+  exit 0
+fi
+echo "unexpected gh invocation: $*" >&2
+exit 2
+`)
+	script := "set -euo pipefail\n" + fn + "\n" + preBuild + "\ngcloud builds submit --quiet\n"
+	env := append(os.Environ(),
+		"PATH="+bin+":"+os.Getenv("PATH"),
+		"CANDIDATE_SHA="+sha,
+		"CI_RUN_ID=123",
+		"CI_RUN_ATTEMPT=1",
+		"GITHUB_REPOSITORY=owner/repo",
+		"RUNNER_TEMP="+t.TempDir(),
+		"GCLOUD_LOG="+gcloudLog,
+		"FAKE_CURRENT_RUN_JSON="+currentFile,
+	)
+	if err := runWorkflowBlock(t, script, env); err == nil {
+		t.Fatal("current attempt 2 before build must fail closed")
+	}
+	logged, _ := os.ReadFile(gcloudLog)
+	if strings.Contains(string(logged), "builds submit") {
+		t.Fatal("gcloud builds submit must not run when current CI attempt changed before build")
+	}
+}
+
+func TestCurrentCanonicalCIRerunAfterJobsCannotDeploy(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
+	body := workflowRunBlock(contents, "Build and deploy to Cloud Run")
+	fn := workflowMarkedSection(body, "# begin current canonical CI run validator", "# end current canonical CI run validator")
+	block := workflowMarkedSection(body, "# begin pinned canonical CI revalidation", "# end pinned canonical CI revalidation")
+	jobsAt := strings.Index(body, "validate-canonical-ci-jobs")
+	preDeployAt := strings.Index(body, "canonical-ci-current-run-pre-deploy.json")
+	deployAt := strings.Index(body, "gcloud run deploy")
+	if fn == "" || block == "" || jobsAt < 0 || preDeployAt < 0 || deployAt < 0 || !(jobsAt < preDeployAt && preDeployAt < deployAt) {
+		t.Fatal("current canonical CI run must be reread after jobs and immediately before gcloud run deploy")
+	}
+	if tail := body[preDeployAt:deployAt]; strings.Contains(tail, "gh api") {
+		t.Fatal("no intervening GitHub evidence fetch is allowed between the final current-run reread and gcloud run deploy")
+	}
+
+	const sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	validAttempt := `{"id":123,"run_attempt":1,"path":".github/workflows/ci.yml","event":"push","head_branch":"develop","head_sha":"` + sha + `","status":"completed","conclusion":"success"}`
+	validJobs := `{"total_count":1,"jobs":[{"name":"test","run_id":123,"run_attempt":1,"status":"completed","conclusion":"success"}]}`
+	currentLater := `{"id":123,"run_attempt":2,"path":".github/workflows/ci.yml","event":"push","head_branch":"develop","head_sha":"` + sha + `","status":"in_progress","conclusion":null}`
+	gcloudLog := filepath.Join(t.TempDir(), "gcloud.log")
+	ghLog := filepath.Join(t.TempDir(), "gh.log")
+	bin := t.TempDir()
+	attemptFile := filepath.Join(t.TempDir(), "attempt.json")
+	currentFile := filepath.Join(t.TempDir(), "current.json")
+	jobsFile := filepath.Join(t.TempDir(), "jobs.json")
+	if err := os.WriteFile(attemptFile, []byte(validAttempt), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(currentFile, []byte(currentLater), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(jobsFile, []byte(validJobs), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeExecutable(t, filepath.Join(bin, "gcloud"), `#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$GCLOUD_LOG"
+exit 0
+`)
+	writeExecutable(t, filepath.Join(bin, "gh"), `#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "$GH_LOG"
+joined="$*"
+if [[ "$joined" == *git/ref/heads/develop* ]]; then
+  printf '{"ref":"refs/heads/develop","object":{"sha":"%s","type":"commit"}}\n' "$CANDIDATE_SHA"
+  exit 0
+fi
+if [[ "$joined" == *"/jobs"* ]]; then
+  cat "$FAKE_JOBS_PAGE"
+  exit 0
+fi
+if [[ "$joined" == *"/attempts/"* ]]; then
+  cat "$FAKE_ATTEMPT_JSON"
+  exit 0
+fi
+if [[ "$joined" == *"/actions/runs/"* ]]; then
+  cat "$FAKE_CURRENT_RUN_JSON"
+  exit 0
+fi
+echo "unexpected gh invocation: $*" >&2
+exit 2
+`)
+	script := "set -euo pipefail\n" + fn + "\n" + block + "\ngcloud run deploy --quiet\n"
+	env := append(os.Environ(),
+		"PATH="+bin+":"+os.Getenv("PATH"),
+		"CANDIDATE_SHA="+sha,
+		"GIT_SHA="+sha,
+		"CI_RUN_ID=123",
+		"CI_RUN_ATTEMPT=1",
+		"GITHUB_REPOSITORY=owner/repo",
+		"RUNNER_TEMP="+t.TempDir(),
+		"GCLOUD_LOG="+gcloudLog,
+		"GH_LOG="+ghLog,
+		"FAKE_ATTEMPT_JSON="+attemptFile,
+		"FAKE_CURRENT_RUN_JSON="+currentFile,
+		"FAKE_JOBS_PAGE="+jobsFile,
+	)
+	if err := runWorkflowBlock(t, script, env); err == nil {
+		t.Fatal("current attempt 2 after jobs must fail closed")
+	}
+	ghLogged, _ := os.ReadFile(ghLog)
+	if !strings.Contains(string(ghLogged), "/jobs") {
+		t.Fatal("attempt-specific jobs must be fetched before the final current-run reread")
+	}
+	logged, _ := os.ReadFile(gcloudLog)
+	if strings.Contains(string(logged), "run deploy") {
+		t.Fatal("gcloud run deploy must not run when current CI attempt changed after jobs pagination")
+	}
+}
+
+func TestDeployBFFCanonicalRefReadsStrictDecode(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
+	if strings.Contains(contents, "--jq .object.sha") {
+		t.Error("canonical git ref reads must not use last-key-wins jq")
+	}
+	for _, want := range []string{
+		"extract-git-ref-sha",
+		`git/ref/heads/develop`,
+		`git/ref/heads/${GITHUB_REF_NAME}`,
+	} {
+		if !strings.Contains(contents, want) {
+			t.Errorf("canonical git ref reads are missing %q", want)
+		}
+	}
+
+	const sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	const other = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	raw := `{"ref":"refs/heads/develop","object":{"type":"commit","sha":"` + other + `","sha":"` + sha + `"}}`
+	body := workflowRunBlock(contents, "Verify exact candidate and main fast-forward eligibility")
+	readAt := strings.Index(body, "git/ref/heads/develop")
+	cutAt := strings.Index(body, "COMPARE_FILE=")
+	start := strings.LastIndex(body[:readAt+1], "DEVELOP_REF_JSON=")
+	if readAt < 0 || cutAt < 0 || start < 0 || readAt > cutAt || start > readAt {
+		t.Fatal("eligibility must read canonical develop before compare")
+	}
+	snippet := "set -euo pipefail\n" + body[start:cutAt]
+	bin := t.TempDir()
+	writeExecutable(t, filepath.Join(bin, "gh"), `#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$*" == *"--jq"* ]]; then
+  printf '%s\n' "$FAKE_LAST_SHA"
+  exit 0
+fi
+printf '%s\n' "$FAKE_REF_JSON"
+`)
+	env := append(os.Environ(),
+		"PATH="+bin+":"+os.Getenv("PATH"),
+		"EVENT_SHA="+sha,
+		"CANDIDATE_SHA="+sha,
+		"GITHUB_REPOSITORY=owner/repo",
+		"RUNNER_TEMP="+t.TempDir(),
+		"FAKE_LAST_SHA="+sha,
+		"FAKE_REF_JSON="+raw,
+	)
+	if err := runWorkflowBlock(t, snippet, env); err == nil {
+		t.Fatal("duplicate git ref SHA keys must fail closed before eligibility success")
+	}
+}
+
+func TestDevReceiptPinsCanonicalCIAttempt(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
+	persist := workflowSection(t, contents, "      - name: Persist build image digest", "      - name: Upload image digest artifact")
+	for _, want := range []string{
+		"receipt_schema_version=3",
+		"ci_run_id=%s",
+		"ci_run_attempt=%s",
+	} {
+		if !strings.Contains(persist, want) {
+			t.Errorf("DEV receipt must pin canonical CI attempt identity %q", want)
+		}
+	}
+}
+
+func TestPromotionReadyAndEligibilityAvoidFullHistoryCheckout(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
+	ready := workflowSection(t, contents, "  production-promotion-ready:", "  main-fast-forward-eligible:")
+	eligibleStart := strings.Index(contents, "  main-fast-forward-eligible:")
+	if eligibleStart < 0 {
+		t.Fatal("workflow is missing main-fast-forward-eligible job")
+	}
+	eligible := contents[eligibleStart:]
+	for name, job := range map[string]string{
+		"production-promotion-ready": ready,
+		"main-fast-forward-eligible": eligible,
+	} {
+		if strings.Contains(job, "fetch-depth: 0") {
+			t.Errorf("%s must not use full-history checkout", name)
+		}
+		if !strings.Contains(job, "fetch-depth: 1") {
+			t.Errorf("%s must use a bounded exact-ref checkout", name)
+		}
+	}
+}
+
+func TestMainFastForwardEligibilityUsesBoundedCompareAPI(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
+	fresh := workflowRunBlock(contents, "Verify exact candidate and main fast-forward eligibility")
+	final := workflowRunBlock(contents, "Publish successful main fast-forward eligibility status")
+	if fresh == "" || final == "" {
+		t.Fatal("could not extract eligibility run blocks")
+	}
+	for name, block := range map[string]string{"fresh": fresh, "final": final} {
+		if strings.Contains(block, "git fetch") || strings.Contains(block, "git merge-base") {
+			t.Errorf("%s eligibility must not prove ancestry via full-history fetch or merge-base", name)
+		}
+		for _, want := range []string{
+			`gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/develop"`,
+			"compare/main...${EVENT_SHA}?per_page=1",
+			"validate-fast-forward-compare",
+		} {
+			if !strings.Contains(block, want) {
+				t.Errorf("%s eligibility is missing bounded compare contract %q", name, want)
+			}
+		}
+	}
+	finalPost := strings.Index(final, "gh api --method POST")
+	develop := strings.Index(final, "git/ref/heads/develop")
+	compare := strings.Index(final, "validate-fast-forward-compare")
+	if finalPost < 0 || develop < 0 || compare < 0 || develop > finalPost || compare > finalPost {
+		t.Fatal("canonical develop reread and compare must precede success publication")
 	}
 }
 
@@ -1276,8 +1856,8 @@ func TestBFFDevWorkflowUsesCanonicalRevisionTransaction(t *testing.T) {
 		"echo \"new_revision=$CREATED_REVISION\" >> \"$GITHUB_OUTPUT\"",
 		"echo \"traffic_mutated=true\" >> \"$GITHUB_OUTPUT\"",
 		"GH_TOKEN: ${{ github.token }}",
-		`gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${GITHUB_REF_NAME}" --jq .object.sha`,
-		`REMOTE_SHA=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${GITHUB_REF_NAME}" --jq .object.sha)`,
+		`gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${GITHUB_REF_NAME}"`,
+		"extract-git-ref-sha",
 		`[[ ! "$REMOTE_SHA" =~ ^[0-9a-f]{40}$ ]]`,
 		"Cloud Run traffic changed before cutover; refusing to mutate traffic.",
 		"--remove-env-vars",
@@ -1318,7 +1898,7 @@ func TestBFFDevWorkflowUsesCanonicalRevisionTransaction(t *testing.T) {
 		t.Fatal("BFF workflow must identify and verify the new revision, persist rollback context, then cut over and verify latestReady")
 	}
 	ghTokenAt := strings.Index(build, "GH_TOKEN: ${{ github.token }}")
-	remoteCheckAt := strings.Index(build, `REMOTE_SHA=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${GITHUB_REF_NAME}" --jq .object.sha)`)
+	remoteCheckAt := strings.Index(build, `gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${GITHUB_REF_NAME}"`)
 	if ghTokenAt < 0 || remoteCheckAt < 0 || !(ghTokenAt < remoteCheckAt && remoteCheckAt < deployAt) {
 		t.Fatal("BFF workflow must use GH_TOKEN and revalidate the exact remote ref immediately before deploy")
 	}
@@ -1878,14 +2458,17 @@ func TestPromotionReadyJobIsSameRunExactAndReadOnly(t *testing.T) {
 		"github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/develop'",
 		"needs.test-and-deploy.result == 'success'",
 		"[[ \"$GITHUB_REF\" != \"refs/heads/develop\" ]]",
-		"DEVELOP_SHA=$(gh api \"repos/${GITHUB_REPOSITORY}/git/ref/heads/develop\" --jq .object.sha)",
-		"if [[ \"$DEVELOP_SHA\" != \"$CANDIDATE_SHA\" ]]",
+		"extract-git-ref-sha",
+		`gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/develop"`,
+		"if [[ ! \"$DEVELOP_SHA\" =~ ^[0-9a-f]{40}$ || \"$DEVELOP_SHA\" != \"$CANDIDATE_SHA\" ]]",
 		"gh run download \"$DEV_RUN_ID\"",
 		"gh api \"repos/${GITHUB_REPOSITORY}/actions/runs/${DEV_RUN_ID}\" > \"$RUNNER_TEMP/bff-dev-run.json\"",
 		"bff-image-digest-$CANDIDATE_SHA",
 		"scripts/validate_bff_promotion_contract.py validate-dev-receipt",
 		"--expected-event workflow_dispatch",
 		"--lifecycle readiness",
+		"--expected-ci-run-id \"$CI_RUN_ID\"",
+		"--expected-ci-run-attempt \"$CI_RUN_ATTEMPT\"",
 		"--producer-result \"${{ needs.test-and-deploy.result }}\"",
 		"--repository \"$GITHUB_REPOSITORY\"",
 		"--traffic-mode artifact",
@@ -1962,10 +2545,10 @@ func TestMainFastForwardEligibilityPublishesExactCommitStatus(t *testing.T) {
 		}
 	}
 	for _, want := range []string{
-		"git fetch --no-tags origin main develop",
 		"git rev-parse HEAD",
-		"git rev-parse origin/develop",
-		"git merge-base --is-ancestor origin/main \"$EVENT_SHA\"",
+		`gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/develop"`,
+		"compare/main...${EVENT_SHA}?per_page=1",
+		"validate-fast-forward-compare",
 		"gh api --method POST \"repos/${GITHUB_REPOSITORY}/statuses/$EVENT_SHA\"",
 		"-f state=success",
 		"-f context=main-fast-forward-eligible",
@@ -2008,7 +2591,12 @@ func TestMainFastForwardEligibilityPublishesExactCommitStatus(t *testing.T) {
 	if finalPost < 0 || strings.Contains(final[finalPost:], "|") || strings.Contains(final[finalPost:], "jq") {
 		t.Fatal("success publication must be one unvalidated gh API command")
 	}
-	for _, check := range []string{"git fetch --no-tags origin main develop", "git rev-parse HEAD", "git rev-parse origin/develop", "git merge-base --is-ancestor origin/main \"$EVENT_SHA\""} {
+	for _, check := range []string{
+		"git rev-parse HEAD",
+		`gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/develop"`,
+		"compare/main...${EVENT_SHA}?per_page=1",
+		"validate-fast-forward-compare",
+	} {
 		if strings.Index(final, check) > finalPost {
 			t.Fatalf("final remote or ancestry check %q must precede the success POST", check)
 		}
@@ -2016,8 +2604,11 @@ func TestMainFastForwardEligibilityPublishesExactCommitStatus(t *testing.T) {
 	if !strings.HasSuffix(strings.TrimSpace(final), `-f description="exact candidate is eligible for a main fast-forward"`) {
 		t.Fatal("success POST must be the final shell action")
 	}
-	if strings.Contains(pendingRun, "jq") || strings.Contains(pendingRun, ".sha") || strings.Contains(freshRun, "gh api") {
-		t.Fatal("pending and fresh verification must not validate provider response schemas or publish status")
+	if strings.Contains(pendingRun, "jq") || strings.Contains(pendingRun, ".sha") {
+		t.Fatal("pending publication must not validate provider response schemas")
+	}
+	if strings.Contains(freshRun, "--method POST") || strings.Contains(freshRun, "state=success") {
+		t.Fatal("fresh verification must not publish status")
 	}
 	if strings.Count(contents, "statuses: write") != 1 || strings.Contains(contents[:strings.Index(contents, "  main-fast-forward-eligible:")], "statuses: write") {
 		t.Fatal("statuses: write must be limited to the main fast-forward job")
@@ -2056,6 +2647,8 @@ func TestMainFastForwardEligibilityNegativePathsDoNotPublishSuccess(t *testing.T
 		{name: "wrong candidate", candidate: other, head: event, develop: event, upstream: "success", wantAccepted: "pending,failure", wantFreshRun: true, wantCleanupRun: true},
 		{name: "malformed candidate", candidate: "not-a-sha", head: event, develop: event, upstream: "success", wantAccepted: "pending,failure", wantFreshRun: true, wantCleanupRun: true},
 		{name: "ancestry failure", candidate: event, head: event, develop: event, ancestry: "fail", upstream: "success", wantAccepted: "pending,failure", wantFreshRun: true, wantCleanupRun: true},
+		{name: "compare API failure", candidate: event, head: event, develop: event, ghMode: "fail_compare", upstream: "success", wantAccepted: "pending,failure", wantFreshRun: true, wantCleanupRun: true},
+		{name: "malformed compare", candidate: event, head: event, develop: event, ghMode: "malformed_compare", upstream: "success", wantAccepted: "pending,failure", wantFreshRun: true, wantCleanupRun: true},
 		{name: "pending API failure", candidate: event, head: event, develop: event, ghMode: "fail_pending", upstream: "success", wantAccepted: "failure", wantCleanupRun: true},
 		{name: "cleanup API failure", candidate: event, head: event, develop: event, ghMode: "fail_failure", upstream: "failure", wantAccepted: "pending", wantFreshRun: true, wantCleanupRun: true},
 		{name: "success API failure", candidate: event, head: event, develop: event, ghMode: "fail_success", upstream: "success", wantAccepted: "pending,failure", wantFreshRun: true, wantFinalRun: true, wantCleanupRun: true},
@@ -2066,27 +2659,57 @@ func TestMainFastForwardEligibilityNegativePathsDoNotPublishSuccess(t *testing.T
 			writeExecutable(t, filepath.Join(bin, "git"), `#!/usr/bin/env bash
 set -euo pipefail
 case "$1 ${2:-}" in
-  fetch\ *) exit 0 ;;
   rev-parse\ HEAD) printf '%s\n' "$FAKE_HEAD" ;;
-  rev-parse\ origin/develop) printf '%s\n' "$FAKE_DEVELOP" ;;
-  merge-base\ --is-ancestor) [[ "${FAKE_ANCESTRY:-}" != fail ]] ;;
   *) echo "unexpected git invocation: $*" >&2; exit 2 ;;
 esac
 `)
 			writeExecutable(t, filepath.Join(bin, "gh"), `#!/usr/bin/env bash
 set -euo pipefail
 state=""
-for arg in "$@"; do
+jq_expr=""
+args=("$@")
+for i in "${!args[@]}"; do
+  arg="${args[$i]}"
   [[ "$arg" == state=* ]] && state="${arg#state=}"
+  if [[ "$arg" == "--jq" ]]; then
+    jq_expr="${args[$((i+1))]:-}"
+  fi
 done
-case "${GH_MODE:-}" in
-  fail_pending) [[ "$state" != pending ]] || exit 1 ;;
-  fail_success) [[ "$state" != success ]] || exit 1 ;;
-  fail_failure) [[ "$state" != failure ]] || exit 1 ;;
-esac
-printf '%s\n' "$state" >> "$GH_ACCEPTED_LOG"
+joined="$*"
+if [[ -n "$state" ]]; then
+  case "${GH_MODE:-}" in
+    fail_pending) [[ "$state" != pending ]] || exit 1 ;;
+    fail_success) [[ "$state" != success ]] || exit 1 ;;
+    fail_failure) [[ "$state" != failure ]] || exit 1 ;;
+  esac
+  printf '%s\n' "$state" >> "$GH_ACCEPTED_LOG"
+  exit 0
+fi
+if [[ "$joined" == *git/ref/heads/develop* ]]; then
+  if [[ "$jq_expr" == ".object.sha" ]]; then
+    printf '%s\n' "$FAKE_DEVELOP"
+    exit 0
+  fi
+  printf '{"object":{"sha":"%s"}}\n' "$FAKE_DEVELOP"
+  exit 0
+fi
+if [[ "$joined" == *compare/main...* ]]; then
+  case "${GH_MODE:-}" in
+    fail_compare) exit 1 ;;
+    malformed_compare) printf '{\n'; exit 0 ;;
+  esac
+  if [[ "${FAKE_ANCESTRY:-}" == fail ]]; then
+    printf '{"status":"diverged","ahead_by":1,"behind_by":1}\n'
+    exit 0
+  fi
+  printf '{"status":"ahead","ahead_by":1,"behind_by":0}\n'
+  exit 0
+fi
+echo "unexpected gh invocation: $*" >&2
+exit 2
 `)
 			log := filepath.Join(t.TempDir(), "accepted-status.log")
+			runnerTemp := t.TempDir()
 			env := append(os.Environ(),
 				"PATH="+bin+":"+os.Getenv("PATH"),
 				"EVENT_SHA="+event,
@@ -2099,6 +2722,7 @@ printf '%s\n' "$state" >> "$GH_ACCEPTED_LOG"
 				"GH_MODE="+tc.ghMode,
 				"GH_ACCEPTED_LOG="+log,
 				"GITHUB_REPOSITORY=owner/repo",
+				"RUNNER_TEMP="+runnerTemp,
 			)
 			pendingErr := runWorkflowBlock(t, pending, env)
 			freshRan := false
@@ -2134,6 +2758,15 @@ printf '%s\n' "$state" >> "$GH_ACCEPTED_LOG"
 			}
 		})
 	}
+}
+
+func workflowMarkedSection(body, begin, end string) string {
+	start := strings.Index(body, begin)
+	stop := strings.Index(body, end)
+	if start < 0 || stop < 0 || start >= stop {
+		return ""
+	}
+	return body[start:stop]
 }
 
 func workflowRunBlock(contents, stepName string) string {
@@ -2177,7 +2810,7 @@ func TestDevReceiptProducerIsVersionedAndSelfBound(t *testing.T) {
 	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
 	persist := workflowSection(t, contents, "      - name: Persist build image digest", "      - name: Upload image digest artifact")
 	for _, want := range []string{
-		"receipt_schema_version=2",
+		"receipt_schema_version=3",
 		"build_ref=develop",
 		"component=lwc-bff",
 		"source_sha=%s",
