@@ -373,6 +373,7 @@ jobs:
         env:
           IMMUTABLE_IMAGE: ${{ steps.image.outputs.image }}
           EXPECTED_COMMIT: ${{ steps.commit.outputs.commit_sha }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           FROZEN_READY_REVISION=$(jq -er '.ready_revision | select(type == "string" and length > 0)' "$ROLLBACK_CONTRACT")
