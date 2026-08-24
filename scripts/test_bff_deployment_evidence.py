@@ -100,7 +100,7 @@ class BFFDeploymentEvidenceTest(unittest.TestCase):
         self.revision_path.write_text(json.dumps(fixture("bff-revision-after.json")))
         self.service_iam.write_text(json.dumps({"bindings": [{"role": "roles/run.invoker", "members": ["allUsers"]}]}))
         self.job_iam.write_text(json.dumps({"bindings": [{"role": "roles/run.jobsExecutorWithOverrides", "members": [f"serviceAccount:{SA}"]}]}))
-        self.env = {**os.environ, "PATH": f"{self.bin}:{os.environ['PATH']}", "FAKE_LOG": str(self.root / "provider.log"), "FAKE_SERVICE_STATE": str(self.root / "service-state"), "FAKE_SERVICE_FIXTURES": f"{self.before},{self.before}", "FAKE_REVISION_FIXTURE": str(self.prior_revision_path), "FAKE_SERVICE_IAM": str(self.service_iam), "FAKE_JOB_IAM": str(self.job_iam), "FAKE_VERSION_JSON": json.dumps({"product_version": "1.2.3", "commit": "c" * 40, "branch": "main", "tag": "", "image_tag": "c" * 40, "service": SERVICE, "revision": "llm-wiki-bff-00002-new"})}
+        self.env = {**os.environ, "PATH": f"{self.bin}:{os.environ['PATH']}", "FAKE_LOG": str(self.root / "provider.log"), "FAKE_SERVICE_STATE": str(self.root / "service-state"), "FAKE_SERVICE_FIXTURES": f"{self.before},{self.before}", "FAKE_REVISION_FIXTURE": str(self.prior_revision_path), "FAKE_SERVICE_IAM": str(self.service_iam), "FAKE_JOB_IAM": str(self.job_iam), "FAKE_VERSION_JSON": json.dumps({"product_version": "1.2.3", "commit": "c" * 40, "branch": "develop", "tag": "", "image_tag": "c" * 40, "service": SERVICE, "revision": "llm-wiki-bff-00002-new"})}
 
     def tearDown(self):
         self.tempdir.cleanup()
@@ -177,6 +177,35 @@ class BFFDeploymentEvidenceTest(unittest.TestCase):
         first_document["health"]["checked_at"] = second["health"]["checked_at"]
         first_document["provider_verification"]["checked_at"] = second["provider_verification"]["checked_at"]
         self.assertEqual(output.read_text(), json.dumps(first_document, sort_keys=True, separators=(",", ":")) + "\n")
+
+    def test_public_identity_retains_metadata_build_ref_during_production_promotion(self):
+        prepared, rollback = self.prepare()
+        self.assertEqual(prepared.returncode, 0, prepared.stderr)
+        identity = json.loads(self.env["FAKE_VERSION_JSON"])
+        identity["branch"] = "develop"
+        self.env["FAKE_VERSION_JSON"] = json.dumps(identity)
+
+        rendered, output, _ = self.render()
+
+        self.assertEqual(rendered.returncode, 0, rendered.stderr)
+        document = json.loads(output.read_text())
+        self.assertEqual(document["build_ref"], "develop")
+        self.assertEqual(document["production_source_ref"], "main")
+        self.assertEqual(document["source"]["ref"], "refs/heads/main")
+        self.assertEqual(document["health"]["identity"]["branch"], "develop")
+
+    def test_public_identity_main_is_rejected_for_develop_build(self):
+        prepared, _ = self.prepare()
+        self.assertEqual(prepared.returncode, 0, prepared.stderr)
+        identity = json.loads(self.env["FAKE_VERSION_JSON"])
+        identity["branch"] = "main"
+        self.env["FAKE_VERSION_JSON"] = json.dumps(identity)
+
+        rendered, output, failure = self.render()
+
+        self.assertNotEqual(rendered.returncode, 0)
+        self.assertFalse(output.exists())
+        self.assertEqual(json.loads(failure.read_text())["reason_code"], "identity_body_mismatch")
 
     def test_old_v2_secret_shape_and_bare_revision_digest_are_rejected(self):
         before = fixture("bff-revision-before.json")

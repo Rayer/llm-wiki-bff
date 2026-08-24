@@ -429,7 +429,7 @@ def validate_rollback(rollback, args):
     return {**rollback, "traffic": traffic, "config": config}
 
 
-def identity(args, url, commit, revision):
+def identity(args, url, commit, revision, expected_branch):
     parsed = urlsplit(url)
     if parsed.scheme != "https" or parsed.username or parsed.password or not parsed.netloc:
         reject("identity endpoint URL is invalid", "identity_unavailable")
@@ -462,7 +462,7 @@ def identity(args, url, commit, revision):
         if parsed_headers.get("cache-control") != "no-store":
             reject("identity Cache-Control is not no-store", "identity_header_mismatch")
         required = {"product_version", "commit", "branch", "tag", "image_tag", "service", "revision"}
-        if not isinstance(body, dict) or set(body) != required or body.get("commit") != commit or body.get("branch") != "main" or body.get("image_tag") != commit or body.get("service") != args.service_name or body.get("revision") != revision or not all(isinstance(body.get(key), str) for key in required):
+        if not isinstance(body, dict) or set(body) != required or body.get("commit") != commit or body.get("branch") != expected_branch or body.get("image_tag") != commit or body.get("service") != args.service_name or body.get("revision") != revision or not all(isinstance(body.get(key), str) for key in required):
             reject("identity body does not match expected structured identity", "identity_body_mismatch")
         return {"commit": body["commit"], "branch": body["branch"], "image_tag": body["image_tag"], "service": body["service"], "revision": body["revision"]}
     finally:
@@ -512,7 +512,7 @@ def render_strict(args):
     url = args.service_url or second_parts[-1].get("url")
     if not isinstance(url, str):
         reject("service URL is unavailable", "identity_unavailable")
-    identity_result = identity(args, url, commit, ready)
+    identity_result = identity(args, url, commit, ready, metadata["build_ref"])
     checked = now()
     return {
         "schema_version": EXPECTED_SCHEMA,
