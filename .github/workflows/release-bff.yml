@@ -212,7 +212,7 @@ jobs:
             --project "$PROJECT_ID" --region "$REGION" --format=json --quiet)
           if ! jq -e --arg member "allUsers" '
             if (.bindings | type) != "array" then false
-            else ([.bindings[] | select(type == "object" and .role == "roles/run.invoker" and (.members | type) == "array" and (.members | index($member)))] | length == 1)
+            else ([.bindings[] | select(type == "object" and .role == "roles/run.invoker" and (.members | type) == "array" and (.members | index($member)) and (has("condition") | not))] | length == 1)
             end' <<<"$SERVICE_POLICY" >/dev/null; then
             echo "required production service IAM binding is missing or malformed; refusing to deploy"
             exit 1
@@ -221,7 +221,7 @@ jobs:
             --project "$PROJECT_ID" --region "$REGION" --format=json --quiet)
           if ! jq -e --arg member "serviceAccount:${RUNTIME_SERVICE_ACCOUNT}" \
             'if (.bindings | type) != "array" then false
-             else ([.bindings[] | select(type == "object" and .role == "roles/run.jobsExecutorWithOverrides" and (.members | type) == "array" and (.members | index($member)))] | length == 1)
+             else ([.bindings[] | select(type == "object" and .role == "roles/run.jobsExecutorWithOverrides" and (.members | type) == "array" and (.members | index($member)) and (has("condition") | not))] | length == 1)
              end' \
             <<<"$JOB_POLICY" >/dev/null; then
             echo "required production pipeline IAM binding is missing or malformed; refusing to deploy"
@@ -322,10 +322,10 @@ jobs:
             --project "$PROJECT_ID" \
             --format=json \
             --quiet)
-          if ! jq -e --arg ready_revision "$FROZEN_READY_REVISION" \
-            '.status.latestCreatedRevisionName == $ready_revision and .status.latestReadyRevisionName == $ready_revision' \
+          if ! jq -e \
+            '(.status.latestCreatedRevisionName | type) == "string" and (.status.latestReadyRevisionName | type) == "string"' \
             <<<"$SERVICE_JSON" >/dev/null; then
-            echo "live rollback state no longer matches the frozen ready revision or authoritative traffic"
+            echo "live rollback state is missing provider revision race markers"
             exit 1
           fi
           if ! printf '%s\n' "$SERVICE_JSON" | python3 scripts/validate_bff_promotion_contract.py validate-traffic \
@@ -476,8 +476,23 @@ jobs:
           jq -er '.query_config.config_revision' "$BODY_FILE" | { read value; echo "config_revision=$value" >> "$GITHUB_OUTPUT"; }
           jq -er '.query_config.config_digest' "$BODY_FILE" | { read value; echo "config_digest=$value" >> "$GITHUB_OUTPUT"; }
 
+      - name: Render normalized deployment evidence after strict read-back
+        id: evidence
+        env:
+          IMMUTABLE_IMAGE: ${{ steps.image.outputs.image }}
+          EXPECTED_RUNTIME_SERVICE_ACCOUNT: ${{ env.RUNTIME_SERVICE_ACCOUNT }}
+        run: |
+          set -euo pipefail
+          # The renderer performs an unauthenticated GET /api/v1/public/version.
+          python3 scripts/render_bff_deployment_evidence.py render-evidence \
+            --project "$PROJECT_ID" --region "$REGION" --service-name "$SERVICE_NAME" \
+            --pipeline-job-name "$PIPELINE_JOB_NAME" --ar-repo "$AR_REPO" \
+            --expected-runtime-service-account "$EXPECTED_RUNTIME_SERVICE_ACCOUNT" \
+            --rollback-contract "$ROLLBACK_CONTRACT" --metadata "$METADATA" \
+            --output "$EVIDENCE" --failure-output "$EVIDENCE_FAILURE"
+
       - name: Restore frozen production traffic after query-config readback failure
-        if: ${{ always() && steps.deploy.outputs.deploy_started == 'true' && (steps.deploy.outcome == 'failure' || steps.query_config_readback.outcome == 'failure') }}
+        if: ${{ always() && steps.deploy.outputs.deploy_started == 'true' && (steps.deploy.outcome == 'failure' || steps.query_config_readback.outcome == 'failure' || steps.evidence.outcome == 'failure') }}
         run: |
           set -euo pipefail
           FROZEN_READY_REVISION=$(jq -er '.ready_revision | select(type == "string" and length > 0)' "$ROLLBACK_CONTRACT")
@@ -499,12 +514,13 @@ jobs:
           validate_effective_traffic() {
             local revision
             revision=$(jq -er '
-              .status as $status
-              | if ($status.latestReadyRevisionName | type) == "string"
-                and ($status.traffic | type) == "array"
-                and ($status.traffic | length) == 1
-                and $status.traffic[0].revisionName == $status.latestReadyRevisionName
-                then $status.latestReadyRevisionName
+              .status.traffic as $traffic
+              | if ($traffic | type) == "array"
+                and ($traffic | length) == 1
+                and ($traffic[0].revisionName | type) == "string"
+                and $traffic[0].percent == 100
+                and ($traffic[0].tag? == null)
+                then $traffic[0].revisionName
                 else empty
                 end
             ' <<<"$1") || return 1
@@ -566,20 +582,6 @@ jobs:
           fi
           echo "restored effective routing: ${RESTORED_EFFECTIVE_REVISION}=${RESTORED_EFFECTIVE_PERCENT} (update exit $ROLLBACK_EXIT); preserving workflow failure"
           exit 1
-
-      - name: Render normalized deployment evidence after strict read-back
-        env:
-          IMMUTABLE_IMAGE: ${{ steps.image.outputs.image }}
-          EXPECTED_RUNTIME_SERVICE_ACCOUNT: ${{ env.RUNTIME_SERVICE_ACCOUNT }}
-        run: |
-          set -euo pipefail
-          # The renderer performs an unauthenticated GET /api/v1/public/version.
-          python3 scripts/render_bff_deployment_evidence.py render-evidence \
-            --project "$PROJECT_ID" --region "$REGION" --service-name "$SERVICE_NAME" \
-            --pipeline-job-name "$PIPELINE_JOB_NAME" --ar-repo "$AR_REPO" \
-            --expected-runtime-service-account "$EXPECTED_RUNTIME_SERVICE_ACCOUNT" \
-            --rollback-contract "$ROLLBACK_CONTRACT" --metadata "$METADATA" \
-            --output "$EVIDENCE" --failure-output "$EVIDENCE_FAILURE"
 
       - name: Finalize partial evidence when provider verification is unknown
         if: always()

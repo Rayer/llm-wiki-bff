@@ -211,6 +211,12 @@ def normalized_traffic(traffic):
     return result
 
 
+def serving_revision(traffic):
+    if len(traffic) != 1 or traffic[0]["percent"] != 100 or "tag" in traffic[0]:
+        reject("effective traffic is not exactly one explicit 100 percent revision", "traffic_mismatch")
+    return traffic[0]["revision_name"]
+
+
 EXPECTED_VALUES = {
     "GCP_PROJECT": PROJECT,
     "BUCKET": "llm-wiki-data",
@@ -289,15 +295,6 @@ def network_config(service_annotations, network_annotations):
     return {"network": "default", "subnet": "default", "vpc_egress": "private-ranges-only", "ingress": "all"}
 
 
-def normalized_config(parts, legacy_preserved):
-    _, service_annotations, template_annotations, spec, container, service_account, _ = parts
-    if service_account != RUNTIME_SERVICE_ACCOUNT:
-        reject("runtime service account does not match production", "runtime_service_account_mismatch")
-    env = normalized_env(container["env"], legacy_preserved, require_stage_config_path=True)
-    config = {**env, "network": network_config(service_annotations, template_annotations), "runtime_service_account": service_account}
-    return config
-
-
 def normalized_revision_config(revision, service_annotations, legacy_preserved=None, expected_image=None):
     metadata = revision.get("metadata") if isinstance(revision, dict) else None
     expected_name = metadata.get("name") if isinstance(metadata, dict) else None
@@ -362,7 +359,7 @@ def binding(policy, role, member):
     if not isinstance(bindings, list):
         reject("IAM policy shape is unsupported", "iam_binding_missing")
     for item in bindings:
-        if isinstance(item, dict) and item.get("role") == role and isinstance(item.get("members"), list) and member in item["members"]:
+        if isinstance(item, dict) and item.get("role") == role and isinstance(item.get("members"), list) and member in item["members"] and "condition" not in item:
             return True
     reject("required IAM binding is missing", "iam_binding_missing")
 
@@ -381,16 +378,17 @@ def prepare_rollback(args):
     remove_output(args.output)
     first = service_json(args)
     parts = service_parts(first, args)
-    ready = parts[-1]["latestReadyRevisionName"]
     traffic = normalized_traffic(parts[-1]["traffic"])
-    prior = revision_json(args, ready)
-    prior_parts = revision_parts(prior, ready)
+    latest_ready = parts[-1]["latestReadyRevisionName"]
+    serving = serving_revision(traffic)
+    prior = revision_json(args, serving)
+    prior_parts = revision_parts(prior, serving)
     prior_config = normalized_revision_config(prior, parts[1])
     second = service_json(args)
     second_parts = service_parts(second, args)
-    if second_parts[-1]["latestReadyRevisionName"] != ready or normalized_traffic(second_parts[-1]["traffic"]) != traffic or second_parts[1].get("run.googleapis.com/ingress") != parts[1].get("run.googleapis.com/ingress"):
+    if second_parts[-1]["latestReadyRevisionName"] != latest_ready or normalized_traffic(second_parts[-1]["traffic"]) != traffic or second_parts[1].get("run.googleapis.com/ingress") != parts[1].get("run.googleapis.com/ingress"):
         reject("service changed while freezing rollback", "rollback_race")
-    rollback = {"provider_handle": handle(args), "artifact_name": args.artifact_name, "ready_revision": ready, "prior_revision_handle": revision_handle(args, ready), "image_reference": prior_parts["image_reference"], "image_digest": prior_parts["image_digest"], "traffic": traffic, "config": prior_config}
+    rollback = {"provider_handle": handle(args), "artifact_name": args.artifact_name, "ready_revision": serving, "prior_revision_handle": revision_handle(args, serving), "image_reference": prior_parts["image_reference"], "image_digest": prior_parts["image_digest"], "traffic": traffic, "config": prior_config}
     write_json(args.output, rollback)
 
 
@@ -483,17 +481,12 @@ def render_strict(args):
         reject("rollback artifact identity does not match metadata")
     first = service_json(args)
     parts = service_parts(first, args)
-    ready = parts[-1]["latestReadyRevisionName"]
-    if not ready:
-        reject("new ready revision is missing", "revision_mismatch")
+    traffic = normalized_traffic(parts[-1]["traffic"])
+    serving = serving_revision(traffic)
     legacy_preserved = rollback["config"]["legacy_preserved"]
-    if parts[4]["image"] != expected_image:
-        reject("service template image does not match promoted image", "image_mismatch")
-    config = normalized_config(parts, legacy_preserved)
-    revision = revision_json(args, ready)
-    revision_parts_value = revision_parts(revision, ready, expected_image)
-    if normalized_revision_config(revision, parts[1], legacy_preserved, expected_image) != config:
-        reject("service template and immutable revision config differ", "config_mismatch")
+    revision = revision_json(args, serving)
+    revision_parts_value = revision_parts(revision, serving, expected_image)
+    config = normalized_revision_config(revision, parts[1], legacy_preserved, expected_image)
     observed_image = revision_parts_value["image_reference"]
     observed_digest = revision_parts_value["image_digest"]
     service_policy = iam_json(args, "services", args.service_name)
@@ -502,17 +495,15 @@ def render_strict(args):
     binding(job_policy, "roles/run.jobsExecutorWithOverrides", "serviceAccount:" + RUNTIME_SERVICE_ACCOUNT)
     second = service_json(args)
     second_parts = service_parts(second, args)
-    traffic = normalized_traffic(second_parts[-1]["traffic"])
-    if second_parts[-1]["latestReadyRevisionName"] != ready:
-        reject("new ready revision changed during read-back", "revision_mismatch")
-    if len(traffic) != 1 or traffic[0]["revision_name"] != ready or traffic[0]["percent"] != 100 or traffic[0].get("latest_revision") is not True:
-        reject("effective traffic is not 100 percent on the new revision", "traffic_mismatch")
-    if second_parts[4]["image"] != expected_image or normalized_config(second_parts, legacy_preserved) != config:
-        reject("service template changed during read-back", "config_mismatch")
+    second_traffic = normalized_traffic(second_parts[-1]["traffic"])
+    if second_traffic != traffic or serving_revision(second_traffic) != serving:
+        reject("effective traffic changed during read-back", "traffic_mismatch")
+    if second_parts[1].get("run.googleapis.com/ingress") != parts[1].get("run.googleapis.com/ingress"):
+        reject("service ingress changed during read-back", "config_mismatch")
     url = args.service_url or second_parts[-1].get("url")
     if not isinstance(url, str):
         reject("service URL is unavailable", "identity_unavailable")
-    identity_result = identity(args, url, commit, ready, metadata["build_ref"])
+    identity_result = identity(args, url, commit, serving, metadata["build_ref"])
     checked = now()
     return {
         "schema_version": EXPECTED_SCHEMA,
@@ -524,7 +515,7 @@ def render_strict(args):
         "dev_provenance": metadata["dev_provenance"],
         "image": metadata["image"],
         "provider": {"current_handle": handle(args), "rollback_handle": rollback["provider_handle"], "rollback_artifact_name": artifact},
-        "observed_service": {"ready_revision": ready, "image_reference": observed_image, "image_digest": observed_digest, "runtime_service_account": RUNTIME_SERVICE_ACCOUNT, "traffic": traffic},
+        "observed_service": {"ready_revision": serving, "image_reference": observed_image, "image_digest": observed_digest, "runtime_service_account": revision_parts_value["service_account"], "traffic": traffic},
         "config": {"result": "verified", "fingerprint": "sha256:" + hashlib.sha256(json.dumps(config, sort_keys=True, separators=(",", ":")).encode()).hexdigest(), "allowlisted": config},
         "provider_verification": {"result": "verified", "checked_at": checked, "checks": ["provider_handle", "ready_revision", "image", "runtime_service_account", "network", "traffic", "service_invoker_iam", "pipeline_executor_iam"]},
         "originating_workflow": metadata["originating_workflow"],

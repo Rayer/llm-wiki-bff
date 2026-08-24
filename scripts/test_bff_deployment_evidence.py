@@ -178,6 +178,117 @@ class BFFDeploymentEvidenceTest(unittest.TestCase):
         first_document["provider_verification"]["checked_at"] = second["provider_verification"]["checked_at"]
         self.assertEqual(output.read_text(), json.dumps(first_document, sort_keys=True, separators=(",", ":")) + "\n")
 
+    def test_strict_evidence_uses_explicit_serving_revision_when_newer_ready_revision_has_no_traffic(self):
+        prepared, rollback = self.prepare()
+        self.assertEqual(prepared.returncode, 0, prepared.stderr)
+        serving = fixture("bff-service-after.json")
+        serving["status"]["latestReadyRevisionName"] = "llm-wiki-bff-00003-ready-no-traffic"
+        serving["status"]["traffic"] = [{"revisionName": "llm-wiki-bff-00002-new", "percent": 100, "latestRevision": False}]
+        first = self.root / "serving-first.json"
+        second = self.root / "serving-second.json"
+        first.write_text(json.dumps(serving))
+        serving_second = json.loads(json.dumps(serving))
+        serving_second["status"]["latestReadyRevisionName"] = "llm-wiki-bff-00004-ready-no-traffic"
+        second.write_text(json.dumps(serving_second))
+
+        rendered, output, _ = self.render(service_fixtures=f"{first},{second}")
+
+        self.assertEqual(rendered.returncode, 0, rendered.stderr)
+        document = json.loads(output.read_text())
+        self.assertEqual(document["observed_service"]["ready_revision"], "llm-wiki-bff-00002-new")
+        self.assertEqual(document["observed_service"]["traffic"], [{"revision_name": "llm-wiki-bff-00002-new", "percent": 100, "latest_revision": False}])
+
+    def test_strict_evidence_uses_serving_revision_config_when_ready_template_is_untrafficked(self):
+        prepared, _ = self.prepare()
+        self.assertEqual(prepared.returncode, 0, prepared.stderr)
+        first = fixture("bff-service-after.json")
+        first["status"]["latestReadyRevisionName"] = "llm-wiki-bff-00003-ready-no-traffic"
+        first["spec"]["template"]["spec"]["containers"][0]["image"] = PRIOR_IMAGE
+        next(entry for entry in first["spec"]["template"]["spec"]["containers"][0]["env"] if entry["name"] == "QUERY_STAGE_CONFIG_PATH")["value"] = PRIOR_QUERY_STAGE_CONFIG_PATH
+        first["spec"]["template"]["metadata"]["annotations"]["run.googleapis.com/vpc-access-egress"] = "all-traffic"
+        second = json.loads(json.dumps(first))
+        first_path = self.root / "template-first.json"
+        second_path = self.root / "template-second.json"
+        first_path.write_text(json.dumps(first))
+        second_path.write_text(json.dumps(second))
+
+        rendered, output, _ = self.render(service_fixtures=f"{first_path},{second_path}")
+
+        self.assertEqual(rendered.returncode, 0, rendered.stderr)
+        document = json.loads(output.read_text())
+        self.assertEqual(document["observed_service"]["image_reference"], IMAGE)
+        self.assertEqual(
+            next(entry for entry in document["config"]["allowlisted"]["env"] if entry["name"] == "QUERY_STAGE_CONFIG_PATH")["value"],
+            QUERY_STAGE_CONFIG_PATH,
+        )
+        self.assertEqual(document["config"]["allowlisted"]["network"]["vpc_egress"], "private-ranges-only")
+
+    def test_strict_evidence_rejects_service_ingress_change_between_reads(self):
+        prepared, _ = self.prepare()
+        self.assertEqual(prepared.returncode, 0, prepared.stderr)
+        first = fixture("bff-service-after.json")
+        second = json.loads(json.dumps(first))
+        second["metadata"]["annotations"]["run.googleapis.com/ingress"] = "internal"
+        first_path = self.root / "ingress-first.json"
+        second_path = self.root / "ingress-second.json"
+        first_path.write_text(json.dumps(first))
+        second_path.write_text(json.dumps(second))
+
+        rendered, output, failure = self.render(service_fixtures=f"{first_path},{second_path}")
+
+        self.assertNotEqual(rendered.returncode, 0)
+        self.assertFalse(output.exists())
+        self.assertEqual(json.loads(failure.read_text())["reason_code"], "config_mismatch")
+
+    def test_iam_bindings_require_unconditional_role_members(self):
+        conditional = {"title": "only during maintenance", "expression": "true"}
+        cases = (
+            (self.service_iam, "roles/run.invoker", "allUsers"),
+            (self.job_iam, "roles/run.jobsExecutorWithOverrides", f"serviceAccount:{SA}"),
+        )
+        for policy_path, role, member in cases:
+            with self.subTest(role=role):
+                policy_path.write_text(json.dumps({"bindings": [{"role": role, "members": [member], "condition": conditional}]}))
+                prepared, _ = self.prepare()
+                self.assertEqual(prepared.returncode, 0, prepared.stderr)
+                result, output, failure = self.render()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(output.exists())
+                self.assertEqual(json.loads(failure.read_text())["reason_code"], "iam_binding_missing")
+                policy_path.write_text(json.dumps({"bindings": [{"role": role, "members": [member]}]}))
+
+        prepared, _ = self.prepare()
+        self.assertEqual(prepared.returncode, 0, prepared.stderr)
+        result, output, _ = self.render()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(output.exists())
+
+    def test_prepare_freezes_effective_serving_revision_when_ready_revision_differs(self):
+        first = fixture("bff-service-before.json")
+        first["status"]["latestCreatedRevisionName"] = "llm-wiki-bff-00071-zgk"
+        first["status"]["latestReadyRevisionName"] = "llm-wiki-bff-00071-zgk"
+        first["status"]["traffic"] = [{"revisionName": "llm-wiki-bff-00070-f5c", "percent": 100}]
+        second = json.loads(json.dumps(first))
+        first_path = self.root / "rollback-first.json"
+        second_path = self.root / "rollback-second.json"
+        first_path.write_text(json.dumps(first))
+        second_path.write_text(json.dumps(second))
+        revision = fixture("bff-revision-before.json")
+        revision["metadata"]["name"] = "llm-wiki-bff-00070-f5c"
+        revision_path = self.root / "serving-revision.json"
+        revision_path.write_text(json.dumps(revision))
+        self.env["FAKE_SERVICE_FIXTURES"] = f"{first_path},{second_path}"
+        self.env["FAKE_REVISION_FIXTURE"] = str(revision_path)
+        output = self.root / "rollback-serving.json"
+
+        result = self.invoke("prepare-rollback", "--artifact-name", ARTIFACT, "--output", str(output))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rollback = json.loads(output.read_text())
+        self.assertEqual(rollback["ready_revision"], "llm-wiki-bff-00070-f5c")
+        self.assertEqual(rollback["prior_revision_handle"], "projects/llm-wiki-cloud/locations/asia-east1/revisions/llm-wiki-bff-00070-f5c")
+        self.assertEqual(rollback["traffic"], [{"revision_name": "llm-wiki-bff-00070-f5c", "percent": 100}])
+
     def test_public_identity_retains_metadata_build_ref_during_production_promotion(self):
         prepared, rollback = self.prepare()
         self.assertEqual(prepared.returncode, 0, prepared.stderr)
@@ -304,35 +415,33 @@ class BFFDeploymentEvidenceTest(unittest.TestCase):
         self.assertEqual(json.loads(failure.read_text())["reason_code"], "config_mismatch")
         self.assertFalse(output.exists())
 
-    def test_promoted_service_and_revision_require_exact_query_stage_path(self):
+    def test_promoted_serving_revision_requires_exact_query_stage_path(self):
         prepared, _ = self.prepare()
         self.assertEqual(prepared.returncode, 0, prepared.stderr)
-        for location in ("service", "revision"):
-            for value in (None, PRIOR_QUERY_STAGE_CONFIG_PATH, "/app/configs/query/dev/wrong.json", "duplicate"):
-                with self.subTest(location=location, value=value):
-                    observed_service = fixture("bff-service-after.json")
-                    observed_revision = fixture("bff-revision-after.json")
-                    target = observed_service["spec"]["template"]["spec"]["containers"][0] if location == "service" else observed_revision["spec"]["containers"][0]
-                    path_entry = next(entry for entry in target["env"] if entry["name"] == "QUERY_STAGE_CONFIG_PATH")
-                    if value is None:
-                        target["env"].remove(path_entry)
-                    elif value == "duplicate":
-                        target["env"].append(dict(path_entry))
-                    else:
-                        path_entry["value"] = value
-                    result, output, failure = self.render_documents(observed_service, observed_revision)
-                    self.assertNotEqual(result.returncode, 0)
-                    self.assertEqual(json.loads(failure.read_text())["reason_code"], "config_mismatch")
-                    self.assertFalse(output.exists())
+        for value in (None, PRIOR_QUERY_STAGE_CONFIG_PATH, "/app/configs/query/dev/wrong.json", "duplicate"):
+            with self.subTest(value=value):
+                observed_revision = fixture("bff-revision-after.json")
+                target = observed_revision["spec"]["containers"][0]
+                path_entry = next(entry for entry in target["env"] if entry["name"] == "QUERY_STAGE_CONFIG_PATH")
+                if value is None:
+                    target["env"].remove(path_entry)
+                elif value == "duplicate":
+                    target["env"].append(dict(path_entry))
+                else:
+                    path_entry["value"] = value
+                result, output, failure = self.render_documents(fixture("bff-service-after.json"), observed_revision)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(json.loads(failure.read_text())["reason_code"], "config_mismatch")
+                self.assertFalse(output.exists())
 
     def test_all_legacy_query_envs_are_rejected_from_promoted_evidence(self):
         prepared, _ = self.prepare()
         self.assertEqual(prepared.returncode, 0, prepared.stderr)
         for name in LEGACY_QUERY_ENV_NAMES:
             with self.subTest(name=name):
-                observed_service = fixture("bff-service-after.json")
-                observed_service["spec"]["template"]["spec"]["containers"][0]["env"].append({"name": name, "value": "legacy"})
-                result, output, failure = self.render_documents(observed_service, fixture("bff-revision-after.json"))
+                observed_revision = fixture("bff-revision-after.json")
+                observed_revision["spec"]["containers"][0]["env"].append({"name": name, "value": "legacy"})
+                result, output, failure = self.render_documents(fixture("bff-service-after.json"), observed_revision)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(json.loads(failure.read_text())["reason_code"], "config_mismatch")
                 self.assertFalse(output.exists())
@@ -442,16 +551,11 @@ class BFFDeploymentEvidenceTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("provider_shape_unsupported", result.stderr)
 
-    def test_provider_traffic_is_compared_in_canonical_order(self):
+    def test_provider_traffic_is_compared_in_canonical_order_for_one_target(self):
         first = fixture("bff-service-before.json")
         second = fixture("bff-service-before.json")
-        traffic = [
-            {"revisionName": "b", "percent": 30, "latestRevision": False, "tag": "z"},
-            {"revisionName": "a", "percent": 20, "latestRevision": True, "tag": "z"},
-            {"revisionName": "a", "percent": 50, "latestRevision": False, "tag": "a"},
-        ]
-        first["status"]["traffic"] = traffic
-        second["status"]["traffic"] = list(reversed(traffic))
+        first["status"]["traffic"] = [{"revisionName": "llm-wiki-bff-00001-old", "percent": 100, "latestRevision": False}]
+        second["status"]["traffic"] = [{"latestRevision": False, "percent": 100, "revisionName": "llm-wiki-bff-00001-old"}]
         first_path = self.root / "traffic-first.json"
         second_path = self.root / "traffic-second.json"
         first_path.write_text(json.dumps(first))
@@ -461,11 +565,28 @@ class BFFDeploymentEvidenceTest(unittest.TestCase):
         output = self.root / "traffic-rollback.json"
         result = self.invoke("prepare-rollback", "--artifact-name", ARTIFACT, "--output", str(output))
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(json.loads(output.read_text())["traffic"], [
-            {"revision_name": "a", "percent": 50, "tag": "a", "latest_revision": False},
-            {"revision_name": "a", "percent": 20, "tag": "z", "latest_revision": True},
-            {"revision_name": "b", "percent": 30, "tag": "z", "latest_revision": False},
-        ])
+        self.assertEqual(json.loads(output.read_text())["traffic"], [{"revision_name": "llm-wiki-bff-00001-old", "percent": 100, "latest_revision": False}])
+
+    def test_prepare_rejects_ambiguous_or_non_100_percent_traffic(self):
+        cases = [
+            [{"revisionName": "llm-wiki-bff-00001-old", "percent": 50}, {"revisionName": "llm-wiki-bff-00002-new", "percent": 50}],
+            [{"revisionName": "llm-wiki-bff-00001-old", "percent": 100}, {"revisionName": "llm-wiki-bff-00002-new", "percent": 0}],
+            [{"revisionName": "llm-wiki-bff-00001-old", "percent": 99}],
+            [{"revisionName": "llm-wiki-bff-00001-old", "percent": 100, "tag": "stable"}],
+            [{"percent": 100}],
+        ]
+        for traffic in cases:
+            with self.subTest(traffic=traffic):
+                first = fixture("bff-service-before.json")
+                first["status"]["traffic"] = traffic
+                second = json.loads(json.dumps(first))
+                first_path = self.root / "invalid-traffic-first.json"
+                second_path = self.root / "invalid-traffic-second.json"
+                first_path.write_text(json.dumps(first))
+                second_path.write_text(json.dumps(second))
+                self.env["FAKE_SERVICE_FIXTURES"] = f"{first_path},{second_path}"
+                result = self.invoke("prepare-rollback", "--artifact-name", ARTIFACT, "--output", str(self.root / "invalid-traffic.json"))
+                self.assertNotEqual(result.returncode, 0)
 
     def test_provider_and_identity_mismatches_are_classified_failed(self):
         cases = {
@@ -595,8 +716,8 @@ class BFFDeploymentEvidenceTest(unittest.TestCase):
         self.assertEqual(document["provider_verification"]["reason_code"], "identity_unavailable")
         self.assertEqual(document["provider_verification"]["checked_at"], marker["checked_at"])
 
-    def test_strict_post_readback_requires_latest_revision_true(self):
-        for value in (False, None):
+    def test_strict_post_readback_rejects_traffic_snapshot_change_between_reads(self):
+        for value in (False,):
             with self.subTest(value=value):
                 prepared, rollback = self.prepare()
                 self.assertEqual(prepared.returncode, 0, prepared.stderr)
@@ -618,6 +739,29 @@ class BFFDeploymentEvidenceTest(unittest.TestCase):
                 partial = self.invoke("render-partial", "--rollback-contract", str(rollback), "--metadata", str(self.root / "metadata.json"), "--output", str(output), "--failure-output", str(failure))
                 self.assertEqual(partial.returncode, 0, partial.stderr)
                 self.assertEqual(json.loads(output.read_text())["status"], "UNHEALTHY")
+
+    def test_strict_post_readback_rejects_split_tag_implicit_and_non_100_traffic(self):
+        cases = [
+            [{"revisionName": "llm-wiki-bff-00002-new", "percent": 50}, {"revisionName": "llm-wiki-bff-00001-old", "percent": 50}],
+            [{"revisionName": "llm-wiki-bff-00002-new", "percent": 100, "tag": "candidate"}],
+            [{"latestRevision": True, "percent": 100}],
+            [{"revisionName": "llm-wiki-bff-00002-new", "percent": 99}],
+        ]
+        for traffic in cases:
+            with self.subTest(traffic=traffic):
+                prepared, _ = self.prepare()
+                self.assertEqual(prepared.returncode, 0, prepared.stderr)
+                good = fixture("bff-service-after.json")
+                bad = json.loads(json.dumps(good))
+                bad["status"]["traffic"] = traffic
+                good_path = self.root / "strict-good.json"
+                bad_path = self.root / "strict-bad.json"
+                good_path.write_text(json.dumps(good))
+                bad_path.write_text(json.dumps(bad))
+                result, output, failure = self.render(service_fixtures=f"{good_path},{bad_path}")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(output.exists())
+                self.assertIn(json.loads(failure.read_text())["reason_code"], {"traffic_mismatch", "provider_shape_unsupported", "rollback_race"})
 
     def test_rollback_race_and_http_identity_gates_fail(self):
         self.env["FAKE_SERVICE_FIXTURES"] = f"{self.before},{self.after}"
