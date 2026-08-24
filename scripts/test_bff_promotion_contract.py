@@ -214,13 +214,13 @@ class BFFPromotionContractTest(unittest.TestCase):
                 self.run_path.write_text(original.replace('"id": 123', f'"id": {constant}', 1))
                 self.assertNotEqual(self.invoke_receipt().returncode, 0)
 
-    def test_traffic_accepts_pre_mutation_explicit_and_resolved_latest_forms(self):
+    def test_traffic_requires_pre_mutation_explicit_revision_forms(self):
         explicit = self.invoke_traffic({"traffic": [{"revisionName": REVISION, "percent": 100}]}, mode="provider-pre-mutation")
         explicit_false = self.invoke_traffic({"traffic": [{"latestRevision": False, "revisionName": REVISION, "percent": 100}]}, mode="provider-pre-mutation")
         latest = self.invoke_traffic({"status": {"traffic": [{"latestRevision": True, "revisionName": REVISION, "percent": 100}]}}, path="status.traffic", mode="provider-pre-mutation")
         self.assertEqual(explicit.returncode, 0, explicit.stderr)
         self.assertEqual(explicit_false.returncode, 0, explicit_false.stderr)
-        self.assertEqual(latest.returncode, 0, latest.stderr)
+        self.assertNotEqual(latest.returncode, 0)
 
     def test_post_rollback_requires_explicit_frozen_revision(self):
         explicit = self.invoke_traffic({"status": {"traffic": [{"revisionName": REVISION, "percent": 100}]}}, path="status.traffic", mode="provider-post-rollback", expected=REVISION)
@@ -229,6 +229,40 @@ class BFFPromotionContractTest(unittest.TestCase):
         self.assertEqual(explicit.returncode, 0, explicit.stderr)
         self.assertEqual(false_latest.returncode, 0, false_latest.stderr)
         self.assertNotEqual(latest.returncode, 0)
+
+    def test_provider_readable_traffic_accepts_cloud_run_routing_shapes(self):
+        readable = [
+            {"revisionName": REVISION, "percent": 50},
+            {
+                "revisionName": "llm-wiki-bff-00002-new",
+                "percent": 50,
+                "tag": "candidate",
+                "url": "https://candidate---llm-wiki-bff-abc.a.run.app",
+                "latestRevision": True,
+            },
+        ]
+        result = self.invoke_traffic({"status": {"traffic": readable}}, path="status.traffic", mode="provider-readable")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        implicit = self.invoke_traffic(
+            {"status": {"traffic": [{"latestRevision": True, "percent": 100}]}},
+            path="status.traffic",
+            mode="provider-readable",
+        )
+        self.assertEqual(implicit.returncode, 0, implicit.stderr)
+
+    def test_provider_readable_traffic_rejects_unreadable_shapes_without_targeting(self):
+        cases = (
+            [{"revisionName": REVISION, "percent": 100, "unknown": True}],
+            [{"revisionName": REVISION, "percent": "100"}],
+            [{"revisionName": REVISION, "percent": 100, "type": []}],
+            [{"revisionName": REVISION, "percent": 101}],
+            [{"revisionName": REVISION, "percent": 50}, {"revisionName": "llm-wiki-bff-00002-new", "percent": 40}],
+            [],
+        )
+        for traffic in cases:
+            with self.subTest(traffic=traffic):
+                result = self.invoke_traffic({"status": {"traffic": traffic}}, path="status.traffic", mode="provider-readable")
+                self.assertNotEqual(result.returncode, 0)
 
     def test_dev_status_spec_convergence_is_stronger_than_production_preflight(self):
         converged = {

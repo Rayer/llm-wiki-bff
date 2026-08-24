@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import sys
 import tempfile
+from urllib.parse import urlsplit
 
 
 RECEIPT_SCHEMA_VERSION = 3
@@ -439,6 +440,63 @@ def validate_traffic_entries(entries, recognized_revisions):
     }
 
 
+PROVIDER_READABLE_TRAFFIC_KEYS = {"revisionName", "percent", "latestRevision", "tag", "url", "type"}
+PROVIDER_READABLE_TRAFFIC_TYPES = {
+    "TRAFFIC_TARGET_ALLOCATION_TYPE_LATEST",
+    "TRAFFIC_TARGET_ALLOCATION_TYPE_REVISION",
+}
+
+
+def validate_provider_readable_entries(entries):
+    if not isinstance(entries, list) or not entries:
+        reject("provider traffic must be a non-empty array")
+    total = 0
+    for entry in entries:
+        if not isinstance(entry, dict):
+            reject("provider traffic entry is malformed")
+        if set(entry) - PROVIDER_READABLE_TRAFFIC_KEYS:
+            reject("provider traffic entry contains unknown fields")
+        latest_revision = entry.get("latestRevision", False)
+        if not isinstance(latest_revision, bool):
+            reject("provider latestRevision is invalid")
+        revision = entry.get("revisionName")
+        if latest_revision:
+            if revision is not None and (not isinstance(revision, str) or not REVISION_RE.fullmatch(revision)):
+                reject("provider traffic entry has an invalid resolved revision identity")
+        elif not isinstance(revision, str) or not REVISION_RE.fullmatch(revision):
+            reject("provider traffic entry has no resolved revision identity")
+        percent = entry.get("percent")
+        if type(percent) is not int or not 0 <= percent <= 100:
+            reject("provider traffic percent is invalid")
+        total += percent
+        if "tag" in entry and (not isinstance(entry["tag"], str) or not entry["tag"]):
+            reject("provider traffic tag is invalid")
+        if "type" in entry and (
+            not isinstance(entry["type"], str) or entry["type"] not in PROVIDER_READABLE_TRAFFIC_TYPES
+        ):
+            reject("provider traffic type is invalid")
+        if "url" in entry:
+            if not isinstance(entry["url"], str):
+                reject("provider traffic URL is invalid")
+            try:
+                parsed = urlsplit(entry["url"])
+                hostname = parsed.hostname
+            except ValueError:
+                reject("provider traffic URL is invalid")
+            if (
+                parsed.scheme != "https"
+                or not hostname
+                or parsed.username is not None
+                or parsed.password is not None
+                or parsed.path
+                or parsed.query
+                or parsed.fragment
+            ):
+                reject("provider traffic URL is invalid")
+    if total != 100:
+        reject("provider traffic percentages must total 100")
+
+
 def validate_traffic(args):
     document = read_json(args.traffic_file)
     recognized = set(args.recognized_revision)
@@ -475,7 +533,9 @@ def validate_traffic(args):
             reject("restored provider traffic is not the frozen explicit revision")
         return
 
-    validate_traffic_entries(entries, recognized)
+    result = validate_traffic_entries(entries, recognized)
+    if result["latest_revision"]:
+        reject("provider traffic target is implicit latest routing")
 
 
 def write_json(path, value):
@@ -531,7 +591,7 @@ def parser():
     traffic = subparsers.add_parser("validate-traffic")
     traffic.add_argument("--traffic-file", required=True)
     traffic.add_argument("--traffic-path", required=True)
-    traffic.add_argument("--traffic-mode", choices=("artifact", "provider-pre-mutation", "provider-post-rollback", "provider-dev-convergence"), required=True)
+    traffic.add_argument("--traffic-mode", choices=("artifact", "provider-readable", "provider-pre-mutation", "provider-post-rollback", "provider-dev-convergence"), required=True)
     traffic.add_argument("--compare-path")
     traffic.add_argument("--expected-revision")
     traffic.add_argument("--recognized-revision", action="append", default=[])
@@ -611,6 +671,9 @@ def main(argv=None):
         elif args.mode == "extract-git-ref-sha":
             extract_git_ref_sha(args)
         else:
+            if args.traffic_mode == "provider-readable":
+                validate_provider_readable_entries(path_value(read_json(args.traffic_file), args.traffic_path))
+                return 0
             if args.traffic_mode == "provider-dev-convergence" and not args.compare_path:
                 reject("DEV convergence validation requires a comparison path")
             if args.traffic_mode == "provider-post-rollback" and not args.expected_revision:

@@ -123,7 +123,7 @@ class BFFDeploymentEvidenceTest(unittest.TestCase):
         result = self.invoke("prepare-rollback", "--artifact-name", ARTIFACT, "--output", str(output))
         return result, output
 
-    def render(self, metadata=None, service_fixtures=None):
+    def render(self, metadata=None, service_fixtures=None, expected_revision=None):
         metadata = self.metadata() if metadata is None else metadata
         metadata_path = self.root / "metadata.json"
         metadata_path.write_text(json.dumps(metadata))
@@ -134,7 +134,8 @@ class BFFDeploymentEvidenceTest(unittest.TestCase):
         self.env["FAKE_REVISION_FIXTURE"] = str(self.revision_path)
         if not getattr(self, "custom_revision", False):
             self.revision_path.write_text(json.dumps(fixture("bff-revision-after.json")))
-        result = self.invoke("render-evidence", "--expected-runtime-service-account", SA, "--rollback-contract", str(self.root / "rollback.json"), "--metadata", str(metadata_path), "--output", str(output), "--failure-output", str(failure))
+        extra = ("--expected-revision", expected_revision) if expected_revision is not None else ()
+        result = self.invoke("render-evidence", "--expected-runtime-service-account", SA, *extra, "--rollback-contract", str(self.root / "rollback.json"), "--metadata", str(metadata_path), "--output", str(output), "--failure-output", str(failure))
         return result, output, failure
 
     def render_documents(self, observed_service, observed_revision=None):
@@ -197,6 +198,14 @@ class BFFDeploymentEvidenceTest(unittest.TestCase):
         document = json.loads(output.read_text())
         self.assertEqual(document["observed_service"]["ready_revision"], "llm-wiki-bff-00002-new")
         self.assertEqual(document["observed_service"]["traffic"], [{"revision_name": "llm-wiki-bff-00002-new", "percent": 100, "latest_revision": False}])
+
+    def test_strict_evidence_rejects_traffic_that_is_not_the_persisted_candidate(self):
+        prepared, _ = self.prepare()
+        self.assertEqual(prepared.returncode, 0, prepared.stderr)
+        rendered, output, failure = self.render(expected_revision="llm-wiki-bff-00003-other")
+        self.assertNotEqual(rendered.returncode, 0)
+        self.assertFalse(output.exists())
+        self.assertEqual(json.loads(failure.read_text())["reason_code"], "traffic_mismatch")
 
     def test_strict_evidence_uses_serving_revision_config_when_ready_template_is_untrafficked(self):
         prepared, _ = self.prepare()

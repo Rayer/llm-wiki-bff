@@ -2880,8 +2880,14 @@ func TestReleaseWorkflowHasBoundedTimeoutBudget(t *testing.T) {
 			t.Fatalf("production release must not use the unbounded or undersized timeout contract %q", forbidden)
 		}
 	}
-	readback := workflowSection(t, contents, "      - name: Verify deployed query config readback", "      - name: Persist build image digest")
-	for _, want := range []string{"READBACK_REVISION_DEADLINE=$((SECONDS + 300))", "READBACK_DEADLINE=$((SECONDS + 300))"} {
+	cutover := workflowSection(t, contents, "      - name: Identify, validate, and explicitly cut over exact BFF candidate", "      - name: Verify deployed query config readback")
+	readback := workflowSection(t, contents, "      - name: Verify deployed query config readback", "      - name: Render normalized deployment evidence after strict read-back")
+	for _, want := range []string{"CANDIDATE_DISCOVERY_TIMEOUT_SECONDS", "CUTOVER_VERIFY_TIMEOUT_SECONDS"} {
+		if !strings.Contains(cutover, want) {
+			t.Errorf("post-deploy cutover is missing bounded loop budget %q", want)
+		}
+	}
+	for _, want := range []string{"READBACK_DEADLINE=$((SECONDS + 300))"} {
 		if !strings.Contains(readback, want) {
 			t.Errorf("post-deploy readback is missing bounded loop %q", want)
 		}
@@ -2915,7 +2921,7 @@ func TestReleaseWorkflowValidatesAndPersistsFrozenLiveRevisionBeforeMutation(t *
 
 func TestReleaseWorkflowRequiresExactChangedCreatedRevision(t *testing.T) {
 	contents := readWorkflow(t, ".github/workflows/release-bff.yml")
-	readback := workflowSection(t, contents, "      - name: Verify deployed query config readback", "      - name: Persist build image digest")
+	readback := workflowSection(t, contents, "      - name: Identify, validate, and explicitly cut over exact BFF candidate", "      - name: Verify deployed query config readback")
 	deploy := strings.Index(contents, "gcloud run deploy")
 	validation := strings.Index(contents, "      - name: Validate frozen rollback traffic before mutation")
 	readbackStart := strings.Index(contents, "      - name: Verify deployed query config readback")
@@ -2924,16 +2930,19 @@ func TestReleaseWorkflowRequiresExactChangedCreatedRevision(t *testing.T) {
 	}
 	for _, want := range []string{
 		`FROZEN_CREATED_REVISION="${FROZEN_CREATED_REVISION:?}"`,
-		`CANDIDATE_REVISION=$(jq -er '.status.latestCreatedRevisionName | select(type == "string" and length > 0)'`,
-		`[[ "$CANDIDATE_REVISION" != "$FROZEN_CREATED_REVISION" ]]`,
-		`.status.latestCreatedRevisionName == $revision and .status.latestReadyRevisionName == $revision`,
+		`CANDIDATE_REVISION=$(jq -r '.status.latestCreatedRevisionName // empty'`,
+		`"$CANDIDATE_REVISION" != "$FROZEN_CREATED_REVISION"`,
+		"gcloud run revisions describe \"$CANDIDATE_REVISION\"",
+		".status.imageDigest",
+		"ContainerReady",
+		"gcloud run services update-traffic \"$SERVICE_NAME\"",
 	} {
 		if !strings.Contains(readback, want) {
 			t.Errorf("post-deploy exact changed-created contract is missing %q", want)
 		}
 	}
-	if strings.Contains(readback, "CANDIDATE_REVISION=$(jq -er '.status.latestCreatedRevisionName // empty'") {
-		t.Fatal("post-deploy candidate revision must reject empty latestCreatedRevisionName")
+	if strings.Contains(readback, "latestReadyRevisionName") {
+		t.Fatal("post-deploy candidate must not use latestReadyRevisionName as authority")
 	}
 	if strings.Contains(readback, "!= \"$FROZEN_READY_REVISION\"") {
 		t.Fatal("post-deploy convergence must compare against the exact frozen latest-created revision")
@@ -3075,6 +3084,8 @@ exec "$REAL_PYTHON" "$@"
 		"FROZEN_CREATED_REVISION=old-created",
 		"COMMIT_SHA=cccccccccccccccccccccccccccccccccccccccc",
 		"EXPECTED_COMMIT=cccccccccccccccccccccccccccccccccccccccc",
+		"EXPECTED_REVISION=new-revision",
+		"CANDIDATE_REVISION=new-revision",
 		"QUERY_STAGE_CONFIG_REVISION=query-dev-2026-08-22.1",
 		"QUERY_STAGE_CONFIG_DIGEST=sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
 		"GITHUB_OUTPUT="+filepath.Join(t.TempDir(), "github-output"),
