@@ -2894,6 +2894,26 @@ func TestReleaseWorkflowHasBoundedTimeoutBudget(t *testing.T) {
 	}
 }
 
+func TestReleaseBFFCutoverAuthenticatesGitHubCLIWithWorkflowToken(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/release-bff.yml")
+	cutover := workflowSection(t, contents, "      - name: Identify, validate, and explicitly cut over exact BFF candidate", "      - name: Verify deployed query config readback")
+	envAt := strings.Index(cutover, "        env:\n")
+	runAt := strings.Index(cutover, "        run: |\n")
+	if envAt < 0 || runAt < 0 || envAt > runAt {
+		t.Fatal("BFF production cutover must define step-scoped environment before its run block")
+	}
+	env := cutover[envAt:runAt]
+	if strings.Count(env, "          GH_TOKEN:") != 1 || !strings.Contains(env, "          GH_TOKEN: ${{ github.token }}\n") {
+		t.Fatal("BFF production cutover gh api check must use the workflow github.token as GH_TOKEN")
+	}
+	if strings.Contains(env, "secrets.") || strings.Contains(env, "ghp_") {
+		t.Fatal("BFF production cutover GH_TOKEN must not come from a secret or hardcoded value")
+	}
+	if !strings.Contains(cutover, `gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq .object.sha`) {
+		t.Fatal("BFF production cutover must retain the exact main race check")
+	}
+}
+
 func TestReleaseWorkflowValidatesAndPersistsFrozenLiveRevisionBeforeMutation(t *testing.T) {
 	contents := readWorkflow(t, ".github/workflows/release-bff.yml")
 	validation := workflowSection(t, contents, "      - name: Validate frozen rollback traffic before mutation", "      - name: Deploy existing immutable image to Cloud Run")
