@@ -413,6 +413,7 @@ func registerAdminRoutes(r *gin.Engine, cfg config.Config, hV1 *handlerv1.Handle
 		admin.PATCH("/projects/:id", hV1.AdminRenameProject)
 		admin.DELETE("/projects/:id", hV1.AdminDeleteProject)
 		admin.POST("/projects/:id/pipeline", hV1.AdminPipelineTrigger)
+		admin.GET("/projects/:id/pipeline/status", hV1.AdminPipelineStatus)
 		admin.POST("/projects/:id/rebuild-index", hV1.AdminRebuildIndex)
 		admin.GET("/users", hV1.AdminListUsers)
 		admin.PATCH("/users/:id", hV1.AdminUpdateUser)

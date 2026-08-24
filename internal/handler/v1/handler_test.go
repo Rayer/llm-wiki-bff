@@ -815,6 +815,9 @@ func TestAdminPipelineTriggerInvokesWorkerWithoutImmediateRebuild(t *testing.T) 
 		projectExists: func(context.Context, string) error {
 			return nil
 		},
+		adminProjectRecordLoader: func(context.Context, string) (adminProjectRecord, error) {
+			return adminProjectRecord{id: "request-user_demo", userID: "request-user", projectID: "demo"}, nil
+		},
 		rebuildIndex: func(context.Context, string, string) (idMap, error) {
 			t.Fatal("AdminPipelineTrigger must not rebuild index immediately")
 			return idMap{}, nil
@@ -827,14 +830,14 @@ func TestAdminPipelineTriggerInvokesWorkerWithoutImmediateRebuild(t *testing.T) 
 
 	h.AdminPipelineTrigger(c)
 
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	if recorder.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusAccepted, recorder.Body.String())
 	}
 	var body map[string]any
 	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	if body["status"] != "ok" || body["execution_id"] != "olw-pipeline-admin" {
+	if body["status"] != "accepted" || body["execution_id"] != "olw-pipeline-admin" {
 		t.Fatalf("body = %#v", body)
 	}
 	if body["clean_rebuild"] != false {
@@ -864,6 +867,137 @@ func TestAdminPipelineTriggerInvokesWorkerWithoutImmediateRebuild(t *testing.T) 
 	}
 	if !foundStage {
 		t.Fatalf("missing PIPELINE_STAGE env: %#v", override.Env)
+	}
+}
+
+func TestAdminPipelineTriggerUsesStoredOwnerForUnderscoredProjectID(t *testing.T) {
+	var gotUserID, gotProjectID string
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/token":
+			return testHTTPResponse(http.StatusOK, `{"access_token":"test-token"}`), nil
+		case "/run":
+			var request struct {
+				Overrides struct {
+					ContainerOverrides []struct {
+						Env []struct{ Name, Value string } `json:"env"`
+					} `json:"containerOverrides"`
+				} `json:"overrides"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				return nil, err
+			}
+			for _, env := range request.Overrides.ContainerOverrides[0].Env {
+				switch env.Name {
+				case "USER_ID":
+					gotUserID = env.Value
+				case "PROJECT_ID":
+					gotProjectID = env.Value
+				}
+			}
+			return testHTTPResponse(http.StatusOK, `{"metadata":{"execution":"projects/p/locations/l/jobs/j/executions/exec-underscore"}}`), nil
+		default:
+			return testHTTPResponse(http.StatusNotFound, `not found`), nil
+		}
+	})}
+	docID := "user-a_project_with_underscores"
+	h := &Handler{
+		httpClient:       client,
+		metadataTokenURL: "http://metadata.test/token",
+		cloudRunJobURL:   "https://run.test/run",
+		adminProjectRecordLoader: func(context.Context, string) (adminProjectRecord, error) {
+			return adminProjectRecord{id: docID, userID: "user-a", projectID: "project_with_underscores"}, nil
+		},
+	}
+	recorder := invokeHandlerWithParams(h.AdminPipelineTrigger, http.MethodPost, "/admin/projects/"+docID+"/pipeline", gin.Params{{Key: "id", Value: docID}})
+	if recorder.Code != http.StatusAccepted {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if gotUserID != "user-a" || gotProjectID != "project_with_underscores" {
+		t.Fatalf("Cloud Run owner=(%q,%q), want (%q,%q)", gotUserID, gotProjectID, "user-a", "project_with_underscores")
+	}
+}
+
+func TestAdminPipelineStatusRouteReturnsOwnedExecution(t *testing.T) {
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/token":
+			return testHTTPResponse(http.StatusOK, `{"access_token":"test-token"}`), nil
+		case "/run/executions/olw-pipeline-admin":
+			return testHTTPResponse(http.StatusOK, `{
+				"name":"projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline/executions/olw-pipeline-admin",
+				"completionStatus":"EXECUTION_RUNNING",
+				"runningCount":1,
+				"template":{"containers":[{"env":[
+					{"name":"USER_ID","value":"user-a"},
+					{"name":"PROJECT_ID","value":"project_with_underscores"},
+					{"name":"TASK_TYPE","value":"pipeline"}
+				]}]}
+			}`), nil
+		default:
+			return testHTTPResponse(http.StatusNotFound, `not found`), nil
+		}
+	})}
+	docID := "user-a_project_with_underscores"
+	h := &Handler{
+		httpClient:       client,
+		metadataTokenURL: "http://metadata.test/token",
+		cloudRunJobURL:   "https://run.test/run",
+		adminProjectRecordLoader: func(context.Context, string) (adminProjectRecord, error) {
+			return adminProjectRecord{id: docID, userID: "user-a", projectID: "project_with_underscores"}, nil
+		},
+	}
+	router := gin.New()
+	router.GET("/api/v1/admin/projects/:id/pipeline/status", h.AdminPipelineStatus)
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/projects/"+docID+"/pipeline/status?execution_id=olw-pipeline-admin", nil)
+	router.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", recorder.Code, recorder.Body.String())
+	}
+	var body struct {
+		ProjectID string                             `json:"project_id"`
+		Execution *handler.PipelineExecutionResponse `json:"last_execution"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if body.ProjectID != "project_with_underscores" || body.Execution == nil || body.Execution.Status != "RUNNING" {
+		t.Fatalf("body = %#v", body)
+	}
+}
+
+func TestAdminPipelineStatusRouteFailsClosedForOtherProject(t *testing.T) {
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == "/token" {
+			return testHTTPResponse(http.StatusOK, `{"access_token":"test-token"}`), nil
+		}
+		return testHTTPResponse(http.StatusOK, `{
+			"name":"projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline/executions/other",
+			"completionStatus":"EXECUTION_SUCCEEDED",
+			"succeededCount":1,
+			"template":{"containers":[{"env":[
+				{"name":"USER_ID","value":"other-user"},
+				{"name":"PROJECT_ID","value":"other-project"},
+				{"name":"TASK_TYPE","value":"pipeline"}
+			]}]}
+		}`), nil
+	})}
+	h := &Handler{
+		httpClient:       client,
+		metadataTokenURL: "http://metadata.test/token",
+		cloudRunJobURL:   "https://run.test/run",
+		adminProjectRecordLoader: func(context.Context, string) (adminProjectRecord, error) {
+			return adminProjectRecord{id: "request-user_demo", userID: "request-user", projectID: "demo"}, nil
+		},
+	}
+	router := gin.New()
+	router.GET("/api/v1/admin/projects/:id/pipeline/status", h.AdminPipelineStatus)
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/v1/admin/projects/request-user_demo/pipeline/status?execution_id=other", nil))
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404; body = %s", recorder.Code, recorder.Body.String())
 	}
 }
 
@@ -903,6 +1037,9 @@ func TestAdminPipelineTriggerSuggestedQueriesStage(t *testing.T) {
 		metadataTokenURL: "http://metadata.test/token",
 		cloudRunJobURL:   "https://run.test/run",
 		projectExists:    func(context.Context, string) error { return nil },
+		adminProjectRecordLoader: func(context.Context, string) (adminProjectRecord, error) {
+			return adminProjectRecord{id: "request-user_demo", userID: "request-user", projectID: "demo"}, nil
+		},
 	}
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
@@ -912,8 +1049,8 @@ func TestAdminPipelineTriggerSuggestedQueriesStage(t *testing.T) {
 
 	h.AdminPipelineTrigger(c)
 
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	if recorder.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusAccepted, recorder.Body.String())
 	}
 	var body map[string]any
 	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
@@ -950,6 +1087,9 @@ func TestAdminPipelineTriggerRejectsCleanRebuildWithSuggestedQueries(t *testing.
 		metadataTokenURL: "http://metadata.test/token",
 		cloudRunJobURL:   "https://run.test/run",
 		projectExists:    func(context.Context, string) error { return nil },
+		adminProjectRecordLoader: func(context.Context, string) (adminProjectRecord, error) {
+			return adminProjectRecord{id: "request-user_demo", userID: "request-user", projectID: "demo"}, nil
+		},
 	}
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
@@ -998,6 +1138,9 @@ func TestAdminPipelineTriggerCleanRebuildSetsEnv(t *testing.T) {
 		metadataTokenURL: "http://metadata.test/token",
 		cloudRunJobURL:   "https://run.test/run",
 		projectExists:    func(context.Context, string) error { return nil },
+		adminProjectRecordLoader: func(context.Context, string) (adminProjectRecord, error) {
+			return adminProjectRecord{id: "request-user_demo", userID: "request-user", projectID: "demo"}, nil
+		},
 	}
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
@@ -1007,8 +1150,8 @@ func TestAdminPipelineTriggerCleanRebuildSetsEnv(t *testing.T) {
 
 	h.AdminPipelineTrigger(c)
 
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	if recorder.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusAccepted, recorder.Body.String())
 	}
 	var body map[string]any
 	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
@@ -1613,6 +1756,9 @@ func TestAdminPipelineTriggerBlocksAlreadyRunning(t *testing.T) {
 		cloudRunJobURL:   "https://run.googleapis.com/v2/projects/llm-wiki-cloud/locations/asia-east1/jobs/olw-pipeline:run",
 		projectExists: func(context.Context, string) error {
 			return nil
+		},
+		adminProjectRecordLoader: func(context.Context, string) (adminProjectRecord, error) {
+			return adminProjectRecord{id: "request-user_demo", userID: "request-user", projectID: "demo"}, nil
 		},
 	}
 	recorder := httptest.NewRecorder()

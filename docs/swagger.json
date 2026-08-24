@@ -214,7 +214,7 @@
                         "BearerAuth": []
                     }
                 ],
-                "description": "Invokes the Cloud Run worker job for the specified project, then rebuilds the search index.",
+                "description": "Invokes the Cloud Run worker job for the specified project. Optional clean_rebuild/stage overrides may be provided in the JSON request body.",
                 "consumes": [
                     "application/json"
                 ],
@@ -224,7 +224,7 @@
                 "tags": [
                     "admin"
                 ],
-                "summary": "Trigger pipeline + rebuild for a project (admin)",
+                "summary": "Trigger pipeline for a project (admin)",
                 "parameters": [
                     {
                         "type": "string",
@@ -232,14 +232,21 @@
                         "name": "id",
                         "in": "path",
                         "required": true
+                    },
+                    {
+                        "description": "Optional pipeline stage and clean rebuild flags",
+                        "name": "body",
+                        "in": "body",
+                        "schema": {
+                            "$ref": "#/definitions/v1.adminPipelineTriggerRequest"
+                        }
                     }
                 ],
                 "responses": {
-                    "200": {
-                        "description": "OK",
+                    "202": {
+                        "description": "Accepted",
                         "schema": {
-                            "type": "object",
-                            "additionalProperties": true
+                            "$ref": "#/definitions/v1.adminPipelineTriggerResponse"
                         }
                     },
                     "400": {
@@ -268,6 +275,77 @@
                     },
                     "409": {
                         "description": "Conflict",
+                        "schema": {
+                            "$ref": "#/definitions/handler.ErrorResponse"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error",
+                        "schema": {
+                            "$ref": "#/definitions/handler.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/admin/projects/{id}/pipeline/status": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Returns the exact Cloud Run execution for the requested project. Ownership mismatches return not found.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin"
+                ],
+                "summary": "Admin pipeline execution status",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Project doc ID ({userID}_{projectID})",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Cloud Run execution ID",
+                        "name": "execution_id",
+                        "in": "query",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/v1.adminPipelineStatusResponse"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/handler.ErrorResponse"
+                        }
+                    },
+                    "401": {
+                        "description": "Unauthorized",
+                        "schema": {
+                            "$ref": "#/definitions/handler.ErrorResponse"
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "$ref": "#/definitions/handler.ErrorResponse"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
                         "schema": {
                             "$ref": "#/definitions/handler.ErrorResponse"
                         }
@@ -2468,6 +2546,45 @@
             ],
             "properties": {
                 "announcement_markdown": {
+                    "type": "string"
+                }
+            }
+        },
+        "v1.adminPipelineStatusResponse": {
+            "type": "object",
+            "properties": {
+                "last_execution": {
+                    "$ref": "#/definitions/handler.PipelineExecutionResponse"
+                },
+                "project_id": {
+                    "type": "string"
+                }
+            }
+        },
+        "v1.adminPipelineTriggerRequest": {
+            "type": "object",
+            "properties": {
+                "clean_rebuild": {
+                    "type": "boolean"
+                },
+                "stage": {
+                    "type": "string"
+                }
+            }
+        },
+        "v1.adminPipelineTriggerResponse": {
+            "type": "object",
+            "properties": {
+                "clean_rebuild": {
+                    "type": "boolean"
+                },
+                "execution_id": {
+                    "type": "string"
+                },
+                "stage": {
+                    "type": "string"
+                },
+                "status": {
                     "type": "string"
                 }
             }
