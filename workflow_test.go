@@ -2631,6 +2631,59 @@ func TestReleaseWorkflowAuthenticatesOnlyAfterReadOnlyGatesAndHasOneProviderMuta
 	}
 }
 
+func TestReleaseWorkflowIAMPreflightRejectsConditionalBindings(t *testing.T) {
+	preflight := workflowRunStep(t, readWorkflow(t, ".github/workflows/release-bff.yml"), "Verify production IAM preflight")
+	bin := t.TempDir()
+	servicePolicy := filepath.Join(t.TempDir(), "service-policy.json")
+	jobPolicy := filepath.Join(t.TempDir(), "job-policy.json")
+	writeExecutable(t, filepath.Join(bin, "gcloud"), `#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$*" == *"run services get-iam-policy"* ]]; then
+  cat "$SERVICE_POLICY"
+elif [[ "$*" == *"run jobs get-iam-policy"* ]]; then
+  cat "$JOB_POLICY"
+else
+  exit 2
+fi
+`)
+	env := append(os.Environ(),
+		"PATH="+bin+":"+os.Getenv("PATH"),
+		"SERVICE_NAME=llm-wiki-bff",
+		"PROJECT_ID=llm-wiki-cloud",
+		"REGION=asia-east1",
+		"PIPELINE_JOB_NAME=olw-pipeline",
+		"RUNTIME_SERVICE_ACCOUNT=lwc-bff-prod@llm-wiki-cloud.iam.gserviceaccount.com",
+		"SERVICE_POLICY="+servicePolicy,
+		"JOB_POLICY="+jobPolicy,
+	)
+	unconditionalService := `{"bindings":[{"role":"roles/run.invoker","members":["allUsers"]}]}`
+	unconditionalJob := `{"bindings":[{"role":"roles/run.jobsExecutorWithOverrides","members":["serviceAccount:lwc-bff-prod@llm-wiki-cloud.iam.gserviceaccount.com"]}]}`
+	conditionalService := `{"bindings":[{"role":"roles/run.invoker","members":["allUsers"],"condition":{"title":"maintenance","expression":"true"}}]}`
+	conditionalJob := `{"bindings":[{"role":"roles/run.jobsExecutorWithOverrides","members":["serviceAccount:lwc-bff-prod@llm-wiki-cloud.iam.gserviceaccount.com"],"condition":{"title":"maintenance","expression":"true"}}]}`
+	for _, tc := range []struct {
+		name          string
+		servicePolicy string
+		jobPolicy     string
+		wantErr       bool
+	}{
+		{name: "unconditional", servicePolicy: unconditionalService, jobPolicy: unconditionalJob},
+		{name: "conditional invoker", servicePolicy: conditionalService, jobPolicy: unconditionalJob, wantErr: true},
+		{name: "conditional executor", servicePolicy: unconditionalService, jobPolicy: conditionalJob, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := os.WriteFile(servicePolicy, []byte(tc.servicePolicy), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(jobPolicy, []byte(tc.jobPolicy), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := runWorkflowBlock(t, preflight, env); (err != nil) != tc.wantErr {
+				t.Fatalf("preflight error = %v, wantErr=%t", err, tc.wantErr)
+			}
+		})
+	}
+}
+
 func TestReleaseWorkflowRequiresCompleteSameRunJobEvidenceBeforeAuth(t *testing.T) {
 	contents := readWorkflow(t, ".github/workflows/release-bff.yml")
 	start := strings.Index(contents, "- name: Validate exact successful DEV promotion jobs")
@@ -2840,8 +2893,8 @@ func TestReleaseWorkflowValidatesAndPersistsFrozenLiveRevisionBeforeMutation(t *
 	validation := workflowSection(t, contents, "      - name: Validate frozen rollback traffic before mutation", "      - name: Deploy existing immutable image to Cloud Run")
 	for _, want := range []string{
 		`SERVICE_JSON=$(gcloud run services describe "$SERVICE_NAME"`,
-		`.status.latestCreatedRevisionName == $ready_revision`,
-		`.status.latestReadyRevisionName == $ready_revision`,
+		`(.status.latestCreatedRevisionName | type) == "string"`,
+		`(.status.latestReadyRevisionName | type) == "string"`,
 		"scripts/validate_bff_promotion_contract.py validate-traffic",
 		"--traffic-path status.traffic",
 		"--traffic-mode provider-pre-mutation",
@@ -2925,6 +2978,132 @@ func TestReleaseWorkflowReconcilesFrozenRestoreRegardlessOfUpdateTrafficStatus(t
 	}
 	if strings.Index(command, "ROLLBACK_EXIT=$?") > strings.Index(command, "while (( SECONDS < ROLLBACK_READBACK_DEADLINE )); do") {
 		t.Fatal("readback must follow update-traffic for both zero and nonzero command statuses")
+	}
+}
+
+func TestReleaseWorkflowEvidenceFailureCausallyRestoresFrozenTraffic(t *testing.T) {
+	contents := readWorkflow(t, ".github/workflows/release-bff.yml")
+	query := workflowRunBlock(contents, "Verify deployed query config readback")
+	evidence := workflowRunBlock(contents, "Render normalized deployment evidence after strict read-back")
+	restore := workflowRunBlock(contents, "Restore frozen production traffic after query-config readback failure")
+	if query == "" || evidence == "" || restore == "" {
+		t.Fatal("release workflow is missing the query readback, evidence, or restore run block")
+	}
+	queryAt := strings.Index(contents, "      - name: Verify deployed query config readback")
+	evidenceAt := strings.Index(contents, "      - name: Render normalized deployment evidence after strict read-back")
+	restoreAt := strings.Index(contents, "      - name: Restore frozen production traffic after query-config readback failure")
+	if !(queryAt < evidenceAt && evidenceAt < restoreAt) {
+		t.Fatal("frozen traffic restore must follow strict evidence so evidence failure is reconciled")
+	}
+
+	bin := t.TempDir()
+	events := filepath.Join(t.TempDir(), "events.log")
+	updated := filepath.Join(t.TempDir(), "updated")
+	queryBody := filepath.Join(t.TempDir(), "query-config.json")
+	if err := os.WriteFile(queryBody, []byte(`{"build":{"commit":"cccccccccccccccccccccccccccccccccccccccc","revision":"new-revision","service":"llm-wiki-bff"},"query_config":{"config_digest":"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","config_revision":"query-dev-2026-08-22.1","default_profile_digest":"p","default_profile_id":"p","default_prompt_digest":"q","default_prompt_id":"q","expansion_model":"deepseek-v4-flash","expansion_provider":"deepseek","expansion_reasoning":"none","expansion_temperature":0,"no_evidence_policy":"full-model-prior-fallback-v1","options":{"evidence_threshold":2,"expansion_attempts":3,"exploration_slots":1,"keywords_per_attempt":24,"rare_document_frequency":1,"selection_limit":10},"query_service_implementation":"query-retrieval-pipeline-v2","schema_version":2,"synthesis_model":"deepseek-v4-pro","synthesis_provider":"deepseek","synthesis_reasoning":"none","synthesis_temperature":0}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rollback := filepath.Join(t.TempDir(), "rollback.json")
+	if err := os.WriteFile(rollback, []byte(`{"ready_revision":"old-revision","traffic":[{"revision_name":"old-revision","percent":100}]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeExecutable(t, filepath.Join(bin, "gcloud"), `#!/usr/bin/env bash
+set -euo pipefail
+joined="$*"
+printf 'gcloud %s\n' "$joined" >> "$EVENT_LOG"
+if [[ "$joined" == *"value(status.url)"* ]]; then
+  printf '%s\n' 'https://llm-wiki-bff-abc-asia-east1.a.run.app'
+elif [[ "$joined" == *"run services describe"* && -f "$UPDATED" ]]; then
+  printf '%s\n' rollback-readback >> "$EVENT_LOG"
+  printf '%s\n' '{"status":{"traffic":[{"revisionName":"old-revision","percent":100}]}}'
+elif [[ "$joined" == *"run services describe"* ]]; then
+  printf '%s\n' '{"status":{"latestCreatedRevisionName":"new-revision","latestReadyRevisionName":"new-revision","traffic":[{"revisionName":"new-revision","percent":100}]}}'
+elif [[ "$joined" == *"run services update-traffic"* ]]; then
+  printf '%s\n' update-traffic >> "$EVENT_LOG"
+  : > "$UPDATED"
+else
+  echo "unexpected gcloud invocation: $*" >&2
+  exit 2
+fi
+`)
+	writeExecutable(t, filepath.Join(bin, "curl"), `#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' query-config-success >> "$EVENT_LOG"
+header=""
+body=""
+while (($#)); do
+  case "$1" in
+    --dump-header) shift; header="$1" ;;
+    --output) shift; body="$1" ;;
+  esac
+  shift
+done
+printf '%s\n' 'HTTP/2 200' 'Cache-Control: no-store' > "$header"
+cat "$FAKE_QUERY_BODY" > "$body"
+printf '200'
+`)
+	realPython, err := exec.LookPath("python3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeExecutable(t, filepath.Join(bin, "python3"), `#!/usr/bin/env bash
+set -euo pipefail
+printf 'python %s\n' "$*" >> "$EVENT_LOG"
+if [[ "$*" == *"render_bff_deployment_evidence.py"* ]]; then
+  printf '%s\n' evidence-failure >> "$EVENT_LOG"
+  exit 42
+fi
+exec "$REAL_PYTHON" "$@"
+`)
+
+	evidence = strings.ReplaceAll(evidence, "${{ steps.image.outputs.image }}", "$IMMUTABLE_IMAGE")
+	restore = strings.NewReplacer(
+		"${{ env.SERVICE_NAME }}", "$SERVICE_NAME",
+		"${{ env.PROJECT_ID }}", "$PROJECT_ID",
+		"${{ env.REGION }}", "$REGION",
+	).Replace(restore)
+	env := append(os.Environ(),
+		"PATH="+bin+":"+os.Getenv("PATH"),
+		"REAL_PYTHON="+realPython,
+		"EVENT_LOG="+events,
+		"UPDATED="+updated,
+		"FAKE_QUERY_BODY="+queryBody,
+		"ROLLBACK_CONTRACT="+rollback,
+		"SERVICE_NAME=llm-wiki-bff",
+		"PROJECT_ID=llm-wiki-cloud",
+		"REGION=asia-east1",
+		"FROZEN_CREATED_REVISION=old-created",
+		"COMMIT_SHA=cccccccccccccccccccccccccccccccccccccccc",
+		"EXPECTED_COMMIT=cccccccccccccccccccccccccccccccccccccccc",
+		"QUERY_STAGE_CONFIG_REVISION=query-dev-2026-08-22.1",
+		"QUERY_STAGE_CONFIG_DIGEST=sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+		"GITHUB_OUTPUT="+filepath.Join(t.TempDir(), "github-output"),
+		"EVIDENCE="+filepath.Join(t.TempDir(), "evidence.json"),
+		"EVIDENCE_FAILURE="+filepath.Join(t.TempDir(), "evidence-failure.json"),
+		"SERVICE_URL=https://llm-wiki-bff-abc-asia-east1.a.run.app",
+		"IMMUTABLE_IMAGE=repo@sha256:"+strings.Repeat("b", 64),
+		"EXPECTED_RUNTIME_SERVICE_ACCOUNT=lwc-bff-prod@llm-wiki-cloud.iam.gserviceaccount.com",
+		"PIPELINE_JOB_NAME=olw-pipeline",
+		"AR_REPO=asia-east1-docker.pkg.dev/llm-wiki-cloud/cloud-run-images",
+		"METADATA="+filepath.Join(t.TempDir(), "metadata.json"),
+	)
+	if err := runWorkflowBlock(t, query, env); err != nil {
+		t.Fatalf("query-config readback should succeed before evidence failure: %v\n%s", err, readTestLog(t, events))
+	}
+	if err := runWorkflowBlock(t, evidence, env); err == nil {
+		t.Fatal("strict evidence renderer should fail in the harness")
+	}
+	if err := runWorkflowBlock(t, restore, env); err == nil {
+		t.Fatal("restore step must preserve the evidence failure")
+	}
+	log := readTestLog(t, events)
+	for _, want := range []string{"query-config-success", "evidence-failure", "update-traffic", "rollback-readback"} {
+		if !strings.Contains(log, want) {
+			t.Errorf("causal rollback harness is missing %q: %s", want, log)
+		}
+	}
+	if !(strings.Index(log, "query-config-success") < strings.Index(log, "evidence-failure") && strings.Index(log, "evidence-failure") < strings.Index(log, "update-traffic")) {
+		t.Fatalf("causal rollback order is wrong: %s", log)
 	}
 }
 

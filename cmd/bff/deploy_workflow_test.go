@@ -215,7 +215,7 @@ func TestReleaseBFFWorkflowPollsExactCreatedRevisionAndRollsBackReadbackFailure(
 		"scripts/validate_bff_promotion_contract.py validate-traffic",
 		"--traffic-path status.traffic",
 		"--recognized-revision \"$FROZEN_READY_REVISION\"",
-		"if: ${{ always() && steps.deploy.outputs.deploy_started == 'true' && (steps.deploy.outcome == 'failure' || steps.query_config_readback.outcome == 'failure') }}",
+		"if: ${{ always() && steps.deploy.outputs.deploy_started == 'true' && (steps.deploy.outcome == 'failure' || steps.query_config_readback.outcome == 'failure' || steps.evidence.outcome == 'failure') }}",
 		"SERVICE_JSON=$(gcloud run services describe",
 		"validate_effective_traffic()",
 		"live production traffic is already the frozen revision",
