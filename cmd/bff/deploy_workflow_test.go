@@ -119,6 +119,9 @@ func TestReleaseBFFWorkflowPromotesImmutableStageConfig(t *testing.T) {
 		t.Fatal("production deploy command is missing")
 	}
 	deployCommand := workflow[deploy : deploy+quiet]
+	if !strings.Contains(deployCommand, "--no-traffic") {
+		t.Fatal("production deploy must create a zero-traffic candidate")
+	}
 	remove := strings.Index(deployCommand, "--remove-env-vars")
 	update := strings.Index(deployCommand, "--update-env-vars")
 	if remove < 0 || update < 0 || remove >= update {
@@ -152,7 +155,7 @@ func TestReleaseBFFWorkflowPromotesImmutableStageConfig(t *testing.T) {
 	for _, required := range []string{
 		"/api/v1/query/config", "Cache-Control", "no-store", "QUERY_STAGE_CONFIG_REVISION", "QUERY_STAGE_CONFIG_DIGEST",
 		"query-retrieval-pipeline-v2", "deepseek-v4-flash", "deepseek-v4-pro", "project_id|generation_id",
-		"EXPECTED_COMMIT", "latestReadyRevisionName", "build.commit", "build.revision", "build.service",
+		"EXPECTED_COMMIT", "EXPECTED_REVISION", "build.commit", "build.revision", "build.service",
 	} {
 		if !strings.Contains(readbackBlock, required) {
 			t.Fatalf("production query config readback missing %q", required)
@@ -160,7 +163,7 @@ func TestReleaseBFFWorkflowPromotesImmutableStageConfig(t *testing.T) {
 	}
 }
 
-func TestReleaseBFFWorkflowPollsExactCreatedRevisionAndRollsBackReadbackFailure(t *testing.T) {
+func TestReleaseBFFWorkflowCutsOverExactCreatedRevisionAndRollsBackFailure(t *testing.T) {
 	data, err := os.ReadFile("../../.github/workflows/release-bff.yml")
 	if err != nil {
 		t.Fatal(err)
@@ -174,6 +177,11 @@ func TestReleaseBFFWorkflowPollsExactCreatedRevisionAndRollsBackReadbackFailure(
 		t.Fatal("release deploy, readback, and rollback steps are missing or out of order")
 	}
 	deployBlock := workflow[deploy:readback]
+	cutover := strings.Index(workflow, "      - name: Identify, validate, and explicitly cut over exact BFF candidate")
+	if cutover < 0 || cutover <= deploy || cutover >= readback {
+		t.Fatal("exact candidate cutover step is missing or out of order")
+	}
+	cutoverBlock := workflow[cutover:readback]
 	readbackBlock := workflow[readback:rollback]
 	rollbackBlock := workflow[rollback:]
 
@@ -189,20 +197,29 @@ func TestReleaseBFFWorkflowPollsExactCreatedRevisionAndRollsBackReadbackFailure(
 	for _, required := range []string{
 		`FROZEN_READY_REVISION=$(jq -er '.ready_revision | select(type == "string" and length > 0)' "$ROLLBACK_CONTRACT")`,
 		"latestCreatedRevisionName",
-		"latestReadyRevisionName",
-		"READBACK_REVISION_DEADLINE",
+		"CANDIDATE_DISCOVERY_DEADLINE",
+		"CANDIDATE_READINESS_DEADLINE",
 		`FROZEN_CREATED_REVISION="${FROZEN_CREATED_REVISION:?}"`,
 		`"$CANDIDATE_REVISION" != "$FROZEN_CREATED_REVISION"`,
-		".status.latestCreatedRevisionName == $revision",
-		".status.latestReadyRevisionName == $revision",
-		"EXPECTED_REVISION=\"$CREATED_REVISION\"",
+		"gcloud run revisions describe \"$CANDIDATE_REVISION\"",
+		".spec.containers[0].image",
+		".status.imageDigest",
+		"ContainerReady",
+		"gcloud run services update-traffic \"$SERVICE_NAME\"",
+		`--to-revisions "${CANDIDATE_REVISION}=100"`,
+		"candidate_revision=$CANDIDATE_REVISION",
 	} {
-		if !strings.Contains(readbackBlock, required) {
-			t.Errorf("readback step missing exact convergence contract %q", required)
+		if !strings.Contains(cutoverBlock, required) {
+			t.Errorf("cutover step missing exact candidate contract %q", required)
 		}
 	}
-	if strings.Contains(readbackBlock, "EXPECTED_REVISION=$(jq -er '.status.latestReadyRevisionName") {
-		t.Fatal("readback must not select the ready revision before exact created-revision convergence")
+	if strings.Contains(cutoverBlock, "latestReadyRevisionName") {
+		t.Fatal("candidate authority must not come from latestReadyRevisionName")
+	}
+	for _, required := range []string{"EXPECTED_REVISION: ${{ steps.cutover.outputs.candidate_revision }}", "EXPECTED_REVISION=\"${EXPECTED_REVISION:?}\"", "--expected-revision \"$CANDIDATE_REVISION\""} {
+		if !strings.Contains(readbackBlock, required) {
+			t.Errorf("readback must consume persisted exact candidate %q", required)
+		}
 	}
 	validation := strings.Index(workflow, "      - name: Validate frozen rollback traffic before mutation")
 	upload := strings.Index(workflow, "      - name: Upload immutable rollback contract")
@@ -215,9 +232,9 @@ func TestReleaseBFFWorkflowPollsExactCreatedRevisionAndRollsBackReadbackFailure(
 		"scripts/validate_bff_promotion_contract.py validate-traffic",
 		"--traffic-path status.traffic",
 		"--recognized-revision \"$FROZEN_READY_REVISION\"",
-		"if: ${{ always() && steps.deploy.outputs.deploy_started == 'true' && (steps.deploy.outcome == 'failure' || steps.query_config_readback.outcome == 'failure' || steps.evidence.outcome == 'failure') }}",
+		"if: ${{ always() && steps.deploy.outputs.deploy_started == 'true' && (steps.deploy.outcome == 'failure' || steps.cutover.outcome == 'failure' || steps.query_config_readback.outcome == 'failure' || steps.evidence.outcome == 'failure') }}",
 		"SERVICE_JSON=$(gcloud run services describe",
-		"validate_effective_traffic()",
+		"validate_frozen_effective_traffic",
 		"live production traffic is already the frozen revision",
 		"provider traffic readback is unavailable, unsupported, or ambiguous",
 		"gcloud run services update-traffic",
@@ -248,7 +265,7 @@ func TestReleaseBFFWorkflowPollsExactCreatedRevisionAndRollsBackReadbackFailure(
 	}
 
 	readLive := strings.Index(rollbackBlock, `SERVICE_JSON=$(gcloud run services describe`)
-	validateLive := strings.Index(rollbackBlock, `validate_effective_traffic "$SERVICE_JSON"`)
+	validateLive := strings.Index(rollbackBlock, `validate_frozen_effective_traffic "$SERVICE_JSON"`)
 	mutate := strings.Index(rollbackBlock, "gcloud run services update-traffic")
 	if readLive < 0 || validateLive < 0 || mutate < 0 || !(readLive < validateLive && validateLive < mutate) {
 		t.Fatal("rollback must strictly read and validate live traffic before any write")
@@ -258,10 +275,8 @@ func TestReleaseBFFWorkflowPollsExactCreatedRevisionAndRollsBackReadbackFailure(
 	if alreadyFrozen < 0 || alreadyFrozenExit < 0 || strings.Contains(rollbackBlock[alreadyFrozen:alreadyFrozen+alreadyFrozenExit], "update-traffic") {
 		t.Fatal("already-frozen traffic path must perform zero writes and preserve failure")
 	}
-	unknown := strings.Index(rollbackBlock, "provider traffic readback is unavailable, unsupported, or ambiguous")
-	unknownExit := strings.Index(rollbackBlock[unknown:], "exit 1")
-	if unknown < 0 || unknownExit < 0 || strings.Contains(rollbackBlock[unknown:unknown+unknownExit], "update-traffic") {
-		t.Fatal("unknown traffic readback must fail partial/unknown without guessing or writing")
+	if !strings.Contains(rollbackBlock, `jq -e 'type == "object" and (.status | type) == "object"' <<<"$SERVICE_JSON"`) {
+		t.Fatal("malformed successful service readback must fail closed before mutation")
 	}
 	if !strings.Contains(rollbackBlock, "live production traffic differs from the frozen revision; restoring") || !strings.Contains(rollbackBlock, "validate_restored_effective_traffic") {
 		t.Fatal("changed traffic path must restore and verify exact frozen effective routing")
@@ -294,7 +309,7 @@ func TestReleaseBFFPreMutationTrafficGuard(t *testing.T) {
 	}
 
 	rollback := workflow[strings.Index(workflow, "      - name: Restore frozen production traffic after query-config readback failure"):]
-	for _, validator := range []string{"validate_restored_effective_traffic()", "validate_effective_traffic()"} {
+	for _, validator := range []string{"validate_restored_effective_traffic()", "validate_frozen_effective_traffic()"} {
 		if !strings.Contains(rollback, validator) {
 			t.Fatalf("post-failure validator %q must remain present", validator)
 		}

@@ -483,6 +483,8 @@ def render_strict(args):
     parts = service_parts(first, args)
     traffic = normalized_traffic(parts[-1]["traffic"])
     serving = serving_revision(traffic)
+    if args.expected_revision is not None and serving != args.expected_revision:
+        reject("effective traffic is not the exact promoted revision", "traffic_mismatch")
     legacy_preserved = rollback["config"]["legacy_preserved"]
     revision = revision_json(args, serving)
     revision_parts_value = revision_parts(revision, serving, expected_image)
@@ -607,6 +609,7 @@ def parser():
             child.add_argument("--failure-output", required=True)
             if mode == "render-evidence":
                 child.add_argument("--expected-runtime-service-account", required=True)
+                child.add_argument("--expected-revision")
                 child.add_argument("--service-url")
     validate = subs.add_parser("validate-metadata")
     validate.add_argument("--project", required=True)

@@ -365,12 +365,194 @@ jobs:
             --update-secrets "JWT_SECRET=${JWT_SECRET_NAME}:latest,DEEPSEEK_API_KEY=${DEEPSEEK_SECRET_NAME}:latest" \
             --remove-env-vars "QUERY_EXPANSION_MODEL,QUERY_EXPANSION_REASONING,ANSWER_SYNTHESIS_MODEL,ANSWER_SYNTHESIS_REASONING,QUERY_SELECTION_LIMIT,QUERY_SELECTION_EXPLORATION_SLOTS,QUERY_SELECTION_EVIDENCE_THRESHOLD,QUERY_EXPANSION_KEYWORDS_PER_ATTEMPT,QUERY_EXPANSION_ATTEMPTS,QUERY_MATCHING_RARE_KEYWORD_MAX_DOCUMENT_FREQUENCY" \
             --update-env-vars "^@^GCP_PROJECT=${PROJECT_ID}@BUCKET=${BUCKET}@FIRESTORE_DATABASE_ID=${FIRESTORE_DATABASE_ID}@PIPELINE_JOB_URL=https://run.googleapis.com/v2/projects/${PROJECT_ID}/locations/${REGION}/jobs/${PIPELINE_JOB_NAME}:run@ALLOWED_ORIGINS=${ALLOWED_ORIGINS}@QUERY_STAGE_CONFIG_PATH=${QUERY_STAGE_CONFIG_PATH}@DEV_JWT=false" \
+            --no-traffic \
             --quiet
+
+      - name: Identify, validate, and explicitly cut over exact BFF candidate
+        id: cutover
+        env:
+          IMMUTABLE_IMAGE: ${{ steps.image.outputs.image }}
+          EXPECTED_COMMIT: ${{ steps.commit.outputs.commit_sha }}
+        run: |
+          set -euo pipefail
+          FROZEN_READY_REVISION=$(jq -er '.ready_revision | select(type == "string" and length > 0)' "$ROLLBACK_CONTRACT")
+          FROZEN_CREATED_REVISION="${FROZEN_CREATED_REVISION:?}"
+          CANDIDATE_DISCOVERY_TIMEOUT_SECONDS="${CANDIDATE_DISCOVERY_TIMEOUT_SECONDS:-300}"
+          CANDIDATE_READINESS_TIMEOUT_SECONDS="${CANDIDATE_READINESS_TIMEOUT_SECONDS:-300}"
+          CUTOVER_VERIFY_TIMEOUT_SECONDS="${CUTOVER_VERIFY_TIMEOUT_SECONDS:-300}"
+          if [[ ! "$CANDIDATE_DISCOVERY_TIMEOUT_SECONDS" =~ ^[0-9]+$ || ! "$CANDIDATE_READINESS_TIMEOUT_SECONDS" =~ ^[0-9]+$ || ! "$CUTOVER_VERIFY_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]]; then
+            echo "candidate discovery, readiness, and cutover timeout values must be non-negative integers"
+            exit 1
+          fi
+
+          validate_frozen_traffic() {
+            printf '%s\n' "$1" | python3 scripts/validate_bff_promotion_contract.py validate-traffic \
+              --traffic-file - \
+              --traffic-path status.traffic \
+              --traffic-mode provider-pre-mutation \
+              --recognized-revision "$FROZEN_READY_REVISION"
+          }
+
+          validate_candidate_identity() {
+            local revision="$1"
+            local revision_json="$2"
+            jq -e --arg revision "$revision" --arg image "$IMMUTABLE_IMAGE" '
+              (.metadata.name // "") == $revision and
+              (.spec.containers | type) == "array" and (.spec.containers | length) == 1 and
+              (.spec.containers[0].image // "") == $image and
+              (.status.imageDigest // "") == $image
+            ' <<<"$revision_json"
+          }
+
+          validate_candidate_readiness() {
+            local revision_json="$1"
+            local zero_traffic_state="${2:-false}"
+            jq -e --arg zero_traffic_state "$zero_traffic_state" '
+              (.status.conditions | type) == "array" and
+              any(.status.conditions[]?; .type == "Ready" and .status == "True") and
+              any(.status.conditions[]?; (.type == "ContainerReady" or .type == "ContainerHealthy") and .status == "True") and
+              any(.status.conditions[]?; .type == "Active" and
+                (.status == "True" or ($zero_traffic_state == "true" and .status == "False" and .reason == "Retired"))) and
+              all(.status.conditions[]?; .type != "Active" or
+                (if $zero_traffic_state == "true" then
+                  (.status == "True" or (.status == "False" and .reason == "Retired"))
+                 else
+                  .status == "True"
+                 end))
+            ' <<<"$revision_json"
+          }
+
+          validate_candidate_revision() {
+            local revision="$1"
+            local revision_json="$2"
+            local zero_traffic_state="${3:-false}"
+            validate_candidate_identity "$revision" "$revision_json" \
+              && validate_candidate_readiness "$revision_json" "$zero_traffic_state"
+          }
+
+          CANDIDATE_REVISION=""
+          CANDIDATE_DISCOVERY_DEADLINE=$((SECONDS + CANDIDATE_DISCOVERY_TIMEOUT_SECONDS))
+          while (( SECONDS < CANDIDATE_DISCOVERY_DEADLINE )); do
+            if ! SERVICE_JSON=$(gcloud run services describe "$SERVICE_NAME" \
+              --region "$REGION" \
+              --project "$PROJECT_ID" \
+              --format=json \
+              --quiet); then
+              echo "Unable to read production service after deploy; refusing to cut over."
+              exit 1
+            fi
+            CANDIDATE_REVISION=$(jq -r '.status.latestCreatedRevisionName // empty' <<<"$SERVICE_JSON")
+            if [[ -n "$CANDIDATE_REVISION" && "$CANDIDATE_REVISION" != "$FROZEN_CREATED_REVISION" ]]; then
+              break
+            fi
+            sleep 5
+          done
+          if [[ -z "$CANDIDATE_REVISION" || "$CANDIDATE_REVISION" == "$FROZEN_CREATED_REVISION" ]]; then
+            echo "Cloud Run did not expose a new latest-created candidate within timeout; refusing to cut over."
+            exit 1
+          fi
+
+          if ! validate_frozen_traffic "$SERVICE_JSON"; then
+            echo "production traffic changed before cutover; refusing to mutate traffic"
+            exit 1
+          fi
+          CANDIDATE_READINESS_DEADLINE=$((SECONDS + CANDIDATE_READINESS_TIMEOUT_SECONDS))
+          CANDIDATE_READY=0
+          while (( SECONDS < CANDIDATE_READINESS_DEADLINE )); do
+            if ! CANDIDATE_JSON=$(gcloud run revisions describe "$CANDIDATE_REVISION" \
+              --region "$REGION" \
+              --project "$PROJECT_ID" \
+              --format=json \
+              --quiet); then
+              echo "Unable to describe exact candidate $CANDIDATE_REVISION; refusing to cut over."
+              exit 1
+            fi
+            if ! validate_candidate_identity "$CANDIDATE_REVISION" "$CANDIDATE_JSON"; then
+              echo "exact candidate $CANDIDATE_REVISION does not match the selected immutable image"
+              exit 1
+            fi
+            if validate_candidate_readiness "$CANDIDATE_JSON" true; then
+              CANDIDATE_READY=1
+              break
+            fi
+            sleep 5
+          done
+          if (( CANDIDATE_READY != 1 )); then
+            echo "exact candidate $CANDIDATE_REVISION did not become Ready, container-healthy, and traffic-capable or Retired before timeout"
+            exit 1
+          fi
+
+          MAIN_SHA=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq .object.sha)
+          if [[ "$MAIN_SHA" != "$EXPECTED_COMMIT" ]]; then
+            echo "current main changed before cutover; refusing to mutate production"
+            exit 1
+          fi
+
+          if ! SERVICE_JSON=$(gcloud run services describe "$SERVICE_NAME" \
+            --region "$REGION" \
+            --project "$PROJECT_ID" \
+            --format=json \
+            --quiet); then
+            echo "Unable to re-read production service immediately before cutover; refusing to mutate traffic"
+            exit 1
+          fi
+          if [[ "$(jq -r '.status.latestCreatedRevisionName // empty' <<<"$SERVICE_JSON")" != "$CANDIDATE_REVISION" ]] || ! validate_frozen_traffic "$SERVICE_JSON"; then
+            echo "production candidate or traffic changed before cutover; refusing to mutate traffic"
+            exit 1
+          fi
+
+          echo "candidate_revision=$CANDIDATE_REVISION" >> "$GITHUB_OUTPUT"
+          echo "CANDIDATE_REVISION=$CANDIDATE_REVISION" >> "$GITHUB_ENV"
+          echo "traffic_mutated=true" >> "$GITHUB_OUTPUT"
+
+          set +e
+          gcloud run services update-traffic "$SERVICE_NAME" \
+            --project "$PROJECT_ID" \
+            --region "$REGION" \
+            --to-revisions "${CANDIDATE_REVISION}=100" \
+            --quiet
+          CUTOVER_EXIT=$?
+          set -e
+
+          CUTOVER_VERIFIED=0
+          CUTOVER_VERIFY_DEADLINE=$((SECONDS + CUTOVER_VERIFY_TIMEOUT_SECONDS))
+          while (( SECONDS < CUTOVER_VERIFY_DEADLINE )); do
+            if SERVICE_JSON=$(gcloud run services describe "$SERVICE_NAME" \
+              --region "$REGION" \
+              --project "$PROJECT_ID" \
+              --format=json \
+              --quiet) \
+              && printf '%s\n' "$SERVICE_JSON" | python3 scripts/validate_bff_promotion_contract.py validate-traffic \
+                --traffic-file - \
+                --traffic-path status.traffic \
+                --traffic-mode provider-post-rollback \
+                --recognized-revision "$CANDIDATE_REVISION" \
+                --expected-revision "$CANDIDATE_REVISION" \
+              && CANDIDATE_JSON=$(gcloud run revisions describe "$CANDIDATE_REVISION" \
+                --region "$REGION" \
+                --project "$PROJECT_ID" \
+                --format=json \
+                --quiet) \
+              && validate_candidate_revision "$CANDIDATE_REVISION" "$CANDIDATE_JSON"; then
+              CUTOVER_VERIFIED=1
+              break
+            fi
+            sleep 10
+          done
+          set -e
+          if (( CUTOVER_VERIFIED != 1 )); then
+            echo "cutover read-back was old, split, tagged, ambiguous, or otherwise unverifiable (update exit $CUTOVER_EXIT)"
+            exit 1
+          fi
+          if (( CUTOVER_EXIT != 0 )); then
+            echo "update-traffic returned $CUTOVER_EXIT, but authoritative read-back proves exact candidate routing; continuing without retry"
+          fi
 
       - name: Verify deployed query config readback
         id: query_config_readback
         env:
           EXPECTED_COMMIT: ${{ steps.commit.outputs.commit_sha }}
+          EXPECTED_REVISION: ${{ steps.cutover.outputs.candidate_revision }}
         run: |
           set -euo pipefail
           SERVICE_URL=$(gcloud run services describe "$SERVICE_NAME" \
@@ -382,35 +564,7 @@ jobs:
             echo "Cloud Run returned an invalid public service URL or host; refusing to verify readback."
             exit 1
           fi
-          FROZEN_READY_REVISION=$(jq -er '.ready_revision | select(type == "string" and length > 0)' "$ROLLBACK_CONTRACT")
-          FROZEN_CREATED_REVISION="${FROZEN_CREATED_REVISION:?}"
-          CREATED_REVISION=""
-          READBACK_REVISION_DEADLINE=$((SECONDS + 300))
-          while (( SECONDS < READBACK_REVISION_DEADLINE )); do
-            SERVICE_JSON=$(gcloud run services describe "$SERVICE_NAME" \
-              --region "$REGION" \
-              --project "$PROJECT_ID" \
-              --format=json \
-              --quiet) || true
-            CANDIDATE_REVISION=$(jq -er '.status.latestCreatedRevisionName | select(type == "string" and length > 0)' <<<"$SERVICE_JSON" 2>/dev/null || true)
-            if [[ -z "$CREATED_REVISION" && -n "$CANDIDATE_REVISION" ]]; then
-              if [[ "$CANDIDATE_REVISION" != "$FROZEN_CREATED_REVISION" ]]; then
-                CREATED_REVISION="$CANDIDATE_REVISION"
-              fi
-            fi
-            if [[ -n "$CREATED_REVISION" ]] \
-              && [[ "$CANDIDATE_REVISION" == "$CREATED_REVISION" ]] \
-              && jq -e --arg revision "$CREATED_REVISION" \
-                '.status.latestCreatedRevisionName == $revision and .status.latestReadyRevisionName == $revision' <<<"$SERVICE_JSON" >/dev/null; then
-              EXPECTED_REVISION="$CREATED_REVISION"
-              break
-            fi
-            sleep 5
-          done
-          if [[ -z "${EXPECTED_REVISION:-}" ]]; then
-            echo "the exact created production revision did not become authoritative within timeout"
-            exit 1
-          fi
+          EXPECTED_REVISION="${EXPECTED_REVISION:?}"
           BODY_FILE=$(mktemp)
           HEADER_FILE=$(mktemp)
           trap 'rm -f "$BODY_FILE" "$HEADER_FILE"' EXIT
@@ -488,11 +642,12 @@ jobs:
             --project "$PROJECT_ID" --region "$REGION" --service-name "$SERVICE_NAME" \
             --pipeline-job-name "$PIPELINE_JOB_NAME" --ar-repo "$AR_REPO" \
             --expected-runtime-service-account "$EXPECTED_RUNTIME_SERVICE_ACCOUNT" \
+            --expected-revision "$CANDIDATE_REVISION" \
             --rollback-contract "$ROLLBACK_CONTRACT" --metadata "$METADATA" \
             --output "$EVIDENCE" --failure-output "$EVIDENCE_FAILURE"
 
       - name: Restore frozen production traffic after query-config readback failure
-        if: ${{ always() && steps.deploy.outputs.deploy_started == 'true' && (steps.deploy.outcome == 'failure' || steps.query_config_readback.outcome == 'failure' || steps.evidence.outcome == 'failure') }}
+        if: ${{ always() && steps.deploy.outputs.deploy_started == 'true' && (steps.deploy.outcome == 'failure' || steps.cutover.outcome == 'failure' || steps.query_config_readback.outcome == 'failure' || steps.evidence.outcome == 'failure') }}
         run: |
           set -euo pipefail
           FROZEN_READY_REVISION=$(jq -er '.ready_revision | select(type == "string" and length > 0)' "$ROLLBACK_CONTRACT")
@@ -511,25 +666,6 @@ jobs:
               --recognized-revision "$FROZEN_READY_REVISION" \
               --expected-revision "$FROZEN_READY_REVISION"
           }
-          validate_effective_traffic() {
-            local revision
-            revision=$(jq -er '
-              .status.traffic as $traffic
-              | if ($traffic | type) == "array"
-                and ($traffic | length) == 1
-                and ($traffic[0].revisionName | type) == "string"
-                and $traffic[0].percent == 100
-                and ($traffic[0].tag? == null)
-                then $traffic[0].revisionName
-                else empty
-                end
-            ' <<<"$1") || return 1
-            printf '%s\n' "$1" | python3 scripts/validate_bff_promotion_contract.py validate-traffic \
-              --traffic-file - \
-              --traffic-path status.traffic \
-              --traffic-mode provider-pre-mutation \
-              --recognized-revision "$revision"
-          }
           validate_frozen_effective_traffic() {
             validate_restored_effective_traffic "$1"
           }
@@ -542,8 +678,15 @@ jobs:
             echo "provider traffic readback is unavailable, unsupported, or ambiguous; refusing to guess or write"
             exit 1
           fi
-          if ! validate_effective_traffic "$SERVICE_JSON"; then
+          if ! jq -e 'type == "object" and (.status | type) == "object"' <<<"$SERVICE_JSON" >/dev/null; then
             echo "provider traffic readback is unavailable, unsupported, or ambiguous; refusing to guess or write"
+            exit 1
+          fi
+          if ! printf '%s\n' "$SERVICE_JSON" | python3 scripts/validate_bff_promotion_contract.py validate-traffic \
+            --traffic-file - \
+            --traffic-path status.traffic \
+            --traffic-mode provider-readable; then
+            echo "provider traffic readback is malformed or unsupported; refusing to guess or write"
             exit 1
           fi
           if validate_frozen_effective_traffic "$SERVICE_JSON"; then
