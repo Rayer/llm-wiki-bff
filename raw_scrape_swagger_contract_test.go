@@ -11,16 +11,16 @@ import (
 )
 
 type swaggerArtifact struct {
-	Paths       map[string]map[string]any                    `json:"paths" yaml:"paths"`
+	Paths       map[string]map[string]any `json:"paths" yaml:"paths"`
 	Definitions map[string]struct {
 		Properties map[string]any `json:"properties" yaml:"properties"`
 	} `json:"definitions" yaml:"definitions"`
 }
 
 type rawScrapeOperation struct {
-	Security  []map[string][]string `json:"security" yaml:"security"`
-	Consumes []string              `json:"consumes" yaml:"consumes"`
-	Produces []string              `json:"produces" yaml:"produces"`
+	Security   []map[string][]string `json:"security" yaml:"security"`
+	Consumes   []string              `json:"consumes" yaml:"consumes"`
+	Produces   []string              `json:"produces" yaml:"produces"`
 	Parameters []struct {
 		In       string `json:"in" yaml:"in"`
 		Name     string `json:"name" yaml:"name"`
@@ -43,7 +43,15 @@ type adminPipelineOperation struct {
 		In       string `json:"in" yaml:"in"`
 		Name     string `json:"name" yaml:"name"`
 		Required bool   `json:"required" yaml:"required"`
+		Schema   struct {
+			Ref string `json:"$ref" yaml:"$ref"`
+		} `json:"schema" yaml:"schema"`
 	} `json:"parameters" yaml:"parameters"`
+	Responses map[string]struct {
+		Schema struct {
+			Ref string `json:"$ref" yaml:"$ref"`
+		} `json:"schema" yaml:"schema"`
+	} `json:"responses" yaml:"responses"`
 }
 
 func TestSwaggerRawScrapeRouteContract(t *testing.T) {
@@ -224,8 +232,8 @@ func rawScrapeOperationForPath(t *testing.T, artifact swaggerArtifact, artifactN
 func assertAdminPipelineOperation(t *testing.T, artifact swaggerArtifact, artifactName string) {
 	t.Helper()
 	const (
-		wantSummary     = "Trigger pipeline + rebuild for a project (admin)"
-		wantDescription = "Invokes the Cloud Run worker job for the specified project, then rebuilds the search index."
+		wantSummary     = "Trigger pipeline for a project (admin)"
+		wantDescription = "Invokes the Cloud Run worker job for the specified project. Optional clean_rebuild/stage overrides may be provided in the JSON request body."
 	)
 
 	admin, ok := artifact.Paths["/api/v1/admin/projects/{id}/pipeline"]
@@ -252,11 +260,63 @@ func assertAdminPipelineOperation(t *testing.T, artifact swaggerArtifact, artifa
 	if op.Description != wantDescription {
 		t.Fatalf("artifact %s admin pipeline description = %q, want %q", artifactName, op.Description, wantDescription)
 	}
-	if len(op.Parameters) != 1 {
-		t.Fatalf("artifact %s admin pipeline parameters = %d, want 1 path-only", artifactName, len(op.Parameters))
+	if len(op.Parameters) != 2 {
+		t.Fatalf("artifact %s admin pipeline parameters = %d, want path plus optional body", artifactName, len(op.Parameters))
 	}
 	if op.Parameters[0].In != "path" || op.Parameters[0].Name != "id" || !op.Parameters[0].Required {
 		t.Fatalf("artifact %s admin pipeline path parameter = {in=%q name=%q required=%v}, want {in=path name=id required=true}", artifactName, op.Parameters[0].In, op.Parameters[0].Name, op.Parameters[0].Required)
+	}
+	if op.Parameters[1].In != "body" || op.Parameters[1].Name != "body" || op.Parameters[1].Required || op.Parameters[1].Schema.Ref != "#/definitions/v1.adminPipelineTriggerRequest" {
+		t.Fatalf("artifact %s admin pipeline body parameter = %+v, want optional v1.adminPipelineTriggerRequest", artifactName, op.Parameters[1])
+	}
+	if op.Responses["202"].Schema.Ref != "#/definitions/v1.adminPipelineTriggerResponse" {
+		t.Fatalf("artifact %s admin pipeline 202 schema = %q, want named response", artifactName, op.Responses["202"].Schema.Ref)
+	}
+	request := artifact.Definitions["v1.adminPipelineTriggerRequest"].Properties
+	for _, field := range []string{"stage", "clean_rebuild"} {
+		if _, ok := request[field]; !ok {
+			t.Fatalf("artifact %s trigger request is missing %q", artifactName, field)
+		}
+	}
+	response := artifact.Definitions["v1.adminPipelineTriggerResponse"].Properties
+	for _, field := range []string{"status", "execution_id", "stage", "clean_rebuild"} {
+		if _, ok := response[field]; !ok {
+			t.Fatalf("artifact %s trigger response is missing %q", artifactName, field)
+		}
+	}
+}
+
+func TestSwaggerAdminPipelineStatusContract(t *testing.T) {
+	for _, artifactName := range []string{"json", "yaml", "docs"} {
+		t.Run(artifactName, func(t *testing.T) {
+			var artifact swaggerArtifact
+			switch artifactName {
+			case "json":
+				artifact = readSwaggerJSON(t, "docs/swagger.json")
+			case "yaml":
+				artifact = readSwaggerYAML(t, "docs/swagger.yaml")
+			default:
+				artifact = readSwaggerFromDocsTemplate(t)
+			}
+			get := artifact.Paths["/api/v1/admin/projects/{id}/pipeline/status"]["get"]
+			bytes, err := json.Marshal(get)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var op adminPipelineOperation
+			if err := json.Unmarshal(bytes, &op); err != nil {
+				t.Fatal(err)
+			}
+			if op.Responses["200"].Schema.Ref != "#/definitions/v1.adminPipelineStatusResponse" {
+				t.Fatalf("200 schema = %q, want named status response", op.Responses["200"].Schema.Ref)
+			}
+			response := artifact.Definitions["v1.adminPipelineStatusResponse"].Properties
+			for _, field := range []string{"project_id", "last_execution"} {
+				if _, ok := response[field]; !ok {
+					t.Fatalf("artifact %s status response is missing %q", artifactName, field)
+				}
+			}
+		})
 	}
 }
 

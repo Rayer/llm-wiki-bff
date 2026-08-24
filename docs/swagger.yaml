@@ -540,6 +540,31 @@ definitions:
     required:
     - announcement_markdown
     type: object
+  v1.adminPipelineStatusResponse:
+    properties:
+      last_execution:
+        $ref: '#/definitions/handler.PipelineExecutionResponse'
+      project_id:
+        type: string
+    type: object
+  v1.adminPipelineTriggerRequest:
+    properties:
+      clean_rebuild:
+        type: boolean
+      stage:
+        type: string
+    type: object
+  v1.adminPipelineTriggerResponse:
+    properties:
+      clean_rebuild:
+        type: boolean
+      execution_id:
+        type: string
+      stage:
+        type: string
+      status:
+        type: string
+    type: object
   v1.adminRenameProjectResponse:
     properties:
       id:
@@ -665,7 +690,9 @@ paths:
     patch:
       consumes:
       - application/json
-      description: Updates the name field on a Firestore project document. The JSON body is limited to 1024 bytes; name is trimmed and must be 1-64 Unicode code points.
+      description: Updates the name field on a Firestore project document. The JSON
+        body is limited to 1024 bytes; name is trimmed and must be 1-64 Unicode code
+        points.
       parameters:
       - description: Project doc ID ({userID}_{projectID})
         in: path
@@ -718,21 +745,26 @@ paths:
     post:
       consumes:
       - application/json
-      description: Invokes the Cloud Run worker job for the specified project, then rebuilds the search index.
+      description: Invokes the Cloud Run worker job for the specified project. Optional
+        clean_rebuild/stage overrides may be provided in the JSON request body.
       parameters:
       - description: Project doc ID ({userID}_{projectID})
         in: path
         name: id
         required: true
         type: string
+      - description: Optional pipeline stage and clean rebuild flags
+        in: body
+        name: body
+        schema:
+          $ref: '#/definitions/v1.adminPipelineTriggerRequest'
       produces:
       - application/json
       responses:
-        "200":
-          description: OK
+        "202":
+          description: Accepted
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/v1.adminPipelineTriggerResponse'
         "400":
           description: Bad Request
           schema:
@@ -759,7 +791,54 @@ paths:
             $ref: '#/definitions/handler.ErrorResponse'
       security:
       - BearerAuth: []
-      summary: Trigger pipeline + rebuild for a project (admin)
+      summary: Trigger pipeline for a project (admin)
+      tags:
+      - admin
+  /api/v1/admin/projects/{id}/pipeline/status:
+    get:
+      description: Returns the exact Cloud Run execution for the requested project.
+        Ownership mismatches return not found.
+      parameters:
+      - description: Project doc ID ({userID}_{projectID})
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: Cloud Run execution ID
+        in: query
+        name: execution_id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/v1.adminPipelineStatusResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+      security:
+      - BearerAuth: []
+      summary: Admin pipeline execution status
       tags:
       - admin
   /api/v1/admin/projects/{id}/rebuild-index:
@@ -1638,7 +1717,8 @@ paths:
       - status
 securityDefinitions:
   BearerAuth:
-    description: 'JWT Bearer token issued by the standalone Auth service. Format: \"Bearer <token>\".'
+    description: 'JWT Bearer token issued by the standalone Auth service. Format:
+      \"Bearer <token>\".'
     in: header
     name: Authorization
     type: apiKey

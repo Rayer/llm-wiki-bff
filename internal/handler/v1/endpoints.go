@@ -1040,6 +1040,23 @@ type pipelineStatusResponse struct {
 	SuggestedQueries []string                           `json:"suggested_queries"`
 }
 
+type adminPipelineTriggerRequest struct {
+	CleanRebuild bool   `json:"clean_rebuild"`
+	Stage        string `json:"stage"`
+}
+
+type adminPipelineTriggerResponse struct {
+	Status       string `json:"status"`
+	ExecutionID  string `json:"execution_id"`
+	CleanRebuild bool   `json:"clean_rebuild"`
+	Stage        string `json:"stage"`
+}
+
+type adminPipelineStatusResponse struct {
+	ProjectID     string                             `json:"project_id"`
+	LastExecution *handler.PipelineExecutionResponse `json:"last_execution"`
+}
+
 type cloudRunExecutionsResponse struct {
 	Executions    []cloudRunExecution `json:"executions"`
 	NextPageToken string              `json:"nextPageToken"`
@@ -1962,8 +1979,7 @@ func (h *Handler) resolveAdminProjectRecord(ctx context.Context, docID string) (
 		if err != nil {
 			return adminProjectRecord{}, err
 		}
-		expectedUserID, expectedProjectID := splitProjectDocID(docID)
-		if record.id != docID || record.userID != expectedUserID || record.projectID != expectedProjectID || !auth.ValidPathSegment(record.userID) || !auth.ValidPathSegment(record.projectID) {
+		if record.id != docID || !validAdminProjectSegments(record.userID, record.projectID) || record.userID+"_"+record.projectID != docID {
 			return adminProjectRecord{}, errInvalidAdminProjectRecord
 		}
 		return record, nil
@@ -2754,13 +2770,13 @@ func (h *Handler) handleGenerationRebuild(c *gin.Context, uid, pid string, rebui
 // AdminPipelineTrigger handles POST /admin/projects/{id}/pipeline.
 //
 //	@Summary		Trigger pipeline for a project (admin)
-//	@Description	Invokes the Cloud Run worker job for the specified project. Optional body {"clean_rebuild":true} cold-starts Synto from raw without prior wiki/state.
+//	@Description	Invokes the Cloud Run worker job for the specified project. Optional clean_rebuild/stage overrides may be provided in the JSON request body.
 //	@Tags			admin
 //	@Accept			json
 //	@Produce		json
 //	@Param			id		path	string	true	"Project doc ID ({userID}_{projectID})"
-//	@Param			body	body	object	false	"Optional flags"
-//	@Success		200	{object}	map[string]any
+//	@Param			body	body	adminPipelineTriggerRequest	false	"Optional pipeline stage and clean rebuild flags"
+//	@Success		202	{object}	adminPipelineTriggerResponse
 //	@Failure		400	{object}	handler.ErrorResponse
 //	@Failure		401	{object}	handler.ErrorResponse
 //	@Failure		403	{object}	handler.ErrorResponse
@@ -2771,15 +2787,21 @@ func (h *Handler) handleGenerationRebuild(c *gin.Context, uid, pid string, rebui
 //	@Router			/api/v1/admin/projects/{id}/pipeline [post]
 func (h *Handler) AdminPipelineTrigger(c *gin.Context) {
 	docID := c.Param("id")
-	uid, pid := splitProjectDocID(docID)
-	if pid == "" {
-		c.JSON(http.StatusBadRequest, handler.ErrorResponse{Error: "invalid project doc ID"})
+	project, err := h.resolveAdminProjectRecord(c.Request.Context(), docID)
+	if err != nil {
+		if errors.Is(err, errFirestoreNotConfigured) {
+			c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "Firestore client is not configured"})
+			return
+		}
+		if errors.Is(err, errInvalidAdminProjectRecord) || status.Code(err) == codes.NotFound {
+			c.JSON(http.StatusNotFound, handler.ErrorResponse{Error: "project not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: pipelineUnavailableMessage})
 		return
 	}
-	var req struct {
-		CleanRebuild bool   `json:"clean_rebuild"`
-		Stage        string `json:"stage"`
-	}
+	uid, pid := project.userID, project.projectID
+	var req adminPipelineTriggerRequest
 	if c.Request.Body != nil && c.Request.ContentLength != 0 {
 		dec := json.NewDecoder(c.Request.Body)
 		if err := dec.Decode(&req); err != nil && !errors.Is(err, io.EOF) {
@@ -2800,18 +2822,6 @@ func (h *Handler) AdminPipelineTrigger(c *gin.Context) {
 		return
 	}
 	ctx := c.Request.Context()
-	if err := h.verifyAdminProjectExists(ctx, docID); err != nil {
-		if errors.Is(err, errFirestoreNotConfigured) {
-			c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: "Firestore client is not configured"})
-			return
-		}
-		if status.Code(err) == codes.NotFound {
-			c.JSON(http.StatusNotFound, handler.ErrorResponse{Error: "project not found"})
-			return
-		}
-		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: pipelineUnavailableMessage})
-		return
-	}
 
 	// Admin bypasses daily/cooldown/new-raw/demo quota but still blocks concurrent runs.
 	alreadyRunning, err := h.isPipelineRunning(ctx, uid, pid)
@@ -2837,12 +2847,58 @@ func (h *Handler) AdminPipelineTrigger(c *gin.Context) {
 		log.Print("admin pipeline triggered")
 	}
 
-	c.JSON(http.StatusOK, gin.H{
-		"status":        "ok",
-		"execution_id":  executionID,
-		"clean_rebuild": req.CleanRebuild,
-		"stage":         stage,
+	c.JSON(http.StatusAccepted, adminPipelineTriggerResponse{
+		Status:       "accepted",
+		ExecutionID:  executionID,
+		CleanRebuild: req.CleanRebuild,
+		Stage:        stage,
 	})
+}
+
+// AdminPipelineStatus handles GET /admin/projects/{id}/pipeline/status?execution_id=...
+//
+//	@Summary		Admin pipeline execution status
+//	@Description	Returns the exact Cloud Run execution for the requested project. Ownership mismatches return not found.
+//	@Tags			admin
+//	@Produce		json
+//	@Param			id		path	string	true	"Project doc ID ({userID}_{projectID})"
+//	@Param			execution_id	query	string	true	"Cloud Run execution ID"
+//	@Success		200	{object}	adminPipelineStatusResponse
+//	@Failure		400	{object}	handler.ErrorResponse
+//	@Failure		401	{object}	handler.ErrorResponse
+//	@Failure		403	{object}	handler.ErrorResponse
+//	@Failure		404	{object}	handler.ErrorResponse
+//	@Failure		500	{object}	handler.ErrorResponse
+//	@Security		BearerAuth
+//	@Router			/api/v1/admin/projects/{id}/pipeline/status [get]
+//
+// The project doc ID supplies the exact execution owner; mismatches are not exposed.
+func (h *Handler) AdminPipelineStatus(c *gin.Context) {
+	project, err := h.resolveAdminProjectRecord(c.Request.Context(), c.Param("id"))
+	if err != nil {
+		if errors.Is(err, errInvalidAdminProjectRecord) || status.Code(err) == codes.NotFound {
+			c.JSON(http.StatusNotFound, handler.ErrorResponse{Error: "project not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: pipelineStatusUnavailableMessage})
+		return
+	}
+	uid, pid := project.userID, project.projectID
+	executionID, err := validatePipelineExecutionID(strings.TrimSpace(c.Query("execution_id")))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, handler.ErrorResponse{Error: "execution_id is required"})
+		return
+	}
+	execution, err := h.pipelineExecutionStatusForOwner(c.Request.Context(), executionID, uid, pid)
+	if err != nil {
+		if errors.Is(err, errPipelineExecutionNotFound) {
+			c.JSON(http.StatusNotFound, handler.ErrorResponse{Error: errPipelineExecutionNotFound.Error()})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, handler.ErrorResponse{Error: pipelineStatusUnavailableMessage})
+		return
+	}
+	c.JSON(http.StatusOK, adminPipelineStatusResponse{ProjectID: pid, LastExecution: execution})
 }
 
 // AdminListUsers handles GET /admin/users.

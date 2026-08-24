@@ -121,7 +121,9 @@ func TestGeneratedPipelineSecurityBoundaryMatrix(t *testing.T) {
 		{
 			name: "admin pipeline provider failure",
 			invoke: func() *httptest.ResponseRecorder {
-				h := &Handler{projectExists: func(context.Context, string) error { return errors.New(securitySentinel) }}
+				h := &Handler{adminProjectRecordLoader: func(context.Context, string) (adminProjectRecord, error) {
+					return adminProjectRecord{}, errors.New(securitySentinel)
+				}}
 				return invokeHandlerWithParams(h.AdminPipelineTrigger, http.MethodPost, "/api/v1/admin/projects/tenant-secret_project-secret/pipeline", ginParams("id", "tenant-secret_project-secret"))
 			},
 			wantStatus: http.StatusInternalServerError,
@@ -181,10 +183,13 @@ func TestAdminPipelineTriggerLogIsSanitized(t *testing.T) {
 		metadataTokenURL: "http://metadata.test/token",
 		cloudRunJobURL:   "https://run.googleapis.com/v2/projects/p/locations/l/jobs/j:run",
 		projectExists:    func(context.Context, string) error { return nil },
+		adminProjectRecordLoader: func(context.Context, string) (adminProjectRecord, error) {
+			return adminProjectRecord{id: "tenant-secret_project-secret", userID: "tenant-secret", projectID: "project-secret"}, nil
+		},
 	}
 	h.cloudRunJobURL = "https://run.test/run"
 	recorder := invokeHandlerWithParams(h.AdminPipelineTrigger, http.MethodPost, "/api/v1/admin/projects/tenant-secret_project-secret/pipeline", ginParams("id", "tenant-secret_project-secret"))
-	if recorder.Code != http.StatusOK {
+	if recorder.Code != http.StatusAccepted {
 		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
 	if got := output.String(); got != "admin pipeline triggered\n" {
