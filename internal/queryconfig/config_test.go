@@ -356,6 +356,22 @@ func TestSealRejectsDuplicateBindingResolutionScope(t *testing.T) {
 	}
 }
 
+func TestSealSerializesZeroProjectBindingsAsArray(t *testing.T) {
+	config := validConfig(t)
+	config.ProjectBindings = nil
+	sealed := mustSealConfig(t, config)
+	canonical, err := queryconfig.CanonicalJSON(sealed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(canonical, []byte(`"project_bindings":[]`)) {
+		t.Fatalf("canonical project_bindings = %s", canonical)
+	}
+	if sealed.ProjectBindings == nil {
+		t.Fatal("sealed zero project bindings should retain canonical array shape")
+	}
+}
+
 func TestNormalizeIsDeterministicAndSemanticChangesAlterDigest(t *testing.T) {
 	left := mustSeal(t)
 	right := validConfig(t)

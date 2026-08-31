@@ -17,9 +17,9 @@ env:
   SERVICE_NAME: llm-wiki-bff
   REGION: asia-east1
   AR_REPO: asia-east1-docker.pkg.dev/llm-wiki-cloud/cloud-run-images
-  QUERY_STAGE_CONFIG_PATH: /app/configs/query/dev/query-dev-2026-08-22.1.json
-  QUERY_STAGE_CONFIG_REVISION: query-dev-2026-08-22.1
-  QUERY_STAGE_CONFIG_DIGEST: sha256:04dd36a4446043f225f651caaae1bf73c605106b99a23acbbc98cac09c6c4942
+  QUERY_STAGE_CONFIG_PATH: /app/configs/query/dev/query-dev-2026-08-31.1.json
+  QUERY_STAGE_CONFIG_REVISION: query-dev-2026-08-31.1
+  QUERY_STAGE_CONFIG_DIGEST: sha256:2ee1a7303c60e810c3240c966a784c4d6cc76419a37b6e0e13e2d9e80f344305
   PIPELINE_JOB_NAME: olw-pipeline
   RUNTIME_SERVICE_ACCOUNT: lwc-bff-prod@llm-wiki-cloud.iam.gserviceaccount.com
   BUCKET: llm-wiki-data

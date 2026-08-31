@@ -10,7 +10,7 @@ import (
 )
 
 func TestLoadStageConfigPathTracksAuthorityAndRejectsMixedLegacyFactors(t *testing.T) {
-	t.Setenv("QUERY_STAGE_CONFIG_PATH", "/app/configs/query/dev/query-dev-2026-08-22.1.json")
+	t.Setenv("QUERY_STAGE_CONFIG_PATH", "/app/configs/query/dev/query-dev-2026-08-31.1.json")
 	for _, name := range []string{
 		"QUERY_EXPANSION_MODEL", "QUERY_EXPANSION_REASONING", "ANSWER_SYNTHESIS_MODEL", "ANSWER_SYNTHESIS_REASONING",
 		"QUERY_SELECTION_LIMIT", "QUERY_SELECTION_EXPLORATION_SLOTS", "QUERY_SELECTION_EVIDENCE_THRESHOLD",

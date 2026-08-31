@@ -223,7 +223,7 @@ class ExplicitCutoverHarnessTest(unittest.TestCase):
             "FIRESTORE_DATABASE_ID": "llm-wiki-cloud-prod",
             "PIPELINE_JOB_NAME": "olw-pipeline",
             "ALLOWED_ORIGINS": "https://wiki.rayer.idv.tw,https://llm-wiki-frontend.vercel.app",
-            "QUERY_STAGE_CONFIG_PATH": "/app/configs/query/dev/query-dev-2026-08-22.1.json",
+            "QUERY_STAGE_CONFIG_PATH": "/app/configs/query/dev/query-dev-2026-08-31.1.json",
             "CANDIDATE_DISCOVERY_TIMEOUT_SECONDS": "1",
             "CANDIDATE_READINESS_TIMEOUT_SECONDS": "5",
             "CUTOVER_VERIFY_TIMEOUT_SECONDS": "1",

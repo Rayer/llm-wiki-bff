@@ -267,7 +267,7 @@ func normalizeWithoutDigest(input Config) (Config, error) {
 	config.ConfigDigest = ""
 	config.Stages = input.Stages
 	config.Profiles = append([]Profile(nil), input.Profiles...)
-	config.ProjectBindings = append([]ProjectBinding(nil), input.ProjectBindings...)
+	config.ProjectBindings = append([]ProjectBinding{}, input.ProjectBindings...)
 	for i := range config.Profiles {
 		config.Profiles[i].CriterionPolicy.RequiredWhenExplicit = append([]string(nil), input.Profiles[i].CriterionPolicy.RequiredWhenExplicit...)
 		config.Profiles[i].CriterionPolicy.PreferredByDefault = append([]string(nil), input.Profiles[i].CriterionPolicy.PreferredByDefault...)
@@ -313,7 +313,7 @@ func normalizeWithoutDigest(input Config) (Config, error) {
 		return Config{}, fmt.Errorf("query expander default prompt: %w", err)
 	}
 	sort.Slice(config.Profiles, func(i, j int) bool { return config.Profiles[i].ID < config.Profiles[j].ID })
-	config.ProjectBindings = append([]ProjectBinding(nil), config.ProjectBindings...)
+	config.ProjectBindings = append([]ProjectBinding{}, config.ProjectBindings...)
 	seenBindings := map[string]struct{}{}
 	for i := range config.ProjectBindings {
 		binding := &config.ProjectBindings[i]
