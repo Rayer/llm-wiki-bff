@@ -1835,9 +1835,9 @@ func TestBFFDevWorkflowAllowsBothMigrationOrigins(t *testing.T) {
 func TestBFFDevWorkflowUsesImmutableQueryConfigWithoutChangingSecretBinding(t *testing.T) {
 	contents := readWorkflow(t, ".github/workflows/deploy-bff.yml")
 	for _, want := range []string{
-		"QUERY_STAGE_CONFIG_PATH: /app/configs/query/dev/query-dev-2026-08-22.1.json",
-		"QUERY_STAGE_CONFIG_REVISION: query-dev-2026-08-22.1",
-		"QUERY_STAGE_CONFIG_DIGEST: sha256:04dd36a4446043f225f651caaae1bf73c605106b99a23acbbc98cac09c6c4942",
+		"QUERY_STAGE_CONFIG_PATH: /app/configs/query/dev/query-dev-2026-08-31.1.json",
+		"QUERY_STAGE_CONFIG_REVISION: query-dev-2026-08-31.1",
+		"QUERY_STAGE_CONFIG_DIGEST: sha256:2ee1a7303c60e810c3240c966a784c4d6cc76419a37b6e0e13e2d9e80f344305",
 		"QUERY_STAGE_CONFIG_PATH=${{ env.QUERY_STAGE_CONFIG_PATH }}",
 		"--remove-env-vars \"QUERY_EXPANSION_MODEL,QUERY_EXPANSION_REASONING,ANSWER_SYNTHESIS_MODEL,ANSWER_SYNTHESIS_REASONING,QUERY_SELECTION_LIMIT,QUERY_SELECTION_EXPLORATION_SLOTS,QUERY_SELECTION_EVIDENCE_THRESHOLD,QUERY_EXPANSION_KEYWORDS_PER_ATTEMPT,QUERY_EXPANSION_ATTEMPTS,QUERY_MATCHING_RARE_KEYWORD_MAX_DOCUMENT_FREQUENCY\"",
 	} {
@@ -3029,7 +3029,7 @@ func TestReleaseWorkflowEvidenceFailureCausallyRestoresFrozenTraffic(t *testing.
 	events := filepath.Join(t.TempDir(), "events.log")
 	updated := filepath.Join(t.TempDir(), "updated")
 	queryBody := filepath.Join(t.TempDir(), "query-config.json")
-	if err := os.WriteFile(queryBody, []byte(`{"build":{"commit":"cccccccccccccccccccccccccccccccccccccccc","revision":"new-revision","service":"llm-wiki-bff"},"query_config":{"config_digest":"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","config_revision":"query-dev-2026-08-22.1","default_profile_digest":"p","default_profile_id":"p","default_prompt_digest":"q","default_prompt_id":"q","expansion_model":"deepseek-v4-flash","expansion_provider":"deepseek","expansion_reasoning":"none","expansion_temperature":0,"no_evidence_policy":"full-model-prior-fallback-v1","options":{"evidence_threshold":2,"expansion_attempts":3,"exploration_slots":1,"keywords_per_attempt":24,"rare_document_frequency":1,"selection_limit":10},"query_service_implementation":"query-retrieval-pipeline-v2","schema_version":2,"synthesis_model":"deepseek-v4-pro","synthesis_provider":"deepseek","synthesis_reasoning":"none","synthesis_temperature":0}}`), 0o600); err != nil {
+	if err := os.WriteFile(queryBody, []byte(`{"build":{"commit":"cccccccccccccccccccccccccccccccccccccccc","revision":"new-revision","service":"llm-wiki-bff"},"query_config":{"config_digest":"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","config_revision":"query-dev-2026-08-31.1","default_profile_digest":"p","default_profile_id":"p","default_prompt_digest":"q","default_prompt_id":"q","expansion_model":"deepseek-v4-flash","expansion_provider":"deepseek","expansion_reasoning":"none","expansion_temperature":0,"no_evidence_policy":"full-model-prior-fallback-v1","options":{"evidence_threshold":2,"expansion_attempts":3,"exploration_slots":1,"keywords_per_attempt":24,"rare_document_frequency":1,"selection_limit":10},"query_service_implementation":"query-retrieval-pipeline-v2","schema_version":2,"synthesis_model":"deepseek-v4-pro","synthesis_provider":"deepseek","synthesis_reasoning":"none","synthesis_temperature":0}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	rollback := filepath.Join(t.TempDir(), "rollback.json")
@@ -3106,7 +3106,7 @@ exec "$REAL_PYTHON" "$@"
 		"EXPECTED_COMMIT=cccccccccccccccccccccccccccccccccccccccc",
 		"EXPECTED_REVISION=new-revision",
 		"CANDIDATE_REVISION=new-revision",
-		"QUERY_STAGE_CONFIG_REVISION=query-dev-2026-08-22.1",
+		"QUERY_STAGE_CONFIG_REVISION=query-dev-2026-08-31.1",
 		"QUERY_STAGE_CONFIG_DIGEST=sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
 		"GITHUB_OUTPUT="+filepath.Join(t.TempDir(), "github-output"),
 		"EVIDENCE="+filepath.Join(t.TempDir(), "evidence.json"),

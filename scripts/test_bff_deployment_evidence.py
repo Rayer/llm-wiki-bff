@@ -21,9 +21,10 @@ JOB = "olw-pipeline"
 SERVICE = "llm-wiki-bff"
 ARTIFACT = "bff-rollback-contract-" + "c" * 40
 EVIDENCE_ARTIFACT = "bff-deployment-evidence-" + "c" * 40
-QUERY_STAGE_CONFIG_PATH = "/app/configs/query/dev/query-dev-2026-08-22.1.json"
+QUERY_STAGE_CONFIG_PATH = "/app/configs/query/dev/query-dev-2026-08-31.1.json"
 PRIOR_QUERY_STAGE_CONFIG_PATH = "/app/configs/query/dev/query-dev-2026-08-21.1.json"
 PRIOR_QUERY_STAGE_CONFIG_PATH_2 = "/app/configs/query/dev/query-dev-2026-08-21.2.json"
+PRIOR_QUERY_STAGE_CONFIG_PATH_3 = "/app/configs/query/dev/query-dev-2026-08-22.1.json"
 LEGACY_QUERY_ENV_NAMES = [
     "QUERY_EXPANSION_MODEL", "QUERY_EXPANSION_REASONING", "ANSWER_SYNTHESIS_MODEL",
     "ANSWER_SYNTHESIS_REASONING", "QUERY_SELECTION_LIMIT", "QUERY_SELECTION_EXPLORATION_SLOTS",
@@ -371,15 +372,24 @@ class BFFDeploymentEvidenceTest(unittest.TestCase):
         saved = json.loads(rollback.read_text())
         self.assertEqual(saved["config"]["env"][-1], {"name": "QUERY_STAGE_CONFIG_PATH", "value": PRIOR_QUERY_STAGE_CONFIG_PATH_2})
 
+    def test_production_prior_2026_08_22_1_revision_builds_rollback_contract(self):
+        prior_revision = fixture("bff-revision-before.json")
+        prior_revision["spec"]["containers"][0]["env"].append({"name": "QUERY_STAGE_CONFIG_PATH", "value": PRIOR_QUERY_STAGE_CONFIG_PATH_3})
+        self.prior_revision_path.write_text(json.dumps(prior_revision))
+        result, rollback = self.prepare()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        saved = json.loads(rollback.read_text())
+        self.assertEqual(saved["config"]["env"][-1], {"name": "QUERY_STAGE_CONFIG_PATH", "value": PRIOR_QUERY_STAGE_CONFIG_PATH_3})
+
     def test_prior_sealed_config_allowlist_and_saved_rollback_are_closed(self):
-        for value in (QUERY_STAGE_CONFIG_PATH, "/app/configs/query/dev/query-dev-2026-08-21.3.json"):
+        for value in (PRIOR_QUERY_STAGE_CONFIG_PATH, PRIOR_QUERY_STAGE_CONFIG_PATH_2, PRIOR_QUERY_STAGE_CONFIG_PATH_3, "/app/configs/query/dev/query-dev-2026-08-21.3.json"):
             with self.subTest(value=value):
                 prior_revision = fixture("bff-revision-before.json")
                 prior_revision["spec"]["containers"][0]["env"].append({"name": "QUERY_STAGE_CONFIG_PATH", "value": value})
                 self.prior_revision_path.write_text(json.dumps(prior_revision))
                 result, _ = self.prepare()
-                self.assertEqual(result.returncode, 0 if value == QUERY_STAGE_CONFIG_PATH else 1, result.stderr)
-                if value != QUERY_STAGE_CONFIG_PATH:
+                self.assertEqual(result.returncode, 0 if value in (PRIOR_QUERY_STAGE_CONFIG_PATH, PRIOR_QUERY_STAGE_CONFIG_PATH_2, PRIOR_QUERY_STAGE_CONFIG_PATH_3) else 1, result.stderr)
+                if value not in (PRIOR_QUERY_STAGE_CONFIG_PATH, PRIOR_QUERY_STAGE_CONFIG_PATH_2, PRIOR_QUERY_STAGE_CONFIG_PATH_3):
                     self.assertIn("config_mismatch", result.stderr)
 
         prior_revision = fixture("bff-revision-before.json")
